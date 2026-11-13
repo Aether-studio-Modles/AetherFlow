@@ -1,0 +1,8 @@
+{
+  "name": "novac",
+  "version": "0.1.0",
+  "aetherflow_api": "1",
+  "factory": "novac.backend:NovaCBackend",
+  "vendor": "AetherFlow 示例",
+  "description": "Nova C 示例硬件包：一份 C 语法方言 + 最小运行时胶水"
+}

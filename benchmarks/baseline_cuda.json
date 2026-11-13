@@ -1,0 +1,84 @@
+{
+  "backend": "cuda",
+  "device": "DeviceInfo(name='NVIDIA GeForce RTX 2080 Ti', runtime=12090, total_memory_bytes=11539054592)",
+  "machine": {
+    "host": "ubuntu22",
+    "cpu": "Intel(R) Xeon(R) CPU E5-2678 v3 @ 2.50GHz",
+    "cores": 8,
+    "python": "3.10.12"
+  },
+  "cases": {
+    "matmul_256": {
+      "median_ms": 0.4378,
+      "p90_ms": 0.4527,
+      "min_ms": 0.4302,
+      "note": "cuBLAS 的基本盘",
+      "rounds": 3
+    },
+    "matmul_1024": {
+      "median_ms": 2.9932,
+      "p90_ms": 3.098,
+      "min_ms": 2.9623,
+      "note": "大 GEMM：算力主导",
+      "rounds": 3
+    },
+    "matmul_batched": {
+      "median_ms": 0.6943,
+      "p90_ms": 0.7065,
+      "min_ms": 0.6864,
+      "note": "批量 GEMM",
+      "rounds": 3
+    },
+    "conv2d_3x3_pad1": {
+      "median_ms": 0.7368,
+      "p90_ms": 0.7916,
+      "min_ms": 0.7282,
+      "note": "浅通道 3x3：K=27，auto 选分块直算",
+      "rounds": 3
+    },
+    "conv2d_1x1": {
+      "median_ms": 0.6699,
+      "p90_ms": 0.7103,
+      "min_ms": 0.6655,
+      "note": "1x1 卷积：K=32，auto 选分块直算",
+      "rounds": 3
+    },
+    "maxpool2x2": {
+      "median_ms": 5.6355,
+      "p90_ms": 5.7479,
+      "min_ms": 5.536,
+      "note": "纯索引算子：访存主导",
+      "rounds": 3
+    },
+    "transformer_block": {
+      "median_ms": 3.2829,
+      "p90_ms": 3.4412,
+      "min_ms": 3.2596,
+      "note": "整图调度 + 多种 kernel 混合",
+      "rounds": 3
+    },
+    "transformer_block_resident": {
+      "median_ms": 2.3609,
+      "p90_ms": 2.4133,
+      "min_ms": 2.259,
+      "note": "同上，权重常驻、只传激活（真实推理口径）",
+      "rounds": 3
+    },
+    "cnn_lenet": {
+      "median_ms": 1.6325,
+      "p90_ms": 1.6779,
+      "min_ms": 1.5942,
+      "note": "CNN 的端到端形态",
+      "rounds": 3
+    },
+    "cnn_lenet_resident": {
+      "median_ms": 1.1109,
+      "p90_ms": 1.1578,
+      "min_ms": 1.1066,
+      "note": "同上，权重常驻、只传激活（真实推理口径）",
+      "rounds": 3
+    }
+  },
+  "conv_impl": "auto",
+  "graph_mode": "off"
+}

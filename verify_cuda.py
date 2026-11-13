@@ -1,0 +1,611 @@
+"""远程 GPU 验证脚本：让 CUDA 后端自证。
+
+本地没有 GPU 时这一步只能跳过，所以凡是"新增了 CUDA 内核"的改动，都必须
+在真机上跑一遍再宣称完成。这个脚本就是那一步：
+
+1. 打印设备信息（确认真的拿到了 GPU，而不是回落到别的东西）；
+2. 跑完整的 conformance 套件（覆盖全部 46 个算子）；
+3. 对新增内核做额外的形状/边界对拍（官方图集里的形状只有一种，
+   边界条件必须另外覆盖），包括 f16 形态与编译期静态显存预算的对照；
+4. 全部通过才返回 0，否则返回 1。
+
+用法::
+
+    python verify_cuda.py
+    python verify_cuda.py --strict   # 把 refused 也视为失败（全算子后端才该用）
+
+需要可用的 CUDA 设备与 cupy；脚本不修改任何文件。
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+import numpy as np
+
+from aetherflow import Graph, ReferenceBackend, f32, i8, i32
+from aetherflow.backends.cuda import CudaBackend
+from aetherflow.conformance import run_conformance
+
+
+def _device_banner(backend: CudaBackend) -> None:
+    info = backend.device_info()
+    print(f"device  : {info.name}")
+    print(f"runtime : CUDA {info.runtime // 1000}.{(info.runtime % 1000) // 10}")
+    print(f"memory  : {info.total_memory_bytes / 2**30:.1f} GiB")
+    print(f"caps    : {len(backend.capabilities())} 个算子")
+
+
+def _rand(rng: np.random.Generator, *shape, scale: float = 1.0) -> np.ndarray:
+    return (rng.standard_normal(shape) * scale).astype(np.float32)
+
+
+def _extra_cases() -> list:
+    """新增内核的边界用例：(名字, 构图函数, 输入)。
+
+    这些形状刻意与 conformance 图集不同——图集保证"能跑"，这里保证
+    "边界对"，两者缺一不可。
+    """
+    rng = np.random.default_rng(20261031)
+
+    def gelu():
+        g = Graph()
+        x = g.input("x", f32[3, 11])
+        g.output(g.gelu(x), "y")
+        # 跨饱和区：值域必须覆盖 tanh 两端的平台
+        return g, {"x": np.array(
+            [[-40.0, -5.0, -1.0, -0.25, 0.0, 0.25, 1.0, 5.0, 40.0, 0.1, -0.1]] * 3,
+            dtype=np.float32,
+        )}
+
+    def rmsnorm():
+        g = Graph()
+        x = g.input("x", f32[2, 3, 16])
+        gamma = g.input("gamma", f32[16])
+        g.output(g.rmsnorm(x, gamma, axes=(-1,), eps=1e-6), "y")
+        return g, {"x": _rand(rng, 2, 3, 16), "gamma": _rand(rng, 16) + 1.0}
+
+    def avgpool_rect():
+        g = Graph()
+        x = g.input("x", f32[2, 3, 9, 7])
+        g.output(g.avgpool2d(x, kernel=(3, 2), stride=(2, 1), padding=(1, 1)), "y")
+        return g, {"x": _rand(rng, 2, 3, 9, 7)}
+
+    def avgpool_backward_overlap():
+        g = Graph()
+        dy = g.input("dy", f32[1, 2, 6, 6])
+        g.output(
+            g.avgpool2d_backward(
+                dy,
+                input_shape=[1, 2, 6, 6],
+                kernel=(3, 3),
+                stride=(1, 1),
+                padding=(1, 1),
+            ),
+            "y",
+        )
+        return g, {"dy": _rand(rng, 1, 2, 6, 6)}
+
+    def maxpool_pad_stride():
+        """窗口伸出图像边界：越界采样点必须跳过，不能跟真实值争最大值。"""
+        g = Graph()
+        x = g.input("x", f32[2, 3, 7, 5])
+        g.output(g.maxpool2d(x, kernel=(3, 3), stride=(2, 2), padding=(1, 1)), "y")
+        return g, {"x": _rand(rng, 2, 3, 7, 5)}
+
+    def maxpool_backward_ties_overlap():
+        """步长 1 + padding 1：窗口重叠，量化后的输入里还会出现并列最大值。"""
+        g = Graph()
+        x = g.input("x", f32[1, 2, 6, 6])
+        dy = g.input("dy", f32[1, 2, 6, 6])
+        g.output(
+            g.maxpool2d_backward(
+                x, dy, kernel=(3, 3), stride=(1, 1), padding=(1, 1)
+            ),
+            "y",
+        )
+        # 量化到整数格点，保证窗口里出现多个相同最大值，考验"取第一个"的平局规则。
+        return g, {
+            "x": np.round(_rand(rng, 1, 2, 6, 6) * 2.0),
+            "dy": _rand(rng, 1, 2, 6, 6),
+        }
+
+    def concat_axis0():
+        g = Graph()
+        a = g.input("a", f32[2, 3])
+        b = g.input("b", f32[5, 3])
+        g.output(g.concat(a, b, axis=0), "y")
+        return g, {"a": _rand(rng, 2, 3), "b": _rand(rng, 5, 3)}
+
+    def concat_middle():
+        g = Graph()
+        a = g.input("a", f32[2, 3, 4])
+        b = g.input("b", f32[2, 5, 4])
+        g.output(g.concat(a, b, axis=1), "y")
+        return g, {"a": _rand(rng, 2, 3, 4), "b": _rand(rng, 2, 5, 4)}
+
+    def embedding_i8():
+        g = Graph()
+        table = g.input("table", f32[100, 2, 3])
+        ids = g.input("ids", i8[4, 5])
+        g.output(g.embedding(table, ids), "y")
+        return g, {
+            "table": _rand(rng, 100, 2, 3),
+            "ids": rng.integers(0, 100, (4, 5), dtype=np.int8),
+        }
+
+    def embedding_backward_duplicates():
+        g = Graph()
+        dy = g.input("dy", f32[3, 5, 4])
+        ids = g.input("ids", i32[3, 5])
+        g.output(g.embedding_backward(dy, ids, table_shape=[10, 4]), "y")
+        return g, {
+            "dy": _rand(rng, 3, 5, 4),
+            # 大量重复：反向必须逐条累加，覆盖 atomicAdd 的路径
+            "ids": np.array(
+                [[0, 0, 0, 1, 1], [1, 1, 2, 2, 2], [0, 3, 3, 3, 9]], dtype=np.int32
+            ),
+        }
+
+    def chain():
+        """端到端小图：查表 -> 归一化 -> 激活，三个新内核首尾相接。"""
+        g = Graph()
+        table = g.input("table", f32[16, 8])
+        ids = g.input("ids", i32[2, 4])
+        gamma = g.input("gamma", f32[8])
+        h = g.embedding(table, ids)
+        h = g.rmsnorm(h, gamma, axes=(-1,), eps=1e-6)
+        g.output(g.gelu(h), "y")
+        return g, {
+            "table": _rand(rng, 16, 8, scale=0.5),
+            "ids": rng.integers(0, 16, (2, 4), dtype=np.int32),
+            "gamma": _rand(rng, 8) + 1.0,
+        }
+
+    def batch_norm_axis0():
+        """通道轴不是 1：一般化靠 (outer, C, inner) 三元组，不是四维特判。"""
+        g = Graph()
+        x = g.input("x", f32[3, 2, 4])
+        gamma = g.input("gamma", f32[3])
+        beta = g.input("beta", f32[3])
+        g.output(g.batch_norm(x, gamma, beta, axis=0), "y")
+        return g, {
+            "x": _rand(rng, 3, 2, 4),
+            "gamma": _rand(rng, 3),
+            "beta": _rand(rng, 3),
+        }
+
+    def batch_norm_single_sample():
+        """N=1 且空间 1x1：方差恰好为 0，只剩 eps，最容易在这里除零。"""
+        g = Graph()
+        x = g.input("x", f32[1, 5, 1, 1])
+        gamma = g.input("gamma", f32[5])
+        beta = g.input("beta", f32[5])
+        g.output(g.batch_norm(x, gamma, beta, axis=1, eps=1e-5), "y")
+        return g, {
+            "x": _rand(rng, 1, 5, 1, 1),
+            "gamma": _rand(rng, 5),
+            "beta": _rand(rng, 5),
+        }
+
+    def batch_norm_stats_axis0():
+        g = Graph()
+        x = g.input("x", f32[4, 3, 5])
+        g.output(g.batch_norm_stats(x, axis=0), "y")
+        return g, {"x": _rand(rng, 4, 3, 5)}
+
+    def conv2d_grouped():
+        """矩形核 + 非对称桶形：分组切片要同时对齐输入与输出通道。"""
+        g = Graph()
+        x = g.input("x", f32[2, 4, 9, 7])
+        w = g.input("w", f32[6, 2, 3, 2])
+        b = g.input("b", f32[6])
+        g.output(
+            g.conv2d(x, w, b, stride=(1, 2), padding=(1, 0), groups=2), "y"
+        )
+        return g, {
+            "x": _rand(rng, 2, 4, 9, 7),
+            "w": _rand(rng, 6, 2, 3, 2, scale=0.3),
+            "b": _rand(rng, 6),
+        }
+
+    def conv2d_depthwise_stride2():
+        """depthwise + stride2：每组只有一个通道，最容易在通道偏移上出错。"""
+        g = Graph()
+        x = g.input("x", f32[1, 4, 11, 11])
+        w = g.input("w", f32[4, 1, 3, 3])
+        g.output(g.conv2d(x, w, padding=(1, 1), stride=(2, 2), groups=4), "y")
+        return g, {
+            "x": _rand(rng, 1, 4, 11, 11),
+            "w": _rand(rng, 4, 1, 3, 3, scale=0.3),
+        }
+
+    def conv2d_input_grad_grouped():
+        g = Graph()
+        dy = g.input("dy", f32[2, 6, 9, 7])
+        w = g.input("w", f32[6, 2, 3, 3])
+        g.output(
+            g.conv2d_input_grad(
+                dy, w, input_shape=[2, 4, 9, 7], padding=(1, 1), groups=2
+            ),
+            "y",
+        )
+        return g, {
+            "dy": _rand(rng, 2, 6, 9, 7),
+            "w": _rand(rng, 6, 2, 3, 3, scale=0.3),
+        }
+
+    def conv2d_weight_grad_grouped():
+        g = Graph()
+        x = g.input("x", f32[2, 4, 9, 7])
+        dy = g.input("dy", f32[2, 6, 9, 7])
+        g.output(
+            g.conv2d_weight_grad(
+                x, dy, weight_shape=[6, 2, 3, 3], padding=(1, 1), groups=2
+            ),
+            "y",
+        )
+        return g, {"x": _rand(rng, 2, 4, 9, 7), "dy": _rand(rng, 2, 6, 9, 7)}
+
+    def adaptive_pool_non_divisible():
+        """7/3 与 5/2 都不整除：窗口端点 floor/ceil 与重叠都要覆盖。"""
+        g = Graph()
+        x = g.input("x", f32[2, 3, 7, 5])
+        g.output(g.adaptive_avg_pool2d(x, output_size=(3, 2)), "y")
+        return g, {"x": _rand(rng, 2, 3, 7, 5)}
+
+    def adaptive_pool_backward_overlap():
+        g = Graph()
+        dy = g.input("dy", f32[2, 3, 3, 2])
+        g.output(
+            g.adaptive_avg_pool2d_backward(
+                dy, input_shape=[2, 3, 7, 5], output_size=(3, 2)
+            ),
+            "y",
+        )
+        return g, {"dy": _rand(rng, 2, 3, 3, 2)}
+
+    def scan_linear_3d():
+        """(T,B,D) + 三维尾：尾维被压平，索引不能依赖尾维的具体阶数。"""
+        g = Graph()
+        a = g.input("a", f32[7, 2, 3])
+        b = g.input("b", f32[7, 2, 3])
+        h0 = g.input("h0", f32[2, 3])
+        g.output(g.add_node("scan_linear", [a, b, h0]), "y")
+        return g, {
+            "a": _rand(rng, 7, 2, 3, scale=0.3),
+            "b": _rand(rng, 7, 2, 3),
+            "h0": _rand(rng, 2, 3),
+        }
+
+    def scan_linear_single_step():
+        """T=1：退化成 a0*h0+b0，最容易被"先循环再写"的写法漏掉。"""
+        g = Graph()
+        a = g.input("a", f32[1, 16])
+        b = g.input("b", f32[1, 16])
+        h0 = g.input("h0", f32[16])
+        g.output(g.add_node("scan_linear", [a, b, h0]), "y")
+        return g, {
+            "a": _rand(rng, 1, 16, scale=0.9),
+            "b": _rand(rng, 1, 16),
+            "h0": _rand(rng, 16),
+        }
+
+    def scan_linear_wide():
+        """长序列 + 宽尾：T 走 64 步，尾 2048 个元素跨多个 block。"""
+        g = Graph()
+        a = g.input("a", f32[64, 2, 1024])
+        b = g.input("b", f32[64, 2, 1024])
+        h0 = g.input("h0", f32[2, 1024])
+        g.output(g.add_node("scan_linear", [a, b, h0]), "y")
+        return g, {
+            "a": _rand(rng, 64, 2, 1024, scale=0.3),
+            "b": _rand(rng, 64, 2, 1024),
+            "h0": _rand(rng, 2, 1024),
+        }
+
+    def scan_linear_backward_long():
+        """伴随从后往前累积：T=9 且 |a| 不小，任何"少乘一步 a"都会放大。"""
+        g = Graph()
+        a = g.input("a", f32[9, 4])
+        dy = g.input("dy", f32[9, 4])
+        g.output(g.add_node("scan_linear_backward", [a, dy]), "y")
+        return g, {
+            "a": _rand(rng, 9, 4, scale=0.6),
+            "dy": _rand(rng, 9, 4),
+        }
+
+    def silu_gate_odd():
+        """SwiGLU 门控：元素总数 21 不是 block 维的倍数，跨步循环必须收尾。"""
+        g = Graph()
+        x = g.input("x", f32[3, 7])
+        gate = g.input("gate", f32[3, 7])
+        g.output(g.silu(x, gate), "y")
+        return g, {"x": _rand(rng, 3, 7), "gate": _rand(rng, 3, 7)}
+
+    def layernorm_residual_odd():
+        """残差融合：列数 7 不是 2 的幂，块内归约要处理非整块。"""
+        g = Graph()
+        a = g.input("a", f32[5, 7])
+        r = g.input("r", f32[5, 7])
+        gamma = g.input("gamma", f32[7])
+        beta = g.input("beta", f32[7])
+        g.output(g.layernorm(a, gamma, beta, r, axes=(-1,)), "y")
+        return g, {
+            "a": _rand(rng, 5, 7),
+            "r": _rand(rng, 5, 7),
+            "gamma": _rand(rng, 7) + 1.0,
+            "beta": _rand(rng, 7),
+        }
+
+    return [
+        ("gelu_saturation", gelu),
+        ("rmsnorm_rank3", rmsnorm),
+        ("avgpool2d_rect_pad", avgpool_rect),
+        ("avgpool2d_backward_overlap", avgpool_backward_overlap),
+        ("maxpool2d_pad_stride", maxpool_pad_stride),
+        ("maxpool2d_backward_ties_overlap", maxpool_backward_ties_overlap),
+        ("concat_axis0", concat_axis0),
+        ("concat_middle_rank3", concat_middle),
+        ("embedding_i8_trailing", embedding_i8),
+        ("embedding_backward_duplicates", embedding_backward_duplicates),
+        ("chain_embedding_rmsnorm_gelu", chain),
+        ("batch_norm_axis0", batch_norm_axis0),
+        ("batch_norm_single_sample", batch_norm_single_sample),
+        ("batch_norm_stats_axis0", batch_norm_stats_axis0),
+        ("conv2d_grouped", conv2d_grouped),
+        ("conv2d_depthwise_stride2", conv2d_depthwise_stride2),
+        ("conv2d_input_grad_grouped", conv2d_input_grad_grouped),
+        ("conv2d_weight_grad_grouped", conv2d_weight_grad_grouped),
+        ("adaptive_pool2d_non_divisible", adaptive_pool_non_divisible),
+        ("adaptive_pool2d_backward_overlap", adaptive_pool_backward_overlap),
+        ("scan_linear_3d_tail", scan_linear_3d),
+        ("scan_linear_single_step", scan_linear_single_step),
+        ("scan_linear_wide", scan_linear_wide),
+        ("scan_linear_backward_long", scan_linear_backward_long),
+        ("silu_gate_odd_length", silu_gate_odd),
+        ("layernorm_residual_odd_cols", layernorm_residual_odd),
+    ]
+
+
+def _run_extra(cuda: CudaBackend, ref: ReferenceBackend) -> list:
+    failures = []
+    for name, build in _extra_cases():
+        graph, feed = build()
+        try:
+            expected = ref.execute(graph, feed)["y"]
+            got = cuda.execute(graph, feed)["y"]
+            np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
+            print(f"  [PASS] {name}")
+        except Exception as exc:  # noqa: BLE001 - 验证脚本要把任何异常都记成失败
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+            print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
+    return failures
+
+
+def _run_dropout_exact(cuda: CudaBackend, ref: ReferenceBackend) -> list:
+    """dropout 是随机算子，但两边共用 SplitMix64，所以这里要求**逐位相等**。
+
+    随机不是放松校验的理由：只要参考实现与内核用同一套位运算，掩码就该
+    一个 bit 都不差。用 allclose 反而会把"某处悄悄换了随机源"放过去。
+    """
+    rng = np.random.default_rng(2024)
+    failures = []
+
+    for p in (0.0, 0.25, 0.9):
+        g = Graph(f"drop{p}")
+        x = g.input("x", f32[7, 13])
+        g.output(g.dropout_mask(x, p=p, seed=987654321), "y")
+        feed = {"x": _rand(rng, 7, 13)}
+        name = f"dropout_p{p}_bitwise"
+        try:
+            np.testing.assert_array_equal(
+                cuda.execute(g, feed)["y"], ref.execute(g, feed)["y"]
+            )
+            print(f"  [PASS] {name}")
+        except Exception as exc:  # noqa: BLE001
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+            print(f"  [FAIL] {name}: {exc}")
+
+    g = Graph("drop_train")
+    x = g.input("x", f32[6, 10])
+    mask = g.dropout_mask(x, p=0.3, seed=7)
+    g.output(g.mul(x, mask), "y")
+    feed = {"x": _rand(rng, 6, 10)}
+    try:
+        np.testing.assert_array_equal(
+            cuda.execute(g, feed)["y"], ref.execute(g, feed)["y"]
+        )
+        print("  [PASS] dropout_train_bitwise")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(("dropout_train_bitwise", f"{type(exc).__name__}: {exc}"))
+        print(f"  [FAIL] dropout_train_bitwise: {exc}")
+
+    return failures
+
+
+def _run_f16_extra(cuda: CudaBackend, ref: ReferenceBackend) -> list:
+    """融合内核的 f16 形态：存储减半、算术仍在 float 里。
+
+    f16 的参考实现按 numpy 的 float16 算，CUDA 在 float 里算再舍入回 f16，
+    两者本来就不是逐位关系，所以这里只要求落在半精度的合理误差内。
+    """
+    from aetherflow import f16
+
+    rng = np.random.default_rng(31415)
+    failures = []
+
+    cases = []
+
+    g = Graph("silu_gate_f16")
+    x = g.input("x", f16[3, 7])
+    gate = g.input("gate", f16[3, 7])
+    g.output(g.silu(x, gate), "y")
+    cases.append(
+        (
+            "silu_gate_f16",
+            g,
+            {
+                "x": _rand(rng, 3, 7, scale=0.5).astype(np.float16),
+                "gate": _rand(rng, 3, 7, scale=0.5).astype(np.float16),
+            },
+        )
+    )
+
+    g = Graph("layernorm_residual_f16")
+    a = g.input("a", f16[4, 16])
+    r = g.input("r", f16[4, 16])
+    gamma = g.input("gamma", f16[16])
+    beta = g.input("beta", f16[16])
+    g.output(g.layernorm(a, gamma, beta, r, axes=(-1,)), "y")
+    cases.append(
+        (
+            "layernorm_residual_f16",
+            g,
+            {
+                "a": _rand(rng, 4, 16, scale=0.5).astype(np.float16),
+                "r": _rand(rng, 4, 16, scale=0.5).astype(np.float16),
+                "gamma": (_rand(rng, 16, scale=0.1) + 1.0).astype(np.float16),
+                "beta": _rand(rng, 16, scale=0.1).astype(np.float16),
+            },
+        )
+    )
+
+    for name, graph, feed in cases:
+        try:
+            got = cuda.execute(graph, feed)["y"]
+            expected = ref.execute(graph, feed)["y"]
+            np.testing.assert_allclose(got, expected, rtol=2e-2, atol=2e-2)
+            print(f"  [PASS] {name}")
+        except Exception as exc:  # noqa: BLE001
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+            print(f"  [FAIL] {name}: {exc}")
+
+    return failures
+
+
+def _run_budget_check(cuda: CudaBackend) -> list:
+    """编译期静态预算与捕获期峰值的对照。
+
+    静态预算（``ir/liveness.py``）在图还没执行时就能报出容量需求；它假设
+    每个中间值独占内存，而 CUDA 后端会把连续张量上的 reshape 实现成视图、
+    arena 又复用已释放的块，所以实测峰值只会更小。预算若被实测超过，说明
+    还有模型没覆盖的分配（工作区之类），必须查清楚。
+    """
+    from aetherflow.ir.liveness import plan_memory
+    from aetherflow.models import BlockSpec, build_transformer_block
+
+    spec = BlockSpec(d_model=32, num_heads=4, d_ff=64)
+    g = Graph("budget")
+    _, out = build_transformer_block(g, spec)
+    g.output(out, "y")
+
+    budget = plan_memory(g, symbols={"B": 2, "S": 5})
+    print(
+        f"  [info] 静态预算：peak_live={budget.peak_live_bytes} B, "
+        f"intermediate_peak={budget.intermediate_peak_bytes} B, "
+        f"reuse={budget.reuse_ratio:.2f}x"
+    )
+
+    rng = np.random.default_rng(2718)
+    feed = {"x": _rand(rng, 2, 5, spec.d_model)}
+    for name, shape in spec.param_shapes.items():
+        if name == "scale":
+            feed[name] = np.array([1.0 / np.sqrt(spec.head_dim)], dtype=np.float32)
+        else:
+            feed[name] = _rand(rng, *shape, scale=0.1)
+
+    try:
+        plan = cuda.capture(g, feed)
+        captured = plan.peak_bytes
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [FAIL] static_budget: {type(exc).__name__}: {exc}")
+        return [("static_budget", f"{type(exc).__name__}: {exc}")]
+
+    static = budget.aligned_intermediate_peak_bytes
+    print(f"  [info] 捕获峰值：{captured} B（静态预算 {static} B，已按 512B 对齐）")
+    # 两者不要求严格相等：对齐与后端小临时让实测偏大，连续张量上的
+    # reshape 走视图又会让它偏小。超出 2 倍说明预算模型失真。
+    if captured > static * 2 or static > captured * 2:
+        message = f"捕获峰值 {captured} B 与静态预算 {static} B 相差超过 2 倍"
+        print(f"  [FAIL] static_budget: {message}")
+        return [("static_budget", message)]
+
+    print("  [PASS] static_budget_matches_capture")
+    return []
+
+
+def _run_tuning_check(cuda: CudaBackend) -> list:
+    """自动调优闭环：搜索一条配置，应用后与默认配置逐位一致。
+
+    本地只能测搜索器；这一步证明插件真的把 block 接进了 launch，
+    而且"应用配置"没有引入任何数值差异。
+    """
+    from benchmarks.tune import TUNE_CASES, apply_and_verify, search
+
+    case = next(c for c in TUNE_CASES if c.name == "relu_1m")
+    try:
+        space = cuda.tuning_space("relu")
+        store = search(cuda, cases=[case], rounds=1)
+        hits, problems = apply_and_verify(cuda, store, cases=[case])
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [FAIL] tuning: {type(exc).__name__}: {exc}")
+        return [("tuning", f"{type(exc).__name__}: {exc}")]
+
+    record = store.records()[0]
+    print(
+        f"  [info] relu 候选 {list(space.values('block'))}，"
+        f"最优 {dict(record.config)} @ {record.median_ms:.4f} ms"
+    )
+    if problems:
+        for item in problems:
+            print(f"  [FAIL] tuning: {item}")
+        return [("tuning", item) for item in problems]
+    if hits != 1:
+        print(f"  [FAIL] tuning: 期望命中 1 条配置，实际 {hits}")
+        return [("tuning", f"命中 {hits} 条配置")]
+
+    print("  [PASS] tuning_roundtrip")
+    return []
+
+
+def main(argv: list) -> int:
+    parser = argparse.ArgumentParser(description="CUDA 后端远程验证")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="把 refused 的用例也视为失败（只对声称承接全部算子的后端有意义）",
+    )
+    args = parser.parse_args(argv)
+
+    cuda = CudaBackend()
+    _device_banner(cuda)
+
+    print("\n== conformance ==")
+    report = run_conformance(cuda)
+    print(report.text())
+    if not report.ok:
+        print("\nconformance 未通过：上面标 FAIL 的检查或用例需要先修")
+        return 1
+    if args.strict and report.refused:
+        print(f"\n--strict：仍有 {len(report.refused)} 个用例被拒绝")
+        return 1
+
+    print("\n== 新增内核的边界用例 ==")
+    ref = ReferenceBackend()
+    failures = _run_extra(cuda, ref)
+    failures += _run_dropout_exact(cuda, ref)
+    failures += _run_f16_extra(cuda, ref)
+    failures += _run_budget_check(cuda)
+    failures += _run_tuning_check(cuda)
+    if failures:
+        print(f"\n{len(failures)} 个边界用例失败")
+        return 1
+
+    print("\n全部通过。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

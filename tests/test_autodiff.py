@@ -1,0 +1,768 @@
+"""自动微分的验收测试。
+
+三条独立的判据，缺一不可：
+
+1. **数值梯度**（中心差分）——不依赖任何外部框架，覆盖每个算子的 vjp 规则；
+2. **torch.autograd 对拍**——只作为"另一个实现"来交叉验证，不是运行期依赖
+   （ADR-008 的例外条款：torch 可以出现在测试对照里）；
+3. **反向图本身合规**——它必须能过 verifier、能 JSON 往返、能在参考后端跑，
+   这样才能支撑"反向图也是普通 IR"这条设计。
+
+用 float64 做对拍：差分噪声随精度平方增长，f32 的噪声与某些规则的量级接近，
+会把"规则写错"和"精度不够"混在一起。
+"""
+
+from __future__ import annotations
+
+import math
+import unittest
+
+import numpy as np
+
+from aetherflow import (
+    Graph,
+    NoGradientError,
+    ReferenceBackend,
+    backward,
+    dumps,
+    f32,
+    f64,
+    loads,
+    verify,
+)
+
+try:
+    import torch
+
+    TORCH_AVAILABLE = True
+except ImportError:  # 内核与全部测试必须在没有 torch 的机器上也能跑（ADR-005）
+    TORCH_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------
+# 通用对拍工具
+# --------------------------------------------------------------------------
+
+
+def _execute(graph, feed):
+    return ReferenceBackend().execute(graph, feed)
+
+
+def _scalar_loss(graph, feed) -> float:
+    return float(sum(float(np.sum(v)) for v in _execute(graph, feed).values()))
+
+
+def _numeric_grad(graph, feed, name: str, eps: float = 1e-6) -> np.ndarray:
+    """中心差分：对 ``feed[name]`` 的每个元素单独扰动。"""
+    arr = feed[name]
+    flat = arr.reshape(-1)
+    grad = np.zeros(flat.size, dtype=np.float64)
+    for i in range(flat.size):
+        orig = float(flat[i])
+        flat[i] = orig + eps
+        hi = _scalar_loss(graph, feed)
+        flat[i] = orig - eps
+        lo = _scalar_loss(graph, feed)
+        grad[i] = (hi - lo) / (2 * eps)
+        flat[i] = orig
+    return grad.reshape(arr.shape)
+
+
+def _analytic_grad(graph, feed, names):
+    wrt = [graph.find(n) for n in names]
+    bwd = backward(graph, wrt=wrt)
+    seed = "d" + graph.output_names[0]
+    out_type = graph.outputs[0].type
+    seed_feed = dict(feed)
+    seed_feed[seed] = np.ones(out_type.shape, dtype=np.float64)
+    res = _execute(bwd, seed_feed)
+    return [res[f"d{n}"] for n in names], bwd
+
+
+class _GradTest(unittest.TestCase):
+    def assertGradients(self, build, names=None, rtol=1e-5, atol=1e-7):
+        graph, feed = build()
+        names = names or [v.name for v in graph.inputs]
+        analytic, bwd = _analytic_grad(graph, feed, names)
+        for name, got in zip(names, analytic):
+            want = _numeric_grad(graph, feed, name)
+            np.testing.assert_allclose(
+                got, want, rtol=rtol, atol=atol, err_msg=f"d{name} 与数值梯度不一致"
+            )
+        return graph, bwd, analytic
+
+
+def _rand(shape, seed=0, scale=1.0, positive=False):
+    rng = np.random.default_rng(seed)
+    if positive:
+        return np.abs(rng.standard_normal(shape)) * scale + 0.5
+    return rng.standard_normal(shape) * scale
+
+
+# --------------------------------------------------------------------------
+# 逐元素
+# --------------------------------------------------------------------------
+
+
+class TestElementwiseGrad(_GradTest):
+    def _unary(self, op, positive=False, scale=1.0):
+        def build():
+            g = Graph(op)
+            x = g.input("x", f64[3, 4])
+            g.output(g.add_node(op, [x]), "y")
+            return g, {"x": _rand((3, 4), scale=scale, positive=positive)}
+
+        return build
+
+    def test_unary_rules(self):
+        cases = {
+            "relu": (False, 1.0),
+            "silu": (False, 1.0),
+            "exp": (False, 0.5),
+            "log": (True, 1.0),
+            "sqrt": (True, 1.0),
+            "neg": (False, 1.0),
+            "tanh": (False, 1.0),
+            "sigmoid": (False, 1.0),
+        }
+        for op, (positive, scale) in cases.items():
+            with self.subTest(op=op):
+                self.assertGradients(self._unary(op, positive=positive, scale=scale))
+
+    def _binary(self, op):
+        def build():
+            g = Graph(op)
+            a = g.input("a", f64[3, 4])
+            b = g.input("b", f64[3, 4])
+            g.output(g.add_node(op, [a, b]), "y")
+            feed = {"a": _rand((3, 4), seed=1)}
+            feed["b"] = _rand((3, 4), seed=2) + (3.0 if op == "div" else 0.0)
+            return g, feed
+
+        return build
+
+    def test_binary_rules(self):
+        for op in ("add", "sub", "mul", "div"):
+            with self.subTest(op=op):
+                self.assertGradients(self._binary(op))
+
+
+# --------------------------------------------------------------------------
+# 广播
+# --------------------------------------------------------------------------
+
+
+class TestBroadcastGrad(_GradTest):
+    def test_trailing_broadcast(self):
+        def build():
+            g = Graph("add_bcast")
+            a = g.input("a", f64[2, 3, 4])
+            b = g.input("b", f64[4])
+            g.output(g.add_node("add", [a, b]), "y")
+            return g, {"a": _rand((2, 3, 4)), "b": _rand((4,), seed=3)}
+
+        self.assertGradients(build)
+
+    def test_middle_broadcast(self):
+        def build():
+            g = Graph("mul_bcast")
+            a = g.input("a", f64[2, 1, 4])
+            b = g.input("b", f64[1, 3, 1])
+            g.output(g.add_node("mul", [a, b]), "y")
+            return g, {"a": _rand((2, 1, 4)), "b": _rand((1, 3, 1), seed=4)}
+
+        self.assertGradients(build)
+
+    def test_five_dimensional_broadcast(self):
+        def build():
+            g = Graph("sub_bcast_5d")
+            a = g.input("a", f64[2, 3, 1, 4, 5])
+            b = g.input("b", f64[1, 1, 6, 1, 1])
+            g.output(g.add_node("sub", [a, b]), "y")
+            return g, {"a": _rand((2, 3, 1, 4, 5)), "b": _rand((1, 1, 6, 1, 1), seed=5)}
+
+        self.assertGradients(build)
+
+
+# --------------------------------------------------------------------------
+# 矩阵 / 归一化 / 归约
+# --------------------------------------------------------------------------
+
+
+class TestLinearAlgebraGrad(_GradTest):
+    def test_matmul_2d(self):
+        def build():
+            g = Graph("matmul")
+            a = g.input("a", f64[3, 4])
+            b = g.input("b", f64[4, 2])
+            g.output(g.add_node("matmul", [a, b]), "y")
+            return g, {"a": _rand((3, 4)), "b": _rand((4, 2), seed=6)}
+
+        self.assertGradients(build)
+
+    def test_matmul_batched_shared_weight(self):
+        def build():
+            g = Graph("matmul_batched")
+            a = g.input("a", f64[3, 2, 4])
+            w = g.input("w", f64[4, 5])
+            g.output(g.add_node("matmul", [a, w]), "y")
+            return g, {"a": _rand((3, 2, 4)), "w": _rand((4, 5), seed=7)}
+
+        self.assertGradients(build)
+
+    def test_softmax_last(self):
+        def build():
+            g = Graph("softmax")
+            x = g.input("x", f64[4, 5])
+            g.output(g.add_node("softmax", [x], {"axis": -1}), "y")
+            return g, {"x": _rand((4, 5), scale=2.0)}
+
+        self.assertGradients(build)
+
+    def test_softmax_axis0(self):
+        def build():
+            g = Graph("softmax")
+            x = g.input("x", f64[4, 5])
+            g.output(g.add_node("softmax", [x], {"axis": 0}), "y")
+            return g, {"x": _rand((4, 5), scale=2.0)}
+
+        self.assertGradients(build)
+
+    def test_layernorm(self):
+        def build():
+            g = Graph("layernorm")
+            x = g.input("x", f64[5, 6])
+            gamma = g.input("gamma", f64[6])
+            beta = g.input("beta", f64[6])
+            g.output(g.add_node("layernorm", [x, gamma, beta], {"axes": (-1,)}), "y")
+            return g, {
+                "x": _rand((5, 6)),
+                "gamma": _rand((6,), seed=8),
+                "beta": _rand((6,), seed=9),
+            }
+
+        self.assertGradients(build)
+
+    def test_reduce_sum_keepdims(self):
+        def build():
+            g = Graph("reduce_sum_keepdims")
+            x = g.input("x", f64[3, 4])
+            g.output(g.add_node("reduce_sum", [x], {"axis": -1, "keepdims": True}), "y")
+            return g, {"x": _rand((3, 4))}
+
+        self.assertGradients(build)
+
+    def test_reduce_sum_dropdims(self):
+        def build():
+            g = Graph("reduce_sum")
+            x = g.input("x", f64[3, 4])
+            g.output(g.add_node("reduce_sum", [x], {"axis": 0, "keepdims": False}), "y")
+            return g, {"x": _rand((3, 4))}
+
+        self.assertGradients(build)
+
+    def test_attention_bias_broadcast_gets_a_gradient(self):
+        """加性 bias 广播到 batch 上时，梯度要沿被广播的轴求和。
+
+        旧规则用"形状完全相同才给梯度"，把 (1,3,3) 的偏置当成结构性 mask
+        返回 None；可学习的相对位置偏置正是这一路的正常用法，梯度必须给出。
+        """
+
+        def build():
+            g = Graph("attention_bias")
+            q = g.input("q", f64[2, 3, 4])
+            k = g.input("k", f64[2, 3, 4])
+            v = g.input("v", f64[2, 3, 4])
+            bias = g.input("bias", f64[1, 3, 3])
+            g.output(g.add_node("attention", [q, k, v, bias], {"scale": 0.7}), "y")
+            return g, {
+                "q": _rand((2, 3, 4), seed=21),
+                "k": _rand((2, 3, 4), seed=22),
+                "v": _rand((2, 3, 4), seed=23),
+                "bias": _rand((1, 3, 3), seed=24, scale=0.5),
+            }
+
+        self.assertGradients(build)
+
+
+# --------------------------------------------------------------------------
+# 形状 / 索引
+# --------------------------------------------------------------------------
+
+
+class TestShapeGrad(_GradTest):
+    def test_reshape(self):
+        def build():
+            g = Graph("reshape")
+            x = g.input("x", f64[2, 6])
+            g.output(g.add_node("reshape", [x], {"shape": [3, 4]}), "y")
+            return g, {"x": _rand((2, 6))}
+
+        self.assertGradients(build)
+
+    def test_transpose(self):
+        def build():
+            g = Graph("transpose")
+            x = g.input("x", f64[2, 3, 4])
+            g.output(g.add_node("transpose", [x], {"perm": [0, 2, 1]}), "y")
+            return g, {"x": _rand((2, 3, 4))}
+
+        self.assertGradients(build)
+
+    def test_slice(self):
+        def build():
+            g = Graph("slice")
+            x = g.input("x", f64[3, 6])
+            g.output(g.add_node("slice", [x], {"dim": 1, "start": 1, "stop": 4}), "y")
+            return g, {"x": _rand((3, 6))}
+
+        self.assertGradients(build)
+
+    def test_pad(self):
+        def build():
+            g = Graph("pad")
+            x = g.input("x", f64[3, 4])
+            g.output(g.add_node("pad", [x], {"dim": 1, "before": 2, "after": 1}), "y")
+            return g, {"x": _rand((3, 4))}
+
+        self.assertGradients(build)
+
+    def test_broadcast_to(self):
+        def build():
+            g = Graph("broadcast_to")
+            x = g.input("x", f64[1, 3])
+            g.output(g.add_node("broadcast_to", [x], {"shape": [4, 3]}), "y")
+            return g, {"x": _rand((1, 3))}
+
+        self.assertGradients(build)
+
+    def test_reduce_max(self):
+        def build():
+            g = Graph("reduce_max")
+            x = g.input("x", f64[3, 5])
+            g.output(
+                g.add_node("reduce_max", [x], {"axis": -1, "keepdims": True}), "y"
+            )
+            # 最大值与次大值拉得足够开，1e-6 的扰动不会跨过 argmax 边界
+            return g, {"x": _rand((3, 5), seed=7) * 10.0}
+
+        self.assertGradients(build)
+
+    def test_reduce_mean(self):
+        def build():
+            g = Graph("reduce_mean")
+            x = g.input("x", f64[3, 5])
+            g.output(
+                g.add_node("reduce_mean", [x], {"axis": -1, "keepdims": False}), "y"
+            )
+            return g, {"x": _rand((3, 5), seed=11)}
+
+        self.assertGradients(build)
+
+    def test_reduce_max_ties_split_gradient(self):
+        """并列最大值时梯度均分——与 PyTorch 的 max 反向一致。"""
+        g = Graph("reduce_max")
+        x = g.input("x", f64[1, 3])
+        g.output(g.add_node("reduce_max", [x], {"axis": -1, "keepdims": True}), "y")
+        bwd = backward(g)
+        res = _execute(bwd, {"x": np.array([[1.0, 5.0, 5.0]]), "dy": np.ones((1, 1))})
+        np.testing.assert_allclose(res["dx"], [[0.0, 0.5, 0.5]])
+
+    def test_argmax_is_not_differentiable(self):
+        """argmax 输出是下标，接进损失必须明确报错，而不是静默给零。"""
+        g = Graph("argmax")
+        x = g.input("x", f64[2, 4])
+        g.output(g.add_node("argmax", [x], {"axis": -1}), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g)
+
+    def test_cast_returns_original_dtype(self):
+        # 数值差分在这里没有意义：cast 到 f32 的舍入会淹没 1e-6 的扰动。
+        # 能测的是规则本身——梯度必须被投回输入的类型，而不是留在 f32。
+        def build():
+            g = Graph("cast")
+            x = g.input("x", f64[2, 3])
+            y = g.add_node("cast", [x], {"dtype": "f32"})
+            g.output(g.add_node("cast", [y], {"dtype": "f64"}), "y")
+            return g, {"x": _rand((2, 3))}
+
+        g, feed = build()
+        bwd = backward(g)
+        res = _execute(bwd, {**feed, "dy": np.ones((2, 3))})
+        self.assertEqual(res["dx"].dtype, np.float64)
+        np.testing.assert_allclose(res["dx"], np.ones((2, 3)))
+
+
+# --------------------------------------------------------------------------
+# 卷积 / 池化
+# --------------------------------------------------------------------------
+
+
+class TestConvPoolGrad(_GradTest):
+    def _conv(self, x_shape, w_shape, **attrs):
+        def build():
+            g = Graph("conv2d")
+            x = g.input("x", f64[x_shape])
+            w = g.input("w", f64[w_shape])
+            b = g.input("b", f64[w_shape[0]])
+            g.output(g.add_node("conv2d", [x, w, b], attrs), "y")
+            return g, {
+                "x": _rand(x_shape, scale=0.5),
+                "w": _rand(w_shape, seed=10, scale=0.25),
+                "b": _rand((w_shape[0],), seed=11, scale=0.1),
+            }
+
+        return build
+
+    def test_conv_padding(self):
+        self.assertGradients(self._conv((1, 2, 5, 5), (3, 2, 3, 3), padding=(1, 1)))
+
+    def test_conv_stride_dilation(self):
+        self.assertGradients(
+            self._conv((1, 2, 7, 7), (2, 2, 3, 3), stride=(2, 2), padding=(1, 1), dilation=(2, 2))
+        )
+
+    def test_conv_no_bias(self):
+        def build():
+            g = Graph("conv2d")
+            x = g.input("x", f64[1, 1, 4, 4])
+            w = g.input("w", f64[2, 1, 2, 2])
+            g.output(g.add_node("conv2d", [x, w], {}), "y")
+            return g, {"x": _rand((1, 1, 4, 4)), "w": _rand((2, 1, 2, 2), seed=12)}
+
+        self.assertGradients(build)
+
+    def test_maxpool(self):
+        def build():
+            g = Graph("maxpool2d")
+            x = g.input("x", f64[1, 2, 4, 4])
+            g.output(g.add_node("maxpool2d", [x], {"kernel": (2, 2)}), "y")
+            # 避免并列最大值：并列时"取第一个"的约定会让数值梯度与解析梯度
+            # 在扰动跨越边界时不连续，那测的是约定不是规则。
+            return g, {"x": _rand((1, 2, 4, 4)) * 10.0}
+
+        self.assertGradients(build)
+
+    def test_maxpool_padding_overlap(self):
+        def build():
+            g = Graph("maxpool2d")
+            x = g.input("x", f64[1, 1, 5, 5])
+            g.output(
+                g.add_node("maxpool2d", [x], {"kernel": (3, 3), "stride": (1, 1), "padding": (1, 1)}),
+                "y",
+            )
+            return g, {"x": _rand((1, 1, 5, 5)) * 10.0}
+
+        self.assertGradients(build)
+
+
+# --------------------------------------------------------------------------
+# 反向图本身的性质
+# --------------------------------------------------------------------------
+
+
+class TestBackwardGraph(unittest.TestCase):
+    def _mlp(self):
+        g = Graph("mlp")
+        x = g.input("x", f64[4, 3])
+        w1 = g.input("w1", f64[3, 5])
+        b1 = g.input("b1", f64[5])
+        w2 = g.input("w2", f64[5, 2])
+        h = g.add_node("relu", [g.add_node("add", [g.add_node("matmul", [x, w1]), b1])])
+        g.output(g.add_node("matmul", [h, w2]), "y")
+        feed = {
+            "x": _rand((4, 3)),
+            "w1": _rand((3, 5), seed=13),
+            "b1": _rand((5,), seed=14),
+            "w2": _rand((5, 2), seed=15),
+        }
+        return g, feed
+
+    def test_backward_graph_passes_verifier(self):
+        g, _ = self._mlp()
+        bwd = backward(g)
+        caps = ReferenceBackend().capabilities()
+        verify(bwd, caps)
+        self.assertTrue(all(n.op.portability.value == "portable" for n in bwd.nodes))
+
+    def test_backward_graph_serializes(self):
+        g, feed = self._mlp()
+        bwd = backward(g)
+        restored = loads(dumps(bwd))
+        want = _execute(bwd, {**feed, "dy": np.ones((4, 2))})
+        got = _execute(restored, {**feed, "dy": np.ones((4, 2))})
+        # 反序列化后的图必须能独立跑，且结果一致
+        for name in want:
+            np.testing.assert_allclose(got[name], want[name], rtol=1e-12)
+
+    def test_parameter_gradient_named_after_input(self):
+        g, _ = self._mlp()
+        bwd = backward(g)
+        self.assertEqual(
+            list(bwd.output_names), [f"d{v.name}" for v in g.inputs]
+        )
+
+    def test_gradients_match_numeric(self):
+        g, feed = self._mlp()
+        names = ["x", "w1", "b1", "w2"]
+        analytic, _ = _analytic_grad(g, feed, names)
+        for name, got in zip(names, analytic):
+            np.testing.assert_allclose(got, _numeric_grad(g, feed, name), rtol=1e-5, atol=1e-7)
+
+    def test_custom_seed_and_wrt_subset(self):
+        g, feed = self._mlp()
+        w2 = g.find("w2")
+        bwd = backward(g, wrt=[w2], seeds={"y": "my_seed"})
+        self.assertEqual(bwd.output_names, ["dw2"])
+        res = _execute(bwd, {**feed, "my_seed": np.ones((4, 2))})
+        analytic = _analytic_grad(g, feed, ["w2"])[0][0]
+        np.testing.assert_allclose(res["dw2"], analytic, rtol=1e-12)
+
+    def test_intermediate_value_can_be_a_wrt_target(self):
+        """``wrt`` 允许中间值：``h=x*x``、``L=sum(h)``，``dL/dh`` 应全为 1。
+
+        逆拓扑循环里 h 的 cotangent 会被 ``pop`` 出去交给它的生产节点；
+        不给 ``wrt`` 留一份引用，收集时就会误报"不在依赖路径上"。
+        """
+        g = Graph("mid")
+        x = g.input("x", f64[3])
+        h = g.mul(x, x)
+        g.output(g.reduce_sum(h, axis=-1, keepdims=False), "l")
+
+        aliaz = "d" + h.name
+        bwd = backward(g, wrt=[h])
+        self.assertEqual(bwd.output_names, [aliaz])
+        res = ReferenceBackend().execute(
+            bwd, {"x": np.array([2.0, -3.0, 0.5]), "dl": np.ones(())}
+        )
+        np.testing.assert_allclose(res[aliaz], np.ones(3))
+
+        # 中间值与输入一起求：两份梯度都要在
+        both = backward(g, wrt=[h, x])
+        self.assertEqual(both.output_names, [aliaz, "dx"])
+        res2 = ReferenceBackend().execute(
+            both, {"x": np.array([2.0, -3.0, 0.5]), "dl": np.ones(())}
+        )
+        np.testing.assert_allclose(res2[aliaz], np.ones(3))
+        np.testing.assert_allclose(res2["dx"], np.array([4.0, -6.0, 1.0]))
+
+    def test_missing_gradient_raises(self):
+        # y 与输出无关：不能凭空造一张零梯度敷衍过去
+        g2 = Graph("dead")
+        x = g2.input("x", f64[2, 2])
+        y = g2.input("y", f64[2, 2])
+        g2.output(g2.add_node("add", [x, x]), "z")
+        with self.assertRaises(NoGradientError):
+            backward(g2, wrt=[y])
+
+    def test_no_rule_operator_raises(self):
+        g = Graph("no_rule")
+        dy_in = g.input("gin", f64[1, 2, 4, 4])
+        w = g.input("w", f64[2, 2, 3, 3])
+        y = g.add_node(
+            "conv2d_input_grad", [dy_in, w], {"input_shape": [1, 2, 4, 4], "padding": (1, 1)}
+        )
+        g.output(y, "y")
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[dy_in])
+
+    def test_seed_name_conflict_raises(self):
+        g = Graph("conflict")
+        x = g.input("x", f64[2])
+        g.output(g.add_node("relu", [x]), "y")
+        with self.assertRaises(ValueError):
+            backward(g, seeds={"y": "x"})
+
+    def test_symbolic_reduction_rejected(self):
+        g = Graph("sym")
+        a = g.input("a", f64["B", 1])
+        b = g.input("b", f64["B", 4])
+        g.output(g.add_node("add", [a, b]), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[a])
+
+    def test_inactive_output_is_pruned_not_zero_seeded(self):
+        """AF-04：未激活输出要从反向图里剪掉，而不是喂零种子。
+
+        ``loss=sum(x*x)`` 配 ``diag=sum(log(x))``、x=0：零种子在 log 的 vjp
+        上仍算出 ``0/0``，把对的梯度污染成 NaN。剪枝后 diag 分支不在反向图
+        里，输入里也不会多出 ``ddiag``。
+        """
+        g = Graph("diag")
+        x = g.input("x", f64[2])
+        g.output(g.reduce_sum(g.mul(x, x), axis=-1, keepdims=False), "loss")
+        g.output(
+            g.reduce_sum(g.add_node("log", [x]), axis=-1, keepdims=False), "diag"
+        )
+
+        bwd = backward(g, wrt=[x], active=["loss"])
+        self.assertEqual(bwd.output_names, ["dx"])
+        self.assertEqual([v.name for v in bwd.inputs], ["x", "dloss"])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            res = ReferenceBackend().execute(
+                bwd, {"x": np.zeros(2), "dloss": np.ones(())}
+            )
+        self.assertTrue(np.array_equal(res["dx"], np.zeros(2)))
+
+        # 对照：喂零种子（旧做法）得到 NaN——说明"剪枝"不是装饰。
+        keep = backward(g, wrt=[x])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            poisoned = ReferenceBackend().execute(
+                keep,
+                {"x": np.zeros(2), "dloss": np.ones(()), "ddiag": np.zeros(())},
+            )
+        self.assertFalse(np.all(np.isfinite(poisoned["dx"])))
+
+        with self.assertRaises(KeyError):
+            backward(g, wrt=[x], active=["nope"])
+        with self.assertRaises(ValueError):
+            backward(g, wrt=[x], active=[])
+
+
+# --------------------------------------------------------------------------
+# 端到端：训练一步
+# --------------------------------------------------------------------------
+
+
+class TestTrainingLoop(unittest.TestCase):
+    def _net(self):
+        g = Graph("net")
+        x = g.input("x", f32[8, 4])
+        w = g.input("w", f32[4, 3])
+        b = g.input("b", f32[3])
+        h = g.add_node("relu", [g.add_node("add", [g.add_node("matmul", [x, w]), b])])
+        g.output(g.add_node("softmax", [h], {"axis": -1}), "y")
+        return g, x, w, b
+
+    def test_sgd_step_reduces_loss(self):
+        g, x, w, b = self._net()
+        rng = np.random.default_rng(0)
+        xs = rng.standard_normal((8, 4)).astype(np.float32)
+        target = rng.standard_normal((8, 3)).astype(np.float32)
+        params = {
+            "w": (rng.standard_normal((4, 3)) * 0.1).astype(np.float32),
+            "b": np.zeros(3, dtype=np.float32),
+        }
+
+        def forward(p):
+            return _execute(g, {"x": xs, **p})["y"]
+
+        def loss_of(p):
+            # 0.5 * sum((y - target)^2)：种子就是 y - target，不需要额外推导系数
+            return float(0.5 * np.sum((forward(p) - target) ** 2))
+
+        bwd = backward(g, wrt=[w, b])
+        before = loss_of(params)
+        lr = 0.05
+        for _ in range(20):
+            seed = forward(params) - target
+            res = _execute(bwd, {"x": xs, "dy": seed.astype(np.float32), **params})
+            params = {k: (params[k] - lr * res[f"d{k}"]).astype(np.float32) for k in params}
+        self.assertLess(loss_of(params), before, "20 步 SGD 后损失没有下降")
+
+    def test_loss_and_grad_match_finite_difference(self):
+        g, _, w, b = self._net()
+        rng = np.random.default_rng(1)
+        xs = rng.standard_normal((8, 4)).astype(np.float32)
+        feed = {
+            "x": xs,
+            "w": rng.standard_normal((4, 3)).astype(np.float32) * 0.2,
+            "b": np.zeros(3, dtype=np.float32),
+        }
+        bwd = backward(g, wrt=[w, b], seeds={"y": "dy"})
+        res = _execute(bwd, {"dy": np.ones((8, 3), dtype=np.float32), **feed})
+        for name in ("w", "b"):
+            arr = feed[name]
+            flat = arr.reshape(-1)
+            got = res[f"d{name}"].reshape(-1)
+            eps = 1e-3
+            for i in range(flat.size):
+                orig = float(flat[i])
+                flat[i] = orig + eps
+                hi = _scalar_loss(g, feed)
+                flat[i] = orig - eps
+                lo = _scalar_loss(g, feed)
+                flat[i] = orig
+                want = (hi - lo) / (2 * eps)
+                self.assertAlmostEqual(float(got[i]), want, delta=2e-2)
+
+
+# --------------------------------------------------------------------------
+# torch.autograd 交叉验证
+# --------------------------------------------------------------------------
+
+
+@unittest.skipUnless(TORCH_AVAILABLE, "需要 torch")
+class TestTorchCrossCheck(unittest.TestCase):
+    def test_mlp_gradients_match_torch(self):
+        rng = np.random.default_rng(2)
+        xs = rng.standard_normal((4, 3)).astype(np.float64)
+        w1 = rng.standard_normal((3, 5)).astype(np.float64) * 0.3
+        b1 = rng.standard_normal((5,)).astype(np.float64) * 0.1
+        w2 = rng.standard_normal((5, 2)).astype(np.float64) * 0.3
+
+        # IR 侧
+        g = Graph("mlp")
+        x = g.input("x", f64[4, 3])
+        w1v = g.input("w1", f64[3, 5])
+        b1v = g.input("b1", f64[5])
+        w2v = g.input("w2", f64[5, 2])
+        h = g.add_node("tanh", [g.add_node("add", [g.add_node("matmul", [x, w1v]), b1v])])
+        g.output(g.add_node("matmul", [h, w2v]), "y")
+        feed = {"x": xs, "w1": w1, "b1": b1, "w2": w2}
+        names = ["w1", "b1", "w2"]
+        ours, _ = _analytic_grad(g, feed, names)
+
+        # torch 侧
+        t = {k: torch.tensor(v, requires_grad=True) for k, v in feed.items()}
+        out = (torch.tanh(t["x"] @ t["w1"] + t["b1"])) @ t["w2"]
+        out.sum().backward()
+
+        for name, got in zip(names, ours):
+            want = t[name].grad.detach().numpy()
+            np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-12)
+
+    def test_conv_gradients_match_torch(self):
+        import torch.nn.functional as F
+
+        rng = np.random.default_rng(3)
+        xs = rng.standard_normal((1, 2, 6, 6)).astype(np.float64)
+        ws = rng.standard_normal((3, 2, 3, 3)).astype(np.float64) * 0.2
+        bs = rng.standard_normal((3,)).astype(np.float64) * 0.1
+
+        g = Graph("conv")
+        x = g.input("x", f64[1, 2, 6, 6])
+        w = g.input("w", f64[3, 2, 3, 3])
+        b = g.input("b", f64[3])
+        g.output(g.add_node("conv2d", [x, w, b], {"padding": (1, 1)}), "y")
+        feed = {"x": xs, "w": ws, "b": bs}
+        ours, _ = _analytic_grad(g, feed, ["x", "w", "b"])
+
+        tx = torch.tensor(xs, requires_grad=True)
+        tw = torch.tensor(ws, requires_grad=True)
+        tb = torch.tensor(bs, requires_grad=True)
+        out = F.conv2d(tx, tw, tb, padding=1)
+        out.sum().backward()
+        for name, tensor, got in (("x", tx, ours[0]), ("w", tw, ours[1]), ("b", tb, ours[2])):
+            np.testing.assert_allclose(
+                got, tensor.grad.detach().numpy(), rtol=1e-10, atol=1e-12, err_msg=name
+            )
+
+    def test_maxpool_gradients_match_torch(self):
+        import torch.nn.functional as F
+
+        rng = np.random.default_rng(4)
+        xs = (rng.standard_normal((1, 2, 6, 6)) * 5.0).astype(np.float64)
+
+        g = Graph("pool")
+        x = g.input("x", f64[1, 2, 6, 6])
+        g.output(g.add_node("maxpool2d", [x], {"kernel": (2, 2)}), "y")
+        ours, _ = _analytic_grad(g, {"x": xs}, ["x"])
+
+        tx = torch.tensor(xs, requires_grad=True)
+        F.max_pool2d(tx, 2).sum().backward()
+        np.testing.assert_allclose(ours[0], tx.grad.detach().numpy(), rtol=1e-12, atol=1e-12)
+
+
+if __name__ == "__main__":
+    unittest.main()

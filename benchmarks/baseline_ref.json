@@ -1,0 +1,62 @@
+{
+  "backend": "reference",
+  "device": "unknown",
+  "cases": {
+    "matmul_256": {
+      "median_ms": 0.2447,
+      "p90_ms": 0.2582,
+      "min_ms": 0.2335,
+      "note": "cuBLAS 的基本盘",
+      "rounds": 3
+    },
+    "matmul_1024": {
+      "median_ms": 4.84,
+      "p90_ms": 5.9742,
+      "min_ms": 4.5059,
+      "note": "大 GEMM：算力主导",
+      "rounds": 3
+    },
+    "matmul_batched": {
+      "median_ms": 1.1868,
+      "p90_ms": 1.2795,
+      "min_ms": 1.1502,
+      "note": "批量 GEMM",
+      "rounds": 3
+    },
+    "conv2d_3x3_pad1": {
+      "median_ms": 6.0085,
+      "p90_ms": 6.8369,
+      "min_ms": 5.8379,
+      "note": "im2col + GEMM 的主路径",
+      "rounds": 3
+    },
+    "conv2d_1x1": {
+      "median_ms": 2.2064,
+      "p90_ms": 2.9173,
+      "min_ms": 2.1868,
+      "note": "1x1 卷积：通道混合，无空间聚合",
+      "rounds": 3
+    },
+    "maxpool2x2": {
+      "median_ms": 7.4866,
+      "p90_ms": 8.2544,
+      "min_ms": 7.0116,
+      "note": "纯索引算子：访存主导",
+      "rounds": 3
+    },
+    "transformer_block": {
+      "median_ms": 0.8469,
+      "p90_ms": 1.0272,
+      "min_ms": 0.8396,
+      "note": "整图调度 + 多种 kernel 混合",
+      "rounds": 3
+    },
+    "cnn_lenet": {
+      "median_ms": 2.6658,
+      "p90_ms": 3.9407,
+      "min_ms": 2.6466,
+      "note": "CNN 的端到端形态",
+      "rounds": 3
+    }
+  }
+}

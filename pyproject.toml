@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aetherflow"
+version = "0.1.0"
+description = "统一深度学习基础设施：统一前端 IR + 可插拔后端插件"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# CUDA 后端是可选插件：内核与全部测试在无 cupy 的环境下依然可运行（CUDA 组跳过）
+cuda = ["cupy-cuda12x>=13"]
+# 前端适配器是可选依赖：卸载 torch 后内核、后端、全部非前端测试仍然可用
+frontend = ["torch>=2.1"]
+
+[tool.setuptools.packages.find]
+include = ["aetherflow*"]

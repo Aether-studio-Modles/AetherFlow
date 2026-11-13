@@ -1,0 +1,227 @@
+{
+  "format": "aetherflow-tune-compare/1",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2080 Ti",
+  "cases": {
+    "add_same_1m": {
+      "op": "add",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ],
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 1024
+      },
+      "best_ms": 1.4164,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.4551,
+      "speedup": 1.0273,
+      "rejected": []
+    },
+    "add_broadcast": {
+      "op": "add",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            4,
+            32,
+            64
+          ],
+          [
+            64
+          ]
+        ]
+      },
+      "best": {
+        "block": 128
+      },
+      "best_ms": 0.3056,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 0.3463,
+      "speedup": 1.1332,
+      "rejected": []
+    },
+    "relu_1m": {
+      "op": "relu",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 128
+      },
+      "best_ms": 1.075,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.0768,
+      "speedup": 1.0017,
+      "rejected": []
+    },
+    "gelu_1m": {
+      "op": "gelu",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 1024
+      },
+      "best_ms": 1.0817,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.0851,
+      "speedup": 1.0031,
+      "rejected": []
+    },
+    "sigmoid_1m": {
+      "op": "sigmoid",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 512
+      },
+      "best_ms": 1.0782,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.0874,
+      "speedup": 1.0085,
+      "rejected": []
+    },
+    "silu_gate": {
+      "op": "silu",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            8,
+            128,
+            256
+          ],
+          [
+            8,
+            128,
+            256
+          ]
+        ]
+      },
+      "best": {
+        "block": 1024
+      },
+      "best_ms": 0.6376,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 0.6448,
+      "speedup": 1.0113,
+      "rejected": []
+    },
+    "step_1m": {
+      "op": "step",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 256
+      },
+      "best_ms": 1.0717,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.0717,
+      "speedup": 1.0,
+      "rejected": []
+    },
+    "dropout_mask_1m": {
+      "op": "dropout_mask",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 512
+      },
+      "best_ms": 1.068,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.0714,
+      "speedup": 1.0032,
+      "rejected": []
+    },
+    "conv2d_tiled_1m": {
+      "op": "conv2d",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1,
+            2,
+            64,
+            512
+          ],
+          [
+            32,
+            2,
+            3,
+            3
+          ]
+        ]
+      },
+      "best": {
+        "tile_w": null
+      },
+      "best_ms": 1.173,
+      "default": {
+        "tile_w": null
+      },
+      "default_ms": 1.173,
+      "speedup": 1.0,
+      "rejected": []
+    }
+  }
+}

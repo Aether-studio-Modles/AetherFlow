@@ -1,0 +1,227 @@
+{
+  "format": "aetherflow-tune-compare/1",
+  "backend": "hip",
+  "device": "AMD Radeon RX 7650 GRE",
+  "cases": {
+    "add_same_1m": {
+      "op": "add",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ],
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 128
+      },
+      "best_ms": 7.382,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 9.6175,
+      "speedup": 1.3028,
+      "rejected": []
+    },
+    "add_broadcast": {
+      "op": "add",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            4,
+            32,
+            64
+          ],
+          [
+            64
+          ]
+        ]
+      },
+      "best": {
+        "block": 1024
+      },
+      "best_ms": 0.8228,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.0016,
+      "speedup": 1.2173,
+      "rejected": []
+    },
+    "relu_1m": {
+      "op": "relu",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 1024
+      },
+      "best_ms": 4.7615,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 6.2972,
+      "speedup": 1.3225,
+      "rejected": []
+    },
+    "gelu_1m": {
+      "op": "gelu",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 256
+      },
+      "best_ms": 6.1434,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 6.1434,
+      "speedup": 1.0,
+      "rejected": []
+    },
+    "sigmoid_1m": {
+      "op": "sigmoid",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 1024
+      },
+      "best_ms": 4.7152,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 6.0033,
+      "speedup": 1.2732,
+      "rejected": []
+    },
+    "silu_gate": {
+      "op": "silu",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            8,
+            128,
+            256
+          ],
+          [
+            8,
+            128,
+            256
+          ]
+        ]
+      },
+      "best": {
+        "block": 256
+      },
+      "best_ms": 1.2313,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 1.2313,
+      "speedup": 1.0,
+      "rejected": []
+    },
+    "step_1m": {
+      "op": "step",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 128
+      },
+      "best_ms": 5.073,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 5.206,
+      "speedup": 1.0262,
+      "rejected": []
+    },
+    "dropout_mask_1m": {
+      "op": "dropout_mask",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1024,
+            1024
+          ]
+        ]
+      },
+      "best": {
+        "block": 512
+      },
+      "best_ms": 5.1416,
+      "default": {
+        "block": 256
+      },
+      "default_ms": 6.3476,
+      "speedup": 1.2346,
+      "rejected": []
+    },
+    "conv2d_tiled_1m": {
+      "op": "conv2d",
+      "signature": {
+        "dtype": "f32",
+        "inputs": [
+          [
+            1,
+            2,
+            64,
+            512
+          ],
+          [
+            32,
+            2,
+            3,
+            3
+          ]
+        ]
+      },
+      "best": {
+        "tile_w": null
+      },
+      "best_ms": 3.7643,
+      "default": {
+        "tile_w": null
+      },
+      "default_ms": 3.7643,
+      "speedup": 1.0,
+      "rejected": []
+    }
+  }
+}

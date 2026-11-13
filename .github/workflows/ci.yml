@@ -1,0 +1,101 @@
+name: CI
+
+# 正确性在云端跑，性能回归在**固定机器**上跑。
+# 原因见 DESIGN.md 5.15：共享 runner 的抖动比 25% 的回归阈值还大，
+# 把性能门禁放上去只会得到"时绿时红"的流水线，最后没人看。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpu:
+    name: 正确性（Python ${{ matrix.python }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # torch 是可选依赖；不装时前端测试整组跳过，CUDA 组同理。
+          python -m pip install numpy
+      - name: 单元测试
+        run: python -m unittest discover -s tests -t . -v
+      - name: 参考后端一致性报告
+        run: |
+          python - <<'PY'
+          from aetherflow import ReferenceBackend, run_conformance
+          report = run_conformance(ReferenceBackend())
+          print(report.text())
+          assert report.ok, "参考后端未通过一致性检查"
+          PY
+
+  fuzz:
+    name: 模糊测试（IR 差分）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+      # 种子固定、无随机状态：失败时按日志里的 seed 用 --start N --iterations 1 复现。
+      - name: 200 个随机种子
+        run: python -m aetherflow.fuzz --iterations 200
+
+  gpu:
+    name: GPU 正确性 + 性能回归
+    # 需要一台装有 NVIDIA 驱动、CUDA 12.x 与 cupy 的自托管 runner，标签为 [self-hosted, gpu]。
+    # 手动触发：避免每次 push 都占用自建机器；也避免共享 runner 的抖动污染性能门禁。
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: 环境自检
+        run: |
+          python -c "import cupy; print('cupy', cupy.__version__, '| runtime', cupy.cuda.runtime.runtimeGetVersion())"
+          python verify_cuda.py
+      - name: 单元测试（含 CUDA 组）
+        run: python -m unittest discover -s tests -t . -v
+      - name: CUDA 一致性报告
+        run: |
+          python - <<'PY'
+          from aetherflow import run_conformance
+          from aetherflow.backends.cuda import CudaBackend
+          report = run_conformance(CudaBackend())
+          print(report.text())
+          assert report.ok, "CUDA 后端未通过一致性检查"
+          PY
+      - name: 性能回归（对照同机基线）
+        run: |
+          python -m benchmarks.run --backend cuda \
+            --check benchmarks/baseline_cuda.json --max-slowdown 0.25
+      - name: 单算子调优往返（交替 A/B 搜索 + 应用后逐位对拍）
+        run: |
+          python -m benchmarks.tune --backend cuda --rounds 2 \
+            --save tuning_cuda.json
+          python -m benchmarks.tune --backend cuda --apply tuning_cuda.json
+      - name: 吞吐 / 显存趋势
+        run: |
+          python -m benchmarks.trend --backend cuda --rounds 3 \
+            --save telemetry_cuda.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-reports
+          path: |
+            tuning_cuda.json
+            telemetry_cuda.json
+          if-no-files-found: ignore
