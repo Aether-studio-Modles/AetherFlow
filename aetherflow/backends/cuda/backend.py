@@ -21,6 +21,7 @@ from ..device_backend import DeviceBackend, GPU_OPS
 from . import codegen
 from .cublas import Cublas
 from .cudnn import CudnnConv, CudnnUnavailable
+from .cusparse import CusparseSpMM, CusparseUnavailable
 from .memory import Arena
 
 # 类级能力声明。它存在的唯一理由：**不建 CUDA 上下文也能读到**。构图的工具、
@@ -30,6 +31,7 @@ from .memory import Arena
 CUDA_OPS: FrozenSet[str] = GPU_OPS
 
 _CONV_IMPLS = ("auto", "im2col", "tiled", "implicit", "cudnn", "grouped")
+_SPARSE_IMPLS = ("custom", "auto", "cusparse")
 
 
 class CudaBackend(DeviceBackend):
@@ -39,6 +41,7 @@ class CudaBackend(DeviceBackend):
     _LABEL = "CUDA 后端"
     _OPS = CUDA_OPS
     CONV_IMPLS = _CONV_IMPLS
+    SPARSE_IMPLS = _SPARSE_IMPLS
 
     def __init__(
         self,
@@ -50,6 +53,7 @@ class CudaBackend(DeviceBackend):
         min_graph_nodes: int = 2,
         chunked_scan: Optional[int] = None,
         memory_mode: str = "container",
+        sparse_impl: str = "custom",
         device: int = 0,
     ) -> None:
         import cupy as cp  # 延迟导入：没有 CUDA 的机器上仍可 import 本模块
@@ -84,6 +88,9 @@ class CudaBackend(DeviceBackend):
         # cuDNN 惰性创建；_cudnn_broken 存"第一次失败的原因"，非空就不再重试
         self._cudnn: Any = None
         self._cudnn_broken: Optional[str] = None
+        # cuSPARSE 同样惰性创建；失败原因只记一次，auto 下不反复 try/except
+        self._cusparse: Any = None
+        self._cusparse_broken: Optional[str] = None
         super().__init__(
             block=block,
             max_blocks=max_blocks,
@@ -93,6 +100,7 @@ class CudaBackend(DeviceBackend):
             min_graph_nodes=min_graph_nodes,
             chunked_scan=chunked_scan,
             memory_mode=memory_mode,
+            sparse_impl=sparse_impl,
         )
 
     def _memory_scope(self):
@@ -264,6 +272,8 @@ class CudaBackend(DeviceBackend):
         self._functions.clear()
         self._kernel_handles.clear()
         self._blas = None
+        # cuSPARSE handle 与 workspace 都绑在旧卡的 context 上，和 cuBLAS 同理
+        self._cusparse = None
         self._resident.clear()
         self._invalidate_plans()
         # 计划里缓存的常量设备副本也属于旧卡（5.172）：计划结构照旧有效，
@@ -360,6 +370,84 @@ class CudaBackend(DeviceBackend):
             self._cudnn_broken = f"{type(exc).__name__}: {exc}"
             return None
         return out
+
+    def _cusparse_engine(self):
+        """惰性建 cuSPARSE handle；失败一次就不再重试（与 cuDNN 同一条理由）。"""
+        if self._cusparse is not None:
+            return self._cusparse
+        if self._cusparse_broken:
+            return None
+        try:
+            self._cusparse = CusparseSpMM()
+        except (CusparseUnavailable, OSError) as exc:
+            if self.sparse_impl == "cusparse":
+                raise BackendCapabilityError(
+                    f"{self._LABEL} 的 sparse_impl='cusparse' 需要可用的 "
+                    f"cuSPARSE：{exc}"
+                ) from exc
+            self._cusparse_broken = str(exc)
+            return None
+        return self._cusparse
+
+    def _pick_cusparse(self, values, indices, offsets) -> bool:
+        """这一次 ``sparse_linear`` 走不走 cuSPARSE。
+
+        只覆盖登记过的形态：f32 值 + i32 的 ``indices`` / ``offsets``。
+        ``auto`` 在捕获期与库缺失时回落到自研核；显式 ``cusparse`` 则把
+        这两种情况变成明确错误，而不是"悄悄换了个实现"。
+
+        **不覆盖越界检查**：自研核在设备端记 ``err`` 后由主机侧抛错，库不做
+        逐元素检查。因此显式走库路径时，下标合法性回到调用方责任——这也是
+        默认值仍是 ``custom`` 的原因。
+        """
+        supported = (
+            np.dtype(values.dtype) == np.dtype("float32")
+            and np.dtype(indices.dtype) == np.dtype("int32")
+            and np.dtype(offsets.dtype) == np.dtype("int32")
+        )
+        if self.sparse_impl == "cusparse":
+            if not supported:
+                raise BackendCapabilityError(
+                    "sparse_impl='cusparse' 只支持 float32 值 + int32 索引，"
+                    f"收到 values={np.dtype(values.dtype)}、"
+                    f"indices={np.dtype(indices.dtype)}、"
+                    f"offsets={np.dtype(offsets.dtype)}"
+                )
+            if self._capturing:
+                raise BackendCapabilityError(
+                    "CUDA Graph 捕获期不支持 sparse_impl='cusparse'"
+                    "（SpMM 的 workspace 查询是 host API）；"
+                    "捕获请用 sparse_impl='auto' 或 'custom'"
+                )
+            return True
+        if self.sparse_impl != "auto" or not supported:
+            return False
+        if self._capturing or self._cusparse_broken is not None:
+            return False
+        return self._cusparse_engine() is not None
+
+    def _sparse_linear_cusparse(self, weights, indices, values, offsets, *,
+                                steps: int, rows: int, cols: int):
+        """cuSPARSE SpMM；返回 ``None`` 表示"没走成，请回落"。
+
+        与 cuDNN 的 ``_conv2d_cudnn`` 同一条策略：auto 模式下任何异常都
+        降级（先把 ``_cusparse_broken`` 记下来，后续步骤不再重试），显式
+        ``cusparse`` 时异常照常抛出。失败时已经写进 ``out`` 的内容不会被
+        使用——调用方会重新走自研核，那条路先把输出清零。
+        """
+        engine = self._cusparse_engine()
+        if engine is None:
+            return None
+        try:
+            return engine.spmm(
+                offsets, indices, values, weights,
+                steps=steps, rows=rows, cols=cols,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 见上面的降级说明
+            if self.sparse_impl == "cusparse":
+                raise
+            self._cusparse_broken = f"{type(exc).__name__}: {exc}"
+            return None
 
     # ------------------------------------------------------------------
     # 编译与 BLAS

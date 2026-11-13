@@ -276,6 +276,12 @@ def _mask_shared_over_heads(mask_shape, s_len: int, t_len: int) -> bool:
 
 _CONV_IMPLS = ("auto", "im2col", "tiled", "implicit")
 
+# ``sparse_linear`` 的实现选择。基类只给 "custom" 与 "auto"——"cusparse"
+# 属于 NVIDIA 的库，由 ``CudaBackend`` 扩展；HIP 侧构造期就会拒绝它，
+# 而不是等到第一次稀疏乘才发现。默认 "custom" 而不是 "auto"：自研核带
+# 下标越界检查，库路径没有；默认值不能悄悄换掉一道检查（见 5.203）。
+_SPARSE_IMPLS = ("custom", "auto")
+
 # 逐元素类：每个线程只处理一个元素，block 大小只影响占用率与合并访存，
 # 不改变 shared memory 需求，也不改变数值语义。
 _ELEMENTWISE_TUNABLE_OPS: FrozenSet[str] = frozenset(
@@ -398,6 +404,8 @@ class DeviceBackend(Executor):
     _F16_OPS: Optional[FrozenSet[str]] = None
     # conv2d 的实现选择。子类可以收窄（HIP 没有 cuDNN）。
     CONV_IMPLS: Tuple[str, ...] = _CONV_IMPLS
+    # sparse_linear 的实现选择。子类可以扩展（CUDA 多一个 "cusparse"）。
+    SPARSE_IMPLS: Tuple[str, ...] = _SPARSE_IMPLS
 
     cp: Any
     codegen: Any
@@ -413,6 +421,7 @@ class DeviceBackend(Executor):
         min_graph_nodes: int = 2,
         chunked_scan: Optional[int] = None,
         memory_mode: str = "container",
+        sparse_impl: str = "custom",
     ) -> None:
         if conv_impl not in self.CONV_IMPLS:
             raise ValueError(
@@ -445,6 +454,11 @@ class DeviceBackend(Executor):
         self.block = block
         self.max_blocks = max_blocks
         self.conv_impl = conv_impl
+        if sparse_impl not in self.SPARSE_IMPLS:
+            raise ValueError(
+                f"sparse_impl 只能是 {self.SPARSE_IMPLS} 之一，收到 {sparse_impl!r}"
+            )
+        self.sparse_impl = sparse_impl
         # 执行期内存策略：``container`` = 容器自己的池（默认，行为与之前一致）；
         # ``tiered`` = 子类提供的分层分配器（小对象池 / 中块 best-fit / 大块
         # 直调），并在执行结束后写入 ``memory_stats()``。
@@ -2949,6 +2963,20 @@ class DeviceBackend(Executor):
         self._check_ids(err, "spike_csr", f"[0, {capacity}]（事件数超过容量）")
         return indices
 
+    def _pick_cusparse(self, values, indices, offsets) -> bool:
+        """这一次 ``sparse_linear`` 走不走厂商库；默认永不启用。
+
+        CUDA 覆盖它（5.203）。放在基类而不是写成 ``hasattr`` 探测：HIP 的
+        ``SPARSE_IMPLS`` 里没有 ``"cusparse"``，构造期就不会接受这个值，
+        这里只需回答"没有库路径"。
+        """
+        return False
+
+    def _sparse_linear_cusparse(self, weights, indices, values, offsets, *,
+                                steps: int, rows: int, cols: int):
+        """厂商库的 SpMM；默认没有，返回 ``None``（调用方回落自研核）。"""
+        return None
+
     def _op_sparse_linear(self, node, args, attrs):
         """事件驱动的稀疏线性：CSR 事件 × 稠密权重。
 
@@ -2972,10 +3000,19 @@ class DeviceBackend(Executor):
             )
         steps = int(offsets.size) - 1
         rows, cols = int(weights.shape[0]), int(weights.shape[1])
-        out = cp.zeros((steps, cols), dtype=values.dtype)
         total = steps * cols
         if total == 0:
-            return out
+            return cp.zeros((steps, cols), dtype=values.dtype)
+        # 5.203：库路径只在显式要求（或 auto 且库可用）时走。默认 custom
+        # 保留越界检查；库路径不做下标检查，这是它不设默认值的直接理由。
+        if self._pick_cusparse(values, indices, offsets):
+            fast = self._sparse_linear_cusparse(
+                weights, indices, values, offsets,
+                steps=steps, rows=rows, cols=cols,
+            )
+            if fast is not None:
+                return fast
+        out = cp.zeros((steps, cols), dtype=values.dtype)
         kernel = self._kernel(
             ("sparse_linear", self._kind(values)),
             lambda: self.codegen.render(

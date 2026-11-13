@@ -71,6 +71,7 @@ class HipBackend(DeviceBackend):
         min_graph_nodes: int = 2,
         chunked_scan: Optional[int] = None,
         memory_mode: str = "container",
+        sparse_impl: str = "custom",
         device: int = 0,
     ) -> None:
         # 容器与方言必须在基类构造前就位：``DeviceBackend.__init__`` 要用它们
@@ -91,6 +92,7 @@ class HipBackend(DeviceBackend):
             min_graph_nodes=min_graph_nodes,
             chunked_scan=chunked_scan,
             memory_mode=memory_mode,
+            sparse_impl=sparse_impl,
         )
 
     # ------------------------------------------------------------------
