@@ -7,6 +7,12 @@
 
 from . import plan
 from .cstyle import CStyleDialect
+from .translate import (
+    SUPPORTED_DIALECTS,
+    TranslationError,
+    compile_translated,
+    translate,
+)
 from .kernel import (
     ArrayDecl,
     Assign,
@@ -99,6 +105,10 @@ __all__ = [
     "CStyleDialect",
     "emit",
     "plan",
+    "SUPPORTED_DIALECTS",
+    "TranslationError",
+    "translate",
+    "compile_translated",
     "Kernel",
     "Expr",
     "Stmt",
