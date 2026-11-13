@@ -9,6 +9,9 @@
 
 融合（``fused_pipeline``）单独提供：它会改变算子的输入形态，
 需要目标后端承接，因此不放进"无硬件假设"的默认管线。
+
+两条管线的名字序列与"单独跑某个 pass"的入口都收在 ``registry`` 里，
+不再由各模块各写一份——名字与顺序只有一处定义。
 """
 
 from .base import GraphRewriter, Pass, PassManager
@@ -16,7 +19,20 @@ from .autocast import Autocast
 from .cse import CommonSubexpressionElimination
 from .dce import DeadCodeElimination
 from .fold import ConstantFolding
-from .fusion import FuseLayerNormResidual, FuseSiLU, FuseSoftmaxScale, fused_pipeline
+from .fusion import FuseLayerNormResidual, FuseSiLU, FuseSoftmaxScale
+from .registry import (
+    DEFAULT_PASS_NAMES,
+    FUSED_PASS_NAMES,
+    available_passes,
+    build_pipeline,
+    default_pipeline,
+    fused_pipeline,
+    get_pass,
+    register_pass,
+    run_pass,
+    run_passes,
+    unregister_pass,
+)
 from .simplify import SimplifyShapeOps
 
 __all__ = [
@@ -31,18 +47,15 @@ __all__ = [
     "FuseSoftmaxScale",
     "FuseLayerNormResidual",
     "FuseSiLU",
+    "DEFAULT_PASS_NAMES",
+    "FUSED_PASS_NAMES",
+    "available_passes",
+    "build_pipeline",
     "default_pipeline",
     "fused_pipeline",
+    "get_pass",
+    "register_pass",
+    "run_pass",
+    "run_passes",
+    "unregister_pass",
 ]
-
-
-def default_pipeline() -> PassManager:
-    """无硬件假设的默认优化管线。"""
-    return PassManager(
-        [
-            SimplifyShapeOps(),
-            ConstantFolding(),
-            CommonSubexpressionElimination(),
-            DeadCodeElimination(),
-        ]
-    )

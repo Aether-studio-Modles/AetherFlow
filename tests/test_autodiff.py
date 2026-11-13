@@ -27,6 +27,7 @@ from aetherflow import (
     dumps,
     f32,
     f64,
+    hessian_vector_product,
     loads,
     verify,
 )
@@ -762,6 +763,174 @@ class TestTorchCrossCheck(unittest.TestCase):
         tx = torch.tensor(xs, requires_grad=True)
         F.max_pool2d(tx, 2).sum().backward()
         np.testing.assert_allclose(ours[0], tx.grad.detach().numpy(), rtol=1e-12, atol=1e-12)
+
+
+# --------------------------------------------------------------------------
+# 二阶导数
+# --------------------------------------------------------------------------
+
+
+class TestSecondOrder(unittest.TestCase):
+    """二阶导数：Hessian-vector product 的判据是解析二阶导与中心差分两条。
+
+    用 f64：差分噪声随精度平方增长，f32 上"规则写错"与"精度不够"会混在一起。
+    """
+
+    def _cube(self):
+        """``f(x) = sum(x**3)``：一阶 ``3x**2``、二阶对角 ``6x``。"""
+        g = Graph("cube")
+        x = g.input("x", f64[3])
+        g.output(
+            g.reduce_sum(g.mul(g.mul(x, x), x), axis=-1, keepdims=False), "y"
+        )
+        return g, x
+
+    def test_hessian_vector_product_matches_the_analytic_value(self):
+        g, x = self._cube()
+        hvp = hessian_vector_product(g, [x])
+        # 输入 = 前向输入 + 一阶种子 + 二阶种子；输出沿用一阶的命名
+        self.assertEqual([v.name for v in hvp.inputs], ["x", "dy", "ddx"])
+        self.assertEqual(hvp.output_names, ["dx"])
+
+        xv = np.array([0.5, -1.25, 2.0])
+        v = np.array([1.0, -2.0, 0.5])
+        res = _execute(hvp, {"x": xv, "dy": np.ones(()), "ddx": v})
+        np.testing.assert_allclose(
+            res["dx"], 6.0 * xv * v, rtol=1e-12, atol=1e-12
+        )
+
+    def test_hvp_matches_the_central_difference_of_the_gradient(self):
+        """独立判据：不借用"二阶规则"，只比较一阶梯度在两个扰动点的差商。"""
+        g, x = self._cube()
+        bwd = backward(g, wrt=[x])
+        hvp = hessian_vector_product(g, [x])
+
+        xv = np.array([0.7, -0.3, 1.1])
+        v = np.array([0.2, -0.4, 0.9])
+        eps = 1e-5
+
+        def grad_at(point):
+            return _execute(bwd, {"x": point, "dy": np.ones(())})["dx"]
+
+        numeric = (grad_at(xv + eps * v) - grad_at(xv - eps * v)) / (2 * eps)
+        got = _execute(hvp, {"x": xv, "dy": np.ones(()), "ddx": v})["dx"]
+        np.testing.assert_allclose(got, numeric, rtol=1e-6, atol=1e-8)
+
+    def test_default_wrt_covers_every_input(self):
+        """不给 wrt 时每个图输入各一项二阶输出，混合偏导也在这张图里。"""
+        g = Graph("mixed")
+        x = g.input("x", f64[2])
+        w = g.input("w", f64[2])
+        g.output(
+            g.reduce_sum(
+                g.mul(g.mul(x, x), g.mul(w, w)), axis=-1, keepdims=False
+            ),
+            "y",
+        )
+        hvp = hessian_vector_product(g)
+        self.assertEqual(hvp.output_names, ["dx", "dw"])
+        self.assertEqual(
+            [v.name for v in hvp.inputs], ["x", "w", "dy", "ddx", "ddw"]
+        )
+
+        xv = np.array([1.5, -2.0])
+        wv = np.array([0.5, 3.0])
+        vx = np.array([1.0, -1.0])
+        vw = np.array([0.25, 2.0])
+        res = _execute(
+            hvp,
+            {"x": xv, "w": wv, "dy": np.ones(()), "ddx": vx, "ddw": vw},
+        )
+        # f = sum(x**2 * w**2) 的完整 Hessian 分块：
+        #   d2/dx2 = 2*w**2   d2/dw2 = 2*x**2   d2/dxdw = 4*x*w
+        # 二阶反向从每个一阶输出各给一个种子，两路的 cotangent 在公共祖先
+        # 汇合，因此每个分量都带上了另一块的混合项——这是完整 Hessian 乘
+        # 向量，不是逐块独立。
+        np.testing.assert_allclose(res["dx"], 2.0 * wv**2 * vx + 4.0 * xv * wv * vw)
+        np.testing.assert_allclose(res["dw"], 4.0 * xv * wv * vx + 2.0 * xv**2 * vw)
+
+    def test_newton_step_is_exact_on_a_quadratic(self):
+        """收敛判据：用 HVP 拼出 Hessian 再解 ``H p = g``，二次目标一步到位。"""
+        g = Graph("quad")
+        x = g.input("x", f64[2])
+        target = g.input("t", f64[2])
+        diff = g.sub(x, target)
+        g.output(g.reduce_sum(g.mul(diff, diff), axis=-1, keepdims=False), "y")
+
+        bwd = backward(g, wrt=[x])
+        hvp = hessian_vector_product(g, [x])
+
+        x0 = np.array([3.0, -1.0])
+        tv = np.array([1.5, -2.0])
+        grad = _execute(bwd, {"x": x0, "t": tv, "dy": np.ones(())})["dx"]
+        hess = np.stack(
+            [
+                _execute(
+                    hvp, {"x": x0, "t": tv, "dy": np.ones(()), "ddx": basis}
+                )["dx"]
+                for basis in np.eye(2)
+            ],
+            axis=1,
+        )
+        np.testing.assert_allclose(hess, 2 * np.eye(2), atol=1e-12)
+        step = np.linalg.solve(hess, grad)
+        np.testing.assert_allclose(x0 - step, tv, atol=1e-12)
+
+    def test_zero_curvature_is_an_error_not_a_zero(self):
+        """线性目标的二阶导不存在"零张量"：IR 里没有无来源的值，显式报错。"""
+        g = Graph("linear")
+        x = g.input("x", f64[3])
+        w = g.input("w", f64[3])
+        g.output(g.reduce_sum(g.mul(x, w), axis=-1, keepdims=False), "y")
+        with self.assertRaises(NoGradientError):
+            hessian_vector_product(g, [x])
+
+    def test_ops_without_second_order_rules_are_named(self):
+        g = Graph("conv")
+        x = g.input("x", f64[1, 1, 4, 4])
+        w = g.input("w", f64[1, 1, 3, 3])
+        y = g.conv2d(x, w, padding=(1, 1))
+        reduced = g.reduce_sum(y, axis=-1, keepdims=False)
+        g.output(g.reduce_sum(reduced, axis=-1, keepdims=False), "y")
+        with self.assertRaises(NoGradientError) as ctx:
+            hessian_vector_product(g, [x])
+        self.assertIn("conv2d", str(ctx.exception))
+
+    def test_seed_name_collision_is_explicit(self):
+        g = Graph("collide")
+        x = g.input("x", f64[2])
+        # 第二个输入故意占用默认的二阶种子名
+        g.input("ddx", f64[2])
+        g.output(g.reduce_sum(g.mul(g.mul(x, x), x), axis=-1, keepdims=False), "y")
+        with self.assertRaises(ValueError) as ctx:
+            hessian_vector_product(g, [x])
+        self.assertIn("seeds", str(ctx.exception))
+        hvp = hessian_vector_product(g, [x], seeds=["v"])
+        self.assertIn("v", [value.name for value in hvp.inputs])
+
+    def test_argument_validation(self):
+        g, x = self._cube()
+        with self.assertRaises(ValueError):
+            hessian_vector_product(g, [])
+        with self.assertRaises(ValueError):
+            hessian_vector_product(g, [x], seeds=["a", "b"])
+        with self.assertRaises(ValueError):
+            hessian_vector_product(g, [x], seeds=["a", "a"])
+
+    def test_hvp_graph_is_an_ordinary_graph(self):
+        """二阶图仍然是普通 IR：能过 verifier、能 JSON 往返、执行逐位一致。"""
+        g, x = self._cube()
+        hvp = hessian_vector_product(g, [x])
+        verify(hvp)
+        clone = loads(dumps(hvp))
+        feed = {
+            "x": np.array([0.5, -1.25, 2.0]),
+            "dy": np.ones(()),
+            "ddx": np.array([1.0, -2.0, 0.5]),
+        }
+        np.testing.assert_array_equal(
+            _execute(hvp, feed)["dx"], _execute(clone, feed)["dx"]
+        )
 
 
 if __name__ == "__main__":

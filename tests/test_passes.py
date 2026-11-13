@@ -13,18 +13,30 @@ import numpy as np
 
 from aetherflow import Graph, ReferenceBackend, dumps, f32, loads, verify
 from aetherflow.ir.ops import OPS, Effect, Op
+from aetherflow.ir.verifier import VerifierError
 from aetherflow.models import BlockSpec, build_transformer_block
 from aetherflow.passes import (
+    DEFAULT_PASS_NAMES,
+    FUSED_PASS_NAMES,
+    Autocast,
     CommonSubexpressionElimination,
     ConstantFolding,
     DeadCodeElimination,
     FuseLayerNormResidual,
     FuseSiLU,
     FuseSoftmaxScale,
+    Pass,
     PassManager,
     SimplifyShapeOps,
+    available_passes,
+    build_pipeline,
     default_pipeline,
     fused_pipeline,
+    get_pass,
+    register_pass,
+    run_pass,
+    run_passes,
+    unregister_pass,
 )
 
 
@@ -686,6 +698,120 @@ class TestEffects(unittest.TestCase):
 
         out = default_pipeline().run(g)
         self.assertEqual([n.op.name for n in out.nodes].count("dropout_mask"), 1)
+
+
+class TestPassRegistry(unittest.TestCase):
+    """注册表与按名入口：名字唯一、工厂每次给新实例、未知名字显式报错。"""
+
+    def _graph(self):
+        g = Graph("registry")
+        x = g.input("x", f32[4, 4])
+        g.silu(x)  # 无用分支，交给 dce 清
+        g.output(g.relu(x), "y")
+        return g
+
+    def test_builtin_names_are_registered(self):
+        names = available_passes()
+        self.assertEqual(names, sorted(names))
+        for name in DEFAULT_PASS_NAMES + FUSED_PASS_NAMES:
+            self.assertIn(name, names)
+        # 带参数的 pass 不进注册表：名字表达不了参数
+        self.assertNotIn("autocast", names)
+
+    def test_get_pass_returns_a_fresh_instance(self):
+        first, second = get_pass("cse"), get_pass("cse")
+        self.assertIsInstance(first, CommonSubexpressionElimination)
+        self.assertIsNot(first, second)
+
+    def test_unknown_name_lists_available_passes(self):
+        with self.assertRaises(ValueError) as ctx:
+            get_pass("no_such_pass")
+        self.assertIn("no_such_pass", str(ctx.exception))
+        self.assertIn("cse", str(ctx.exception))
+        with self.assertRaises(TypeError):
+            get_pass(3)
+
+    def test_duplicate_registration_requires_replace(self):
+        class _Noop(Pass):
+            name = "test_noop"
+
+            def run(self, graph):
+                return graph
+
+        register_pass("test_noop", _Noop)
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                register_pass("test_noop", _Noop)
+            self.assertIn("replace=True", str(ctx.exception))
+            register_pass("test_noop", _Noop, replace=True)
+            self.assertIsInstance(get_pass("test_noop"), _Noop)
+        finally:
+            unregister_pass("test_noop")
+
+    def test_registration_name_must_match_the_pass_name(self):
+        class _Mismatch(Pass):
+            name = "something_else"
+
+            def run(self, graph):
+                return graph
+
+        with self.assertRaises(ValueError) as ctx:
+            register_pass("mismatch", _Mismatch)
+        self.assertIn("something_else", str(ctx.exception))
+        self.assertNotIn("mismatch", available_passes())
+
+    def test_unregister_unknown_name_is_explicit(self):
+        with self.assertRaises(KeyError):
+            unregister_pass("definitely_not_registered")
+
+    def test_single_entry_matches_the_class(self):
+        g = self._graph()
+        got = run_pass(g, "dce")
+        want = DeadCodeElimination().run(g)
+        self.assertEqual(got.op_names(), want.op_names())
+        self.assertEqual(got.output_names, want.output_names)
+        # pass 是函数式的：原图不被原地修改
+        self.assertEqual([n.op.name for n in g.nodes], ["silu", "relu"])
+
+    def test_default_pipeline_is_the_registry_order(self):
+        self.assertEqual(
+            [p.name for p in default_pipeline().passes], list(DEFAULT_PASS_NAMES)
+        )
+        self.assertEqual(
+            [p.name for p in fused_pipeline().passes], list(FUSED_PASS_NAMES)
+        )
+
+    def test_run_passes_matches_default_pipeline(self):
+        g = self._graph()
+        by_name = run_passes(g, DEFAULT_PASS_NAMES)
+        by_pipeline = default_pipeline().run(g)
+        self.assertEqual(by_name.op_names(), by_pipeline.op_names())
+        self.assertEqual(by_name.output_names, by_pipeline.output_names)
+
+    def test_build_pipeline_accepts_instances(self):
+        """带参数的 pass 不进注册表，但可以按实例进管线。"""
+        pm = build_pipeline([Autocast(), "dce"])
+        self.assertEqual([p.name for p in pm.passes], ["autocast", "dce"])
+
+    def test_build_pipeline_rejects_a_bare_name(self):
+        with self.assertRaises(TypeError):
+            build_pipeline("cse")
+
+    def test_empty_pipeline_is_identity(self):
+        g = self._graph()
+        self.assertIs(build_pipeline([]).run(g), g)
+
+    def test_single_pass_still_runs_the_verifier(self):
+        class _Broken(Pass):
+            name = "broken"
+
+            def run(self, graph):
+                return Graph("empty")  # 没有输出，verifier 必须拒绝
+
+        g = self._graph()
+        with self.assertRaises(VerifierError):
+            run_pass(g, _Broken())
+        self.assertEqual(len(run_pass(g, _Broken(), check=False).nodes), 0)
 
 
 if __name__ == "__main__":

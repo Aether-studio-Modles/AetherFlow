@@ -8,6 +8,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # 趋势采集要的是"连续"，不是"每次提交"：每天 18:00 UTC（北京次日 02:00）
+    # 在固定机器上追加一轮，接上历史后按图名裁剪。
+    - cron: "0 18 * * *"
 
 jobs:
   cpu:
@@ -57,8 +61,9 @@ jobs:
   gpu:
     name: GPU 正确性 + 性能回归
     # 需要一台装有 NVIDIA 驱动、CUDA 12.x 与 cupy 的自托管 runner，标签为 [self-hosted, gpu]。
-    # 手动触发：避免每次 push 都占用自建机器；也避免共享 runner 的抖动污染性能门禁。
-    if: github.event_name == 'workflow_dispatch'
+    # 只在手动触发与每日定时（趋势采集）时跑：避免每次 push 都占用自建机器；
+    # 也避免共享 runner 的抖动污染性能门禁。
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: [self-hosted, gpu]
     timeout-minutes: 30
     steps:
@@ -87,10 +92,29 @@ jobs:
           python -m benchmarks.tune --backend cuda --rounds 2 \
             --save tuning_cuda.json
           python -m benchmarks.tune --backend cuda --apply tuning_cuda.json
-      - name: 吞吐 / 显存趋势
+      - name: 恢复趋势历史
+        uses: actions/cache/restore@v4
+        with:
+          path: telemetry_history.json
+          # key 每次不同（cache 不可变），restore-keys 按前缀取最近一次
+          key: telemetry-cuda-${{ github.run_id }}
+          restore-keys: |
+            telemetry-cuda-
+      - name: 吞吐 / 显存趋势（接上历史，每张图留最近 200 条）
         run: |
-          python -m benchmarks.trend --backend cuda --rounds 3 \
-            --save telemetry_cuda.json
+          if [ -f telemetry_history.json ]; then
+            python -m benchmarks.trend --backend cuda --rounds 3 \
+              --compare telemetry_history.json \
+              --save telemetry_history.json --prune 200
+          else
+            python -m benchmarks.trend --backend cuda --rounds 3 \
+              --save telemetry_history.json --prune 200
+          fi
+      - name: 保存趋势历史
+        uses: actions/cache/save@v4
+        with:
+          path: telemetry_history.json
+          key: telemetry-cuda-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -98,4 +122,5 @@ jobs:
           path: |
             tuning_cuda.json
             telemetry_cuda.json
+            telemetry_history.json
           if-no-files-found: ignore

@@ -7,7 +7,17 @@
     底层硬件 IR   -> 待实现：由后端插件内部产生，不进入公共契约
 """
 
+from .control import (
+    Conditional,
+    ControlFlowError,
+    ControlRegion,
+    GraphRegion,
+    WhileLoop,
+    from_spec,
+    to_spec,
+)
 from .grad import GradCtx, backward
+from .second_order import hessian_vector_product
 from .graph import Graph, Node, Value
 from .liveness import ALIGNMENT, Footprint, MemoryBudget, plan_memory
 from .ops import (
@@ -62,6 +72,14 @@ __all__ = [
     "NoGradientError",
     "GradCtx",
     "backward",
+    "hessian_vector_product",
+    "ControlFlowError",
+    "ControlRegion",
+    "GraphRegion",
+    "Conditional",
+    "WhileLoop",
+    "to_spec",
+    "from_spec",
     "Portability",
     "get_op",
     "register",

@@ -13,12 +13,12 @@ import numpy as np
 
 from aetherflow import Graph, ReferenceExecutor, f32
 from benchmarks.cases import Case
-from benchmarks.trend import _select, _units, collect
+from benchmarks.trend import _main, _select, _units, collect, prune
 
 
-def _build(shape=(2, 3)):
+def _build(shape=(2, 3), name="tiny"):
     def build(rng):
-        graph = Graph("tiny")
+        graph = Graph(name)
         x = graph.input("x", f32[shape])
         graph.output(graph.relu(x), "y")
         return graph, {"x": np.ones(shape, dtype=np.float32)}
@@ -67,6 +67,47 @@ class TestCollect(unittest.TestCase):
         trend = recorder.trend()
         self.assertEqual(trend["runs"], 3)
         self.assertEqual(trend["graphs"]["tiny"]["count"], 3)
+
+
+class TestPrune(unittest.TestCase):
+    """裁剪按图名分别计数：冷门用例不会因为热门用例多而被挤掉。"""
+
+    def _recorder(self):
+        cases = [
+            Case("tiny", _build(), 0, 1, ""),
+            Case("other", _build((1, 2), name="other"), 0, 1, ""),
+        ]
+        return collect(ReferenceExecutor(), cases, rounds=3)
+
+    def test_keeps_the_newest_records_per_graph(self):
+        trimmed = prune(self._recorder(), 2)
+        self.assertEqual(len(trimmed.records), 4)
+        self.assertEqual(
+            [record.graph for record in trimmed.records],
+            ["tiny", "tiny", "other", "other"],
+        )
+        # 保留的确实是最近的两轮：第一轮那两条被丢了
+        self.assertEqual(trimmed.trend()["graphs"]["tiny"]["count"], 2)
+
+    def test_keep_larger_than_history_is_identity(self):
+        original = self._recorder()
+        trimmed = prune(original, 99)
+        self.assertEqual(len(trimmed.records), len(original.records))
+        self.assertEqual(
+            [record.graph for record in trimmed.records],
+            [record.graph for record in original.records],
+        )
+
+    def test_keep_must_be_a_positive_int(self):
+        original = self._recorder()
+        for bad in (0, -1, True, 1.5, "3"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                prune(original, bad)
+
+    def test_prune_without_save_is_rejected_before_running(self):
+        with self.assertRaises(SystemExit) as ctx:
+            _main(["--prune", "3"])
+        self.assertIn("--save", str(ctx.exception))
 
 
 if __name__ == "__main__":

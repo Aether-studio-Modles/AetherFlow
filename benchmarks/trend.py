@@ -70,6 +70,33 @@ def collect(backend, cases: Sequence[Case], rounds: int, seed: int = 0) -> Telem
     return recorder
 
 
+def prune(recorder: TelemetryRecorder, keep: int) -> TelemetryRecorder:
+    """每张图只保留最近 ``keep`` 条记录，其余原样丢弃。
+
+    趋势文件会在每次调度（CI / 本地定时）后追加一轮，不裁剪就是无限增长：
+    一张图一年能攒出几千条，最后连 JSON 都要读半天。裁剪按**图名**分别计数，
+    不是取全局最近 N 条——后者会让冷门用例被热门用例挤掉，曲线直接断掉。
+    """
+    if not isinstance(keep, int) or isinstance(keep, bool) or keep < 1:
+        raise ValueError(f"keep 必须是 >= 1 的整数，得到 {keep!r}")
+
+    counters: dict = {}
+    flags = []
+    for record in reversed(recorder.records):
+        count = counters.get(record.graph, 0)
+        kept = count < keep
+        flags.append(kept)
+        if kept:
+            counters[record.graph] = count + 1
+    flags.reverse()
+
+    trimmed = TelemetryRecorder(capacity=max(64, sum(flags)))
+    trimmed.extend(
+        [record for record, kept in zip(recorder.records, flags) if kept]
+    )
+    return trimmed
+
+
 def _print_table(payload: dict, window: Optional[int]) -> None:
     graphs = payload["graphs"]
     suffix = f"，每组取最近 {window} 次" if window else ""
@@ -114,11 +141,20 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--compare", action="append", default=[], help="接着这些历史记录往后排（可重复）")
     parser.add_argument("--save", help="把（含历史的）全部记录写到该 JSON")
     parser.add_argument("--window", type=int, help="每组只看最近 N 次")
+    parser.add_argument(
+        "--prune",
+        type=int,
+        metavar="N",
+        help="保存时每张图只留最近 N 条（默认全留；只对 --save 生效）",
+    )
     parser.add_argument("--json", action="store_true", help="打印 JSON 而不是表格")
     args = parser.parse_args(argv)
 
     if args.rounds < 1:
         raise SystemExit("--rounds 至少为 1")
+    if args.prune is not None and not args.save:
+        # 参数错误在跑基准之前就拒绝：花几分钟采完再报错没有意义。
+        raise SystemExit("--prune 只对 --save 生效；请同时指定 --save")
 
     cases = _select(CASES, args.case)
     backend = (
@@ -145,6 +181,9 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         _print_table(payload, args.window)
+
+    if args.prune is not None:
+        merged = prune(merged, args.prune)
 
     if args.save:
         merged.save(args.save)

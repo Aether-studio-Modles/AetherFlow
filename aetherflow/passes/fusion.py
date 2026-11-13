@@ -240,24 +240,11 @@ class FuseSiLU(Pass):
 
 
 def fused_pipeline() -> PassManager:
-    """带融合的优化管线。
+    """带融合的优化管线（名字序列与顺序见 ``registry.FUSED_PASS_NAMES``）。
 
     融合会让节点多出可选输入，因此要求目标后端承接这些形态；
     参考后端与 CUDA 后端都已支持。默认管线（无硬件假设）刻意不含它。
     """
-    from .cse import CommonSubexpressionElimination
-    from .dce import DeadCodeElimination
-    from .fold import ConstantFolding
-    from .simplify import SimplifyShapeOps
+    from .registry import fused_pipeline as _fused
 
-    return PassManager(
-        [
-            ConstantFolding(),
-            SimplifyShapeOps(),
-            CommonSubexpressionElimination(),
-            FuseSoftmaxScale(),
-            FuseLayerNormResidual(),
-            FuseSiLU(),
-            DeadCodeElimination(),
-        ]
-    )
+    return _fused()

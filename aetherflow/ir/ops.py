@@ -196,6 +196,13 @@ def _broadcast_shape(a: Sequence[Dim], b: Sequence[Dim]) -> Tuple[Dim, ...]:
 
 
 def _norm_axes(axis, rank: int) -> Tuple[int, ...]:
+    if axis is None:
+        # 显式拒绝，而不是让 tuple(None) 抛一句 "'NoneType' object is not
+        # iterable"：全归约在 IR 里没有独立的语义位，写清楚该写什么。
+        raise ValueError(
+            "axis=None（全归约）不受支持；"
+            f"请显式列出所有轴，例如 axis=tuple(range({rank}))"
+        )
     axes = (axis,) if isinstance(axis, int) else tuple(axis)
     norm = tuple(a + rank if a < 0 else a for a in axes)
     for a in norm:
@@ -218,8 +225,16 @@ def _elementwise_unary_infer(inputs: Tuple[TensorType, ...], attrs: dict) -> Ten
 
 
 def _binary_ref(np_fn):
+    """二元逐元素：溢出 / 无效值按 IEEE 返回，且不在宿主上打警告。
+
+    f16 的 ``add`` 溢出成 ``inf`` 是位宽决定的语义，不是错误；numpy 默认会
+    往 stderr 打一条 RuntimeWarning。这条口径与 ``div``、``exp/log/sqrt``
+    一致——同一张图在参考后端与设备后端上不该有"日志差异"。
+    """
+
     def ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
-        return np_fn(args[0], args[1])
+        with np.errstate(all="ignore"):
+            return np_fn(args[0], args[1])
 
     return ref
 
@@ -351,10 +366,26 @@ def _erf_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
     return _ERF_VEC(x).astype(x.dtype, copy=False)
 
 
+def _ieee_math(fn):
+    """定义域外按 IEEE 返回，且不在宿主上打 numpy RuntimeWarning。
+
+    ``log(0) = -inf``、``log(-1) = nan``、``sqrt(-1) = nan``、
+    ``exp(x)`` 溢出成 ``inf`` 都是浮点语义的一部分（设备内核同样如此），
+    不是错误；numpy 默认还会往 stderr 打一条 RuntimeWarning，同一张图在
+    参考后端上跑就会污染日志。``div`` 早已按这条口径处理，这里补齐数学族。
+    """
+
+    def reference(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+        with np.errstate(all="ignore"):
+            return fn(args[0])
+
+    return reference
+
+
 for _name, _ref, _doc in (
-    ("exp", lambda a, at: np.exp(a[0]), "自然指数 e^x"),
-    ("log", lambda a, at: np.log(a[0]), "自然对数 ln(x)"),
-    ("sqrt", lambda a, at: np.sqrt(a[0]), "平方根"),
+    ("exp", _ieee_math(np.exp), "自然指数 e^x"),
+    ("log", _ieee_math(np.log), "自然对数 ln(x)"),
+    ("sqrt", _ieee_math(np.sqrt), "平方根"),
     ("neg", lambda a, at: -a[0], "取负"),
     ("tanh", lambda a, at: np.tanh(a[0]), "双曲正切"),
     ("sigmoid", _sigmoid_ref, "logistic 函数 1/(1+e^-x)"),
