@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ..ir.graph import Graph, Value
-from ..ir.types import DType, TensorType, f16, f32, f64
+from ..ir.types import DType, TensorType, bf16, f16, f32, f64
+from .compat import TorchCompatibility, check_torch
 
 try:  # 可选依赖：没有 torch 的机器上内核仍可用
     import torch
@@ -37,6 +38,7 @@ _TORCH_DTYPE = {
     "float32": f32,
     "float64": f64,
     "float16": f16,
+    "bfloat16": bf16,
 }
 
 
@@ -67,15 +69,25 @@ class ImportedModel:
         return "\n".join(lines)
 
 
-def _require_torch() -> None:
+def _require_torch() -> TorchCompatibility:
+    """确认 torch 可用**且**在兼容矩阵内，返回对应的矩阵行。
+
+    版本不在矩阵里时抛 ``UnsupportedTorchVersion``（见 :mod:`.compat`）：
+    ``torch.export`` 的 IR 细节会随版本变，没验证过的版本不该被当成能用。
+    """
     if not _TORCH_AVAILABLE:
         raise ImportError("需要 torch 才能导入 torch.export 的模型；torch 是可选依赖")
+    return check_torch(torch)
 
 
 def _to_dtype(dtype: Any) -> DType:
     key = str(dtype).replace("torch.", "")
     if key not in _TORCH_DTYPE:
-        raise UnsupportedOperatorError(f"不支持的 dtype: {dtype}")
+        supported = "、".join(sorted(_TORCH_DTYPE))
+        raise UnsupportedOperatorError(
+            f"不支持的 dtype: {dtype}；矩阵内的 dtype 是 {supported}"
+            "（整数张量请先转成浮点，或作为图输入由调用方处理）"
+        )
     return _TORCH_DTYPE[key]
 
 

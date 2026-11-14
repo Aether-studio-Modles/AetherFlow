@@ -22,10 +22,12 @@ from aetherflow.backends.cuda import CUDA_AVAILABLE, CudaBackend
 from aetherflow.train import (
     SGD,
     DataParallelTrainer,
+    DeviceCollectiveUnavailable,
     ParameterStore,
     Trainer,
     allreduce,
     allreduce_grads,
+    collective_support,
     copy_across_devices,
     init_array,
     mse,
@@ -396,6 +398,165 @@ class TestCudaDataParallel(unittest.TestCase):
                 rtol=1e-4, atol=1e-6, err_msg=name,
             )
         self.assertEqual(multi.steps, 2)
+
+
+def _mean_provider(calls):
+    """一个"设备侧"归约的替身：按 allreduce 的累加顺序求均值。
+
+    真实的 NCCL / RCCL 由调用方注入；这里只验证契约与接线——数值必须与主机
+    路径逐位相同，否则说明两条路径的累加顺序变了。
+    """
+
+    def provider(per_device, target, *, reduction="mean"):
+        calls.append((tuple(per_device), target, reduction))
+        ranks = list(per_device)
+        names = list(per_device[ranks[0]])
+        out = {}
+        for name in names:
+            total = np.array(np.asarray(per_device[ranks[0]][name]), copy=True)
+            for rank in ranks[1:]:
+                total += np.asarray(per_device[rank][name])
+            if reduction == "mean":
+                total /= len(ranks)
+            out[name] = total
+        return out
+
+    provider.name = "fake-nccl"
+    return provider
+
+
+class TestCollectiveSeam(unittest.TestCase):
+    """AF-33 补：设备侧集合通信的能力声明与接线。
+
+    判据是"声明不撒谎"：没有实现时查询得到 False 且带原因，请求设备路径
+    当场抛能力错误；注入 provider 后数值与主机路径逐位一致，且只把结果
+    拉回主机一次。
+    """
+
+    def test_support_declares_host_only_without_provider(self):
+        """没有 provider 时：设备归约不可用、重叠不可用，原因点名 NCCL / RCCL。"""
+        support = collective_support(_FakeDevices(2))
+        self.assertFalse(support.device_allreduce)
+        self.assertFalse(support.overlap)
+        self.assertIsNone(support.provider)
+        self.assertIn("NCCL", support.reason)
+        self.assertIn("重叠", support.reason)
+
+    def test_support_reflects_injected_provider(self):
+        """注入 provider 后设备归约声明为可用，但重叠仍然如实为不可用。"""
+        support = collective_support(_FakeDevices(2), provider=_mean_provider([]))
+        self.assertTrue(support.device_allreduce)
+        self.assertEqual(support.provider, "fake-nccl")
+        self.assertFalse(support.overlap)
+        self.assertIn("重叠", support.reason)
+        with self.assertRaisesRegex(TypeError, "provider"):
+            collective_support(_FakeDevices(2), provider=3)
+
+    def test_device_mode_without_provider_is_explicit(self):
+        """请求设备路径但没有实现：抛能力错误并带原因，不静默退回主机。"""
+        with self.assertRaisesRegex(DeviceCollectiveUnavailable, "NCCL"):
+            DataParallelTrainer(
+                _linear_graph(),
+                _linear_store(),
+                SGD(_linear_store().arrays(), lr=0.1),
+                backend=_FakeDevices(2),
+                devices=[0, 1],
+                collective="device",
+            )
+
+    def test_inconsistent_collective_arguments_are_rejected(self):
+        """非法 collective 取值、注入了 provider 却选 host、provider 不可调用。"""
+        store = _linear_store()
+        with self.assertRaisesRegex(ValueError, "collective"):
+            DataParallelTrainer(
+                _linear_graph(),
+                store,
+                SGD(store.arrays(), lr=0.1),
+                backend=_FakeDevices(2),
+                devices=[0, 1],
+                collective="nccl",
+            )
+        store = _linear_store()
+        with self.assertRaisesRegex(ValueError, "device_collective"):
+            DataParallelTrainer(
+                _linear_graph(),
+                store,
+                SGD(store.arrays(), lr=0.1),
+                backend=_FakeDevices(2),
+                devices=[0, 1],
+                device_collective=_mean_provider([]),
+            )
+        store = _linear_store()
+        with self.assertRaisesRegex(TypeError, "device_collective"):
+            DataParallelTrainer(
+                _linear_graph(),
+                store,
+                SGD(store.arrays(), lr=0.1),
+                backend=_FakeDevices(2),
+                devices=[0, 1],
+                collective="device",
+                device_collective=3,
+            )
+
+    def test_device_path_matches_host_path(self):
+        """两条归约路径的损失与参数逐位相同，provider 每步只被调用一次。"""
+        calls = []
+        host_store = _linear_store()
+        device_store = _linear_store()
+        host = DataParallelTrainer(
+            _linear_graph(batch=4),
+            host_store,
+            SGD(host_store.arrays(), lr=0.1),
+            backend=_FakeDevices(2),
+            devices=[0, 1],
+        )
+        device = DataParallelTrainer(
+            _linear_graph(batch=4),
+            device_store,
+            SGD(device_store.arrays(), lr=0.1),
+            backend=_FakeDevices(2),
+            devices=[0, 1],
+            collective="device",
+            device_collective=_mean_provider(calls),
+        )
+        for step in range(2):
+            batch = _linear_batch(seed=step)
+            self.assertEqual(device.step(batch), host.step(batch))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], 0)  # 归约目标是第一块卡
+        self.assertEqual(calls[0][2], "mean")
+        for name in host_store.names:
+            np.testing.assert_array_equal(device_store[name], host_store[name])
+
+    def test_provider_result_is_validated(self):
+        """provider 返回值是外部输入：名字、形状、类型不对都当场报错。"""
+        cases = (
+            (lambda per_device, target, **kw: [1, 2], TypeError),
+            (lambda per_device, target, **kw: {"w": np.zeros((3, 1), np.float32)}, KeyError),
+            (
+                lambda per_device, target, **kw: {
+                    name: np.zeros((1, 1), np.float32) for name in ("w", "b")
+                },
+                ValueError,
+            ),
+        )
+        for provider, error in cases:
+            with self.subTest(error=error.__name__):
+                store = _linear_store()
+                trainer = DataParallelTrainer(
+                    _linear_graph(batch=4),
+                    store,
+                    SGD(store.arrays(), lr=0.1),
+                    backend=_FakeDevices(2),
+                    devices=[0, 1],
+                    collective="device",
+                    device_collective=provider,
+                )
+                # 不只断言异常类型：优化器本身也会对缺名字 / 形状不符报错，
+                # 那种"碰巧也是 KeyError"的通过说明不了归约结果被校验过。
+                with self.assertRaises(error) as caught:
+                    trainer.step(_linear_batch())
+                self.assertIn("device_collective", str(caught.exception))
 
 
 if __name__ == "__main__":

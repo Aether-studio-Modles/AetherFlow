@@ -8,6 +8,8 @@
 决定正确性的是"整份看不到的那部分状态没有影响结果"，而逐位一致已经涵盖它。
 """
 
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -382,6 +384,103 @@ class ReduceScatterTest(unittest.TestCase):
             reduce_scatter_grads(
                 local, params, transport=lambda index, grads: {}
             )
+
+
+class CrossProcessShardTest(unittest.TestCase):
+    """AF-34 补：每个进程只持有 / 只落地自己那片槽位。
+
+    判据是"总量"与"归属"：各片的常驻字节数之和等于**一份**整槽位（不是
+    world_size 份）；每个存档文件里只出现本片的参数；续训轨迹与不分片逐位相同。
+    """
+
+    def _trained(self, world_size, steps=3):
+        params = _params()
+        opt = ShardedOptimizer(
+            lambda p: Adam(p, lr=1e-2), params, world_size=world_size
+        )
+        for step in range(steps):
+            opt.step(_grads(params, step))
+        return params, opt
+
+    def test_slot_bytes_add_up_to_one_copy(self):
+        """各片槽位字节数之和 == 不分片时的一份槽位。"""
+        params, opt = self._trained(3)
+        sizes = opt.slot_bytes_by_shard()
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(all(size > 0 for size in sizes))
+        whole = Adam(_params(), lr=1e-2)
+        whole.step(_grads(params, 0))
+        reference = sum(
+            int(array.nbytes)
+            for arrays in whole.state_dict()["slots"].values()
+            for array in arrays.values()
+        )
+        self.assertEqual(sum(sizes), reference)
+        # 单个进程只常驻自己那片，比整份小
+        self.assertLess(max(sizes), reference)
+
+    def test_each_rank_saves_only_its_own_params(self):
+        """每个 npz 里只出现本片的参数名，合起来覆盖全部参数。"""
+        params, opt = self._trained(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = set()
+            for rank in range(3):
+                path = opt.save_shard(os.path.join(tmp, f"rank{rank}"), rank)
+                with np.load(path, allow_pickle=False) as data:
+                    names = {
+                        key.partition("::")[2]
+                        for key in data.files
+                        if key != "__meta__"
+                    }
+                self.assertEqual(
+                    names, set(opt.shards[rank].params)
+                )
+                seen |= names
+            self.assertEqual(seen, set(params))
+
+    def test_cross_process_roundtrip_resumes_identically(self):
+        """各片分别落地再装回，续训一步与不分片优化器逐位相同。"""
+        params, opt = self._trained(2)
+        grads = _grads(params, 9)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [opt.save_shard(os.path.join(tmp, f"r{rank}"), rank) for rank in range(2)]
+            # 参数本身（模型状态）与槽位分开存：续训必须从**已训练**的参数出发，
+            # 只有槽位被恢复。拿初始参数去接槽位，比较的就不是同一条轨迹了。
+            resumed_params = {name: array.copy() for name, array in params.items()}
+            resumed = ShardedOptimizer(
+                lambda p: Adam(p, lr=1e-2), resumed_params, world_size=2
+            )
+            for rank, path in enumerate(paths):
+                resumed.load_shard(path, rank)
+        reference_params = _params()
+        reference = Adam(reference_params, lr=1e-2)
+        for step in range(3):
+            reference.step(_grads(reference_params, step))
+        reference.step(grads)
+        opt.step(grads)
+        resumed.step(grads)
+        for name in params:
+            np.testing.assert_array_equal(opt.params[name], reference_params[name], err_msg=name)
+            np.testing.assert_array_equal(
+                resumed.params[name], reference_params[name], err_msg=name
+            )
+
+    def test_wrong_rank_or_layout_is_rejected(self):
+        """装错片、分片数不同、非法 rank 都当场报错。"""
+        params, opt = self._trained(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            first = opt.save_shard(os.path.join(tmp, "r0"), 0)
+            with self.assertRaisesRegex(ValueError, "属于 rank 0"):
+                opt.load_shard(first, 1)
+            other = ShardedOptimizer(
+                lambda p: Adam(p, lr=1e-2), _params(), world_size=3
+            )
+            with self.assertRaisesRegex(ValueError, "分片数"):
+                other.load_shard(first, 0)
+        with self.assertRaisesRegex(ValueError, "越界"):
+            opt.save_shard("nowhere", 2)
+        with self.assertRaisesRegex(TypeError, "rank"):
+            opt.load_shard("nowhere", True)
 
 
 if __name__ == "__main__":

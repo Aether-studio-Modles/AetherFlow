@@ -709,5 +709,87 @@ class TestTorchExportOnCuda(unittest.TestCase):
             )
 
 
+class TestTorchCompatMatrix(unittest.TestCase):
+    """AF-32 补：torch 兼容矩阵把"验证过的版本 / dtype"写成可查询的声明。
+
+    矩阵的意义不是"多支持几个版本"，而是让**矩阵之外**的版本显式失败：
+    ``torch.export`` 的 IR 细节会随版本变，没跑过就是没跑过。
+    """
+
+    def test_matrix_rows_are_well_formed(self):
+        """区间有序、verified 版本落在区间内、dtype 都是 IR 认得的名字。"""
+        from aetherflow.frontend import TORCH_MATRIX, parse_torch_version
+        from aetherflow.frontend.torch_export import _TORCH_DTYPE
+
+        self.assertTrue(TORCH_MATRIX)
+        for row in TORCH_MATRIX:
+            self.assertLessEqual(row.min_version, row.max_version)
+            self.assertTrue(row.dtypes)
+            for name in row.dtypes:
+                self.assertIn(name, _TORCH_DTYPE, msg=f"{name} 没有落到 IR dtype")
+            for text in row.verified:
+                version = parse_torch_version(text)
+                self.assertTrue(row.covers(version), msg=f"{text} 不在 {row.span} 内")
+
+    def test_parse_version_accepts_build_and_prerelease_suffixes(self):
+        """``2.13.0+cpu`` / ``2.9.0a0`` / ``2.13`` 都解析成三元组。"""
+        from aetherflow.frontend import parse_torch_version
+
+        self.assertEqual(parse_torch_version("2.13.0+cpu"), (2, 13, 0))
+        self.assertEqual(parse_torch_version("2.9.0a0"), (2, 9, 0))
+        self.assertEqual(parse_torch_version(" 2.13 "), (2, 13, 0))
+        for bad in ("", "torch", "v2"):
+            with self.subTest(text=bad):
+                with self.assertRaisesRegex(ValueError, "版本号"):
+                    parse_torch_version(bad)
+
+    def test_out_of_matrix_version_is_rejected(self):
+        """矩阵之外的版本抛 UnsupportedTorchVersion，并带上已验证区间。"""
+        from aetherflow.frontend import UnsupportedTorchVersion, matrix_row
+
+        with self.assertRaisesRegex(UnsupportedTorchVersion, "兼容矩阵"):
+            matrix_row((9, 9, 0))
+        with self.assertRaisesRegex(UnsupportedTorchVersion, "2\.9"):
+            matrix_row((1, 0, 0))
+
+    def test_check_torch_validates_the_module_version(self):
+        """check_torch 只认版本号，不认"装了就行"。"""
+        from types import SimpleNamespace
+
+        from aetherflow.frontend import UnsupportedTorchVersion, check_torch
+
+        self.assertIsNotNone(check_torch(SimpleNamespace(__version__="2.13.0+cpu")))
+        with self.assertRaises(UnsupportedTorchVersion):
+            check_torch(SimpleNamespace(__version__="1.7.1"))
+        with self.assertRaisesRegex(ValueError, "版本号"):
+            check_torch(SimpleNamespace(__version__="nightly"))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "需要 torch")
+    def test_installed_torch_is_verified(self):
+        """本机装的 torch 必须落在矩阵内，且版本被标记为 verified 之外也不静默。"""
+        from aetherflow.frontend import check_torch, parse_torch_version
+
+        row = check_torch(torch)
+        version = parse_torch_version(torch.__version__)
+        self.assertTrue(row.covers(version))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "需要 torch")
+    def test_dtype_coverage_matches_matrix(self):
+        """bfloat16 在矩阵内 → 能导出；int64 不在 → 显式拒绝。"""
+        from aetherflow.frontend import TORCH_MATRIX
+        from aetherflow.frontend.torch_export import (
+            UnsupportedOperatorError,
+            _require_torch,
+            _to_dtype,
+        )
+        from aetherflow.ir.types import bf16
+
+        row = _require_torch()
+        self.assertIn(row.span, "、".join(r.span for r in TORCH_MATRIX))
+        self.assertIs(_to_dtype(torch.bfloat16), bf16)
+        with self.assertRaisesRegex(UnsupportedOperatorError, "dtype"):
+            _to_dtype(torch.int64)
+
+
 if __name__ == "__main__":
     unittest.main()

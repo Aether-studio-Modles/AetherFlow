@@ -17,13 +17,19 @@
 **边界。** 分片按**名字**切，不按元素切——拆单个张量要改优化器的槽位布局，
 而收益只在"一个参数就大到一片装不下"时才出现。按参数字节数做贪心均衡，各片
 最多相差一个参数的大小；世界大小大于参数个数时会出现空片，这是合法状态，
-不报错（空片仍要参与 ``step_count`` 的推进，否则各片步数会分叉）。真机多进程
-没有做：这里省的是同一进程的主机内存，不是显存；要省显存需要"每个进程只上传
-自己那片参数"，那属于运行时改造（与 5.190 的边界一致）。
+不报错（空片仍要参与 ``step_count`` 的推进，否则各片步数会分叉）。
+
+**跨进程落地。** 进程内分片省不了"每个进程都持有一整份槽位"这件事：只要所有
+分片都在同一个进程里，常驻内存就是整份。真正落地要靠"每个进程只写/只读自己
+那片"：``save_shard(path, rank)`` / ``load_shard(path, rank)`` 只碰本片的槽位，
+``slot_bytes_by_shard()`` 给出每片的常驻字节数。n 个进程各持一片，合计仍是
+**一份**整槽位；存档里的归属表让"装错片"在加载时报错，而不是悄悄换成另一片
+的参数。参数本身仍假定各进程共享（all-gather 未做），这与 5.190 的边界一致。
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
@@ -35,6 +41,15 @@ __all__ = ["shard_params", "ShardedOptimizer", "reduce_scatter_grads", "Transpor
 #: 归约传输：``(片号, 本片梯度) -> 本片梯度``。真机上是 Reduce-Scatter 的
 #: 接收侧；默认实现是进程内直算，只用于验证语义与统计通信量。
 Transport = Callable[[int, Mapping[str, np.ndarray]], Mapping[str, np.ndarray]]
+
+
+def _check_rank(rank: Any, world_size: int) -> int:
+    """校验片号：必须是 int 且落在 ``0..world_size-1``。"""
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        raise TypeError(f"rank 必须是 int，收到 {rank!r}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank {rank} 越界：world_size={world_size}")
+    return rank
 
 
 def shard_params(
@@ -349,6 +364,122 @@ class ShardedOptimizer:
         ]
         for shard, batch in zip(self._shards, prepared):
             shard._commit_state(*batch)
+
+    # -- 跨进程分片 ---------------------------------------------------
+
+    def slot_bytes_by_shard(self) -> List[int]:
+        """每片优化器槽位的字节数（不含参数本身）。
+
+        这是"跨进程分片到底省了多少"的唯一硬指标：把每一片交给一个进程，
+        每个进程常驻的槽位就是这里对应的一项，总和仍是**一份**整槽位；
+        不分片时每个进程都要整份，总和是 ``world_size`` 份。
+        """
+        sizes: List[int] = []
+        for shard in self._shards:
+            total = 0
+            for arrays in shard._slots().values():
+                for array in arrays.values():
+                    total += int(np.asarray(array).nbytes)
+            sizes.append(total)
+        return sizes
+
+    def shard_state(self, rank: int) -> dict:
+        """本 rank 那份存档：步数 + 超参 + **只有本片**的槽位 + 归属表。
+
+        带上 ``rank`` 与 ``world_size`` 是为了让"把 rank 1 的存档装进 rank 0"
+        这种事在加载时就是显式错误——形状与名字都对得上，只有归属不同。
+        """
+        index = _check_rank(rank, self._world_size)
+        state = self._shards[index].state_dict()
+        return {
+            "rank": index,
+            "world_size": self._world_size,
+            "step": state["step"],
+            "hyper": state["hyper"],
+            "slots": state["slots"],
+            "assignments": {
+                name: shard for name, shard in self.assignments.items() if shard == index
+            },
+        }
+
+    def save_shard(self, path: Any, rank: int) -> str:
+        """把本 rank 的槽位写到 ``path``（一份 ``.npz``），返回实际文件名。
+
+        每个进程只调用自己那一份：跨进程落地时，磁盘上的 n 个文件合起来是
+        **一份**完整槽位。文件名不带节点后缀时自动补 ``.npz``（与
+        ``np.savez`` 的行为一致）。
+        """
+        index = _check_rank(rank, self._world_size)
+        state = self.shard_state(index)
+        target = str(path)
+        if not target.endswith(".npz"):
+            target += ".npz"
+        arrays: Dict[str, np.ndarray] = {}
+        for slot, by_name in state["slots"].items():
+            for name, array in by_name.items():
+                arrays[f"{slot}::{name}"] = np.asarray(array)
+        meta = {
+            "rank": state["rank"],
+            "world_size": state["world_size"],
+            "step": state["step"],
+            "hyper": state["hyper"],
+            "assignments": state["assignments"],
+        }
+        arrays["__meta__"] = np.array(json.dumps(meta, ensure_ascii=False))
+        np.savez(target, **arrays)
+        return target
+
+    def load_shard(self, path: Any, rank: int) -> None:
+        """从 ``path`` 装回本 rank 那片槽位。
+
+        校验顺序：片号 → 文件归属 → 分片数 → 归属表，最后才交给该片的
+        ``load_state_dict``（它再核对槽位名、形状、dtype 与超参）。任何一步
+        不符都报错，不做"能装多少装多少"。
+        """
+        index = _check_rank(rank, self._world_size)
+        target = str(path)
+        if not target.endswith(".npz"):
+            target += ".npz"
+        with np.load(target, allow_pickle=False) as data:
+            if "__meta__" not in data.files:
+                raise ValueError(f"{target} 不是分片存档：缺少 __meta__")
+            meta = json.loads(str(data["__meta__"]))
+            saved_rank = int(meta.get("rank", -1))
+            if saved_rank != index:
+                raise ValueError(
+                    f"{target} 属于 rank {saved_rank}，不能装进 rank {index}"
+                )
+            saved_world = int(meta.get("world_size", 0))
+            if saved_world != self._world_size:
+                raise ValueError(
+                    f"存档的分片数 {saved_world} 与当前 world_size "
+                    f"{self._world_size} 不一致"
+                )
+            saved_assign = {
+                name: int(shard) for name, shard in dict(meta["assignments"]).items()
+            }
+            current = {
+                name: shard for name, shard in self.assignments.items() if shard == index
+            }
+            if saved_assign != current:
+                raise ValueError(
+                    f"rank {index} 的参数归属与存档不同："
+                    f"存档 {saved_assign}，当前 {current}"
+                )
+            slots: Dict[str, Dict[str, np.ndarray]] = {}
+            for key in data.files:
+                if key == "__meta__":
+                    continue
+                slot, _, name = key.partition("::")
+                if not name:
+                    raise ValueError(f"{target} 里的键 {key!r} 不是 slot::name 形式")
+                slots.setdefault(slot, {})[name] = np.array(data[key], copy=True)
+            state = {
+                "step": int(meta["step"]),
+                "hyper": meta["hyper"],
+                "slots": slots,
+            }
+        self._shards[index].load_state_dict(state)
 
     def __repr__(self) -> str:
         sizes = [len(names) for names in self._names]

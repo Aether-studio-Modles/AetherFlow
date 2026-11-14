@@ -10,6 +10,14 @@
   让手写图写起来像动态图，但产出物仍是同一份静态 IR——不引入任何后端依赖。
 """
 
+from .compat import (
+    TORCH_MATRIX,
+    TorchCompatibility,
+    UnsupportedTorchVersion,
+    check_torch,
+    matrix_row,
+    parse_torch_version,
+)
 from .eager import EagerGraph, Tensor
 from .torch_export import ImportedModel, UnsupportedOperatorError, import_exported
 
@@ -19,4 +27,10 @@ __all__ = [
     "ImportedModel",
     "UnsupportedOperatorError",
     "import_exported",
+    "TORCH_MATRIX",
+    "TorchCompatibility",
+    "UnsupportedTorchVersion",
+    "check_torch",
+    "matrix_row",
+    "parse_torch_version",
 ]

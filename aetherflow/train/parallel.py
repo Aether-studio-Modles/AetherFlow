@@ -17,6 +17,15 @@
 工作。之所以先做串行闭环，是因为它把"多卡训练是否正确"与"通信是否高效"
 拆开了：数值对了，再谈重叠。
 
+**集合通信到哪一级，写在声明里。** :func:`collective_support` 返回
+``CollectiveSupport``：参考 / CUDA / HIP 后端都没有接入设备侧归约
+（NCCL / RCCL），跨卡归约一律经主机中转；``overlap`` 恒为 False。请求
+``DataParallelTrainer(collective="device")`` 而进程里没有实现时，抛
+``DeviceCollectiveUnavailable`` 并带上"为什么不行"——不静默降级回主机路径，
+否则调用方会以为通信留在设备上。想要设备侧归约，注入 ``device_collective``
+（契约见 ``DeviceAllReduce``）：归约留在设备上，只把结果拉回主机一次，
+D2H 的字节数从"每卡一份整梯度"降到"一份整梯度"。
+
 **代价如实写在接口上。** ``set_device`` 是丢弃而不是迁移旧卡缓存（5.169），
 所以每切一次卡，旧卡上的编译产物与捕获计划都会作废。这个循环因此不适合
 小模型；它适合"一步的计算量远大于重新编译 / 重新上传"的规模。参数副本也
@@ -36,7 +45,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -51,10 +61,82 @@ __all__ = [
     "copy_across_devices",
     "allreduce",
     "allreduce_grads",
+    "collective_support",
+    "CollectiveSupport",
+    "DeviceAllReduce",
+    "DeviceCollectiveUnavailable",
     "DataParallelTrainer",
 ]
 
 _REDUCTIONS = ("mean", "sum")
+
+
+#: 设备侧归约契约：``provider(per_device, target_device, reduction=...)``。
+#: ``per_device`` 是"设备号 → {参数名: **留在设备上的**数组}"；返回值必须
+#: 恰好覆盖同一组名字，且每个数组都落在 ``target_device`` 上。调用方只把
+#: 归约结果拉回主机一次（而不是每卡各拉一次），通信量的差额就在这里。
+DeviceAllReduce = Callable[..., Mapping[str, Any]]
+
+
+class DeviceCollectiveUnavailable(NotImplementedError):
+    """请求了设备侧集合通信，但当前进程没有可用实现。
+
+    刻意继承 ``NotImplementedError``：缺的是**能力**，不是参数写错。调用方
+    该做的是退回主机路径（显式改成 ``collective="host"``）或接入 NCCL / RCCL，
+    而不是去改参数重试。
+    """
+
+
+@dataclass(frozen=True)
+class CollectiveSupport:
+    """后端在集合通信上的能力声明。
+
+    ``device_allreduce`` 为 False 时，多卡路径只能走主机中转归约；``overlap``
+    目前恒为 False——执行器是同步的、切卡是串行的，进程内没有可重叠的窗口。
+    ``reason`` 是给人读的"为什么不行"，空字符串只出现在全部能力都具备时。
+    """
+
+    device_allreduce: bool
+    overlap: bool
+    provider: Optional[str]
+    reason: str
+
+
+def collective_support(
+    backend: Any, *, provider: Optional[DeviceAllReduce] = None
+) -> CollectiveSupport:
+    """查询后端能提供到哪一级集合通信。
+
+    参考后端与 CUDA / HIP 后端都没有接入设备侧集合通信（NCCL / RCCL）：
+    跨卡归约一律经主机中转。把这件事变成**可查询的声明**，而不是让调用方
+    从性能曲线里猜。注入 ``provider`` 时声明随之变化——这条路径由调用方
+    保证实现，本层只负责把契约校验住。
+    """
+    _check_multi_device_backend(backend)
+    if provider is not None:
+        if not callable(provider):
+            raise TypeError(
+                f"provider 必须是可调用对象，得到 {type(provider).__name__}"
+            )
+        name = getattr(provider, "name", type(provider).__name__)
+        return CollectiveSupport(
+            device_allreduce=True,
+            overlap=False,
+            provider=str(name),
+            reason=(
+                "设备侧归约由注入的 provider 提供；计算/通信重叠仍未实现："
+                "执行器同步、切卡串行，进程内没有重叠窗口"
+            ),
+        )
+    return CollectiveSupport(
+        device_allreduce=False,
+        overlap=False,
+        provider=None,
+        reason=(
+            "设备侧集合通信（NCCL / RCCL）未接入：跨卡归约一律经主机中转"
+            "（D2H → 主机求和 → H2D）；计算/通信重叠也未实现"
+        ),
+    )
 
 
 def _check_multi_device_backend(backend: Any) -> None:
@@ -233,6 +315,8 @@ class DataParallelTrainer:
         devices: Sequence[int],
         output: Optional[str] = None,
         reduction: str = "mean",
+        collective: str = "host",
+        device_collective: Optional[DeviceAllReduce] = None,
     ) -> None:
         if not isinstance(graph, Graph):
             raise TypeError(f"graph 必须是 Graph，得到 {type(graph).__name__}")
@@ -247,6 +331,26 @@ class DataParallelTrainer:
         if reduction not in _REDUCTIONS:
             raise ValueError(
                 f"reduction 必须是 {_REDUCTIONS} 之一，收到 {reduction!r}"
+            )
+        if collective not in ("host", "device"):
+            raise ValueError(
+                f"collective 必须是 'host' 或 'device'，收到 {collective!r}"
+            )
+        if device_collective is not None and not callable(device_collective):
+            raise TypeError(
+                f"device_collective 必须是可调用对象，"
+                f"得到 {type(device_collective).__name__}"
+            )
+        if collective == "host" and device_collective is not None:
+            raise ValueError(
+                "注入了 device_collective 却选了 collective='host'："
+                "两种归约路径只能选一条，不猜"
+            )
+        if collective == "device" and device_collective is None:
+            support = collective_support(backend)
+            raise DeviceCollectiveUnavailable(
+                f"collective='device' 需要设备侧归约实现，当前没有：{support.reason}；"
+                "请显式改用 collective='host'（经主机中转），或注入 device_collective"
             )
 
         if isinstance(devices, (str, bytes)) or not isinstance(devices, Sequence):
@@ -288,6 +392,8 @@ class DataParallelTrainer:
         self.backend = backend
         self.devices = tuple(picked)
         self.reduction = reduction
+        self.collective = collective
+        self.device_collective = device_collective
         self.output = chosen
         self.steps = 0
 
@@ -362,6 +468,42 @@ class DataParallelTrainer:
 
     # -- 单步 ---------------------------------------------------------
 
+    def _host_grads(self, reduced: Any) -> Dict[str, np.ndarray]:
+        """校验设备侧归约结果并转成主机数组。
+
+        provider 的返回值是**外部输入**：名字少一个、多一个、形状或 dtype
+        变了，都必须当场报错。否则"某块卡悄悄少归约了一个参数"要等到几十步
+        之后才以"损失不降"的形式暴露。
+        """
+        if not isinstance(reduced, Mapping):
+            raise TypeError(
+                f"device_collective 必须返回名字到设备数组的映射，"
+                f"得到 {type(reduced).__name__}"
+            )
+        missing = [name for name in self.store.names if name not in reduced]
+        unknown = [name for name in reduced if name not in self._param_names]
+        if missing or unknown:
+            raise KeyError(
+                f"device_collective 返回的名字与参数表不一致："
+                f"多 {sorted(unknown)}，少 {sorted(missing)}"
+            )
+        host: Dict[str, np.ndarray] = {}
+        for name in self.store.names:
+            array = np.asarray(self.backend.to_host(reduced[name]))
+            expected = tuple(self.store[name].shape)
+            if array.shape != expected:
+                raise ValueError(
+                    f"device_collective 返回的 {name} 形状是 {array.shape}，"
+                    f"参数形状是 {expected}"
+                )
+            if array.dtype != self.store[name].dtype:
+                raise TypeError(
+                    f"device_collective 返回的 {name} dtype 是 {array.dtype}，"
+                    f"参数 dtype 是 {self.store[name].dtype}"
+                )
+            host[name] = array
+        return host
+
     def step(self, batch: Mapping[str, Any]) -> float:
         """跑一步数据并行，返回各卡损失的均值。"""
         if not isinstance(batch, Mapping):
@@ -374,7 +516,9 @@ class DataParallelTrainer:
             self._replicate()
 
         losses: List[float] = []
-        grads_on: Dict[int, Dict[str, np.ndarray]] = {}
+        # 名字固定为 "设备号 → 名字 → 梯度"：主机路径存主机数组，设备路径存
+        # 设备数组。两种路径的**采样与反向完全相同**，只在归约这一步分叉。
+        grads_on: Dict[int, Dict[str, Any]] = {}
         try:
             for rank, device in enumerate(self.devices):
                 self.backend.set_device(device)
@@ -386,11 +530,25 @@ class DataParallelTrainer:
                 losses.append(float(self.backend.to_host(out)))
                 seed = np.asarray(1.0, dtype=self._loss_dtype)
                 result = self.backend.execute(self._bwd, {**feed, self._seed_name: seed})
-                grads_on[device] = {
-                    name: self.backend.to_host(result["d" + name])
-                    for name in self.store.names
-                }
-            self.optimizer.step(allreduce_grads(grads_on, reduction=self.reduction))
+                if self.collective == "device":
+                    grads_on[device] = {
+                        name: result["d" + name] for name in self.store.names
+                    }
+                else:
+                    grads_on[device] = {
+                        name: self.backend.to_host(result["d" + name])
+                        for name in self.store.names
+                    }
+            if self.collective == "device":
+                # 归约留在设备侧，只把结果拉回主机一次——主机路径是每卡各拉
+                # 一份整梯度再在主机上求和，D2H 的字节数是这里的 world_size 倍。
+                self.backend.set_device(self.devices[0])
+                reduced = self.device_collective(
+                    grads_on, self.devices[0], reduction=self.reduction
+                )
+                self.optimizer.step(self._host_grads(reduced))
+            else:
+                self.optimizer.step(allreduce_grads(grads_on, reduction=self.reduction))
             # 优化器改的是主机参数；各卡副本必须整份跟上，否则下一步读的是旧权重。
             self._replicate()
         finally:
@@ -402,5 +560,6 @@ class DataParallelTrainer:
     def __repr__(self) -> str:
         return (
             f"DataParallelTrainer(devices={self.devices}, "
-            f"params={len(self.store)}, reduction={self.reduction!r})"
+            f"params={len(self.store)}, reduction={self.reduction!r}, "
+            f"collective={self.collective!r})"
         )

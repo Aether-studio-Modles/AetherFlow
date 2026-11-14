@@ -28,9 +28,13 @@ from .loop import Trainer, TrainingState
 
 from .optim import SGD, Adam, Optimizer
 from .parallel import (
+    CollectiveSupport,
     DataParallelTrainer,
+    DeviceAllReduce,
+    DeviceCollectiveUnavailable,
     allreduce,
     allreduce_grads,
+    collective_support,
     copy_across_devices,
 )
 from .params import ParameterStore, default_init, init_array
@@ -56,6 +60,10 @@ __all__ = [
     "allreduce",
     "allreduce_grads",
     "copy_across_devices",
+    "collective_support",
+    "CollectiveSupport",
+    "DeviceAllReduce",
+    "DeviceCollectiveUnavailable",
     "TrainingSnapshot",
     "mean",
     "mse",
