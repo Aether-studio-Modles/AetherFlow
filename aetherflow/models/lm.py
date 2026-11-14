@@ -29,9 +29,10 @@ prefill 的 ``state_out`` 直接就是 decode 的输入。
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -51,6 +52,7 @@ __all__ = [
     "generate_beam",
     "LMRunner",
     "ServingEngine",
+    "QueueFullError",
 ]
 
 
@@ -1852,6 +1854,7 @@ class _ServingRequest:
         "state",
         "logits",
         "feed_token",
+        "deadline",
     )
 
     def __init__(
@@ -1867,6 +1870,7 @@ class _ServingRequest:
         repetition_penalty: float,
         seed: int,
         constraint,
+        deadline: Optional[float] = None,
     ) -> None:
         self.rid = rid
         self.prompt = prompt
@@ -1884,6 +1888,16 @@ class _ServingRequest:
         self.state: Optional[Dict[str, Any]] = None
         self.logits = None
         self.feed_token: Optional[int] = None
+        self.deadline = deadline
+
+
+class QueueFullError(RuntimeError):
+    """等待队列已满，新请求被拒绝。
+
+    这是**容量**条件而不是参数错误，所以刻意不继承 :class:`ValueError`：
+    调用方该做的是稍后重试或调大 ``max_pending``，不是去改参数。
+    已在槽位里跑着的请求不受影响——上限只约束排队。
+    """
 
 
 class ServingEngine:
@@ -1915,6 +1929,19 @@ class ServingEngine:
       会建新图，`max_graphs` 用 LRU 封顶。
     - 只支持 `spec.batch=1` 的会话级构造：capacity 是调度器自己的概念，
       不借用 spec 的 batch 维。
+
+    **服务侧的三件事**（AF-35 补）：
+
+    - **取消**：`cancel(rid)` 对排队中与在跑的请求都有效，腾出的槽位立刻
+      参与下一次准入；返回 ``True`` 表示这次真的取消了，``False`` 表示请求
+      不存在或已经完成——幂等，重复取消不是错误。
+    - **排队上限**：``max_pending`` 只约束**等待队列**，满了抛
+      :class:`QueueFullError`。在跑的请求不受影响，调用方决定重试还是降级。
+    - **请求超时**：``submit(..., timeout=秒)`` 是**墙钟**时限，从提交那一刻
+      起算（排队时间也算在 SLO 里）。到点即中止，已生成的 token 随
+      ``(rid, tokens)`` 进 `take_timed_out()`，**不会混进完成列表**：超时不是
+      完成，把两者混在一起会让调用方分不清"结果"和"残片"。时钟可注入
+      （默认 ``time.monotonic``），测试用假时钟就能逐位确定。
     """
 
     def __init__(
@@ -1927,6 +1954,8 @@ class ServingEngine:
         chunk_size: Optional[int] = None,
         resident: bool = False,
         max_graphs: int = 16,
+        max_pending: Optional[int] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int):
             raise TypeError(f"capacity 必须是 int，得到 {capacity!r}")
@@ -1936,6 +1965,13 @@ class ServingEngine:
             raise TypeError(f"max_graphs 必须是 int，得到 {max_graphs!r}")
         if max_graphs < 1:
             raise ValueError(f"max_graphs 必须 >= 1，得到 {max_graphs}")
+        if max_pending is not None:
+            if isinstance(max_pending, bool) or not isinstance(max_pending, int):
+                raise TypeError(f"max_pending 必须是 int 或 None，得到 {max_pending!r}")
+            if max_pending < 1:
+                raise ValueError(f"max_pending 必须 >= 1，得到 {max_pending}")
+        if clock is not None and not callable(clock):
+            raise TypeError(f"clock 必须是可调用对象，得到 {clock!r}")
         self.spec = spec or LMSpec()
         if self.spec.batch != 1:
             raise ValueError(
@@ -1959,6 +1995,9 @@ class ServingEngine:
         self._pending: "deque[_ServingRequest]" = deque()
         self._slots: List[Optional[_ServingRequest]] = [None] * capacity
         self._ready: List[Tuple[int, List[int]]] = []
+        self._timed_out: List[Tuple[int, List[int]]] = []
+        self.max_pending = max_pending
+        self._clock = clock if clock is not None else time.monotonic
         self._next_id = 0
 
     # -- 图缓存 -------------------------------------------------------
@@ -1994,6 +2033,7 @@ class ServingEngine:
         eos_id: Optional[int] = None,
         seed: int = 0,
         constraint=None,
+        timeout: Optional[float] = None,
     ) -> int:
         """入队一条请求，返回请求 id。参数与 :func:`generate` 同义。
 
@@ -2003,9 +2043,19 @@ class ServingEngine:
 
         ``max_new_tokens=0`` 的请求不构图，直接进完成队列，由下一次
         ``step`` 返回。
+
+        ``timeout`` 是从**提交**起算的墙钟时限（秒）；``None`` 表示不设限。
+        队列满（``max_pending``）时抛 :class:`QueueFullError`。
         """
         if self._closed:
             raise ValueError("ServingEngine 已关闭，请新建一个调度器")
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                raise TypeError(f"timeout 必须是有限正数或 None，得到 {timeout!r}")
+            if not np.isfinite(timeout) or timeout <= 0.0:
+                raise ValueError(
+                    f"timeout 必须是有限正数或 None，得到 {timeout!r}"
+                )
         prompt, _chunk, limit, stop = _check_request(
             self.spec, prompt, self.chunk, max_new_tokens, eos_id, None
         )
@@ -2017,6 +2067,15 @@ class ServingEngine:
         nucleus = float(top_p)
         if not np.isfinite(nucleus) or nucleus <= 0.0:
             raise ValueError(f"top_p 必须是有限正数，得到 {top_p!r}")
+        if (
+            self.max_pending is not None
+            and limit > 0
+            and len(self._pending) >= self.max_pending
+        ):
+            raise QueueFullError(
+                f"等待队列已满（max_pending={self.max_pending}），"
+                f"在跑 {self.active} 条；请稍后重试或调大上限"
+            )
         request = _ServingRequest(
             self._next_id,
             list(prompt),
@@ -2028,6 +2087,9 @@ class ServingEngine:
             repetition_penalty=penalty,
             seed=int(seed),
             constraint=constraint,
+            deadline=(
+                None if timeout is None else self._clock() + float(timeout)
+            ),
         )
         self._next_id += 1
         if limit == 0:
@@ -2044,13 +2106,75 @@ class ServingEngine:
     def active(self) -> int:
         return sum(1 for slot in self._slots if slot is not None)
 
+    @property
+    def timed_out(self) -> int:
+        """已超时但调用方还没取走的请求条数。"""
+        return len(self._timed_out)
+
+    def take_timed_out(self) -> List[Tuple[int, List[int]]]:
+        """取走并清空超时记录 ``(请求 id, 已生成 token)``。
+
+        超时的请求**不会**出现在 ``step`` / ``run`` 的完成列表里：完成与
+        超时是两种结果，混在一起调用方就分不清拿到的是结果还是残片。
+        """
+        taken = self._timed_out
+        self._timed_out = []
+        return taken
+
+    def cancel(self, rid: int) -> bool:
+        """取消一条请求；返回 ``True`` 表示这次确实移除了它。
+
+        排队中的请求直接出队；在跑的请求清空槽位（下一次 ``step`` 就能把
+        槽位让给新请求）。请求已完成、id 不存在、或重复取消都返回 ``False``
+        ——取消是幂等的，不该抛异常。
+        """
+        if isinstance(rid, bool) or not isinstance(rid, int):
+            raise TypeError(f"请求 id 必须是 int，得到 {rid!r}")
+        if self._closed:
+            raise ValueError("ServingEngine 已关闭，请新建一个调度器")
+        for request in list(self._pending):
+            if request.rid == rid:
+                self._pending.remove(request)
+                return True
+        for index, request in enumerate(self._slots):
+            if request is not None and request.rid == rid:
+                self._slots[index] = None
+                return True
+        return False
+
+    def _sweep_timeouts(self) -> None:
+        """把到点的请求从队列与槽位里摘掉，记进超时列表。
+
+        在每个 ``step`` 的最前面做：超时只在调度点生效，采样与解码的
+        中间状态因此不会被半路改写。
+        """
+        now = self._clock()
+        if not self._pending and not any(self._slots):
+            return
+        keep: "deque[_ServingRequest]" = deque()
+        for request in self._pending:
+            if request.deadline is not None and now >= request.deadline:
+                self._timed_out.append((request.rid, list(request.generated)))
+            else:
+                keep.append(request)
+        self._pending = keep
+        for index, request in enumerate(self._slots):
+            if request is None:
+                continue
+            if request.deadline is not None and now >= request.deadline:
+                self._timed_out.append((request.rid, list(request.generated)))
+                self._slots[index] = None
+
     def step(self) -> List[Tuple[int, List[int]]]:
         """推进一个解码步，返回**本步完成**的 ``(请求 id, 生成 token)``。
 
         没有活动请求也没有等待请求时返回空列表（重复调用是安全的）。
+        超时的请求在推进前就被摘掉，不会出现在返回值里（见
+        :meth:`take_timed_out`）。
         """
         if self._closed:
             raise ValueError("ServingEngine 已关闭，请新建一个调度器")
+        self._sweep_timeouts()
         finished = self._ready
         self._ready = []
 
@@ -2187,6 +2311,7 @@ class ServingEngine:
         self._pending.clear()
         self._slots = [None] * self.capacity
         self._ready = []
+        self._timed_out = []
         self._closed = True
 
     def __enter__(self) -> "ServingEngine":

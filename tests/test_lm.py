@@ -19,6 +19,7 @@ from aetherflow import Graph, ReferenceBackend, backward, f16, f32, i32
 from aetherflow.models import (
     LMSpec,
     LMRunner,
+    QueueFullError,
     ServingEngine,
     build_language_model,
     build_language_model_stateful,
@@ -1644,6 +1645,159 @@ class TestServingEngine(unittest.TestCase):
             engine.submit([2])
         with self.assertRaisesRegex(ValueError, "已关闭"):
             engine.step()
+
+
+class _FakeClock:
+    """手动推进的时钟。
+
+    超时是墙钟语义，但测试不能靠 ``sleep``——那会把"是否到点"交给机器负载。
+    注入假时钟后，每一步的时间点是确定的。
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+class TestServingControl(unittest.TestCase):
+    """AF-35 补：排队上限、取消、请求超时。
+
+    三条判据都只谈调度器自己的状态：被取消/超时的请求**不再输出**，
+    在跑的请求不受旁人影响，槽位腾出来就立刻被下一次准入用上。
+    """
+
+    def _setup(self, seed=21, **kwargs):
+        spec = _small(batch=1, steps=6)
+        params = spec.init_params(seed=seed)
+        return spec, params, ServingEngine(BACKEND, params, spec, **kwargs)
+
+    def test_cancel_queued_request_removes_it(self):
+        """排队中的请求被取消后不再出现在完成列表里，别的请求照常跑完。"""
+        spec, params, engine = self._setup(capacity=1)
+        running = engine.submit([2], max_new_tokens=5)
+        engine.step()  # 预填充，占住唯一槽位
+        queued = engine.submit([4, 5], max_new_tokens=2)
+        self.assertEqual(engine.pending, 1)
+        self.assertTrue(engine.cancel(queued))
+        self.assertEqual(engine.pending, 0)
+        self.assertFalse(engine.cancel(queued))  # 幂等
+
+        done = dict(engine.run())
+        self.assertIn(running, done)
+        self.assertNotIn(queued, done)
+        self.assertEqual(
+            done[running], list(generate(BACKEND, params, [2], spec, max_new_tokens=5))
+        )
+        engine.close()
+
+    def test_cancel_running_request_frees_its_slot(self):
+        """取消在跑的请求会清空槽位，队列里的下一条下一步就拿到它。"""
+        spec, params, engine = self._setup(capacity=1)
+        first = engine.submit([2], max_new_tokens=5)
+        engine.step()
+        self.assertEqual(engine.active, 1)
+        second = engine.submit([6, 7], max_new_tokens=2)
+        self.assertTrue(engine.cancel(first))
+        self.assertEqual(engine.active, 0)
+        done = dict(engine.run())
+        self.assertNotIn(first, done)
+        self.assertEqual(
+            done[second],
+            list(generate(BACKEND, params, [6, 7], spec, max_new_tokens=2)),
+        )
+        engine.close()
+
+    def test_cancel_unknown_or_finished_returns_false(self):
+        """不存在的 id、已完成的请求、以及非整数 id 的拒绝面。"""
+        spec, params, engine = self._setup(capacity=2)
+        self.assertFalse(engine.cancel(999))
+        rid = engine.submit([2], max_new_tokens=1)
+        engine.run()
+        self.assertFalse(engine.cancel(rid))
+        with self.assertRaisesRegex(TypeError, "id"):
+            engine.cancel(True)
+        engine.close()
+        with self.assertRaisesRegex(ValueError, "已关闭"):
+            engine.cancel(rid)
+
+    def test_queue_cap_rejects_and_recovers_after_cancel(self):
+        """``max_pending`` 只约束排队：满了抛 QueueFullError，取消后可再提交。"""
+        spec, params, engine = self._setup(capacity=1, max_pending=1)
+        engine.submit([2], max_new_tokens=5)
+        engine.step()
+        queued = engine.submit([4, 5], max_new_tokens=2)
+        with self.assertRaisesRegex(QueueFullError, "队列已满"):
+            engine.submit([6], max_new_tokens=2)
+        # max_new_tokens=0 的请求直接完成，不占队列
+        zero = engine.submit([6], max_new_tokens=0)
+        self.assertEqual(engine.step()[-1], (zero, []))
+        self.assertTrue(engine.cancel(queued))
+        engine.submit([6], max_new_tokens=2)
+        engine.close()
+
+    def test_timeout_drops_request_and_reports_partial_tokens(self):
+        """到点的请求带着已生成的 token 进超时列表，而不是完成列表。"""
+        clock = _FakeClock()
+        spec, params, engine = self._setup(capacity=1, clock=clock)
+        want = list(generate(BACKEND, params, [2, 3], spec, max_new_tokens=5))
+        rid = engine.submit([2, 3], max_new_tokens=5, timeout=1.0)
+
+        engine.step()  # 预填充
+        clock.advance(0.5)
+        self.assertEqual(engine.step(), [])  # 采出第 1 个 token
+        clock.advance(0.6)  # 越过 1.0 秒
+        self.assertEqual(engine.step(), [])
+        self.assertEqual((engine.pending, engine.active), (0, 0))
+        self.assertEqual(engine.timed_out, 1)
+        taken = engine.take_timed_out()
+        self.assertEqual(taken, [(rid, [want[0]])])
+        self.assertEqual(engine.timed_out, 0)
+        engine.close()
+
+    def test_timeout_counts_queue_wait_but_spares_others(self):
+        """超时从提交起算：还在排队也会到点；没设时限的请求不受影响。"""
+        clock = _FakeClock()
+        spec, params, engine = self._setup(capacity=1, clock=clock)
+        running = engine.submit([2], max_new_tokens=5)
+        engine.step()
+        waiting = engine.submit([4, 5], max_new_tokens=2, timeout=1.0)
+        clock.advance(2.0)
+        engine.step()
+        self.assertEqual(engine.pending, 0)
+        self.assertEqual(engine.take_timed_out(), [(waiting, [])])
+        done = dict(engine.run())
+        self.assertIn(running, done)
+        self.assertNotIn(waiting, done)
+        engine.close()
+
+    def test_invalid_control_arguments_are_rejected(self):
+        """非法 timeout / max_pending / clock 在构造或提交时显式报错。"""
+        spec = _small(batch=1, steps=6)
+        params = spec.init_params(seed=22)
+        with self.assertRaisesRegex(ValueError, "max_pending"):
+            ServingEngine(BACKEND, params, spec, max_pending=0)
+        with self.assertRaisesRegex(TypeError, "max_pending"):
+            ServingEngine(BACKEND, params, spec, max_pending=True)
+        with self.assertRaisesRegex(TypeError, "max_pending"):
+            ServingEngine(BACKEND, params, spec, max_pending=2.5)
+        with self.assertRaisesRegex(TypeError, "clock"):
+            ServingEngine(BACKEND, params, spec, clock=3)
+
+        engine = ServingEngine(BACKEND, params, spec)
+        for bad in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(timeout=bad):
+                with self.assertRaisesRegex(ValueError, "timeout"):
+                    engine.submit([2], timeout=bad)
+        for bad in (True, "1.0"):
+            with self.subTest(timeout=bad):
+                with self.assertRaisesRegex(TypeError, "timeout"):
+                    engine.submit([2], timeout=bad)
+        engine.close()
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from .cnn import CNNSpec, bn_conv_block, bn_infer, build_cnn, conv_block, residu
 from .lm import (
     LMSpec,
     LMRunner,
+    QueueFullError,
     ServingEngine,
     build_language_model,
     build_language_model_stateful,
@@ -135,6 +136,7 @@ __all__ = [
     "generate_beam",
     "LMRunner",
     "ServingEngine",
+    "QueueFullError",
     "ByteTokenizer",
     "ChatTemplate",
     "JsonGrammar",
