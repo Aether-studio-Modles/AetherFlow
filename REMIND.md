@@ -12,7 +12,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2300 个用例 / 410 跳过，WSL HIP 2300 个用例 / 369 跳过。
+当前基线：本地 2336 个用例 / 412 跳过，WSL HIP 2336 个用例 / 371 跳过。
 
 ## CUDA 真机
 
@@ -22,22 +22,31 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
 - 主机：`223.109.239.36`（移动）/ `180.127.11.177`（电信），端口 `24636`，用户 `root`
   （另有 `vipuser` 同密码；密码见对话记录，不写进版本库）。
 - 系统：Ubuntu 22.04.3，16 核 / 31 GB / 196 GB，2× Tesla V100-PCIE-16GB（sm_70），
-  驱动 550.127.05，CUDA 12.4 toolkit（含 libnvrtc / libcudart），**没有** NCCL 库。
+  驱动 550.127.05，CUDA 12.4 toolkit（含 libnvrtc / libcudart）；NCCL 2.32.6 见下。
 - 环境：系统 python3.10 + numpy 2.2.6（apt 的 python3-numpy 只有 1.21，不满足
   `numpy>=1.24`，要用 pip 覆盖安装）；`cupy-cuda12x 14.2.0` 由官方 PyPI 装好
-  （日志 `/root/pip_cupy2.log`，`getDeviceCount()==2`、sm 7.0）；无 Docker、无 cuDNN、
-  无 NCCL。
+  （日志 `/root/pip_cupy2.log`，`getDeviceCount()==2`、sm 7.0）；无 Docker、无 cuDNN。
+- NCCL 2.32.6：`pip install nvidia-nccl-cu12`（阿里镜像）装到
+  `/usr/local/lib/python3.10/dist-packages/nvidia/nccl`，`ncclGetVersion` 返回 23206；
+  `aetherflow/train/nccl.py` 先查 `find_library`，再按这个 pip 路径找 `libnccl.so.2`。
 - 代码同步：`tar czf - --exclude=__pycache__ --exclude=.git . | ssh ... 'tar xzf - -C /root/aetherflow'`，
   远端目录 `/root/aetherflow`。
-- 已验证：远端全量 `Ran 2295 tests / OK (skipped=119)` 全绿；CUDA 组
-  `Ran 332 tests / OK (skipped=1)`，唯一跳过来自系统没有 cuDNN。收集到的用例比本地
-  少 5 条（与 torch 版本相关）。
+- 已验证：远端全量 `Ran 2331 tests / OK (skipped=120)` 全绿；CUDA 组
+  `Ran 332 tests / OK (skipped=1)`，唯一跳过来自系统没有 cuDNN，另有 1 条"库缺失"的
+  离线用例在有 NCCL 的机器上按设计跳过；NCCL / ZeRO 专项
+  `python3 -m unittest tests.test_nccl tests.test_zero -v` → `Ran 36 tests / OK (skipped=1)`。
+  收集到的用例比本地少 5 条（与 torch 版本相关）。
 - 真机踩过的坑（已修，结论见 DESIGN 5.227）：`cusparseIndexType_t` 的
   `CUSPARSE_INDEX_32I` 是 **2** 不是 1——写成 1 会被当成 uint16 读 int32 的
   `rowOffsets`，表现为内核 `cudaErrorIllegalAddress` 而不是参数错误；一旦发生，
   上下文中毒会连带后续用例报 E。`cusparseSpMM` 是 11 个形参，别多传 C 描述符。
 - 机器相关用例要按卡现算：CSR 铺法的阈值是 `SM 数 × 32`（M40 24 SM / V100 80 SM），
   行数写死会在另一张卡上走错分支。
+- NCCL 的坑（结论见 DESIGN 5.228 / 5.229）：`ncclAllGather` 是 **6 个形参**（没有
+  redOp），按 AllReduce 的 7 形参绑会在真机首个调用抛 `TypeError`；`ncclUniqueId`
+  是 128 字节不透明结构，`bytes(c_char*128)` 会按第一个 NUL 截断成 `b''`，必须用
+  `ctypes.string_at` / `ctypes.memmove`；优化器槽位是懒分配的，未 `step` 前
+  `owned_bytes()==0`，比较分片大小之前要先真的走一步。
 
 
 ## 提交约定
@@ -59,9 +68,13 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   `take_timed_out()`，绝不混进完成列表。
 - 集合通信（5.221）只做了能力声明与设备侧 provider 缝：没有接入真 NCCL / RCCL，
   `overlap` 恒为 `False`（计算/通信重叠未实现），未注入 provider 时显式报
-  `DeviceCollectiveUnavailable`。
+  `DeviceCollectiveUnavailable`。5.228 起接了真 NCCL（`train/nccl.py`：AllReduce /
+  AllGather / ReduceScatter / Broadcast，f16/f32/f64 + sum/prod/max/min），但只在
+  单机多进程下验证；bf16 与 `avg` 归约显式拒绝，`overlap` 仍恒为 `False`。
 - 跨进程 ZeRO（5.222）只把优化器槽位按 rank 切分落地（npz + `__meta__`），不省显存、
   不做 all-gather；`load_shard` 靠片号 / 分片数 / 归属表三道校验兜底（优化器自身不查）。
+  5.229 起有跨进程 ZeRO-1（`train/zero.py`）：每进程仍持完整参数、只分片优化器槽位，
+  通信量与 DDP 相同（整份 AllReduce）；没有 ZeRO-2/3 的参数分片与 all-gather。
 - torch 兼容矩阵（5.223）是声明式区间（2.9–2.13，六个 dtype：四个浮点 + 两个整数）；
   区间内非 verified 版本
   不保证回归覆盖，越界或 dtype 缺席显式抛 `UnsupportedTorchVersion` /
