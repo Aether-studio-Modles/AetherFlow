@@ -357,6 +357,16 @@ def _argmax(axis: int = -1, keepdims: bool = False, shape: tuple = (4, 7)):
     return build
 
 
+def _topk_mask(k: int = 2, axis: int = -1, shape: tuple = (3, 5)):
+    def build(rng):
+        g = Graph("topk_mask")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("topk_mask", [x], {"k": k, "axis": axis}), "y")
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
 def _reshape():
     def build(rng):
         g = Graph("reshape")
@@ -1200,6 +1210,10 @@ def default_cases() -> List[Case]:
         _case("argmax_axis0", _argmax(axis=0, shape=(4, 7)), rtol=0.0, atol=0.0,
               note="任意单轴：非末轴先置换到最后再复用同一个内核，下标语义不变"),
         _case("argmax_axis1_keepdims", _argmax(axis=1, keepdims=True, shape=(3, 4, 5)),
+              rtol=0.0, atol=0.0),
+        _case("topk_mask_last", _topk_mask(), rtol=0.0, atol=0.0,
+              note="路由掩码：输出 0/1，必须精确相等；同值按下标小者优先（稳定排序）"),
+        _case("topk_mask_axis0", _topk_mask(k=1, axis=0, shape=(4, 3)),
               rtol=0.0, atol=0.0),
         _case("reduce_sum_multi_axis", _reduce_sum(axis=(0, 2), shape=(3, 4, 5)),
               note="多轴归约：置换到 [keep..., reduce...] 再合并成一个轴"),

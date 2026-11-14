@@ -53,6 +53,12 @@ from .mamba_reference import (
     official_selective_scan,
 )
 from .mlp import MLPSpec, build_mlp
+from .moe import (
+    EXPERT_PARALLEL_SUPPORTED,
+    MoESpec,
+    build_moe,
+    require_expert_parallel,
+)
 from .rnn import RNNSpec, build_rnn
 from .snn import (
     LIFSpec,
@@ -81,6 +87,10 @@ __all__ = [
     "causal_mask_bias",
     "MLPSpec",
     "build_mlp",
+    "MoESpec",
+    "build_moe",
+    "require_expert_parallel",
+    "EXPERT_PARALLEL_SUPPORTED",
     "CNNSpec",
     "build_cnn",
     "conv_block",

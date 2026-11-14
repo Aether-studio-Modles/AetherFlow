@@ -1972,6 +1972,59 @@ register(
 
 
 # --------------------------------------------------------------------------
+# 稀疏选择
+# --------------------------------------------------------------------------
+
+
+def _infer_topk_mask(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    t = inputs[0]
+    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+    if len(axes) != 1:
+        raise ValueError(f"topk_mask 只接受一个轴，得到 {axes}")
+    k = attrs.get("k")
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise TypeError(f"topk_mask 的 k 必须是整数，得到 {k!r}")
+    if k <= 0:
+        raise ValueError(f"topk_mask 的 k 必须为正，得到 {k}")
+    dim = t.shape[axes[0]]
+    if isinstance(dim, int) and k > dim:
+        raise ValueError(f"topk_mask 的 k={k} 超过轴 {axes[0]} 的长度 {dim}")
+    return t
+
+
+def _ref_topk_mask(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """沿单个轴取前 k 大的位置置 1，其余置 0；同值按下标小者优先。
+
+    只输出"选谁"的掩码，不输出被选值本身：MoE 的门控权重仍由 softmax
+    概率乘掩码得到，梯度因此只经概率那条边回传，选择本身不可导（与
+    ``argmax`` 同一条约定）。稳定排序保证同一输入在下一次执行里选出同一组
+    下标，DP 的多份参考执行不会因为并列值而产生不同的路由。
+    """
+    x = args[0]
+    axis = _norm_axes(attrs.get("axis", -1), x.ndim)[0]
+    k = int(attrs["k"])
+    order = np.argsort(-x, axis=axis, kind="stable")
+    picked = np.take(order, np.arange(k), axis=axis)
+    mask = np.zeros_like(x)
+    np.put_along_axis(mask, picked, 1, axis=axis)
+    return mask
+
+
+register(
+    Op(
+        name="topk_mask",
+        infer=_infer_topk_mask,
+        reference=_ref_topk_mask,
+        attrs_schema=("k", "axis"),
+        doc="沿单个轴取前 k 大的位置生成同形状 0/1 掩码，dtype 与输入一致。"
+        "它不可导（选择是离散的），接进损失会在 backward 时明确报错，"
+        "而不是静默给零；MoE 路由把掩码只用在门控权重的乘法里，"
+        "梯度经 softmax 概率那条边回传",
+    )
+)
+
+
+# --------------------------------------------------------------------------
 # 形状与类型算子
 # --------------------------------------------------------------------------
 
