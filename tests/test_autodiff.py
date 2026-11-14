@@ -147,6 +147,29 @@ class TestElementwiseGrad(_GradTest):
             with self.subTest(op=op):
                 self.assertGradients(self._binary(op))
 
+    def test_gated_silu_gate_gradient(self):
+        """门控 SiLU 对 gate 的梯度必须带上游权重（F01）。
+
+        必须用非均匀 seed 才能发现「漏乘上游 g」：全 1 seed 时两种写法结果相同，
+        所以这里额外乘一个权重输入，让数值差分的判据真正生效。
+        """
+
+        def build():
+            g = Graph("gated_silu")
+            x = g.input("x", f64[2, 3])
+            gate = g.input("gate", f64[2, 3])
+            w = g.input("w", f64[2, 3])
+            y = g.add_node("silu", [x, gate])
+            g.output(g.add_node("mul", [y, w]), "loss")
+            feed = {
+                "x": _rand((2, 3), seed=3),
+                "gate": _rand((2, 3), seed=4),
+                "w": _rand((2, 3), seed=5),
+            }
+            return g, feed
+
+        self.assertGradients(build, names=["x", "gate"])
+
 
 # --------------------------------------------------------------------------
 # 广播

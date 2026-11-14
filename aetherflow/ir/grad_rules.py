@@ -209,9 +209,9 @@ def _silu(ctx):
     dx = b.add_node("mul", [b.add_node("mul", [g, s]), t])
     if len(ctx.node.inputs) == 1:
         return (dx,)
-    # 门控形态 y = silu(x) * gate：对 x 的梯度再乘 gate，对 gate 的梯度是 silu(x)。
+    # 门控形态 y = silu(x) * gate：对 x 的梯度再乘 gate，对 gate 的梯度是 g*silu(x)。
     gate = ctx.input(1)
-    return (b.add_node("mul", [dx, gate]), b.add_node("silu", [x]))
+    return (b.add_node("mul", [dx, gate]), b.add_node("mul", [g, b.add_node("silu", [x])]))
 
 
 @vjp("gelu")
