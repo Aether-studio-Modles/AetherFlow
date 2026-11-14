@@ -12,7 +12,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2298 个用例 / 410 跳过，WSL HIP 2298 个用例 / 369 跳过。
+当前基线：本地 2300 个用例 / 410 跳过，WSL HIP 2300 个用例 / 369 跳过。
 
 ## CUDA 真机
 
@@ -42,14 +42,18 @@ CUDA 侧只能做离线 / 伪 runtime 验证；涉及 `cufftExec*`、真机耗�
   `DeviceCollectiveUnavailable`。
 - 跨进程 ZeRO（5.222）只把优化器槽位按 rank 切分落地（npz + `__meta__`），不省显存、
   不做 all-gather；`load_shard` 靠片号 / 分片数 / 归属表三道校验兜底（优化器自身不查）。
-- torch 兼容矩阵（5.223）是声明式区间（2.9–2.13，四个 dtype）；区间内非 verified 版本
+- torch 兼容矩阵（5.223）是声明式区间（2.9–2.13，六个 dtype：四个浮点 + 两个整数）；
+  区间内非 verified 版本
   不保证回归覆盖，越界或 dtype 缺席显式抛 `UnsupportedTorchVersion` /
   `UnsupportedOperatorError`。
 - torch 入口（5.224）的整数只有 i32：int64 收窄、越界值在执行器入口拒绝；`padding_idx`
   / `sparse` / `scale_grad_by_freq` 仍未实现（显式拒绝）；提升常量与 `get_attr` 常量落成
-  `constant`，单常量上限 65536 个元素；`torch.arange` 之类仍是未支持算子。
-- 续训的数据迭代位置（5.225）按 `data_*` 标量进 meta，`data_kind` 只认精确类名；位置只到
-  "第几轮第几批"，batch 内偏移不在协议内；流式 loader 的 `size` 是构造时快照。
+  `constant`，单常量上限 65536 个元素，i32 常量在导入时做值域检查（常量不经过执行器
+  入口），`_to_dtype` 用兼容矩阵的行做 dtype 校验；`bool` 常量仍无 IR 语义；
+  `torch.arange` 之类仍是未支持算子。
+- 续训的数据迭代位置（5.225）用专属标量键 `loader_state`（JSON）+ `loader_kind`，
+  冲突检查只看这两个键；位置只到"第几轮第几批"，batch 内偏移不在协议内；流式 loader 的
+  `size` 是构造时快照。游标在所有提交完成后才推进（5.226）。
 
 ## 临时脚本
 
