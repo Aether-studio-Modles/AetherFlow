@@ -12,7 +12,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2293 个用例 / 410 跳过，WSL HIP 2293 个用例 / 369 跳过。
+当前基线：本地 2298 个用例 / 410 跳过，WSL HIP 2298 个用例 / 369 跳过。
 
 ## CUDA 真机
 
@@ -48,6 +48,8 @@ CUDA 侧只能做离线 / 伪 runtime 验证；涉及 `cufftExec*`、真机耗�
 - torch 入口（5.224）的整数只有 i32：int64 收窄、越界值在执行器入口拒绝；`padding_idx`
   / `sparse` / `scale_grad_by_freq` 仍未实现（显式拒绝）；提升常量与 `get_attr` 常量落成
   `constant`，单常量上限 65536 个元素；`torch.arange` 之类仍是未支持算子。
+- 续训的数据迭代位置（5.225）按 `data_*` 标量进 meta，`data_kind` 只认精确类名；位置只到
+  "第几轮第几批"，batch 内偏移不在协议内；流式 loader 的 `size` 是构造时快照。
 
 ## 临时脚本
 
