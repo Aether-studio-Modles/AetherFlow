@@ -152,6 +152,59 @@ def install_root() -> Path:
     return search_roots()[0]
 
 
+# 信任记录放在**安装根目录**里，不能放进包目录：包内的每个文件都会参与摘要
+# 校验，多一个记录文件会变成"未声明文件"而被判为坏包。
+_TRUST_FILE = ".trust.json"
+
+
+def _trust_path(root: Path) -> Path:
+    return Path(root) / _TRUST_FILE
+
+
+def _load_trust(root: Path) -> Dict[str, Dict[str, str]]:
+    """读回安装时留下的来源记录；文件缺失或损坏时当作"没有记录"。
+
+    损坏时选择空表而不是抛错：扫描目录的契约是"坏包跳过、不打断别人"，
+    一个写坏的小 json 不该让所有已装硬件都消失。代价是带签名的包会因为
+    找不到信任锚而在扫描时被跳过——这与"记录丢了"的事实一致。
+    """
+    path = _trust_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            continue
+        algorithm = entry.get("algorithm")
+        public_key = entry.get("public_key")
+        if isinstance(algorithm, str) and isinstance(public_key, str):
+            out[name] = {"algorithm": algorithm, "public_key": public_key}
+    return out
+
+
+def _save_trust(root: Path, entries: Dict[str, Dict[str, str]]) -> None:
+    """原子替换信任记录；表空时直接删掉文件。"""
+    path = _trust_path(root)
+    if not entries:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(entries, sort_keys=True, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
 # --------------------------------------------------------------------------
 # 校验
 # --------------------------------------------------------------------------
@@ -333,6 +386,17 @@ def _signature_payload(data: dict) -> bytes:
     ).encode("utf-8")
 
 
+def _trust_entry(manifest: dict) -> Optional[Dict[str, str]]:
+    """从已校验的清单里取出要持久化的信任锚；未签名时返回 ``None``。"""
+    signature = manifest.get("signature")
+    if not isinstance(signature, dict):
+        return None
+    return {
+        "algorithm": str(signature.get("algorithm")),
+        "public_key": _public_key_bytes(signature.get("public_key")).hex(),
+    }
+
+
 def _check_signature(
     data: dict, root: Path, trusted_keys: Optional[Iterable[object]]
 ) -> bool:
@@ -464,18 +528,26 @@ def iter_installed() -> Iterator[HardwareRecord]:
 
     坏包跳过，不打断别人：manifest 不合法、文件摘要不符、依赖不满足，
     都属于"这个包在这台机器上用不了"，不是"整个硬件目录坏了"。
+
+    安装时验过的来源会被持久化到安装根目录的 ``.trust.json``，扫描时按
+    记录把公钥重新作为信任锚传进去。否则带签名的包装好之后，下次启动
+    会因为没有 ``trusted_keys`` 而被判为"无法确认来源"，等于签名包只能用
+    到进程退出——这比不签名还糟。
     """
     seen = set()
     for root in search_roots():
         if not root.is_dir():
             continue
+        trust = _load_trust(root)
         for child in sorted(root.iterdir()):
             if not child.is_dir() or child.name.startswith("."):
                 continue
             if not (child / MANIFEST).is_file():
                 continue
+            entry = trust.get(child.name)
+            trusted = [entry["public_key"]] if entry is not None else None
             try:
-                record = _record_from_dir(child)
+                record = _record_from_dir(child, trusted)
             except HardwarePackageError:
                 continue
             if record.name in seen:
@@ -614,7 +686,8 @@ def install_hardware(
     tmp = target_root / f".install-{uuid.uuid4().hex[:8]}"
     try:
         _extract(src, tmp)
-        record = _record_from_dir(tmp, trusted_keys)
+        manifest = _read_manifest(tmp)
+        record = _validate(manifest, tmp, trusted_keys)
         # 内置名不允许被硬件包占用：装一个叫 cuda 的包去顶掉真 CUDA 后端，
         # 是"看起来装好了、其实跑的是别人的实现"这类事故的标准模板。
         from .discovery import BUILTIN_BACKENDS
@@ -637,6 +710,17 @@ def install_hardware(
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+
+    # 把这次验过的来源记到安装根目录：下次扫描要用它重建信任锚，否则带签名
+    # 的包会在重启后被判为"无法确认来源"。无签名的包必须清掉同名旧记录，
+    # 不然扫描会拿旧公钥去要求一个本来就没有签名的包。
+    trust = _load_trust(target_root)
+    entry = _trust_entry(manifest)
+    if entry is None:
+        trust.pop(record.name, None)
+    else:
+        trust[record.name] = entry
+    _save_trust(target_root, trust)
 
     record = HardwareRecord(
         name=record.name,
@@ -668,6 +752,10 @@ def uninstall_hardware(name: str) -> bool:
     if not dest.is_dir():
         return False
     shutil.rmtree(dest)
+    trust = _load_trust(install_root())
+    if key in trust:
+        trust.pop(key)
+        _save_trust(install_root(), trust)
 
     from .discovery import unregister_backend
 

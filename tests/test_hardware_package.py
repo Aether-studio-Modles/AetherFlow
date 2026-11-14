@@ -601,6 +601,47 @@ class TestSignature(_HardwareTest):
             )
         self.assertIn("签名", str(ctx.exception))
 
+    def test_signed_package_is_rediscovered_after_install(self):
+        """重启后重新扫描必须还能认出签名包（F07）。
 
-if __name__ == "__main__":
-    unittest.main()
+        安装时验过的来源要落到安装根目录；否则 ``iter_installed`` 没有
+        ``trusted_keys``，带签名的包会被当成"无法确认来源"而消失。
+        """
+        name = self._name()
+        install_hardware(self._signed(name), trusted_keys=[self.public])
+        self.addCleanup(uninstall_hardware, name)
+
+        # 模拟新进程：扫描是只读目录，不依赖安装时的任何内存状态
+        records = installed_hardware()
+        self.assertIn(name, records)
+        self.assertTrue(records[name].signed)
+
+    def test_tampering_after_install_still_hides_the_package(self):
+        """信任记录只给锚，包本身仍要重新验签；改过内容就不能被发现。"""
+        name = self._name()
+        record = install_hardware(self._signed(name), trusted_keys=[self.public])
+        self.addCleanup(uninstall_hardware, name)
+        (record.root / name / "backend.py").write_text("# tampered\n", encoding="utf-8")
+        self.assertNotIn(name, installed_hardware())
+
+    def test_uninstall_clears_the_trust_record(self):
+        name = self._name()
+        install_hardware(self._signed(name), trusted_keys=[self.public])
+        self.assertTrue((self.home / ".trust.json").is_file())
+
+        self.assertTrue(uninstall_hardware(name))
+        self.assertFalse((self.home / ".trust.json").exists())
+
+    def test_unsigned_replace_clears_the_old_trust_record(self):
+        """换成无签名版本后必须删掉旧锚，否则扫描会拿旧公钥要求签名。"""
+        name = self._name()
+        install_hardware(self._signed(name), trusted_keys=[self.public])
+        self.addCleanup(uninstall_hardware, name)
+
+        record = install_hardware(
+            _package(self.dir, name, version="0.2.0"), replace=True
+        )
+        self.assertFalse(record.signed)
+        records = installed_hardware()
+        self.assertIn(name, records)
+        self.assertFalse(records[name].signed)
