@@ -35,7 +35,7 @@ from .parallel import (
 )
 from .params import ParameterStore, default_init, init_array
 from .pipeline import PipelineStage, PipelineTrainer
-from .sharded import ShardedOptimizer, shard_params
+from .sharded import ShardedOptimizer, reduce_scatter_grads, shard_params
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "Adam",
     "ShardedOptimizer",
     "shard_params",
+    "reduce_scatter_grads",
     "Trainer",
     "TrainingState",
     "DataParallelTrainer",

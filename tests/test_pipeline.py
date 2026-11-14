@@ -432,5 +432,112 @@ class PipelineValidationTest(unittest.TestCase):
         self.assertIn(1, backend.switches)
 
 
+class PipelineScheduleTest(unittest.TestCase):
+    def _stages3(self, batch=4):
+        return [
+            PipelineStage(_stage0(batch), params=("w1", "b1"), output="h1"),
+            PipelineStage(
+                _stage_mid(batch), params=("w2", "b2"), inputs=("h1",), output="h2"
+            ),
+            PipelineStage(
+                _stage_last(batch, incoming="h2"),
+                params=("w3", "b3"),
+                inputs=("h2",),
+                output="loss",
+            ),
+        ]
+
+    def _make(self, stages, store, devices, schedule):
+        return PipelineTrainer(
+            stages,
+            store,
+            Adam(store.arrays(), lr=1e-2),
+            backend=_FakeDevices(devices),
+            devices=list(range(devices)),
+            schedule=schedule,
+        )
+
+    def test_1f1b_matches_gpipe(self):
+        data = _batch(32)
+        stores = {}
+        for schedule in ("gpipe", "1f1b", "sequential"):
+            store = _store3()
+            trainer = self._make(self._stages3(), store, 3, schedule)
+            for step in range(2):
+                trainer.step(
+                    {
+                        "x": data["x"][step * 16 : step * 16 + 16],
+                        "target": data["target"][step * 16 : step * 16 + 16],
+                    },
+                    micro_batches=4,
+                )
+            stores[schedule] = store
+        for name in stores["gpipe"].names:
+            for schedule in ("1f1b", "sequential"):
+                np.testing.assert_allclose(
+                    stores[schedule][name],
+                    stores["gpipe"][name],
+                    rtol=1e-6,
+                    atol=1e-7,
+                    err_msg=(
+                        f"{schedule} 与 gpipe 的 {name} 不一致："
+                        "换的是调度顺序，不该换数值"
+                    ),
+                )
+
+    def test_sequential_peak_is_one(self):
+        store = _store3()
+        trainer = self._make(self._stages3(), store, 3, "sequential")
+        trainer.step(_batch(16), micro_batches=4)
+        self.assertEqual(trainer.last_resident_peak, 1)
+
+    def test_gpipe_peak_equals_micro_batches(self):
+        store = _store3()
+        trainer = self._make(self._stages3(), store, 3, "gpipe")
+        trainer.step(_batch(16), micro_batches=4)
+        self.assertEqual(trainer.last_resident_peak, 4)
+
+    def test_1f1b_peak_is_stages_minus_one(self):
+        store = _store3()
+        trainer = self._make(self._stages3(), store, 3, "1f1b")
+        trainer.step(_batch(16), micro_batches=4)
+        # 三段、四份：预热两份，稳态里始终只有两份"前向已完、反向未做"
+        self.assertEqual(trainer.last_resident_peak, 2)
+
+    def test_1f1b_peak_capped_by_micro_batches(self):
+        store = _store3()
+        trainer = self._make(self._stages3(), store, 3, "1f1b")
+        trainer.step(_batch(4), micro_batches=1)
+        # 只有一份时预热 0 份：前向完立刻反向，驻留峰值就是 1
+        self.assertEqual(trainer.last_resident_peak, 1)
+
+    def test_single_stage_1f1b(self):
+        store = _store()
+        trainer = PipelineTrainer(
+            [
+                PipelineStage(
+                    _whole(4),
+                    params=("w1", "b1", "w2", "b2"),
+                    output="loss",
+                )
+            ],
+            store,
+            Adam(store.arrays(), lr=1e-2),
+            backend=_FakeDevices(1),
+            devices=[0],
+            schedule="1f1b",
+        )
+        before = {name: store[name].copy() for name in store.names}
+        trainer.step(_batch(8), micro_batches=2)
+        self.assertEqual(trainer.last_resident_peak, 1)
+        for name in store.names:
+            self.assertFalse(np.array_equal(before[name], store[name]))
+
+    def test_unknown_schedule_is_refused(self):
+        store = _store()
+        with self.assertRaises(ValueError):
+            self._make(_stages(), store, 2, "interleaved")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,14 @@ import unittest
 
 import numpy as np
 
-from aetherflow.train import SGD, Adam, ShardedOptimizer, shard_params
+from aetherflow.train import (
+    SGD,
+    Adam,
+    ShardedOptimizer,
+    allreduce_grads,
+    reduce_scatter_grads,
+    shard_params,
+)
 
 
 def _params(seed=0):
@@ -196,6 +203,132 @@ class ShardedOptimizerTest(unittest.TestCase):
         other = ShardedOptimizer(lambda p: Adam(p, lr=1e-2), _params(), world_size=2)
         with self.assertRaises(ValueError):
             other.load_state_dict(saved)
+
+
+class ReduceScatterTest(unittest.TestCase):
+    def _local_grads(self, params, world, seed=10):
+        return [_grads(params, seed + rank) for rank in range(world)]
+
+    def test_matches_allreduce_bitwise(self):
+        params = _params()
+        world = 3
+        local = self._local_grads(params, world)
+        per_shard = reduce_scatter_grads(local, params, world_size=world)
+        merged = allreduce_grads({i: grads for i, grads in enumerate(local)})
+        assignments = {
+            name: index
+            for index, names in enumerate(shard_params(params, world))
+            for name in names
+        }
+        for index, grads in enumerate(per_shard):
+            for name, value in grads.items():
+                self.assertEqual(assignments[name], index)
+                # 逐位相等：Reduce-Scatter 只换"谁收到结果"，不换归约本身
+                np.testing.assert_array_equal(value, merged[name])
+
+    def test_sum_reduction(self):
+        params = _params()
+        local = self._local_grads(params, 2)
+        per_shard = reduce_scatter_grads(local, params, reduction="sum")
+        got = {name: v for grads in per_shard for name, v in grads.items()}
+        for name in params:
+            np.testing.assert_array_equal(
+                got[name], local[0][name] + local[1][name]
+            )
+
+    def test_communication_volume_is_one_copy(self):
+        params = _params()
+        world = 4
+        local = self._local_grads(params, world)
+        seen = []
+
+        def transport(index, grads):
+            seen.append(index)
+            self.assertEqual(
+                set(grads),
+                set(shard_params(params, world)[index]),
+                "transport 只该看到本片的名字",
+            )
+            return grads
+
+        reduce_scatter_grads(local, params, world_size=world, transport=transport)
+        # 每片各被投递一次；接收总量 = 整份梯度一份（all-reduce 会是 world 份）
+        self.assertEqual(sorted(seen), list(range(world)))
+        received = sum(
+            int(np.prod(np.shape(params[name]), dtype=np.int64))
+            for names in shard_params(params, world)
+            for name in names
+        )
+        total = sum(
+            int(np.prod(np.shape(arr), dtype=np.int64)) for arr in params.values()
+        )
+        self.assertEqual(received, total)
+
+    def test_sharded_step_matches_full_optimizer(self):
+        params = _params()
+        world = 3
+        local = self._local_grads(params, world)
+        merged = allreduce_grads({i: grads for i, grads in enumerate(local)})
+
+        reference = {name: arr.copy() for name, arr in params.items()}
+        full = Adam(reference, lr=1e-2)
+        full.step(merged)
+
+        sharded_params = {name: arr.copy() for name, arr in params.items()}
+        sharded = ShardedOptimizer(
+            lambda sub: Adam(sub, lr=1e-2), sharded_params, world_size=world
+        )
+        per_shard = reduce_scatter_grads(local, params, world_size=world)
+        for shard, grads in zip(sharded.shards, per_shard):
+            shard.step(grads)
+
+        for name in params:
+            np.testing.assert_array_equal(sharded_params[name], reference[name])
+
+    def test_empty_shard_skips_transport(self):
+        params = {"w": np.zeros((2,), dtype=np.float32)}
+        local = [
+            {"w": np.ones((2,), dtype=np.float32)}
+            for _ in range(3)
+        ]
+        seen = []
+
+        def transport(index, grads):
+            seen.append(index)
+            return grads
+
+        result = reduce_scatter_grads(
+            local, params, world_size=3, transport=transport
+        )
+        # 世界大小大于参数个数时只会有 1 个非空片
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(sum(len(g) for g in result), 1)
+
+    def test_rejections(self):
+        params = _params()
+        local = self._local_grads(params, 2)
+        with self.assertRaises(ValueError):
+            reduce_scatter_grads(local, params, world_size=3)
+        with self.assertRaises(ValueError):
+            reduce_scatter_grads(local, params, reduction="max")
+        with self.assertRaises(ValueError):
+            reduce_scatter_grads([], params)
+        with self.assertRaises(KeyError):
+            reduce_scatter_grads([dict(local[0]), {}], params)
+        extra = dict(local[0])
+        extra["ghost"] = np.zeros((1,), dtype=np.float32)
+        with self.assertRaises(KeyError):
+            reduce_scatter_grads([extra, local[1]], params)
+        wrong = dict(local[0])
+        wrong["w1"] = np.zeros((7, 5), dtype=np.float32)
+        with self.assertRaises(ValueError):
+            reduce_scatter_grads([wrong, local[1]], params)
+        with self.assertRaises(TypeError):
+            reduce_scatter_grads([{name: v.astype(np.float64) for name, v in local[0].items()}, local[1]], params)
+        with self.assertRaises(KeyError):
+            reduce_scatter_grads(
+                local, params, transport=lambda index, grads: {}
+            )
 
 
 if __name__ == "__main__":

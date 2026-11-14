@@ -24,13 +24,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
 
 from .optim import Optimizer
 
-__all__ = ["shard_params", "ShardedOptimizer"]
+__all__ = ["shard_params", "ShardedOptimizer", "reduce_scatter_grads", "Transport"]
+
+#: 归约传输：``(片号, 本片梯度) -> 本片梯度``。真机上是 Reduce-Scatter 的
+#: 接收侧；默认实现是进程内直算，只用于验证语义与统计通信量。
+Transport = Callable[[int, Mapping[str, np.ndarray]], Mapping[str, np.ndarray]]
 
 
 def shard_params(
@@ -62,6 +66,112 @@ def shard_params(
         buckets[target].append(name)
         weights[target] += size
     return buckets
+
+
+def reduce_scatter_grads(
+    grads_per_rank: Sequence[Mapping[str, np.ndarray]],
+    params: Mapping[str, Any],
+    *,
+    world_size: Optional[int] = None,
+    reduction: str = "mean",
+    transport: Optional[Transport] = None,
+) -> List[Dict[str, np.ndarray]]:
+    """ZeRO 的通信面：用 Reduce-Scatter 取代 All-Reduce。
+
+    数据并行里每个 rank 都算出**整份**梯度，但优化器只消费自己那片参数的
+    梯度。All-Reduce 会把归约后的整份梯度发给每个 rank（每 rank 收 N 字节，
+    全网 W·N）；Reduce-Scatter 只把每片交给它的主人（每 rank 收 N/W 字节，
+    全网 N）。这份差额就是 ZeRO 省下的通信量，而**数值上完全等价**——每个
+    参数仍然是在全部 rank 上求和 / 求平均，只是结果不再广播给不关心的 rank。
+
+    约定：
+
+    - ``grads_per_rank[i]`` 是第 ``i`` 个 rank 在本步算出的梯度；名字必须与
+      ``params`` 完全一致（少一个说明反向没跑全，多一个说明参数表分叉）。
+    - 归约顺序沿用 ``allreduce`` 的"从第 0 个依次累加"，因此结果与
+      ``allreduce_grads`` **逐位相同**，不是"在容差内接近"。
+    - ``transport`` 拿到的是"这一片、已经归约好的梯度"，返回值必须恰好覆盖
+      同一组名字；默认 ``None`` 表示进程内直算。空片不调用 ``transport``，
+      也不会出现在结果里——世界大小大于参数个数是合法状态（与 ``shard_params``
+      一致）。
+    - 参数本身不做 all-gather：本层象 ``ShardedOptimizer`` 一样假定各 rank
+      共享同一份主机参数，跨进程的参数同步是运行时的事。
+
+    返回按片号排列的列表，每项是该 rank 需要的那几个参数的梯度。
+    """
+    if reduction not in ("mean", "sum"):
+        raise ValueError(f"reduction 必须是 mean / sum，收到 {reduction!r}")
+    if isinstance(grads_per_rank, (str, bytes)) or not isinstance(
+        grads_per_rank, Sequence
+    ):
+        raise TypeError(
+            f"grads_per_rank 必须是序列，得到 {type(grads_per_rank).__name__}"
+        )
+    ranks = len(grads_per_rank)
+    if ranks == 0:
+        raise ValueError("grads_per_rank 不能为空：至少需要一个 rank 的梯度")
+    if world_size is None:
+        world_size = ranks
+    if isinstance(world_size, bool) or not isinstance(world_size, int):
+        raise TypeError(f"world_size 必须是 int，收到 {world_size!r}")
+    if world_size != ranks:
+        raise ValueError(
+            f"world_size={world_size} 与给出的梯度份数 {ranks} 不一致；"
+            "每一片都必须有自己的本地梯度"
+        )
+
+    names = list(params)
+    if not names:
+        raise ValueError("参数表为空：没有可归约的梯度")
+    expected = set(names)
+    for index, grads in enumerate(grads_per_rank):
+        if not isinstance(grads, Mapping):
+            raise TypeError(
+                f"第 {index} 个 rank 的梯度必须是映射，得到 {type(grads).__name__}"
+            )
+        if set(grads) != expected:
+            raise KeyError(
+                f"第 {index} 个 rank 的梯度名字与参数表不一致："
+                f"多 {sorted(set(grads) - expected)}，"
+                f"少 {sorted(expected - set(grads))}"
+            )
+        for name in names:
+            if np.shape(grads[name]) != np.shape(params[name]):
+                raise ValueError(
+                    f"第 {index} 个 rank 的 {name} 梯度形状 {np.shape(grads[name])} "
+                    f"与参数形状 {np.shape(params[name])} 不一致"
+                )
+
+    assignments = shard_params(params, world_size)
+    result: List[Dict[str, np.ndarray]] = []
+    for index, shard_names in enumerate(assignments):
+        local: Dict[str, np.ndarray] = {}
+        for name in shard_names:
+            first = grads_per_rank[0][name]
+            # 与 allreduce 相同的累加顺序，保证逐位一致
+            total = np.array(first, copy=True)
+            for other in grads_per_rank[1:]:
+                array = other[name]
+                if array.dtype != total.dtype:
+                    raise TypeError(
+                        f"{name} 在各 rank 上的 dtype 不一致："
+                        f"{total.dtype} vs {array.dtype}"
+                    )
+                total += array
+            if reduction == "mean":
+                total /= ranks
+            local[name] = total
+        if transport is not None and local:
+            carried = transport(index, local)
+            if set(carried) != set(shard_names):
+                raise KeyError(
+                    f"transport 为第 {index} 片返回的名字不对："
+                    f"多 {sorted(set(carried) - set(shard_names))}，"
+                    f"少 {sorted(set(shard_names) - set(carried))}"
+                )
+            local = {name: np.asarray(carried[name]) for name in shard_names}
+        result.append(local)
+    return result
 
 
 class ShardedOptimizer:

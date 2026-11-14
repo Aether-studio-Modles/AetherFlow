@@ -49,6 +49,12 @@ from .params import ParameterStore
 
 __all__ = ["PipelineStage", "PipelineTrainer"]
 
+#: 三种调度。``sequential`` 是既有行为：一份走完前向与反向，再下一份；
+#: ``gpipe`` 是经典批式：全部份前向完再全部反向（驻留 = 份数）；``1f1b``
+#: 预热"段数-1"份后交替"反向一份、前向下一份"（驻留 = 段数-1）。
+#: 三者数值等价，差别只在"有几份段间激活同时活着"。
+_SCHEDULES = ("sequential", "gpipe", "1f1b")
+
 
 @dataclass(frozen=True)
 class PipelineStage:
@@ -84,6 +90,7 @@ class PipelineTrainer:
         backend: Any,
         devices: Sequence[int],
         reduction: str = "mean",
+        schedule: str = "sequential",
     ) -> None:
         if not isinstance(store, ParameterStore):
             raise TypeError(f"store 必须是 ParameterStore，得到 {type(store).__name__}")
@@ -94,6 +101,12 @@ class PipelineTrainer:
         _check_multi_device_backend(backend)
         if reduction not in _REDUCTIONS:
             raise ValueError(f"reduction 必须是 {_REDUCTIONS} 之一，收到 {reduction!r}")
+        if schedule not in _SCHEDULES:
+            raise ValueError(
+                f"schedule 必须是 {_SCHEDULES} 之一，收到 {schedule!r}；"
+                "sequential 逐份走完全部段再逆序反向，gpipe 先全部前向后全部反向，"
+                "1f1b 在稳态里交替反向与下一份前向"
+            )
         if isinstance(stages, (str, bytes)) or not isinstance(stages, Sequence):
             raise TypeError(f"stages 必须是 PipelineStage 序列，得到 {type(stages).__name__}")
         if not stages:
@@ -128,8 +141,12 @@ class PipelineTrainer:
         self.backend = backend
         self.devices = tuple(picked)
         self.reduction = reduction
+        self.schedule = schedule
         self.name = f"pipeline_{len(stages)}"
         self.steps = 0
+        # 最近一步里"前向已完成、反向还没做"的 micro-batch 峰值数。这是
+        # 1F1B 相对 GPipe 唯一的结构性收益：段间激活不随 micro-batch 数线性堆积。
+        self.last_resident_peak = 0
 
         self._check_stages()
         self._build_backward()
@@ -335,39 +352,90 @@ class PipelineTrainer:
         seed = (
             1.0 / micro_batches if self.reduction == "mean" else float(chunk)
         )
+        resident = _ResidentTracker()
         try:
-            for mb in range(micro_batches):
-                losses.append(self._micro_step(mb, chunk, data, totals, seed))
+            if self.schedule == "sequential":
+                for mb in range(micro_batches):
+                    state = self._forward_micro(mb, chunk, data, resident)
+                    losses.append(self._backward_micro(state, totals, seed, resident))
+            elif self.schedule == "gpipe":
+                states = [
+                    self._forward_micro(mb, chunk, data, resident)
+                    for mb in range(micro_batches)
+                ]
+                for state in states:
+                    losses.append(self._backward_micro(state, totals, seed, resident))
+            else:
+                losses.extend(
+                    self._run_1f1b(chunk, data, micro_batches, totals, seed, resident)
+                )
             # 种子已经带上了权重，这里不再做第二次缩放。
             self.optimizer.step(totals)
             self._replicate()
         finally:
             self.backend.set_device(origin)
 
+        self.last_resident_peak = resident.peak
         self.steps += 1
         return float(np.mean(losses))
 
-    def _micro_step(
+    def _run_1f1b(
+        self,
+        chunk: int,
+        data: Mapping[str, np.ndarray],
+        micro_batches: int,
+        totals: Dict[str, np.ndarray],
+        seed: float,
+        resident: "_ResidentTracker",
+    ) -> List[float]:
+        """1F1B：预热 ``min(段数-1, 份数)`` 份，之后每反向一份就前向下一份。
+
+        单进程串行切卡，"前向的 micro-batch 1 与反向的 micro-batch 0 **真正
+        并发**"做不到——这里交换的是**顺序**，不是线程。收益是可验证的两条：
+
+        - 数值与 GPipe 在同一容差内一致（顺序不改变归约结果，只是改变了
+          "哪一份的中间值还在内存里"）；
+        - 同时驻留的段间激活从"份数"降到 ``min(段数-1, 份数)``，
+          用 ``last_resident_peak`` 记账，不靠估算。
+        """
+        stages = len(self._stages)
+        losses: List[float] = []
+        if stages == 1:
+            # 只有一段时没有段间交替，1F1B 退化成逐份前向 + 反向
+            for mb in range(micro_batches):
+                state = self._forward_micro(mb, chunk, data, resident)
+                losses.append(self._backward_micro(state, totals, seed, resident))
+            return losses
+        warmup = min(stages - 1, micro_batches)
+        waiting: Dict[int, dict] = {}
+        for mb in range(warmup):
+            waiting[mb] = self._forward_micro(mb, chunk, data, resident)
+
+        for mb in range(micro_batches):
+            state = waiting.pop(mb)
+            losses.append(self._backward_micro(state, totals, seed, resident))
+            nxt = mb + warmup
+            if nxt < micro_batches:
+                waiting[nxt] = self._forward_micro(nxt, chunk, data, resident)
+        return losses
+
+    def _forward_micro(
         self,
         index: int,
         chunk: int,
         data: Mapping[str, np.ndarray],
-        totals: Dict[str, np.ndarray],
-        seed: float,
-    ) -> float:
-        """一个 micro-batch 的前向 + 反向，梯度累加进 ``totals``。
+        resident: "_ResidentTracker",
+    ) -> dict:
+        """一个 micro-batch 走完全部段的前向，返回留给反向的状态。
 
-        前向的段间激活留在**产生它的那张卡**上；反向到该段时直接用，
-        不再从主机重新上传——否则每段要两头往返一趟，而这段激活本来就是
-        这张卡算出来的。
+        段间激活留在**产生它的那张卡**上，反向到该段时直接用，不再从主机
+        重新上传——否则每段要两头往返一趟，而这段激活本来就是这张卡算出来的。
         """
         start = index * chunk
         piece = {
             name: self.backend.to_array(value[start : start + chunk])
             for name, value in data.items()
         }
-
-        # 1) 前向：``activations[i]`` 是第 i 段的输出，也就是第 i+1 段的输入。
         count = len(self._stages)
         activations: List[Any] = [None] * count
         loss = 0.0
@@ -389,8 +457,21 @@ class PipelineTrainer:
                 loss = float(self.backend.to_host(out))
             else:
                 activations[stage_index] = out
+        state = {"index": index, "piece": piece, "activations": activations, "loss": loss}
+        resident.add(state)
+        return state
 
-        # 2) 反向：逆序，dout 沿段间边界传回去。
+    def _backward_micro(
+        self,
+        state: dict,
+        totals: Dict[str, np.ndarray],
+        seed: float,
+        resident: "_ResidentTracker",
+    ) -> float:
+        """逆序反向，dout 沿段间边界传回去；结束后立刻释放该份的激活。"""
+        activations = state["activations"]
+        piece = state["piece"]
+        count = len(self._stages)
         dout: Any = None
         for stage_index in reversed(range(count)):
             stage = self._stages[stage_index]
@@ -416,10 +497,36 @@ class PipelineTrainer:
                 totals[name] += self.backend.to_host(result["d" + name])
             if stage_index > 0:
                 dout = result["d" + stage.inputs[0]]
-        return loss
+        # 这一份的段间激活到这里就没人再读了：马上放掉，峰值才有意义。
+        state["activations"] = []
+        resident.remove(state)
+        return state["loss"]
 
     def __repr__(self) -> str:
         return (
             f"PipelineTrainer(stages={len(self._stages)}, devices={self.devices}, "
-            f"params={len(self.store)}, reduction={self.reduction!r})"
+            f"params={len(self.store)}, reduction={self.reduction!r}, "
+            f"schedule={self.schedule!r})"
         )
+
+
+class _ResidentTracker:
+    """记"前向已完成、反向还没做"的 micro-batch 数。
+
+    不是显存字节数：同一段激活的形状由图的静态形状决定，而**有几份同时
+    活着**才是调度决定的量。GPipe 的峰值等于份数，1F1B 的上限是段数减一。
+    """
+
+    __slots__ = ("live", "peak")
+
+    def __init__(self) -> None:
+        self.live = 0
+        self.peak = 0
+
+    def add(self, state: dict) -> None:
+        self.live += 1
+        if self.live > self.peak:
+            self.peak = self.live
+
+    def remove(self, state: dict) -> None:
+        self.live -= 1
