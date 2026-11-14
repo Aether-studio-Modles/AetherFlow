@@ -18,6 +18,12 @@
 **只降 f32，不碰 f64 与整数。** f64 是调用方明确要求的高精度，整数
 （argmax 的下标、dropout 掩码）根本不该参与浮点提升。
 
+**``dtype`` 可以是 ``f16`` 或 ``bf16``。** 两者的规则完全相同，差别只在
+数值：bf16 的指数范围与 f32 一样（不需要梯度缩放），但尾数只有 7 位，
+同样的图在 bf16 下的相对误差会比 f16 大一个量级左右。参考执行器会把每个
+bf16 类型的值量化到 bf16 精度（``runtime/bf16.py``），所以这里的"降到
+bf16"是数值承诺，不是换个标签。
+
 **图输出一律恢复原图的 dtype。** 打开 autocast 不改变对外接口：调用方交进
 交出的仍是同一份 f32 张量，只有图内部的中间值变窄。这也是它幂等的原因——
 对已经转换过的图再跑一次，所有输入都已在对的位置，一个 ``cast`` 都不会新增。
@@ -56,9 +62,13 @@ FORCE_F32_OPS: Tuple[str, ...] = (
     "reduce_max",
 )
 
-# 浮点宽窄次序：值越大越宽。f64 不参与降精度，只作为"最宽输入"参与提升。
+# 浮点宽窄次序：值越大越宽。这是一个**实用性**排序，不是 IEEE 位宽表：
+# bf16 的指数范围与 f32 相同（不会像 f16 那样溢出到 inf），但尾数只有 7 位，
+# 所以计算精度仍然低于 f32；把它排在 f16 与 f32 之间，既能让 "f32 + bf16"
+# 提升到 f32，也不会让 bf16 与 f16 混用时把范围更宽的 bf16 降回 f16。
+# f64 不参与降精度，只作为"最宽输入"参与提升。
 # 键用 IR 里的短名（``DType.value``），与 ``cast`` 的 ``dtype`` 属性一致。
-_FLOAT_ORDER = {"f16": 0, "f32": 1, "f64": 2}
+_FLOAT_ORDER = {"f16": 0, "bf16": 1, "f32": 2, "f64": 3}
 
 
 class Autocast(Pass):
@@ -144,8 +154,9 @@ class Autocast(Pass):
         widest = max(floats, key=_FLOAT_ORDER.__getitem__)
 
         if op_name in self.force_f32:
-            # f64 已经比 f32 宽，不下压
-            return "f32" if widest == self.dtype else widest
+            # f64 已经比 f32 宽，不下压；f16 / bf16 都要提到 f32——数值敏感
+            # 算子的工作精度不能因为目标 dtype 换了就跟着变窄。
+            return "f32" if _FLOAT_ORDER[widest] < _FLOAT_ORDER["f32"] else widest
         if op_name in self.low_precision:
             # 只降 f32；f64 不动
             return self.dtype if widest == "f32" else widest

@@ -394,10 +394,11 @@ class TestMasterWeights(unittest.TestCase):
         store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
         with self.assertRaises(ValueError):
             Trainer(g, store, SGD(store.arrays(), lr=0.1), master_weights=True)
+        # bf16 已支持（见 test_bf16.py）；f32 目标与低精度驻留互相矛盾。
         with self.assertRaises(ValueError):
             Trainer(
                 g, store, SGD(store.arrays(), lr=0.1),
-                mixed_precision="bf16", master_weights=True,
+                mixed_precision="f32", master_weights=True,
             )
 
         g64 = Graph("lin64")

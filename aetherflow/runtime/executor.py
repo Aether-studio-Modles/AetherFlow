@@ -17,7 +17,8 @@ from weakref import WeakKeyDictionary
 import numpy as np
 
 from ..ir.graph import Graph, Node
-from ..ir.types import TensorType, dim_resolve
+from ..ir.types import DType, TensorType, dim_resolve
+from .bf16 import round_bf16
 
 
 class ShapeMismatchError(ValueError):
@@ -33,7 +34,10 @@ class _GroupPlan:
     对象；含符号维的图按本次绑定解析，结果记在单格备忘里（见 ``resolve``）。
     """
 
-    __slots__ = ("nodes", "args", "attrs", "expected", "dtype", "kernels", "constants", "_memo")
+    __slots__ = (
+        "nodes", "args", "attrs", "expected", "dtype", "out_dtype",
+        "kernels", "constants", "_memo",
+    )
 
     def __init__(self, nodes: Tuple[Node, ...], static: bool) -> None:
         self.nodes = nodes
@@ -53,6 +57,9 @@ class _GroupPlan:
         # dtype 与形状无关，构建期解析成 np.dtype 存下来：``np.asarray(x, "float32")``
         # 每次都要做一次字符串→dtype 的解析，而这是每个节点的必经之路。
         self.dtype = np.dtype(nodes[-1].output.type.dtype.np_dtype)
+        # IR 的 dtype 本身：bf16 的载体是 f32，但边界处要做 bf16 量化，
+        # 只看 np.dtype 会把两件事混成一件。
+        self.out_dtype = nodes[-1].output.type.dtype
         self._memo = None
 
     def resolve(self, binding: Dict[str, int]):
@@ -153,6 +160,21 @@ class Executor:
 
     def cast(self, value: Any, dtype: np.dtype) -> Any:
         return np.asarray(value, dtype=dtype)
+
+    def quantize(self, value: Any, dtype: DType) -> Any:
+        """把声明为 bf16 的值量化到 bf16 精度。
+
+        bf16 的 numpy 载体是 f32，若只按 ``np_dtype`` 处理，它就会退化成
+        "标签是 bf16、数值却是 f32"——尾数精度凭空多出 3 位。参考语义是
+        **数值**基准，所以每个 bf16 类型的值在离开节点 / 进入图时都必须
+        落到 bf16 的格点上。
+
+        设备后端目前不支持 bf16；真要有原生容器，子类覆盖这个方法即可，
+        不必改执行骨架。
+        """
+        if dtype is DType.BF16 and isinstance(value, np.ndarray):
+            return round_bf16(value)
+        return value
 
     def to_host(self, value: Any) -> Any:
         return value
@@ -296,12 +318,13 @@ class Executor:
             arr = self.to_array(inputs[value.name])
             # 输入在入口就对齐到 IR 声明的 dtype。此前只校验形状，于是
             # "声明 f32、传 f64"会让整条链按 f64 算、直到输出才降回去：
-            # 类型成了协议，精度却不是。BF16 的承载本来就是 f32
-            # （见 ``TensorType`` 的 np_dtype），这里不会对它做位宽转换。
+            # 类型成了协议，精度却不是。BF16 的载体是 f32（见 ``np_dtype``），
+            # 这里不做位宽转换，量化由下面的 ``quantize`` 负责。
             want = np.dtype(value.type.dtype.np_dtype)
             if arr.dtype != want:
                 _check_input_dtype(arr, want, value.name)
                 arr = self.cast(arr, want)
+            arr = self.quantize(arr, value.type.dtype)
             self._bind(value.type, tuple(arr.shape), f"输入 %{value.name}", binding)
             env[value.id] = arr
 
@@ -329,7 +352,9 @@ class Executor:
                     f"节点 %{last.output.name}（{last.op.name}）运行期形状 {tuple(out.shape)} "
                     f"与 IR 推导 {expected.shape} 不一致"
                 )
-            env[last.output.id] = self.cast(out, group.dtype)
+            env[last.output.id] = self.quantize(
+                self.cast(out, group.dtype), group.out_dtype
+            )
             out = None
 
             if release:

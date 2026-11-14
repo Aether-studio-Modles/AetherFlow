@@ -230,8 +230,9 @@ class DType(str, Enum):
     def np_dtype(self) -> str:
         """numpy 中用于承载该 dtype 的类型名。
 
-        BF16 在 numpy 中没有原生类型，参考语义借用 float32 承载，
-        只用于验证数学语义，不代表位宽。
+        BF16 在 numpy 中没有原生类型，参考语义借用 float32 承载。载体只是
+        存储容器：参考执行器在每次 bf16 边界把数值量化到 bf16 精度
+        （``runtime/bf16.py``），所以它不是"精度等于 f32 的别名"。
         """
         return _NP_DTYPE[self]
 

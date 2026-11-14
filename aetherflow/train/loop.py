@@ -22,6 +22,7 @@ from ..backends.reference_backend import ReferenceBackend
 from ..ir.grad import backward
 from ..ir.graph import Graph
 from ..passes.autocast import Autocast
+from ..runtime.bf16 import pack_bf16, unpack_bf16
 from ._arrays import array_module
 from .amp import GradScaler
 from .checkpoint import TrainingSnapshot, inspect_checkpoint, load_checkpoint
@@ -110,10 +111,19 @@ class Trainer:
     f32（图输入与输出都保持原 dtype），所以优化器与存档代码不用改；反向图从
     转换后的前向图展开，梯度自然落回 f32。图必须是 f32 构图，f64 会被原样保留。
 
-    ``master_weights=True`` 让参数**以 f16 驻留、在 f32 主副本上更新**，需要
-    同时打开 ``mixed_precision="f16"``。它改三处：图输入声明为 f16（参数缓冲
-    与读取带宽都减半）、``store`` 仍是 f32 主副本（优化器更新它、存档存它）、
-    Trainer 内部多一份 f16 驻留缓冲，每次参数真的更新后从主副本覆盖写回。
+    ``mixed_precision="bf16"`` 走同一条路，差别只在数值与配套约束：
+    bf16 的指数范围与 f32 相同（不会像 f16 那样溢出到 inf），尾数只有 7 位，
+    所以**不需要** ``GradScaler``（传了会直接报错），相对误差也比 f16 大一个
+    量级。参考执行器把每个 bf16 值量化到 bf16 精度；设备后端目前不支持 bf16，
+    因此 ``device_state=True`` 与 bf16 的组合被拒绝。
+
+    ``master_weights=True`` 让参数**以低精度驻留、在 f32 主副本上更新**，需要
+    同时打开 ``mixed_precision="f16"`` 或 ``"bf16"``。它改三处：图输入声明为
+    低精度（参数缓冲与读取带宽都减少）、``store`` 仍是 f32 主副本（优化器更新
+    它、存档存它）、Trainer 内部多一份驻留缓冲，每次参数真的更新后从主副本
+    覆盖写回。f16 驻留缓冲是 ``float16``；bf16 在 numpy 里没有原生类型，驻留
+    缓冲用 2 字节的 ``uint16`` 存位模式，读图前解开成 f32 载体——这确实省下了
+    一半的权重存储，而不是"借 f32 承载"的空标签。
     代价是参数多出一份 f32 主副本（设备态下总占用从 1 份 f32 变成 1.5 份），
     只被 f32-only 算子消费的参数也会在入口多一次 up-cast；净收益取决于模型
     里 f16 算子与 f32 算子的比例（见 DESIGN 5.126）。
@@ -197,10 +207,20 @@ class Trainer:
                 f"rng_rank 必须落在 [0, {rng_world_size})，得到 {rng_rank!r}"
             )
 
-        if master_weights and mixed_precision != "f16":
+        if master_weights and mixed_precision not in ("f16", "bf16"):
             raise ValueError(
-                "master_weights=True 需要 mixed_precision=\"f16\"，"
+                "master_weights=True 需要 mixed_precision=\"f16\" 或 \"bf16\"，"
                 f"得到 {mixed_precision!r}：低精度驻留与低精度计算必须用同一种 dtype"
+            )
+        if scaler is not None and mixed_precision == "bf16":
+            raise ValueError(
+                "bf16 与 f32 的指数范围相同，梯度下溢不是它的问题，不需要 GradScaler；"
+                "传 scaler 只会把梯度白乘一遍再除回来"
+            )
+        if device_state and mixed_precision == "bf16":
+            raise ValueError(
+                "设备态训练需要后端原生的 bf16 缓冲；当前设备后端只支持 f32 / f16。"
+                "请在主机态使用 bf16，或改用 mixed_precision=\"f16\""
             )
         if master_weights:
             for name in store.names:
@@ -251,10 +271,13 @@ class Trainer:
         self.store = store
         self.optimizer = optimizer
         self.master_weights = bool(master_weights)
+        self.mixed_precision = mixed_precision
         # 低精度驻留缓冲：只有 master weights 模式才有。``store`` 是 f32 主副本，
-        # 这里是从它 cast 出来的一份 f16 副本，图每步读这一份。
+        # 这里是从它 cast 出来的一份低精度副本，图每步读这一份。f16 用
+        # ``float16`` 容器；bf16 没有 numpy 类型，用 2 字节的 ``uint16``
+        # 存位模式（``runtime/bf16.py``），读取时再还原成 f32 载体。
         self._resident: Optional[Dict[str, np.ndarray]] = (
-            {name: store[name].astype(np.float16) for name in store.names}
+            {name: self._to_resident(store[name]) for name in store.names}
             if self.master_weights
             else None
         )
@@ -384,17 +407,34 @@ class Trainer:
         self.steps += 1
         return float(out)
 
+    def _to_resident(self, value: np.ndarray) -> np.ndarray:
+        """f32 主副本 -> 低精度驻留缓冲（f16 容器或 bf16 位模式）。"""
+        if self.mixed_precision == "bf16":
+            return pack_bf16(value)
+        return np.asarray(value).astype(np.float16)
+
+    def _resident_feed(self, name: str) -> np.ndarray:
+        """低精度驻留缓冲 -> 图输入（bf16 解开成 f32 载体）。"""
+        if self._resident is None:
+            raise RuntimeError("没有低精度驻留缓冲")
+        arr = self._resident[name]
+        if self.mixed_precision == "bf16":
+            return unpack_bf16(arr)
+        return arr
+
     def _feed(self, batch: Optional[Mapping[str, np.ndarray]]) -> Dict[str, np.ndarray]:
         """主机态的完整输入：参数 + 本批数据 + 随机 key。
 
         参数用低精度驻留缓冲（master weights 模式），而不是 ``store`` 里的
-        f32 主副本——图的输入已经声明成 f16，交 f32 过去会让执行器直接报
-        dtype 不符；即便后端容忍隐式转换，那也等于每步都做一次没人记账的 cast。
+        f32 主副本——图的输入已经声明成 f16 / bf16，交 f32 过去会让执行器
+        直接报 dtype 不符；即便后端容忍隐式转换，那也等于每步都做一次没人
+        记账的 cast。bf16 的驻留缓冲是打包的位模式，这里解开成 f32 载体
+        （bf16 -> f32 是无损的，量化误差早已在打包时确定）。
         """
         feed = self.store.feed(dict(batch) if batch is not None else None)
         if self._resident is not None:
             for name in self.store.names:
-                feed[name] = self._resident[name]
+                feed[name] = self._resident_feed(name)
         feed.update(self._rng_feed())
         return feed
 
@@ -403,7 +443,7 @@ class Trainer:
         if self._resident is None:
             return
         for name in self.store.names:
-            self._resident[name][...] = self.store[name]
+            self._resident[name][...] = self._to_resident(self.store[name])
 
     def refresh_resident(self) -> None:
         """外部改过 ``store`` 之后，重建低精度驻留缓冲。
@@ -769,9 +809,14 @@ class Trainer:
             )
 
     def _upload_params(self) -> Dict[str, Any]:
-        """上传图输入用的参数缓冲（master weights 模式下是 f16 驻留副本）。"""
+        """上传图输入用的参数缓冲（master weights 模式下是低精度驻留副本）。"""
         backend = self.backend
-        source = self._resident if self._resident is not None else self.store.arrays()
+        if self._resident is not None:
+            source = {
+                name: self._resident_feed(name) for name in self.store.names
+            }
+        else:
+            source = self.store.arrays()
         dev_params = {name: backend.to_array(source[name]) for name in self.store.names}
         # 优化器按数组模块分派（numpy / cupy）。后端若给出第三种容器，
         # 更新会走到 numpy 分支并在一句隐式转换里失败——在这里拦下来，
@@ -926,6 +971,9 @@ class Trainer:
                 aux[f"grad/{name}"] = arr
         merged.setdefault("rng_seed", self.rng_seed)
         merged.setdefault("rng_rank", self.rng_rank)
+        # 计算精度也是"同一条轨迹"的一部分：bf16 与 f16 的量化误差不同，
+        # 把 bf16 的存档接进 f16 训练器，损失曲线会先跳一下再继续。
+        merged.setdefault("mixed_precision", self.mixed_precision or "f32")
         source: Mapping[str, Any]
         if self._device_ready:
             # master weights 模式下存档存的必须是 f32 主副本：f16 驻留缓冲
@@ -1010,6 +1058,14 @@ class Trainer:
                 raise ValueError(
                     f"存档的 {key}={saved_meta[key]} 与当前 {current} 不一致；"
                     "随机流不同，dropout 与重算的掩码都对不上"
+                )
+        if "mixed_precision" in saved_meta:
+            saved_mp = str(saved_meta["mixed_precision"])
+            current_mp = self.mixed_precision or "f32"
+            if saved_mp != current_mp:
+                raise ValueError(
+                    f"存档的 mixed_precision={saved_mp!r} 与当前 {current_mp!r} 不一致；"
+                    "量化误差不同，这不是同一条训练轨迹"
                 )
 
         pending = int(saved_meta.get("accum_pending", 0))
