@@ -41,6 +41,7 @@ from .params import ParameterStore, default_init, init_array
 from .pipeline import PipelineStage, PipelineTrainer
 from .sharded import ShardedOptimizer, reduce_scatter_grads, shard_params
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
+from .zero import LoopbackWorld, NcclHostCollective, ZeroRank
 
 __all__ = [
     "ParameterStore",
@@ -52,6 +53,9 @@ __all__ = [
     "ShardedOptimizer",
     "shard_params",
     "reduce_scatter_grads",
+    "ZeroRank",
+    "LoopbackWorld",
+    "NcclHostCollective",
     "Trainer",
     "TrainingState",
     "DataParallelTrainer",
