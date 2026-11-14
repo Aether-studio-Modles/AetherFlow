@@ -650,6 +650,173 @@ class TestTorchExport(unittest.TestCase):
         model = tvm.squeezenet1_0(weights=None).eval()
         self._roundtrip(model, torch.randn(1, 3, 64, 64), atol=1e-5)
 
+    def test_embedding_with_int64_tokens(self):
+        """AF-32 补：int64 token 输入按 i32 承载，``table[ids]`` 落成 embedding。"""
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = nn.Embedding(10, 4)
+
+            def forward(self, ids):
+                return self.emb(ids)
+
+        ids = torch.tensor([[1, 2], [3, 9]], dtype=torch.int64)
+        imported = self._roundtrip(M().eval(), ids)
+        self.assertEqual(imported.user_inputs, ["ids"])
+        ids_input = next(v for v in imported.graph.inputs if v.name == "ids")
+        self.assertEqual(
+            ids_input.type.dtype.value, "i32",
+            "int64 应按 IR 的 i32 声明",
+        )
+        self.assertIn("embedding", [n.op.name for n in imported.graph.nodes])
+
+    def test_functional_embedding_without_padding(self):
+        """``F.embedding``（无 padding_idx）同样落到 embedding。"""
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.randn(7, 3))
+
+            def forward(self, ids):
+                return F.embedding(ids, self.w)
+
+        ids = torch.tensor([0, 6, 2], dtype=torch.int64)
+        imported = self._roundtrip(M().eval(), ids)
+        self.assertEqual([n.op.name for n in imported.graph.nodes], ["embedding"])
+
+    def test_embedding_padding_idx_is_rejected(self):
+        """padding_idx 有"该行梯度恒为零"的语义，IR 没有 → 显式拒绝。"""
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.randn(10, 4))
+
+            def forward(self, ids):
+                return F.embedding(ids, self.w, padding_idx=0)
+
+        ids = torch.tensor([0, 3], dtype=torch.int64)
+        with self.assertRaisesRegex(UnsupportedOperatorError, "padding_idx"):
+            self.import_exported(torch.export.export(M().eval(), (ids,)))
+
+    def test_general_advanced_index_is_rejected(self):
+        """多索引的高级索引不能退化成"只取第一个索引"。"""
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.randn(5, 5))
+
+            def forward(self, a, b):
+                return self.w[a, b]
+
+        a = torch.tensor([0, 1], dtype=torch.int64)
+        with self.assertRaisesRegex(UnsupportedOperatorError, "高级索引"):
+            self.import_exported(torch.export.export(M().eval(), (a, a)))
+
+    def test_lifted_constant_is_not_a_user_input(self):
+        """字面量张量被提升为 placeholder，但它是常量而不是用户输入。"""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x + torch.tensor([1.0, 2.0, 3.0])
+
+        imported = self._roundtrip(M().eval(), torch.randn(2, 3))
+        self.assertEqual(imported.user_inputs, ["x"])
+        self.assertIn("constant", [n.op.name for n in imported.graph.nodes])
+        self.assertEqual(imported.parameters, {}, "常量不能混进参数表")
+
+    def test_get_attr_constant_becomes_constant_node(self):
+        """``get_attr`` 常量同样落成 constant，而不是报未支持。"""
+        from types import SimpleNamespace
+
+        from torch.fx import Graph, GraphModule
+
+        class Holder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = torch.tensor([1.0, 2.0])
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(2, 2)
+        bias = graph.get_attr("bias")
+        out = graph.call_function(torch.ops.aten.add.Tensor, (x, bias))
+        graph.output((out,))
+        gm = GraphModule(Holder(), graph)
+        sig = SimpleNamespace(
+            inputs_to_parameters={},
+            inputs_to_buffers={},
+            inputs_to_lifted_tensor_constants={},
+            user_inputs=("x",),
+            user_outputs=(),  # 空表示"输出槽全部保留"（与真实签名的非空分支等价）
+        )
+        ep = SimpleNamespace(graph_module=gm, graph_signature=sig, state_dict={})
+        imported = self.import_exported(ep)
+        self.assertEqual(imported.user_inputs, ["x"])
+        self.assertIn("constant", [n.op.name for n in imported.graph.nodes])
+
+        feed = imported.feed(x=np.ones((2, 2), "float32"))
+        got = list(self.ref.execute(imported.graph, feed).values())[0]
+        np.testing.assert_allclose(got, np.ones((2, 2)) + np.array([1.0, 2.0]))
+
+    def test_oversized_lifted_constant_is_rejected(self):
+        """常量落进 attrs 有体积上限，超限显式拒绝而不是塞进图里。"""
+        from types import SimpleNamespace
+
+        from aetherflow.frontend import UnsupportedOperatorError
+        from aetherflow.frontend.torch_export import MAX_IMPORTED_CONSTANT_ELEMENTS
+        from torch.fx import Graph, GraphModule
+
+        size = MAX_IMPORTED_CONSTANT_ELEMENTS + 1
+
+        class Holder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.big = torch.zeros(size)
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.randn(1)
+        big = graph.get_attr("big")
+        out = graph.call_function(torch.ops.aten.add.Tensor, (x, big))
+        graph.output((out,))
+        gm = GraphModule(Holder(), graph)
+        ep = SimpleNamespace(
+            graph_module=gm,
+            graph_signature=SimpleNamespace(
+                inputs_to_parameters={},
+                inputs_to_buffers={},
+                inputs_to_lifted_tensor_constants={},
+                user_inputs=("x",),
+                user_outputs=(),
+            ),
+            state_dict={},
+        )
+        with self.assertRaisesRegex(UnsupportedOperatorError, "导入上限"):
+            self.import_exported(ep)
+
+    def test_int64_input_beyond_i32_is_rejected_at_entry(self):
+        """i64 → i32 是收窄：越界值在入口报错，不静默包成别的下标。"""
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = nn.Embedding(10, 4)
+
+            def forward(self, ids):
+                return self.emb(ids)
+
+        ids = torch.tensor([1, 2], dtype=torch.int64)
+        imported = self.import_exported(torch.export.export(M().eval(), (ids,)))
+        feed = imported.feed(ids=np.array([[2 ** 31]], dtype=np.int64))
+        with self.assertRaisesRegex(ValueError, "i32|范围|越界"):
+            self.ref.execute(imported.graph, feed)
+
 
 @unittest.skipUnless(TORCH_AVAILABLE and CUDA_AVAILABLE, "需要 torch 与 GPU")
 class TestTorchExportOnCuda(unittest.TestCase):
@@ -749,7 +916,7 @@ class TestTorchCompatMatrix(unittest.TestCase):
 
         with self.assertRaisesRegex(UnsupportedTorchVersion, "兼容矩阵"):
             matrix_row((9, 9, 0))
-        with self.assertRaisesRegex(UnsupportedTorchVersion, "2\.9"):
+        with self.assertRaisesRegex(UnsupportedTorchVersion, r"2\.9"):
             matrix_row((1, 0, 0))
 
     def test_check_torch_validates_the_module_version(self):
@@ -775,20 +942,23 @@ class TestTorchCompatMatrix(unittest.TestCase):
 
     @unittest.skipUnless(TORCH_AVAILABLE, "需要 torch")
     def test_dtype_coverage_matches_matrix(self):
-        """bfloat16 在矩阵内 → 能导出；int64 不在 → 显式拒绝。"""
+        """bfloat16 与 int64 在矩阵内 → 能导出；bool 不在 → 显式拒绝。"""
         from aetherflow.frontend import TORCH_MATRIX
         from aetherflow.frontend.torch_export import (
             UnsupportedOperatorError,
             _require_torch,
             _to_dtype,
         )
-        from aetherflow.ir.types import bf16
+        from aetherflow.ir.types import bf16, i32
 
         row = _require_torch()
         self.assertIn(row.span, "、".join(r.span for r in TORCH_MATRIX))
         self.assertIs(_to_dtype(torch.bfloat16), bf16)
+        # IR 只有 i32：int32 无损、int64 收窄（越界值在入口拒绝）
+        self.assertIs(_to_dtype(torch.int32), i32)
+        self.assertIs(_to_dtype(torch.int64), i32)
         with self.assertRaisesRegex(UnsupportedOperatorError, "dtype"):
-            _to_dtype(torch.int64)
+            _to_dtype(torch.bool)
 
 
 if __name__ == "__main__":

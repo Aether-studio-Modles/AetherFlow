@@ -69,11 +69,12 @@ TORCH_MATRIX: Tuple[TorchCompatibility, ...] = (
     TorchCompatibility(
         min_version=(2, 9),
         max_version=(2, 13),
-        dtypes=("float16", "float32", "float64", "bfloat16"),
+        dtypes=("float16", "float32", "float64", "bfloat16", "int32", "int64"),
         verified=("2.13.0",),
         notes=(
-            "verified 列出的版本由 tests/test_torch_export*.py 实跑；"
-            "区间内其余版本只有声明，没有逐版本回归"
+            "verified 列出的版本由 tests/test_frontend.py 实跑；"
+            "区间内其余版本只有声明，没有逐版本回归。int64 按 IR 的 i32 承载"
+            "（IR 没有 i64），越界值在执行器入口拒绝"
         ),
     ),
 )

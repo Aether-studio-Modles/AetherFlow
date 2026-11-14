@@ -6,7 +6,9 @@
 1. torch 只在模块内延迟导入，缺 torch 时本模块导入不报错，调用时报明确错误。
 2. 只翻译已知的 aten 算子。未知算子抛 ``UnsupportedOperatorError``，
    绝不静默跳过或用近似算子代替——那会让"对齐失败"变成不可解释的问题。
-3. 参数一律降级为图输入（IR 里没有常量节点），运行时由 ``ImportedModel.feed`` 组装。
+3. 参数一律降级为图输入，运行时由 ``ImportedModel.feed`` 组装；``torch.export``
+   提升出来的常量张量（``lifted_tensor`` / ``get_attr``）落成 IR 的 ``constant``
+   节点，不混进用户输入——否则调用方会被要求喂一个本该写在图里的值（5.224）。
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ..ir.graph import Graph, Value
-from ..ir.types import DType, TensorType, bf16, f16, f32, f64
+from ..ir.types import DType, TensorType, bf16, f16, f32, f64, i32
 from .compat import TorchCompatibility, check_torch
 
 try:  # 可选依赖：没有 torch 的机器上内核仍可用
@@ -39,7 +41,17 @@ _TORCH_DTYPE = {
     "float64": f64,
     "float16": f16,
     "bfloat16": bf16,
+    # 整数只有 i32 一种载体（IR 没有 i64）：int32 无损，int64 收窄。
+    # 收窄不是"静默截断"——执行器入口的 ``_check_input_dtype`` 会先验范围，
+    # 越界值在入口就报错（见 5.181）。
+    "int32": i32,
+    "int64": i32,
 }
+
+#: 导入时允许落成 ``constant`` 节点的最大元素数。与常量折叠的上限同量级：
+#: 再大的"常量"往 attrs 里塞，序列化体积和反序列化开销都会失控，应该改成
+#: 参数或显式输入。
+MAX_IMPORTED_CONSTANT_ELEMENTS = 65536
 
 
 @dataclass
@@ -86,9 +98,38 @@ def _to_dtype(dtype: Any) -> DType:
         supported = "、".join(sorted(_TORCH_DTYPE))
         raise UnsupportedOperatorError(
             f"不支持的 dtype: {dtype}；矩阵内的 dtype 是 {supported}"
-            "（整数张量请先转成浮点，或作为图输入由调用方处理）"
+            "（bool 没有对应的张量语义；int64 会按 i32 承载，越界值在入口拒绝）"
         )
     return _TORCH_DTYPE[key]
+
+
+def _constant_node(g: Graph, value: Any, source: str) -> Value:
+    """把 torch 常量张量落成 IR 的 ``constant`` 节点。
+
+    常量写进 attrs（``data``），所以图仍然自包含、可序列化。超过上限就显式
+    拒绝：再大的值应该改成参数或显式输入，而不是塞进图属性里。
+    """
+    if not hasattr(value, "detach"):
+        raise UnsupportedOperatorError(
+            f"{source} 不是常量张量（{type(value).__name__}），无法落成 constant 节点"
+        )
+    tensor = value.detach().cpu()
+    dtype = _to_dtype(tensor.dtype)
+    # numpy 没有 bfloat16：先转 float32 取位；执行器在节点边界按 bf16 量化。
+    if str(tensor.dtype) == "torch.bfloat16":
+        tensor = tensor.float()
+    arr = tensor.numpy()
+    if arr.size > MAX_IMPORTED_CONSTANT_ELEMENTS:
+        raise UnsupportedOperatorError(
+            f"{source} 有 {arr.size} 个元素，超过导入上限 "
+            f"{MAX_IMPORTED_CONSTANT_ELEMENTS}；请改成显式输入或参数"
+        )
+    attrs = {
+        "dtype": dtype,
+        "shape": tuple(int(dim) for dim in arr.shape),
+        "data": arr.tolist(),
+    }
+    return g.add_node("constant", [], attrs)
 
 
 def _shape_of(value: Any) -> tuple:
@@ -145,6 +186,16 @@ def import_exported(
     # 可训练参数，只出现在 inputs_to_buffers 里。两者都要从 state_dict 取。
     buffer_by_input: Dict[str, str] = dict(getattr(sig, "inputs_to_buffers", {}) or {})
     state_by_input = {**param_by_input, **buffer_by_input}
+    # ``torch.export`` 会把 forward 里的字面量张量提升成 placeholder（名字常见
+    # ``c_lifted_tensor_0``）。它们既不是参数也不是缓冲，但同样**不是**用户输入：
+    # 按原样走会要求调用方喂一个本该写在图里的常量。这里只认图签名明确登记的
+    # 提升常量，其余 placeholder 仍按用户输入处理（不靠名字猜）。
+    const_by_input: Dict[str, str] = dict(
+        getattr(sig, "inputs_to_lifted_tensor_constants", {}) or {}
+    )
+    lifted_constants = getattr(exported_program, "tensor_constants", None)
+    if lifted_constants is None:
+        lifted_constants = getattr(exported_program, "constants", {}) or {}
 
     g = Graph(name)
     env: Dict[str, Any] = {}
@@ -210,6 +261,16 @@ def import_exported(
         if node.op == "placeholder":
             if node.name not in used:
                 continue
+            if node.name in const_by_input:
+                key = const_by_input[node.name]
+                if key not in lifted_constants:
+                    raise KeyError(
+                        f"提升常量 {key!r}（节点 {node.name}）不在导出的常量表里"
+                    )
+                env[node.name] = _constant_node(
+                    g, lifted_constants[key], f"常量 {key!r}"
+                )
+                continue
             val = node.meta["val"]
             t = TensorType(_to_dtype(val.dtype), _shape_of(val))
             env[node.name] = g.input(node.name, t)
@@ -225,9 +286,14 @@ def import_exported(
                 continue  # buffer 的原地自增/写回：图外语义，见上面的说明
             env[node.name] = _translate(g, node, env)
         elif node.op == "get_attr":
-            raise UnsupportedOperatorError(
-                f"暂不支持 get_attr 常量节点（{node.name}）；torch.export 通常会把参数提升为 placeholder"
-            )
+            # 有些导出形态把常量留在 GraphModule 的属性上，而不是提升成
+            # placeholder。值与 placeholder 常量同源，落成同一个 constant 节点。
+            raw = getattr(gm, str(node.target), None)
+            if raw is None:
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 引用的属性 {node.target!r} 不在 GraphModule 上"
+                )
+            env[node.name] = _constant_node(g, raw, f"属性 {node.target!r}")
         elif node.op == "output":
             names = list(getattr(sig, "user_outputs", ()) or ())
             for i, v in enumerate(kept_slots):
@@ -680,9 +746,54 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
         parts.extend([None] * (chunks - len(parts)))
         return tuple(parts)
 
-    if target in ("aten.clone.default", "aten.alias.default", "aten.detach.default"):
+    if target in (
+        "aten.clone.default",
+        "aten.alias.default",
+        "aten.detach.default",
+        # ``detach_`` / ``lift_fresh*`` 是 torch.export 给提升常量套的包装：
+        # 输出与输入同值。IR 是 SSA、值不可变，这些包装在语义上就是恒等。
+        "aten.detach_.default",
+        "aten.lift_fresh.default",
+        "aten.lift_fresh_copy.default",
+    ):
         # IR 是 SSA、值不可变，clone/alias/detach 在语义上就是恒等
         return a(0)
+
+    if target == "aten.index.Tensor":
+        # ``table[ids]``（单个整数索引张量）正是 IR 的 embedding 语义。
+        # 多索引 / 带 None 的通用高级索引没有对应的 IR 算子：只取第一个索引
+        # 会把语义悄悄改掉，必须显式拒绝。
+        raw = args[1] if len(args) > 1 else None
+        if not isinstance(raw, (list, tuple)) or len(raw) != 1 or raw[0] is None:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 只支持单个整数索引张量（table[ids]）；"
+                f"收到索引 {raw!r}，其余高级索引形态没有 IR 语义"
+            )
+        table = a(0)
+        ids = env.get(getattr(raw[0], "name", ""))
+        if not isinstance(ids, Value):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的索引不是图内的值"
+            )
+        return g.add_node("embedding", [table, ids])
+
+    if target == "aten.embedding.default":
+        # (weight, indices, padding_idx=None, scale_grad_by_freq=False, sparse=False)
+        padding_idx = _aten_arg(args, kwargs, 2, "padding_idx", None)
+        if padding_idx is not None and int(padding_idx) >= 0:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 带 padding_idx={padding_idx}：IR 的 embedding 是"
+                "普通查表，没有“该行梯度恒为零”的语义；显式拒绝而不是算成普通查表"
+            )
+        if _aten_arg(args, kwargs, 3, "scale_grad_by_freq", False):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 scale_grad_by_freq=True 没有 IR 语义"
+            )
+        if _aten_arg(args, kwargs, 4, "sparse", False):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 sparse=True 没有 IR 语义"
+            )
+        return g.add_node("embedding", [a(0), a(1)])
 
     if target == "aten._native_batch_norm_legit_no_training.default":
         return _batch_norm_inference(g, node, args, a, n)
