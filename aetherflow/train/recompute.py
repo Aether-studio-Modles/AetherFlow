@@ -39,6 +39,7 @@ import numpy as np
 from ..ir.grad import backward
 from ..ir.graph import Graph, Node, Value
 from ..ir.ops import UNREPLAYABLE_EFFECTS
+from ..ir.shape_contract import require_static_shapes
 from ..ir.types import TensorType
 
 __all__ = ["Segment", "CheckpointPlan"]
@@ -77,6 +78,11 @@ class CheckpointPlan:
     ) -> None:
         if not isinstance(graph, Graph):
             raise TypeError(f"graph 必须是 Graph，得到 {type(graph).__name__}")
+        require_static_shapes(
+            graph,
+            stage="recompute",
+            hint="请用固定形状构图，或关闭重算（segments=None）",
+        )
         if isinstance(segments, bool) or not isinstance(segments, int) or segments < 1:
             raise ValueError(f"segments 必须是正整数，得到 {segments!r}")
         nodes = graph.nodes

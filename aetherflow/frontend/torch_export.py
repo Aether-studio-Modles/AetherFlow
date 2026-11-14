@@ -83,7 +83,18 @@ def _shape_of(value: Any) -> tuple:
     shape = getattr(value, "shape", None)
     if shape is None:
         raise UnsupportedOperatorError(f"无法从 {value!r} 取得形状")
-    return tuple(int(d) for d in shape)
+    dims = []
+    for dim in shape:
+        # 静态导出里 shape 的元素是 int；torch 的动态维是 SymInt，直接 int()
+        # 会触发一次 guard 把它具体化成一个"碰巧这次成立"的数字，导出的图
+        # 却不再对别的形状成立。这里显式拒绝，让调用方先固定该维。
+        if not isinstance(dim, int):
+            raise UnsupportedOperatorError(
+                f"torch 导入只接受静态形状，遇到动态维 {dim!r}（{type(dim).__name__}）；"
+                "请先用 torch._dynamo.mark_static 固定该维，或按具体输入尺寸导出"
+            )
+        dims.append(int(dim))
+    return tuple(dims)
 
 
 def _norm_dim(dim: int, rank: int) -> int:

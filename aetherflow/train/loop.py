@@ -24,6 +24,7 @@ from ..backends.reference_backend import ReferenceBackend
 from ..ir.grad import backward
 from ..ir.graph import Graph
 from ..ir.serialize import dumps as _serialize_dumps
+from ..ir.shape_contract import require_static_shapes
 from ..passes.autocast import Autocast
 from ..runtime.bf16 import pack_bf16, unpack_bf16
 from ._arrays import array_module
@@ -286,13 +287,11 @@ class Trainer:
                 low_precision_inputs=store.names if master_weights else (),
             ).run(graph)
 
-        symbolic = [value.name for value in graph.inputs if not value.type.is_static]
-        if symbolic:
-            raise ValueError(
-                f"训练图必须用静态形状，这些输入含符号维: {symbolic}。"
-                "反向图的归约需要运行期形状表达式（尚未实现）；"
-                "请用固定 batch 构图，变长数据先补齐或用 DataLoader(drop_last=True)"
-            )
+        require_static_shapes(
+            graph,
+            stage="trainer",
+            hint="请用固定 batch 构图，变长数据先补齐或用 DataLoader(drop_last=True)",
+        )
 
         inputs = {value.name for value in graph.inputs}
         missing = [name for name in store.names if name not in inputs]

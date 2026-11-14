@@ -31,6 +31,13 @@ from .ops import (
     register,
 )
 from .serialize import IRVersionError, dumps, from_dict, loads, to_dict
+from .shape_contract import (
+    DYNAMIC_SHAPE_SUPPORT,
+    StageSupport,
+    require_static_shapes,
+    support_for,
+    symbolic_inputs,
+)
 from .types import DType, TensorType, bf16, boolean, c128, c64, f16, f32, f64, i8, i32
 from .verifier import Issue, VerifierError, require, verify, verify_portable_only
 from .version import (
@@ -85,6 +92,11 @@ __all__ = [
     "register",
     "DType",
     "TensorType",
+    "DYNAMIC_SHAPE_SUPPORT",
+    "StageSupport",
+    "support_for",
+    "symbolic_inputs",
+    "require_static_shapes",
     "f16",
     "bf16",
     "c64",
