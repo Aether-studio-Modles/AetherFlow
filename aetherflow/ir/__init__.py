@@ -31,7 +31,7 @@ from .ops import (
     register,
 )
 from .serialize import IRVersionError, dumps, from_dict, loads, to_dict
-from .types import DType, TensorType, bf16, boolean, f16, f32, f64, i8, i32
+from .types import DType, TensorType, bf16, boolean, c128, c64, f16, f32, f64, i8, i32
 from .verifier import Issue, VerifierError, require, verify, verify_portable_only
 from .version import (
     IR_VERSION,
@@ -87,6 +87,8 @@ __all__ = [
     "TensorType",
     "f16",
     "bf16",
+    "c64",
+    "c128",
     "f32",
     "f64",
     "i8",

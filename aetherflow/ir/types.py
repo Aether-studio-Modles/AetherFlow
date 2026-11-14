@@ -220,6 +220,8 @@ class DType(str, Enum):
     BF16 = "bf16"
     F32 = "f32"
     F64 = "f64"
+    C64 = "c64"
+    C128 = "c128"
     I8 = "i8"
     I32 = "i32"
     BOOL = "bool"
@@ -232,6 +234,16 @@ class DType(str, Enum):
         只用于验证数学语义，不代表位宽。
         """
         return _NP_DTYPE[self]
+
+    @property
+    def is_complex(self) -> bool:
+        """复数 dtype。FFT 类算子只在这些类型上定义。"""
+        return self in (DType.C64, DType.C128)
+
+    @property
+    def is_float(self) -> bool:
+        """实数浮点 dtype（不含复数）。"""
+        return self in (DType.F16, DType.BF16, DType.F32, DType.F64)
 
     def __getitem__(self, shape: Union[Dim, Iterable[Dim]]) -> "TensorType":
         """``f32["B", "S", 64]`` 语法糖，用于在构图时声明张量类型。"""
@@ -246,6 +258,8 @@ _NP_DTYPE = {
     DType.BF16: "float32",
     DType.F32: "float32",
     DType.F64: "float64",
+    DType.C64: "complex64",
+    DType.C128: "complex128",
     DType.I8: "int8",
     DType.I32: "int32",
     DType.BOOL: "bool",
@@ -324,6 +338,8 @@ f16 = DType.F16
 bf16 = DType.BF16
 f32 = DType.F32
 f64 = DType.F64
+c64 = DType.C64
+c128 = DType.C128
 i8 = DType.I8
 i32 = DType.I32
 boolean = DType.BOOL

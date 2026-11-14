@@ -128,6 +128,14 @@ def _check_input_dtype(arr: Any, want: np.dtype, name: str) -> None:
         raise TypeError(
             f"输入 %{name} 声明为 bool，收到 {src.name}；布尔输入必须显式给出"
         )
+    elif want.kind == "c" and src.kind != "c":
+        # 实数 -> 复数是无损的（虚部补 0），允许；反方向在下一个分支拒绝。
+        return
+    elif want.kind in "fiu" and src.kind == "c":
+        raise TypeError(
+            f"输入 %{name} 声明为 {want.name}，收到复数 {src.name}；"
+            "复数转实数必须由调用方显式取实部 / 虚部"
+        )
 
 
 class Executor:

@@ -15,12 +15,14 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from ...ir.graph import Node
 from ..base import BackendCapabilityError
 from ..contracts import DeviceInfo
 from ..device_backend import DeviceBackend, GPU_OPS
 from . import codegen
 from .cublas import Cublas
 from .cudnn import CudnnConv, CudnnUnavailable
+from .cufft import CufftPlan, CufftUnavailable, available as cufft_available
 from .cusparse import CusparseSpMM, CusparseUnavailable
 from .memory import Arena
 
@@ -32,6 +34,11 @@ CUDA_OPS: FrozenSet[str] = GPU_OPS
 
 _CONV_IMPLS = ("auto", "im2col", "tiled", "implicit", "cudnn", "grouped")
 _SPARSE_IMPLS = ("custom", "auto", "cusparse")
+
+# fft / rfft 由 cuFFT 承接。它们不在 ``CUDA_OPS`` 里：那张表是"自研内核模板
+# 承接面"的声明，而 FFT 没有自研内核——它是厂商库能力，与 cuDNN 一样只作为
+# 实现细节存在。``invoke`` 在 dtype 门禁之前拦下这两个名字。
+_FFT_OPS: FrozenSet[str] = frozenset({"fft", "rfft"})
 
 
 class CudaBackend(DeviceBackend):
@@ -91,6 +98,9 @@ class CudaBackend(DeviceBackend):
         # cuSPARSE 同样惰性创建；失败原因只记一次，auto 下不反复 try/except
         self._cusparse: Any = None
         self._cusparse_broken: Optional[str] = None
+        # cuFFT 同样是惰性创建 + 失败只记一次
+        self._cufft: Any = None
+        self._cufft_broken: Optional[str] = None
         super().__init__(
             block=block,
             max_blocks=max_blocks,
@@ -274,6 +284,10 @@ class CudaBackend(DeviceBackend):
         self._blas = None
         # cuSPARSE handle 与 workspace 都绑在旧卡的 context 上，和 cuBLAS 同理
         self._cusparse = None
+        # cuFFT 的 plan 绑在旧卡的 context 上
+        if self._cufft is not None:
+            self._cufft.close()
+        self._cufft = None
         self._resident.clear()
         self._invalidate_plans()
         # 计划里缓存的常量设备副本也属于旧卡（5.172）：计划结构照旧有效，
@@ -448,6 +462,77 @@ class CudaBackend(DeviceBackend):
                 raise
             self._cusparse_broken = f"{type(exc).__name__}: {exc}"
             return None
+
+    # ------------------------------------------------------------------
+    # cuFFT
+    # ------------------------------------------------------------------
+
+    def _cufft_engine(self) -> CufftPlan:
+        """惰性建 cuFFT plan 池；失败一次就不再重试（与 cuDNN 同一条理由）。
+
+        ``fft`` / ``rfft`` 没有自研内核可回落，所以这里不设"auto 降级"：
+        库不可用就是明确错误。捕获期单独拒绝——``cufftPlanMany`` 是 host API，
+        在 CUDA Graph 捕获里调用不安全。
+        """
+        if self._cufft is not None:
+            return self._cufft
+        if self._cufft_broken:
+            raise BackendCapabilityError(
+                f"{self._LABEL} 的 fft/rfft 需要可用的 cuFFT：{self._cufft_broken}"
+            )
+        if self._capturing:
+            raise BackendCapabilityError(
+                "CUDA Graph 捕获期不支持 fft/rfft（cufftPlanMany 是 host API）；"
+                "含 FFT 的图请用 graph_mode='off'"
+            )
+        try:
+            self._cufft = CufftPlan()
+        except (CufftUnavailable, OSError) as exc:
+            self._cufft_broken = str(exc)
+            raise BackendCapabilityError(
+                f"{self._LABEL} 的 fft/rfft 需要可用的 cuFFT：{exc}"
+            ) from exc
+        return self._cufft
+
+    def invoke(self, node: Node, args: List[Any], attrs: dict) -> Any:
+        """``fft`` / ``rfft`` 走 cuFFT，其余交给基类。
+
+        这两个算子的输入 dtype（c64 / c128 / f32 / f64）不在基类的"f32 或
+        f16"门禁里，必须在门禁之前拦下。dtype 与形状仍按 IR 声明核对：
+        入口已在 ``run_device`` 对齐过，这里再确认一次是为了让"直接调
+        ``invoke``"的路径同样严格。
+        """
+        name = node.op.name
+        if name not in _FFT_OPS:
+            return super().invoke(node, args, attrs)
+        x = self._contig(args[0])
+        if x.dtype != np.dtype(node.inputs[0].type.dtype.np_dtype):
+            raise BackendCapabilityError(
+                f"{self._LABEL} 的 {name} 输入 dtype {x.dtype} 与 IR 声明的 "
+                f"{node.inputs[0].type.dtype.value} 不一致"
+            )
+        size = int(x.shape[-1])
+        rows = int(x.size // size) if size else 0
+        inverse = bool(attrs.get("inverse", False)) if name == "fft" else False
+        return self._cufft_engine().transform(
+            x,
+            size=size,
+            rows=rows,
+            inverse=inverse,
+            norm=attrs.get("norm", "backward"),
+        )
+
+    def capabilities(self) -> FrozenSet[str]:
+        """自研内核 + 可用的 cuFFT。
+
+        ``fft`` / ``rfft`` 不是内核表里的条目，但能力声明必须如实反映"这个
+        后端能不能算"。cuFFT 缺失时**不声明**：宁可让一致性套件把它记为
+        "未声明算子"从而拒绝，也不要声明一个执行时才失败的算子。
+        """
+        caps = super().capabilities()
+        if cufft_available():
+            return caps | _FFT_OPS
+        return caps
 
     # ------------------------------------------------------------------
     # 编译与 BLAS

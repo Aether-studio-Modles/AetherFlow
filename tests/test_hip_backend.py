@@ -948,8 +948,16 @@ class TestHipPinnedArray(unittest.TestCase):
         self.assertIn("a", keys)
 
     def test_pinned_rejects_unsupported_dtype(self):
+        # int16 既不在容器承载面，也不对应任何 IR dtype
         with self.assertRaises(runtime.HipRuntimeError):
-            runtime.pinned((4,), np.complex64)
+            runtime.pinned((4,), np.int16)
+
+    def test_pinned_accepts_complex(self):
+        # 复数必须能被承载：HIP 没有 rocFFT，``fft`` 要在 invoke 里以
+        # "未实现算子"被拒，而不是在拷贝阶段变成一个裸的运行时错误
+        holder = runtime.pinned((4,), np.complex64)
+        self.assertEqual(holder.view.dtype, np.dtype("complex64"))
+        self.assertEqual(holder.nbytes, 32)
 
 
 @unittest.skipUnless(HIP_AVAILABLE, "需要 HIP 运行时（ROCm）")

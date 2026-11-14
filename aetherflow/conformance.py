@@ -51,7 +51,7 @@ from .backends.reference_backend import ReferenceBackend
 from .ir.graph import Graph
 from .ir.ops import OPS
 from .ir.serialize import dumps, loads, to_dict
-from .ir.types import f32, f64, i32
+from .ir.types import c64, f32, f64, i32
 from .ir.verifier import verify_portable_only
 from .models.transformer import BlockSpec, build_transformer_block
 
@@ -383,6 +383,32 @@ def _cast(dtype: str = "f64"):
         x = g.input("x", f32[4, 5])
         g.output(g.cast(x, dtype=dtype), "y")
         return g, {"x": _f32(rng, (4, 5))}
+
+    return build
+
+
+def _complex(shape: tuple, rng: np.random.Generator) -> np.ndarray:
+    return (
+        rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    ).astype(np.complex64)
+
+
+def _fft(norm: str = "ortho", inverse: bool = False, shape: tuple = (3, 8)):
+    def build(rng):
+        g = Graph("fft")
+        x = g.input("x", c64[shape])
+        g.output(g.add_node("fft", [x], {"norm": norm, "inverse": inverse}), "y")
+        return g, {"x": _complex(shape, rng)}
+
+    return build
+
+
+def _rfft(norm: str = "backward", shape: tuple = (4, 10)):
+    def build(rng):
+        g = Graph("rfft")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("rfft", [x], {"norm": norm}), "y")
+        return g, {"x": _f32(rng, shape)}
 
     return build
 
@@ -1055,6 +1081,12 @@ def default_cases() -> List[Case]:
               note="前向与 step 相同；差异只在反向的替代梯度（SNN 可训练的前提）"),
         _case("constant", _constant(),
               note="零输入节点：图自包含的前提，反向图不能靠外部喂常量"),
+        _case("fft_ortho", _fft(),
+              note="复数 dtype 的参照语义；CUDA 侧由 cuFFT 承接"),
+        _case("fft_inverse", _fft(norm="backward", inverse=True),
+              note="逆变换：cuFFT 不归一化，缩放必须由实现显式补上"),
+        _case("rfft_backward", _rfft(),
+              note="实数半谱：形状 (..., n) -> (..., n//2+1)，dtype f32 -> c64"),
         _case("broadcast_to", _broadcast_to(),
               note="归约/softmax 反向把梯度广播回原形状的唯一手段"),
         _case("pad", _pad(), note="slice 的反向；补零必须与切片严格对称"),
@@ -1291,7 +1323,9 @@ def _compare(got: Mapping[str, np.ndarray], expected: Mapping[str, np.ndarray], 
         try:
             np.testing.assert_allclose(got_arr, exp_arr, rtol=case.rtol, atol=case.atol)
         except AssertionError:
-            diff = np.abs(got_arr.astype(np.float64) - exp_arr.astype(np.float64))
+            # 先在公共 dtype 上求差再取模：复数不能先转 float64，否则虚部被
+            # 静默丢弃，误差会算成 0。
+            diff = np.abs(got_arr - exp_arr)
             peak = float(np.nanmax(diff)) if diff.size else 0.0
             return (
                 False,
@@ -1300,7 +1334,7 @@ def _compare(got: Mapping[str, np.ndarray], expected: Mapping[str, np.ndarray], 
                 peak,
             )
         if got_arr.size:
-            diff = np.abs(got_arr.astype(np.float64) - exp_arr.astype(np.float64))
+            diff = np.abs(got_arr - exp_arr)
             max_error = max(max_error, float(np.nanmax(diff)))
     return True, "", max_error
 

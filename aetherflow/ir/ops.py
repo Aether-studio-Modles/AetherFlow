@@ -2789,3 +2789,106 @@ register(
         effects=frozenset({Effect.RNG}),
     )
 )
+
+
+# --------------------------------------------------------------------------
+# 傅里叶变换
+# --------------------------------------------------------------------------
+
+#: numpy 与 cuFFT 共有的三档归一化。``backward`` 只在正向除以 N（numpy 默认），
+#: ``ortho`` 两侧各除 √N，``forward`` 只在反向除以 N。
+_FFT_NORMS = ("backward", "ortho", "forward")
+
+
+def _fft_norm(attrs: dict) -> str:
+    norm = attrs.get("norm", "backward")
+    if norm not in _FFT_NORMS:
+        raise ValueError(f"fft 的 norm 只能是 {_FFT_NORMS} 之一，得到 {norm!r}")
+    return norm
+
+
+def _infer_fft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """复数到复数的 DFT（沿最后一维）。形状与 dtype 都不变。
+
+    只接受复数输入：实数进复数出是 ``rfft`` 的语义，混在同一个算子里会让
+    输出形状依赖 dtype，类型推导就得多一条分支；更重要的是**默不作声地
+    把实数升成复数**属于隐式降级，宁可显式要求 cast。
+    """
+    x = inputs[0]
+    if not x.dtype.is_complex:
+        raise TypeError(
+            f"fft 的输入必须是复数 dtype（c64/c128），得到 {x.dtype.value}；"
+            "实数序列请用 rfft，或先用 cast 显式转成 c64"
+        )
+    if x.rank == 0:
+        raise ValueError("fft 至少需要 1 维（变换沿最后一维）")
+    _fft_norm(attrs)
+    inverse = attrs.get("inverse", False)
+    if not isinstance(inverse, bool):
+        raise TypeError(f"fft 的 inverse 必须是 bool，得到 {type(inverse).__name__}")
+    return x
+
+
+def _ref_fft(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    norm = _fft_norm(attrs)
+    fn = np.fft.ifft if attrs.get("inverse", False) else np.fft.fft
+    return fn(args[0], axis=-1, norm=norm)
+
+
+register(
+    Op(
+        name="fft",
+        infer=_infer_fft,
+        reference=_ref_fft,
+        attrs_schema=("norm", "inverse"),
+        doc="沿最后一维的离散傅里叶变换（复数 → 复数）。``inverse=True`` 走逆变换；"
+        "``norm`` 取 backward / ortho / forward，与 numpy.fft 同义。"
+        "复数 dtype 只有 c64 / c128 两种，形状与 dtype 都保持不变。"
+        "反向图暂不提供 VJP（复数线性算子的伴随需要共轭转置，"
+        "IR 里还没有 conj 算子），求导会显式报 NoGradientError。",
+    )
+)
+
+
+def _infer_rfft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """实数到复数的半谱 DFT：``f32 -> c64``、``f64 -> c128``。
+
+    f16 / bf16 显式拒绝：半精度 FFT 的舍入误差会盖过数值本身，且
+    numpy 没有对应的参考实现——没有参考语义就不该进入 IR。
+    """
+    x = inputs[0]
+    if x.dtype == DType.F32:
+        out = DType.C64
+    elif x.dtype == DType.F64:
+        out = DType.C128
+    else:
+        raise TypeError(
+            f"rfft 只接受 f32 / f64 实数输入（分别得到 c64 / c128），"
+            f"得到 {x.dtype.value}；f16 请先 cast 到 f32"
+        )
+    if x.rank == 0:
+        raise ValueError("rfft 至少需要 1 维（变换沿最后一维）")
+    _fft_norm(attrs)
+    last = x.shape[-1]
+    if isinstance(last, int):
+        last = last // 2 + 1
+    else:
+        last = sym_binary("add", sym_binary("floordiv", last, 2), 1)
+    return TensorType(out, x.shape[:-1] + (last,))
+
+
+def _ref_rfft(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    return np.fft.rfft(args[0], axis=-1, norm=_fft_norm(attrs))
+
+
+register(
+    Op(
+        name="rfft",
+        infer=_infer_rfft,
+        reference=_ref_rfft,
+        attrs_schema=("norm",),
+        doc="沿最后一维的实数半谱 DFT：形状 ``(..., n) -> (..., n//2+1)``，"
+        "dtype 由 f32/f64 变成 c64/c128。只保留非负频率那一半，"
+        "因为实序列的谱是共轭对称的。反向同样不提供 VJP。",
+    )
+)

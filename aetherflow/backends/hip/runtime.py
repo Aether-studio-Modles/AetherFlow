@@ -273,7 +273,7 @@ def _dtype(dtype) -> np.dtype:
     dt = np.dtype(dtype)
     if dt not in _SUPPORTED:
         raise HipRuntimeError(
-            f"HIP 容器只支持 f32/f16/i32/i8，收到 {dt}。"
+            f"HIP 容器不支持 {dt}。"
             "其它 dtype 应在进入后端前被 IR 拒绝"
         )
     return dt
@@ -553,9 +553,12 @@ class DeviceArray:
 
 # 容器能**承载**的 dtype 比内核能**计算**的 dtype 宽：f64 与 bool 必须能被
 # 上传，才能让"不支持"的判定发生在 ``invoke`` 的能力检查里（与 CUDA 侧一致，
-# 报 BackendCapabilityError），而不是在拷贝阶段抛一个容器错误。
+# 报 BackendCapabilityError），而不是在拷贝阶段抛一个容器错误。复数同理：
+# HIP 侧没有 rocFFT 绑定，``fft`` / ``rfft`` 会在 ``invoke`` 以"未实现算子"
+# 被拒；若容器先一步拒收 complex，拒绝就会变成一个裸的运行时错误。
 _SUPPORTED = {
     np.dtype("float32"), np.dtype("float16"), np.dtype("float64"),
+    np.dtype("complex64"), np.dtype("complex128"),
     np.dtype("int32"), np.dtype("int8"), np.dtype("bool"),
 }
 
@@ -563,6 +566,8 @@ _SUPPORTED = {
 float32 = np.float32
 float16 = np.float16
 float64 = np.float64
+complex64 = np.complex64
+complex128 = np.complex128
 int32 = np.int32
 int8 = np.int8
 bool_ = np.bool_
