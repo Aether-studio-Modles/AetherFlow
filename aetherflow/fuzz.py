@@ -59,7 +59,7 @@ import numpy as np
 
 from .ir.graph import Graph, Node, Value
 from .ir.serialize import dumps, loads, to_dict
-from .ir.types import f32, i32
+from .ir.types import DType, f32, i32
 from .ir.verifier import ERROR, verify
 from .passes import default_pipeline
 from .runtime.reference import ReferenceExecutor
@@ -191,6 +191,10 @@ def _add_binary(g: Graph, pool: List[Value], rng: np.random.Generator) -> Option
         same = [v for v in pool if v.type.dtype == a.type.dtype and v.type.shape == a.type.shape]
         b = same[int(rng.integers(0, len(same)))]
     name = _BINARY[int(rng.integers(0, len(_BINARY)))]
+    if name == "div" and a.type.dtype in (DType.I8, DType.I32):
+        # 整数除法不做隐式舍入，池子里的整数可能是 0；随机抽中它当除数会让
+        # "合法图 + 合法输入"直接除零，掩盖真正想找的语义问题。
+        b = g.constant(2, dtype=a.type.dtype, shape=a.type.shape)
     return g.add_node(name, [a, b])
 
 

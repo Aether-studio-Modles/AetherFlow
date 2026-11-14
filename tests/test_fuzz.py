@@ -19,6 +19,7 @@ from aetherflow import (
     Graph,
     ReferenceExecutor,
     f32,
+    i32,
     random_case,
     run_fuzz,
 )
@@ -59,6 +60,23 @@ class TestMutation(unittest.TestCase):
         verdicts = [_mutate_rejected(random_case(seed)) for seed in range(24)]
         self.assertNotIn(False, verdicts, "存在被接受的非法属性")
         self.assertIn(True, verdicts, "24 个种子里没有一个可用变异")
+
+
+class TestIntegerArithmetic(unittest.TestCase):
+    def test_integer_division_gets_a_nonzero_divisor(self):
+        """整数 div 的除数必须是显式的非零常量（F11）。
+
+        fuzz 的整数池会包含全零张量；抽中它当除数时，合法图在运行期抛
+        除零错误，看起来像被测后端的缺陷，实际是生成器造了不可执行的输入。
+        """
+        g = Graph("fuzz_div")
+        a = g.input("a", i32[(2,)])
+        with mock.patch.object(fuzz, "_BINARY", ("div",)):
+            node = fuzz._add_binary(g, [a], np.random.default_rng(0))
+        self.assertIsNotNone(node)
+        g.output(node, "y")
+        out = ReferenceExecutor().run(g, {"a": np.array([0, 0], np.int32)})["y"]
+        np.testing.assert_array_equal(out, np.array([0, 0], np.int32))
 
 
 class TestRunFuzz(unittest.TestCase):
