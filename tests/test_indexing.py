@@ -218,5 +218,38 @@ class TestUnravel(unittest.TestCase):
                 )
 
 
+class TestProductionLayouts(unittest.TestCase):
+    """5.209：生产内核的行主序线性化由 ``Layout`` 生成，且 token 与手写一致。
+
+    这几条直接看渲染出来的源码：抽象层一旦把 ``cast`` 打开或括号加错，
+    求值测试未必接得住，但源码会立刻变样。
+    """
+
+    def setUp(self):
+        from aetherflow.backends.cuda.codegen import render
+        from aetherflow.lower import kernels
+
+        self.render = render
+        self.kernels = kernels
+
+    def test_sparse_linear_weights_index(self):
+        src = self.render(self.kernels.sparse_linear(), "float32")
+        self.assertIn("r * cols + n", src)
+        self.assertNotIn("(long long)r * cols", src)
+
+    def test_scan_linear_element_index(self):
+        src = self.render(self.kernels.scan_linear(), "float32")
+        self.assertIn("t * elems + i", src)
+        self.assertNotIn("(long long)t * elems", src)
+
+    def test_spike_linear_spike_index(self):
+        src = self.render(self.kernels.spike_linear(), "float32")
+        self.assertIn("s * rows + r", src)
+
+    def test_production_layouts_are_layout_objects(self):
+        for name in ("_ROW_COLS", "_T_ELEMS", "_C_ELEMS", "_S_ROWS", "_T_WIDTH"):
+            self.assertIsInstance(getattr(self.kernels, name), Layout)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

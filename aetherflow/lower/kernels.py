@@ -1651,7 +1651,7 @@ def spike_offsets() -> Kernel:
     """
     hit = Bin(
         "!=",
-        Load("spikes", Bin("+", Bin("*", Var("t"), Var("width")), Var("k"))),
+        Load("spikes", _T_WIDTH.offset(("t", "k"), cast=None)),
         Num("0.f"),
     )
     return Kernel(
@@ -1734,7 +1734,7 @@ def spike_csr_serial() -> Kernel:
     """
     hit = Bin(
         "!=",
-        Load("spikes", Bin("+", Bin("*", Var("t"), Var("width")), Var("k"))),
+        Load("spikes", _T_WIDTH.offset(("t", "k"), cast=None)),
         Num("0.f"),
     )
     lo, hi = Var("lo"), Var("hi")
@@ -1944,7 +1944,7 @@ def sparse_linear() -> Kernel:
     输出本身是稠密的 ``(S, N)``，所以一个线程负责一个输出元素；选"按输出
     收集"而不是"按事件散射"，是为了每个输出只写一次、不需要原子加。
     """
-    weight_at = Bin("+", Bin("*", Var("r"), Var("cols")), Var("n"))
+    weight_at = _ROW_COLS.offset(("r", "n"), cast=None)
     return Kernel(
         name="sparse_linear",
         params=(
@@ -2000,7 +2000,7 @@ def sparse_linear_weight_grad() -> Kernel:
     同一行会被多个事件命中（同一神经元在 batch 内多次发放、或同一 batch 里
     重复的 index），写回必须原子加；输出缓冲由后端先清零。
     """
-    dst = Bin("+", Bin("*", Var("r"), Var("cols")), Var("n"))
+    dst = _ROW_COLS.offset(("r", "n"), cast=None)
     return Kernel(
         name="sparse_linear_weight_grad",
         params=(
@@ -2055,7 +2055,7 @@ def sparse_linear_values_grad() -> Kernel:
     空步的线程直接空转——两点都比多一层二分简单。
     """
     dout_at = Bin("+", Bin("*", Var("i"), Var("cols")), Var("n"))
-    weight_at = Bin("+", Bin("*", Var("r"), Var("cols")), Var("n"))
+    weight_at = _ROW_COLS.offset(("r", "n"), cast=None)
     return Kernel(
         name="sparse_linear_values_grad",
         params=(
@@ -2122,8 +2122,8 @@ def spike_linear() -> Kernel:
 
     ``e`` 仍只扫第 ``s`` 步真正发放的区间：稠密的 ``(S, K)`` 乘积从不物化。
     """
-    weight_at = Bin("+", Bin("*", Var("r"), Var("cols")), Var("n"))
-    spike_at = Bin("+", Bin("*", Var("s"), Var("rows")), Var("r"))
+    weight_at = _ROW_COLS.offset(("r", "n"), cast=None)
+    spike_at = _S_ROWS.offset(("s", "r"), cast=None)
     return Kernel(
         name="spike_linear",
         params=(
@@ -2179,8 +2179,8 @@ def spike_linear_weight_grad() -> Kernel:
     值由脉冲矩阵现场读取，因此不需要 values 缓冲；同一行被多个事件命中时
     必须原子累加，输出缓冲由后端先清零。
     """
-    dst = Bin("+", Bin("*", Var("r"), Var("cols")), Var("n"))
-    spike_at = Bin("+", Bin("*", Var("s"), Var("rows")), Var("r"))
+    dst = _ROW_COLS.offset(("r", "n"), cast=None)
+    spike_at = _S_ROWS.offset(("s", "r"), cast=None)
     return Kernel(
         name="spike_linear_weight_grad",
         params=(
@@ -2228,7 +2228,7 @@ def scan_linear() -> Kernel:
     一个线程负责一个尾元素、沿时间轴顺序走。递推本身串行，并行度来自尾部
     （batch / channel / state），所以尾维被展平，秩 >= 2 都适用。
     """
-    idx = Bin("+", Bin("*", Var("t"), Var("elems")), Var("i"))
+    idx = _T_ELEMS.offset(("t", "i"), cast=None)
     return Kernel(
         name="scan_linear",
         params=(
@@ -2275,7 +2275,7 @@ def scan_linear_backward() -> Kernel:
     同样的"一个线程一个尾元素"，只是倒着走。``a[idx + elems]`` 是 ``a_{t+1}``；
     最后一步没有后继，进位被丢弃。
     """
-    idx = Bin("+", Bin("*", Var("t"), Var("elems")), Var("i"))
+    idx = _T_ELEMS.offset(("t", "i"), cast=None)
     return Kernel(
         name="scan_linear_backward",
         params=(
@@ -2387,7 +2387,7 @@ def _chunk_prefix_scan() -> tuple:
                 Let(
                     "const long long",
                     "cidx",
-                    Bin("+", Bin("*", Var("c"), Var("elems")), Var("i")),
+                    _C_ELEMS.offset(("c", "i"), cast=None),
                 ),
                 Assign(
                     Var("h"),
@@ -2441,7 +2441,7 @@ def scan_linear_chunk_sum() -> Kernel:
                         Let(
                             "const long long",
                             "idx",
-                            Bin("+", Bin("*", Var("t"), Var("elems")), Var("i")),
+                            _T_ELEMS.offset(("t", "i"), cast=None),
                         ),
                         Let("const float", "av", Load("a", Var("idx"))),
                         Assign(
@@ -2501,7 +2501,7 @@ def scan_linear_chunk() -> Kernel:
                         Let(
                             "const long long",
                             "idx",
-                            Bin("+", Bin("*", Var("t"), Var("elems")), Var("i")),
+                            _T_ELEMS.offset(("t", "i"), cast=None),
                         ),
                         Assign(
                             Var("h"),
@@ -2562,7 +2562,7 @@ def scan_linear_chunk_sum_backward() -> Kernel:
                         Let(
                             "const long long",
                             "idx",
-                            Bin("+", Bin("*", Var("t"), Var("elems")), Var("i")),
+                            _T_ELEMS.offset(("t", "i"), cast=None),
                         ),
                         Let(
                             "const float",
@@ -2634,7 +2634,7 @@ def scan_linear_chunk_backward() -> Kernel:
                         Let(
                             "const long long",
                             "cidx",
-                            Bin("+", Bin("*", Var("c"), Var("elems")), Var("i")),
+                            _C_ELEMS.offset(("c", "i"), cast=None),
                         ),
                         Assign(
                             Var("h"),
@@ -2661,7 +2661,7 @@ def scan_linear_chunk_backward() -> Kernel:
                         Let(
                             "const long long",
                             "idx",
-                            Bin("+", Bin("*", Var("t"), Var("elems")), Var("i")),
+                            _T_ELEMS.offset(("t", "i"), cast=None),
                         ),
                         Let(
                             "const float",
@@ -2730,7 +2730,7 @@ def scan_linear_last() -> Kernel:
                         Let(
                             "const long long",
                             "idx",
-                            Bin("+", Bin("*", Var("t"), Var("elems")), Var("i")),
+                            _T_ELEMS.offset(("t", "i"), cast=None),
                         ),
                         Assign(
                             Var("h"),
@@ -2780,7 +2780,7 @@ def scan_linear_chunk_last() -> Kernel:
                         Let(
                             "const long long",
                             "cidx",
-                            Bin("+", Bin("*", Var("c"), Var("elems")), Var("i")),
+                            _C_ELEMS.offset(("c", "i"), cast=None),
                         ),
                         Assign(
                             Var("h"),
@@ -2801,6 +2801,15 @@ def scan_linear_chunk_last() -> Kernel:
         ),
     )
 
+
+# 布局常量：生产内核里反复出现的两维行主序线性化，统一由 ``Layout`` 生成。
+# ``cast=None`` 关掉首因子到 64 位的提升，生成的表达式与原先手写的
+# ``a * stride + b`` 逐 token 相同（5.209 的判据是对渲染源码取哈希比对）。
+_ROW_COLS = Layout(("r", "n"), (None, "cols"))
+_T_ELEMS = Layout(("t", "i"), (None, "elems"))
+_C_ELEMS = Layout(("c", "i"), (None, "elems"))
+_S_ROWS = Layout(("s", "r"), (None, "rows"))
+_T_WIDTH = Layout(("t", "k"), (None, "width"))
 
 _IMAGE_LAYOUT = Layout(("n", "c", "h", "w"), (None, "C", "H", "W"))
 _TAP_LAYOUT = Layout(("h", "w"), (None, "W"))
