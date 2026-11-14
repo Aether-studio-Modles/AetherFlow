@@ -58,7 +58,9 @@ class _GroupPlan:
         # 每次都要做一次字符串→dtype 的解析，而这是每个节点的必经之路。
         self.dtype = np.dtype(nodes[-1].output.type.dtype.np_dtype)
         # IR 的 dtype 本身：bf16 的载体是 f32，但边界处要做 bf16 量化，
-        # 只看 np.dtype 会把两件事混成一件。
+        # 只看 np.dtype 会把两件事混成一件。取组尾节点：组内前序节点的输出
+        # 不物化、也不进环境，所以没有"中间值需要量化"的边界；目前唯一的
+        # 分组实现是设备后端，而它拒绝 bf16，这条前提因此不会被打破。
         self.out_dtype = nodes[-1].output.type.dtype
         self._memo = None
 

@@ -78,6 +78,16 @@ class TestBf16Codec(unittest.TestCase):
         # 最大有限 f32 在 RNE 下进位成 inf，这是位宽决定的语义。
         self.assertTrue(np.isinf(got[5]))
 
+    def test_nan_payload_survives_quantization(self):
+        # 尾数全 1 的 NaN 加上 RNE 偏置会进位到指数甚至回绕，早先会变成 ±0。
+        bits = np.array([0x7FFFFFFF, 0xFFFFFFFF, 0x7F80FFFF], np.uint32)
+        x = bits.view(np.float32)
+        got = round_bf16(x)
+        self.assertTrue(np.isnan(got).all())
+        # 尾数截断后为 0 的 NaN 补 quiet 位，不能被读成 inf。
+        self.assertEqual(got.view(np.uint32)[2], np.uint32(0x7FC00000))
+        self.assertTrue(np.isnan(unpack_bf16(pack_bf16(x))).all())
+
     def test_pack_is_two_bytes_and_roundtrip_is_exact(self):
         x = np.array([[1.0 + 2.0 ** -9, 1e30], [1e-30, -2.5]], np.float32)
         packed = pack_bf16(x)

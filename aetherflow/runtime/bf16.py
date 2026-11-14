@@ -11,7 +11,9 @@ inf），尾数只有 7 位（f16 是 10 位）。因此 bf16 不需要梯度缩
 舍入采用 IEEE 754 的 round-to-nearest-even（RNE），与硬件 ``cvt`` 指令一致：
 
 - 尾数第 16 位（bf16 的 LSB）为 1 时加 1，实现"恰好一半时进位到偶数"；
-- inf / nan 的位模式在加偏置后仍落在自身（全 1 指数），不会被改成有限值；
+- 指数全 1 的 inf / nan **不参与进位**，只截断尾数：偏置加到尾数全 1 的
+  NaN 上会进位到指数、甚至回绕，把 NaN 变成 0；截断后尾数为 0 的 NaN 再补
+  一个 quiet 位，避免被读成 inf；
 - 最大有限值加偏置后进位成 inf——这正是 RNE 的溢出语义。
 """
 
@@ -30,6 +32,9 @@ _MASK = np.uint32(0xFFFF0000)
 _HALF = np.uint32(0x7FFF)
 _ONE = np.uint32(1)
 _SHIFT = np.uint32(16)
+_EXP_MASK = np.uint32(0x7F800000)
+_MANT_MASK = np.uint32(0x007FFFFF)
+_QUIET = np.uint32(0x00400000)
 
 
 def round_bf16(value: Any) -> np.ndarray:
@@ -44,9 +49,22 @@ def round_bf16(value: Any) -> np.ndarray:
     # 先看尾数第 16 位（bf16 的 LSB）：为 1 时加 1 才会把"恰好一半"进位到
     # 偶数，这就是 RNE 与"四舍五入"的唯一区别。
     lsb = (bits >> _SHIFT) & _ONE
-    bits += _HALF + lsb
-    bits &= _MASK
-    return bits.view(np.float32)
+    rounded = (bits + _HALF + lsb) & _MASK
+    # inf / nan 的指数全 1，加偏置会让尾数全 1 的 NaN 进位到指数（NaN 变 0）
+    # 甚至回绕。它们本来就落在 bf16 的格点上，只截断尾数即可。
+    special = (bits & _EXP_MASK) == _EXP_MASK
+    if special.any():
+        kept = bits & _MASK
+        # 截断后尾数为 0 的 NaN 会被读成 inf：补一个 quiet 位保住 NaN。
+        quiet = (
+            special
+            & ((bits & _MANT_MASK) != 0)
+            & ((kept & _MANT_MASK) == 0)
+        )
+        rounded = np.where(
+            special, kept | np.where(quiet, _QUIET, np.uint32(0)), rounded
+        )
+    return rounded.view(np.float32)
 
 
 def pack_bf16(value: Any) -> np.ndarray:
