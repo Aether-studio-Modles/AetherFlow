@@ -126,6 +126,7 @@ GPU_OPS: FrozenSet[str] = frozenset(
     "scan_linear_backward",
     "sparse_linear",
     "sparse_linear_weight_grad",
+    "sparse_linear_values_grad",
     "spike_linear",
     "spike_linear_weight_grad",
     "spike_offsets",
@@ -142,6 +143,7 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "dropout_mask": frozenset({1}),
     "sparse_linear": frozenset({1, 3}),
     "sparse_linear_weight_grad": frozenset({1, 3}),
+    "sparse_linear_values_grad": frozenset({2, 3}),
     "spike_linear": frozenset({2, 3}),
     "spike_linear_weight_grad": frozenset({2, 3}),
     "spike_csr": frozenset({1}),
@@ -427,6 +429,10 @@ class DeviceBackend(Executor):
             raise ValueError(
                 f"conv_impl 只能是 {self.CONV_IMPLS} 之一，收到 {conv_impl!r}"
             )
+        if sparse_impl not in self.SPARSE_IMPLS:
+            raise ValueError(
+                f"sparse_impl 只能是 {self.SPARSE_IMPLS} 之一，收到 {sparse_impl!r}"
+            )
         if graph_mode not in _GRAPH_MODES:
             raise ValueError(
                 f"graph_mode 只能是 {_GRAPH_MODES} 之一，收到 {graph_mode!r}"
@@ -454,10 +460,6 @@ class DeviceBackend(Executor):
         self.block = block
         self.max_blocks = max_blocks
         self.conv_impl = conv_impl
-        if sparse_impl not in self.SPARSE_IMPLS:
-            raise ValueError(
-                f"sparse_impl 只能是 {self.SPARSE_IMPLS} 之一，收到 {sparse_impl!r}"
-            )
         self.sparse_impl = sparse_impl
         # 执行期内存策略：``container`` = 容器自己的池（默认，行为与之前一致）；
         # ``tiered`` = 子类提供的分层分配器（小对象池 / 中块 best-fit / 大块
@@ -687,6 +689,7 @@ class DeviceBackend(Executor):
         r.register("scan_linear_backward", self._op_scan_linear_backward)
         r.register("sparse_linear", self._op_sparse_linear)
         r.register("sparse_linear_weight_grad", self._op_sparse_linear_weight_grad)
+        r.register("sparse_linear_values_grad", self._op_sparse_linear_values_grad)
         r.register("spike_linear", self._op_spike_linear)
         r.register("spike_linear_weight_grad", self._op_spike_linear_weight_grad)
         r.register("spike_offsets", self._op_spike_offsets)
@@ -3091,6 +3094,53 @@ class DeviceBackend(Executor):
         )
         self._check_ids(err, "sparse_linear_weight_grad", f"[0, {rows})")
         return dweights
+
+    def _op_sparse_linear_values_grad(self, node, args, attrs):
+        """``sparse_linear`` 对事件幅度的梯度：每个事件与所属步的 ``dout`` 做点积。
+
+        按步并行——一个线程包办该步的全部事件，直接写 ``dvalues[e]``。事件之间
+        没有重复下标，所以不像权重梯度那样需要"先清零再原子累加"。代价是
+        ``steps`` 少时并行度低，但省掉了在设备上把事件号映射回步号的二分查找。
+        """
+        cp = self.cp
+        dout, weights, indices, offsets = args
+        dout = self._contig(dout)
+        weights = self._contig(weights)
+        indices = cp.ascontiguousarray(indices).reshape(-1)
+        offsets = cp.ascontiguousarray(offsets).reshape(-1)
+        steps = int(offsets.size) - 1
+        rows, cols = int(weights.shape[0]), int(weights.shape[1])
+        nnz = int(indices.size)
+        dvalues = cp.zeros((nnz,), dtype=dout.dtype)
+        if steps == 0:
+            return dvalues
+        kernel = self._kernel(
+            ("sparse_linear_values_grad", self._kind(dout)),
+            lambda: self.codegen.render(
+                self.codegen.sparse_linear_values_grad_source(), dout.dtype
+            ),
+            "sparse_linear_values_grad",
+        )
+        err = cp.zeros(1, dtype=cp.int32)
+        block, grid = self._grid("sparse_linear_values_grad", steps)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                dout,
+                weights,
+                indices,
+                offsets,
+                dvalues,
+                np.int64(cols),
+                np.int64(rows),
+                np.int64(nnz),
+                np.int64(steps),
+                err,
+            ),
+        )
+        self._check_ids(err, "sparse_linear_values_grad", f"[0, {rows})")
+        return dvalues
 
     def _op_spike_linear(self, node, args, attrs):
         """事件驱动的脉冲线性：事件幅度直接从脉冲矩阵按列号读取。

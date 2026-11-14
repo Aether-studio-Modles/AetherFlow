@@ -868,6 +868,39 @@ def _sparse_linear_weight_grad(
     return build
 
 
+def _sparse_linear_values_grad(
+    steps: int = 4, rows: int = 6, cols: int = 5, counts=(2, 0, 2, 1)
+):
+    """``sparse_linear`` 对事件幅度的梯度：逐事件与所属步的 ``dout`` 做点积。
+
+    事件表刻意含一个空步（第 1 步）与重复行（第 0、2 步都命中行 3）：前者
+    检验空段的线程不写脏值，后者检验"梯度按事件独立、与重复行无关"。
+    """
+
+    def build(rng):
+        offsets = np.zeros(steps + 1, dtype=np.int32)
+        for i, c in enumerate(counts):
+            offsets[i + 1] = offsets[i] + c
+        nnz = int(offsets[-1])
+        g = Graph("sparse_linear_values_grad")
+        dout = g.input("dout", f32[steps, cols])
+        weights = g.input("weights", f32[rows, cols])
+        indices = g.input("indices", i32[nnz])
+        slots = g.input("offsets", i32[steps + 1])
+        g.output(
+            g.add_node("sparse_linear_values_grad", [dout, weights, indices, slots]),
+            "y",
+        )
+        return g, {
+            "dout": _f32(rng, (steps, cols)),
+            "weights": _f32(rng, (rows, cols)),
+            "indices": np.array([1, 3, 3, 0, 1], dtype=np.int32),
+            "offsets": offsets,
+        }
+
+    return build
+
+
 def _spike_linear(
     steps: int = 4, rows: int = 6, cols: int = 5, counts=(2, 0, 2, 1)
 ):
@@ -1041,6 +1074,8 @@ def default_cases() -> List[Case]:
               note="CSR 事件 × 稠密权重：稠密脉冲矩阵不物化；含一个空步，必须输出全零"),
         _case("sparse_linear_weight_grad", _sparse_linear_weight_grad(),
               note="散射累加回权重行：同一行被多次命中时必须是累加而不是覆盖"),
+        _case("sparse_linear_values_grad", _sparse_linear_values_grad(),
+              note="逐事件回收一行点积：空步不写脏值，重复行不改变事件梯度"),
         _case("spike_linear", _spike_linear(),
               note="事件幅度直接取自脉冲矩阵：必须等于稠密矩阵乘，含一个空步"),
         _case("spike_linear_weight_grad", _spike_linear_weight_grad(),

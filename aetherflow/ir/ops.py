@@ -614,6 +614,88 @@ register(
 )
 
 
+def _infer_sparse_linear_values_grad(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    """``(dout, weights, indices, offsets) -> (E,)``。
+
+    输出形状直接取 ``indices`` 的长度：它是事件数，可以和前向一样是符号维，
+    且每个事件恰好产出一个标量。这里没有 ``values`` 这个输入，于是把
+    ``indices`` 自己传给 ``_check_event_inputs`` 顶替"等长"这一条——事件数
+    本来就是由 ``indices`` 定义的，与 ``values`` 等长在前向构图时已经查过。
+    """
+    dout, weights, indices, offsets = inputs
+    if dout.rank != 2:
+        raise ValueError(
+            f"sparse_linear_values_grad 的 dout 必须是 (S, N) 二维，"
+            f"得到 {dout.shape}"
+        )
+    if weights.rank != 2:
+        raise ValueError(
+            f"sparse_linear_values_grad 的 weights 必须是 (K, N) 二维，"
+            f"得到 {weights.shape}"
+        )
+    slots = _check_event_inputs(indices, indices, offsets, op="sparse_linear_values_grad")
+    if dout.shape[1] != weights.shape[1]:
+        raise ValueError(
+            f"sparse_linear_values_grad 的 dout 与 weights 最后一维必须一致，"
+            f"得到 {dout.shape[1]} 与 {weights.shape[1]}"
+        )
+    if dout.shape[0] != slots - 1:
+        raise ValueError(
+            f"sparse_linear_values_grad 的 dout 步数应为 {slots - 1}，"
+            f"得到 {dout.shape[0]}"
+        )
+    if dout.dtype != weights.dtype:
+        raise TypeError(
+            f"sparse_linear_values_grad 的 dout 与 weights 必须同 dtype，"
+            f"得到 {dout.dtype} 与 {weights.dtype}"
+        )
+    return TensorType(dout.dtype, indices.shape)
+
+
+def _ref_sparse_linear_values_grad(
+    args: List[np.ndarray], attrs: dict
+) -> np.ndarray:
+    """``dvalues[e] = dout[s(e), :] · weights[indices[e], :]``。
+
+    ``s(e)`` 是事件 ``e`` 所属的步，由 ``offsets`` 唯一决定。与权重梯度不同，
+    这里**没有重复下标问题**：每个事件只写一次，不需要 ``add.at``。
+    """
+    dout, weights, indices, offsets = args
+    steps, cols = int(dout.shape[0]), int(dout.shape[1])
+    rows = int(weights.shape[0])
+    nnz = int(indices.shape[0])
+    _check_event_offsets(np.asarray(offsets), nnz, "sparse_linear_values_grad")
+    idx = np.asarray(indices, dtype=np.int64)
+    if idx.size and (idx.min() < 0 or idx.max() >= rows):
+        raise ValueError(
+            f"sparse_linear_values_grad 的 indices 必须落在 [0, {rows})，"
+            f"得到 [{int(idx.min())}, {int(idx.max())}]"
+        )
+    acc = np.float32 if dout.dtype == np.float16 else dout.dtype
+    d = dout.astype(acc, copy=False)
+    w = weights.astype(acc, copy=False)
+    dv = np.zeros(nnz, dtype=acc)
+    for s in range(steps):
+        lo, hi = int(offsets[s]), int(offsets[s + 1])
+        if hi > lo:
+            dv[lo:hi] = (w[idx[lo:hi]] * d[s][None, :]).sum(axis=1)
+    return dv.astype(dout.dtype)
+
+
+register(
+    Op(
+        name="sparse_linear_values_grad",
+        infer=_infer_sparse_linear_values_grad,
+        reference=_ref_sparse_linear_values_grad,
+        doc="sparse_linear 对事件幅度 values 的梯度：dvalues[e] = dout[s(e)] · "
+        "weights[indices[e]]。s(e) 由 offsets 决定，每个事件只写一次，"
+        "不需要原子加。输出长度等于事件数 E，可以是符号维",
+    )
+)
+
+
 def _check_spike_matrix(spikes: TensorType, op: str) -> Tuple[int, int]:
     if spikes.rank != 2:
         raise ValueError(

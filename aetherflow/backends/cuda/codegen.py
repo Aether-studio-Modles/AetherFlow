@@ -68,6 +68,7 @@ from ...lower.kernels import (
     spike_linear_weight_grad,
     spike_offsets,
     sparse_linear,
+    sparse_linear_values_grad,
     sparse_linear_weight_grad,
 )
 
@@ -1911,6 +1912,16 @@ def spike_csr_serial_source() -> Kernel:
 def sparse_linear_weight_grad_source() -> Kernel:
     """事件驱动稀疏线性对权重梯度的 L2 描述（生产路径）。"""
     return sparse_linear_weight_grad()
+
+
+def sparse_linear_values_grad_source() -> Kernel:
+    """事件驱动稀疏线性对事件幅度梯度的 L2 描述（生产路径）。
+
+    与权重梯度相反，这里按步并行、逐事件算点积，不需要原子加——事件之间
+    不存在重复下标。没有手写模板对照物：骨架就是"一段事件 + 一段列号"，
+    与 ``sparse_linear`` 的前向同形。
+    """
+    return sparse_linear_values_grad()
 
 
 def spike_linear_source() -> Kernel:

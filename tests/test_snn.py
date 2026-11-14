@@ -19,6 +19,7 @@ from aetherflow import (
     ReferenceBackend,
     backward,
     dumps,
+    f16,
     f32,
     f64,
     i32,
@@ -388,6 +389,222 @@ class TestSparseLinear(unittest.TestCase):
             })["dweights"],
             rtol=1e-6,
         )
+
+
+class TestSparseLinearValuesGrad(unittest.TestCase):
+    """事件幅度的梯度（5.204）：``dvalues[e] = dout[s(e)] · W[idx[e]]``。
+
+    这组用例要证明四件事：
+
+    1. 与解析式逐事件一致（不是"能跑"）；
+    2. 事件之间彼此独立——同一步里两个事件命中同一行时，各自的梯度互不干扰；
+    3. 空步不产生事件，也就不产生梯度，长度始终等于事件数；
+    4. 事件数 ``E`` 是符号维时反向图依然成立，f16 与 f64 都不例外。
+    """
+
+    STEPS, ROWS, COLS = 4, 6, 5
+    OFFSETS = np.array([0, 2, 2, 4, 5], dtype=np.int32)
+    INDICES = np.array([1, 3, 3, 0, 1], dtype=np.int32)
+
+    def _feed(self, seed=0, dtype=np.float32):
+        rng = np.random.default_rng(seed)
+        # numpy 的 ``random(dtype=)`` 不接受 float16，先在 f32 上采样再落位。
+        return {
+            "weights": rng.random((self.ROWS, self.COLS), dtype=np.float32).astype(dtype),
+            "indices": self.INDICES,
+            "values": rng.random(self.INDICES.size, dtype=np.float32).astype(dtype),
+            "offsets": self.OFFSETS,
+        }
+
+    def _graph(self, dt=f32, nnz=None, steps=None):
+        nnz = self.INDICES.size if nnz is None else nnz
+        steps = self.STEPS if steps is None else steps
+        g = Graph("sparse_values_grad")
+        w = g.input("weights", dt[self.ROWS, self.COLS])
+        idx = g.input("indices", i32[nnz])
+        val = g.input("values", dt[nnz])
+        off = g.input("offsets", i32[steps + 1])
+        g.output(g.add_node("sparse_linear", [w, idx, val, off]), "y")
+        return g
+
+    def _dvalues(self, graph, feed, dout):
+        bwd = backward(graph, wrt=[graph.find("values")], seeds={"y": "dy"})
+        return _run(bwd, {**feed, "dy": dout})["dvalues"]
+
+    @staticmethod
+    def _expected(indices, offsets, weights, dout):
+        """逐事件算 ``dout[s] · W[idx[e]]``，作为唯一真值。"""
+        out = np.zeros(len(indices), dtype=np.float32)
+        for s in range(len(offsets) - 1):
+            lo, hi = int(offsets[s]), int(offsets[s + 1])
+            for e in range(lo, hi):
+                out[e] = float(np.dot(dout[s], weights[indices[e]]))
+        return out
+
+    def test_matches_analytic_reference(self):
+        feed = self._feed(seed=3)
+        rng = np.random.default_rng(4)
+        dout = rng.random((self.STEPS, self.COLS), dtype=np.float32)
+        got = self._dvalues(self._graph(), feed, dout)
+        expect = self._expected(
+            feed["indices"], feed["offsets"], feed["weights"], dout
+        )
+        np.testing.assert_allclose(got, expect, rtol=1e-6, atol=1e-6)
+
+    def test_repeated_row_keeps_events_independent(self):
+        """同一步里两个事件命中同一行：梯度按事件算，不是把两者加起来。"""
+        indices = np.array([3, 3], dtype=np.int32)
+        offsets = np.array([0, 1, 2], dtype=np.int32)
+        feed = {
+            "weights": np.arange(30, dtype=np.float32).reshape(self.ROWS, self.COLS),
+            "indices": indices,
+            "values": np.array([0.5, 2.0], dtype=np.float32),
+            "offsets": offsets,
+        }
+        dout = np.zeros((2, self.COLS), dtype=np.float32)
+        dout[0, 0], dout[1, 1] = 1.0, 2.0
+        got = self._dvalues(self._graph(nnz=2, steps=2), feed, dout)
+        w = feed["weights"][3]
+        np.testing.assert_allclose(got, [w[0], 2.0 * w[1]], rtol=1e-6, atol=1e-6)
+
+    def test_empty_step_contributes_no_events(self):
+        """第 1 步为空：输出长度仍是事件数，空步什么都不写。"""
+        feed = self._feed(seed=6)
+        dout = np.ones((self.STEPS, self.COLS), dtype=np.float32)
+        got = self._dvalues(self._graph(), feed, dout)
+        self.assertEqual(got.shape, (self.INDICES.size,))
+
+    def test_symbolic_event_count(self):
+        g = Graph("values_grad_symbolic")
+        w = g.input("weights", f32[self.ROWS, self.COLS])
+        idx = g.input("indices", i32["E"])
+        val = g.input("values", f32["E"])
+        off = g.input("offsets", i32[self.STEPS + 1])
+        g.output(g.add_node("sparse_linear", [w, idx, val, off]), "y")
+        bwd = backward(g, wrt=[g.find("values")], seeds={"y": "dy"})
+
+        for nnz in (3, 5):
+            rng = np.random.default_rng(nnz)
+            indices = np.arange(nnz, dtype=np.int32) % self.ROWS
+            offsets = np.zeros(self.STEPS + 1, dtype=np.int32)
+            offsets[1:] = np.linspace(0, nnz, self.STEPS, dtype=np.int32)
+            weights = rng.random((self.ROWS, self.COLS), dtype=np.float32)
+            dout = rng.random((self.STEPS, self.COLS), dtype=np.float32)
+            got = _run(
+                bwd,
+                {
+                    "weights": weights,
+                    "indices": indices,
+                    "values": rng.random(nnz, dtype=np.float32),
+                    "offsets": offsets,
+                    "dy": dout,
+                },
+            )["dvalues"]
+            np.testing.assert_allclose(
+                got, self._expected(indices, offsets, weights, dout),
+                rtol=1e-6, atol=1e-6,
+            )
+
+    def test_f16_matches_float_accumulation(self):
+        feed = self._feed(seed=11, dtype=np.float16)
+        rng = np.random.default_rng(12)
+        dout = rng.random((self.STEPS, self.COLS), dtype=np.float32).astype(np.float16)
+        got = self._dvalues(self._graph(f16), feed, dout)
+        expect = self._expected(
+            feed["indices"],
+            feed["offsets"],
+            feed["weights"].astype(np.float32),
+            dout.astype(np.float32),
+        )
+        np.testing.assert_allclose(
+            got.astype(np.float32), expect, rtol=2e-3, atol=2e-3
+        )
+
+    def test_finite_difference_matches(self):
+        """f64 上做中心差分：解析梯度与数值梯度必须一致。"""
+        feed = self._feed(seed=7, dtype=np.float64)
+        rng = np.random.default_rng(8)
+        dout = rng.random((self.STEPS, self.COLS))
+        g = self._graph(f64)
+        analytic = self._dvalues(g, feed, dout)
+
+        eps = 1e-6
+        numeric = np.zeros(self.INDICES.size)
+        for e in range(self.INDICES.size):
+            plus = feed["values"].copy()
+            minus = feed["values"].copy()
+            plus[e] += eps
+            minus[e] -= eps
+            yp = _run(g, {**feed, "values": plus})["y"]
+            ym = _run(g, {**feed, "values": minus})["y"]
+            numeric[e] = ((yp - ym) * dout).sum() / (2.0 * eps)
+        np.testing.assert_allclose(analytic, numeric, rtol=1e-6, atol=1e-6)
+
+    def test_backward_graph_is_portable_and_round_trips(self):
+        g = self._graph()
+        bwd = backward(g, wrt=[g.find("values")])
+        verify(bwd)
+        verify_portable_only(bwd)
+        feed = self._feed(seed=9)
+        dout = np.ones((self.STEPS, self.COLS), dtype=np.float32)
+        a = _run(bwd, {**feed, "dy": dout})["dvalues"]
+        b = _run(loads(dumps(bwd)), {**feed, "dy": dout})["dvalues"]
+        np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-6)
+
+    def test_wrong_step_count_is_refused_at_build(self):
+        g = Graph("values_grad_bad_steps")
+        dout = g.input("dout", f32[self.STEPS - 1, self.COLS])
+        w = g.input("weights", f32[self.ROWS, self.COLS])
+        idx = g.input("indices", i32[self.INDICES.size])
+        off = g.input("offsets", i32[self.STEPS + 1])
+        with self.assertRaises(ValueError):
+            g.add_node("sparse_linear_values_grad", [dout, w, idx, off])
+
+    def test_dtype_mismatch_is_refused_at_build(self):
+        g = Graph("values_grad_bad_dtype")
+        dout = g.input("dout", f32[self.STEPS, self.COLS])
+        w = g.input("weights", f64[self.ROWS, self.COLS])
+        idx = g.input("indices", i32[self.INDICES.size])
+        off = g.input("offsets", i32[self.STEPS + 1])
+        with self.assertRaises(TypeError):
+            g.add_node("sparse_linear_values_grad", [dout, w, idx, off])
+
+    def _direct(self, dt=f32, steps=None, nnz=None):
+        steps = self.STEPS if steps is None else steps
+        nnz = self.INDICES.size if nnz is None else nnz
+        g = Graph("values_grad_direct")
+        dout = g.input("dout", dt[steps, self.COLS])
+        w = g.input("weights", dt[self.ROWS, self.COLS])
+        idx = g.input("indices", i32[nnz])
+        off = g.input("offsets", i32[steps + 1])
+        g.output(g.add_node("sparse_linear_values_grad", [dout, w, idx, off]), "y")
+        return g
+
+    def test_out_of_range_index_is_rejected(self):
+        g = self._direct(steps=2, nnz=2)
+        with self.assertRaises(ValueError):
+            _run(
+                g,
+                {
+                    "dout": np.zeros((2, self.COLS), dtype=np.float32),
+                    "weights": np.zeros((self.ROWS, self.COLS), dtype=np.float32),
+                    "indices": np.array([0, self.ROWS], dtype=np.int32),
+                    "offsets": np.array([0, 1, 2], dtype=np.int32),
+                },
+            )
+
+    def test_offsets_must_be_non_decreasing(self):
+        g = self._direct()
+        with self.assertRaises(ValueError):
+            _run(
+                g,
+                {
+                    "dout": np.zeros((self.STEPS, self.COLS), dtype=np.float32),
+                    "weights": np.zeros((self.ROWS, self.COLS), dtype=np.float32),
+                    "indices": np.zeros(self.INDICES.size, dtype=np.int32),
+                    "offsets": np.array([0, 2, 1, 4, 5], dtype=np.int32),
+                },
+            )
 
 
 class TestSpikeLinear(unittest.TestCase):

@@ -2042,6 +2042,77 @@ def sparse_linear_weight_grad() -> Kernel:
     )
 
 
+def sparse_linear_values_grad() -> Kernel:
+    """``sparse_linear`` 对事件幅度的梯度：``dvalues[e] = dout[s] · W[r]``。
+
+    与权重梯度"按输出散射、重复下标要原子加"不同，这里**按步并行**：第
+    ``i`` 个线程独占第 ``i`` 步的全部事件，逐个算一个长度 ``cols`` 的点积，
+    直接写 ``dvalues[e]``。每个事件只被一个线程写一次，因此不需要原子加。
+
+    并行度取步数而不是事件数，是为了避免"事件 → 步"的映射：那需要在设备上
+    对 ``offsets`` 做二分查找（L2 没有 while，只能展开成定长 for），而这里
+    ``offsets`` 只需顺序读一遍。代价是同一 batch 内步数少时并行度偏低、且
+    空步的线程直接空转——两点都比多一层二分简单。
+    """
+    dout_at = Bin("+", Bin("*", Var("i"), Var("cols")), Var("n"))
+    weight_at = Bin("+", Bin("*", Var("r"), Var("cols")), Var("n"))
+    return Kernel(
+        name="sparse_linear_values_grad",
+        params=(
+            Tensor("dout"),
+            Tensor("weights"),
+            Tensor("indices", type_name="int"),
+            Tensor("offsets", type_name="int"),
+            Tensor("dvalues", read_only=False),
+            Scalar("long long", "cols"),
+            Scalar("long long", "rows"),
+            Scalar("long long", "nnz"),
+            Scalar("long long", "steps"),
+            Tensor("err", read_only=False, type_name="int"),
+        ),
+        body=grid_stride(
+            Var("steps"),
+            *(
+                Let("const long long", "s", Var("i")),
+                *_event_segment(),
+                For(
+                    "e",
+                    Var("lo"),
+                    Var("hi"),
+                    Num("1"),
+                    (
+                        *_event_row_check(),
+                        Let("float", "acc", Num("0.f")),
+                        For(
+                            "n",
+                            Num("0"),
+                            Var("cols"),
+                            Num("1"),
+                            (
+                                Assign(
+                                    Var("acc"),
+                                    Bin(
+                                        "+",
+                                        Var("acc"),
+                                        Bin(
+                                            "*",
+                                            Load("dout", dout_at),
+                                            Load("weights", weight_at),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                            incr="++",
+                        ),
+                        Store("dvalues", Var("e"), Var("acc")),
+                    ),
+                    incr="++",
+                ),
+            ),
+        ),
+    )
+
+
 def spike_linear() -> Kernel:
     """事件驱动的脉冲线性：``out[s, n] = Σ_e spikes[s, indices[e]] * W[indices[e], n]``。
 

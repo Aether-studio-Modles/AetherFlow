@@ -942,16 +942,28 @@ def _embedding(ctx):
 
 @vjp("sparse_linear")
 def _sparse_linear(ctx):
-    """事件驱动稀疏线性：只有 ``weights`` 需要梯度。
+    """事件驱动稀疏线性：``weights`` 与 ``values`` 都有梯度。
 
-    ``indices`` / ``offsets`` 是整数索引，没有梯度；``values`` 是事件幅度
-    （SNN 里是 0/1 的发放强度），当前不训练它——按 ``dropout_mask`` 的约定
-    返回 ``None`` 表示"该输入确实不接收梯度"，而不是造一个零张量。
+    前向对 ``values`` 是线性的（``out[s] = Σ_e values[e] * W[idx[e]]``），所以
 
-    ``rows`` 只能由属性带过来：反向图里没有 ``weights`` 这个输入（它只通过
-    ``ctx.input(0)`` 取形状），而散射内核必须知道行数才能检查越界。
+        dvalues[e] = dout[s(e), :] · W[idx[e], :]
+
+    每个事件只出现一次，这条梯度是**逐事件独立**的，不需要 ``add.at`` 式的
+    重复下标累加。它与权重梯度的方向正好相反：权重是"把事件散射回行"（会撞
+    行、要原子加），这里是"把每行收回来"（不撞事件、直接写）。
+
+    为什么不做成"散射进稠密 ``(S, K)`` 的 dspikes"：那需要 ``(S, K)`` 的缓冲与
+    原子加，正好把前向省下来的稠密脉冲矩阵又在反向造回来。事件形态的梯度
+    长度就是 ``E``，交给 ``spike`` 之类的上游算子按事件处理即可。
+
+    ``indices`` / ``offsets`` 是整数索引，没有梯度。``rows`` 只能由属性带过来：
+    反向图里没有 ``weights`` 这个输入，而散射内核必须知道行数才能检查越界。
     """
     shape = _static(ctx.input(0), "sparse_linear")
+    dvalues = ctx.b.add_node(
+        "sparse_linear_values_grad",
+        [ctx.g, ctx.input(0), ctx.input(1), ctx.input(3)],
+    )
     return (
         ctx.b.add_node(
             "sparse_linear_weight_grad",
@@ -959,7 +971,7 @@ def _sparse_linear(ctx):
             {"rows": int(shape[0])},
         ),
         None,
-        None,
+        dvalues,
         None,
     )
 
