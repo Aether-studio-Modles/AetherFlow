@@ -54,8 +54,14 @@ def _scalar_loss(graph, feed) -> float:
 
 
 def _numeric_grad(graph, feed, name: str, eps: float = 1e-6) -> np.ndarray:
-    """中心差分：对 ``feed[name]`` 的每个元素单独扰动。"""
-    arr = feed[name]
+    """中心差分：对 ``feed[name]`` 的每个元素单独扰动。
+
+    先复制成 ndarray 再放回 ``feed``：标量输入（``shape=()``）在某些写法下
+    是 numpy 标量，``reshape(-1)`` 只是视图的临时桥接，原地扰动改不到
+    ``feed``，数值梯度会静默变成 0——测试会误判实现有问题。
+    """
+    arr = np.array(feed[name], copy=True)
+    feed[name] = arr
     flat = arr.reshape(-1)
     grad = np.zeros(flat.size, dtype=np.float64)
     for i in range(flat.size):
@@ -266,6 +272,40 @@ class TestLinearAlgebraGrad(_GradTest):
             }
 
         self.assertGradients(build)
+
+    def test_scalar_norm_parameters_keep_their_shape(self):
+        """广播成标量的 gamma/beta，梯度形状必须回到参数形状（F09）。
+
+        归一化轴是最后一维时，对"其余轴"求和得到的是 (3,)，而参数是 ()；
+        不做最终归约的话，优化器会在形状校验处直接失败（或更糟：静默错用）。
+        """
+
+        def build():
+            g = Graph("layernorm_scalar")
+            x = g.input("x", f64[2, 3])
+            gamma = g.input("gamma", f64[()])
+            beta = g.input("beta", f64[()])
+            g.output(g.add_node("layernorm", [x, gamma, beta], {"axes": (-1,)}), "y")
+            return g, {
+                "x": _rand((2, 3)),
+                "gamma": _rand((), seed=1),
+                "beta": _rand((), seed=2),
+            }
+
+        _, _, analytic = self.assertGradients(build)
+        self.assertEqual(analytic[1].shape, ())
+        self.assertEqual(analytic[2].shape, ())
+
+    def test_scalar_rmsnorm_gamma_keeps_its_shape(self):
+        def build():
+            g = Graph("rmsnorm_scalar")
+            x = g.input("x", f64[2, 3])
+            gamma = g.input("gamma", f64[()])
+            g.output(g.add_node("rmsnorm", [x, gamma], {"axes": (-1,)}), "y")
+            return g, {"x": _rand((2, 3)), "gamma": _rand((), seed=1)}
+
+        _, _, analytic = self.assertGradients(build)
+        self.assertEqual(analytic[1].shape, ())
 
     def test_reduce_sum_keepdims(self):
         def build():

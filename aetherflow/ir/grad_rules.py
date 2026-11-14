@@ -621,10 +621,12 @@ def _layernorm(ctx):
     )
     xhat = b.add_node("mul", [xc, inv_std])
 
-    # gamma / beta 的形状是"归一化轴上的长度"，所以要对**其余所有轴**求和
+    # gamma / beta 的形状是"归一化轴上的长度"，所以要对**其余所有轴**求和。
+    # 参数本身可能被广播（标量 gamma/beta 也合法）：最后必须归约到它的
+    # 实际形状，否则梯度是 (C,) 而参数是 ()，求和/更新会直接报形状不一致。
     rest = tuple(i for i in range(r) if i not in norm)
-    dbeta = sum_axes(b, g, rest)
-    dgamma = sum_axes(b, b.add_node("mul", [g, xhat]), rest)
+    dbeta = sum_to(b, sum_axes(b, g, rest), beta.type.shape)
+    dgamma = sum_to(b, sum_axes(b, b.add_node("mul", [g, xhat]), rest), gamma.type.shape)
 
     dhat = b.add_node("mul", [g, gamma])
     m1 = b.add_node(
@@ -757,7 +759,12 @@ def _rmsnorm(ctx):
     )
 
     rest = tuple(i for i in range(r) if i not in norm)
-    dgamma = sum_axes(b, b.add_node("mul", [b.add_node("mul", [g, x]), inv_r]), rest)
+    # 同 layernorm：gamma 可以被广播成标量，梯度要归约回它的实际形状。
+    dgamma = sum_to(
+        b,
+        sum_axes(b, b.add_node("mul", [b.add_node("mul", [g, x]), inv_r]), rest),
+        gamma.type.shape,
+    )
 
     dgx = b.add_node("mul", [g, gamma])
     dx_first = b.add_node("mul", [inv_r, dgx])
