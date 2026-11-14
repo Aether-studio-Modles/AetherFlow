@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -21,6 +23,7 @@ from ..backends.base import Backend
 from ..backends.reference_backend import ReferenceBackend
 from ..ir.grad import backward
 from ..ir.graph import Graph
+from ..ir.serialize import dumps as _serialize_dumps
 from ..passes.autocast import Autocast
 from ..runtime.bf16 import pack_bf16, unpack_bf16
 from ._arrays import array_module
@@ -40,6 +43,29 @@ _KEY_MASK = 0xFFFFFFFFFFFFFFFF
 _KEY_GOLDEN = 0x9E3779B97F4A7C15
 _KEY_MIX_A = 0xBF58476D1CE4E5B9
 _KEY_MIX_B = 0x94D049BB133111EB
+
+
+def _plain_config(value: Any) -> Any:
+    """把配置值收成能进 meta 的标量：npz 的 meta 只收 0 维标量。"""
+    if isinstance(value, Mapping):
+        return {str(key): _plain_config(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(
+        f"配置凭证里的 {type(value).__name__} 无法序列化；"
+        "hyperparams() 只能返回标量、标量列表或它们的嵌套字典"
+    )
+
+
+def _config_json(value: Any) -> str:
+    """配置凭证的稳定字符串：键排序、无多余空白，可直接判等。"""
+    return json.dumps(
+        _plain_config(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
 
 def _derive_rng_key(seed: int, step: int, rank: int) -> int:
@@ -940,6 +966,24 @@ class Trainer:
             "host_in_sync": not self._host_stale,
         }
 
+    def graph_fingerprint(self) -> str:
+        """前向图的稳定指纹（16 位十六进制）。
+
+        参数集合、形状与 dtype 已经由 ``load_checkpoint`` 校验，但**计算图
+        本身**换了（激活、残差连接、算子实现）时这些全都对得上，续训却走上
+        另一条轨迹。这里对序列化后的 IR 取哈希，把"同一组参数"收紧成"同一
+        张图"。autocast 会改图里的 dtype，因此指纹也隐含了精度信息。
+        """
+        text = _serialize_dumps(self.graph)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    def _schedule_config(self) -> str:
+        """调度器配置凭证；自定义调度器没有 ``hyperparams`` 时只比类型。"""
+        if self.schedule is None:
+            return ""
+        hyper = getattr(self.schedule, "hyperparams", None)
+        return _config_json(hyper()) if callable(hyper) else ""
+
     def snapshot(self, meta: Optional[Mapping[str, object]] = None) -> TrainingSnapshot:
         """在**当前 step 边界**取一份一致的主机快照。
 
@@ -956,6 +1000,9 @@ class Trainer:
         参数与优化器状态的话，窗口里已经算过的几个微批会静默消失，续训的
         等效 batch 变小。窗口长度、已累积数与 RNG 约定（``seed``/``rank``）
         一并进 meta，供 :meth:`load_training_state` 校验"这是同一条轨迹"。
+
+        前向图指纹与调度器类型 / 超参也一起进 meta：参数名、形状与 dtype
+        全都相同，但计算图换了、或者衰减曲线换了，续训同样不是同一条轨迹。
         """
         merged: Dict[str, object] = dict(meta or {})
         if self.scaler is not None:
@@ -974,6 +1021,15 @@ class Trainer:
         # 计算精度也是"同一条轨迹"的一部分：bf16 与 f16 的量化误差不同，
         # 把 bf16 的存档接进 f16 训练器，损失曲线会先跳一下再继续。
         merged.setdefault("mixed_precision", self.mixed_precision or "f32")
+        # 配置凭证：参数集合与形状由 load_checkpoint 校验，这里补上"图本身"
+        # 与"调度器怎么衰减"——两者都改了、看起来却仍是同一个模型时，
+        # 续训的轨迹会悄悄换一条。
+        merged.setdefault("graph_fingerprint", self.graph_fingerprint())
+        merged.setdefault(
+            "schedule_kind",
+            "" if self.schedule is None else type(self.schedule).__name__,
+        )
+        merged.setdefault("schedule_config", self._schedule_config())
         source: Mapping[str, Any]
         if self._device_ready:
             # master weights 模式下存档存的必须是 f32 主副本：f16 驻留缓冲
@@ -1020,8 +1076,9 @@ class Trainer:
         """恢复一整份训练状态，包括**尚未提交**的梯度累积窗口。
 
         与模块级 ``load_checkpoint`` 的差别在于它知道训练配置：累积窗口长度、
-        RNG 约定、有没有 scaler。任何一项对不上都会在加载前报错，而不是等到
-        续训几十步之后才从损失曲线上看出"这不是同一条轨迹"。
+        RNG 约定、有没有 scaler、前向图指纹、调度器类型与超参。任何一项对不上
+        都会在加载前报错，而不是等到续训几十步之后才从损失曲线上看出"这不是
+        同一条轨迹"。
 
         参数与槽位仍然原地写入 ``store`` / 优化器；设备态**已经建立**时拒绝
         （那份训练参数在显存里，写主机副本不会生效）：请在第一次 ``step``
@@ -1067,6 +1124,33 @@ class Trainer:
                     f"存档的 mixed_precision={saved_mp!r} 与当前 {current_mp!r} 不一致；"
                     "量化误差不同，这不是同一条训练轨迹"
                 )
+
+        if "graph_fingerprint" in saved_meta:
+            saved_fp = str(saved_meta["graph_fingerprint"])
+            current_fp = self.graph_fingerprint()
+            if saved_fp != current_fp:
+                raise ValueError(
+                    f"存档的前向图指纹 {saved_fp} 与当前 {current_fp} 不一致；"
+                    "参数名与形状可能相同，但计算图不同，续训不是同一条轨迹"
+                )
+        if "schedule_kind" in saved_meta:
+            saved_kind = str(saved_meta["schedule_kind"])
+            current_kind = (
+                "" if self.schedule is None else type(self.schedule).__name__
+            )
+            if saved_kind != current_kind:
+                raise ValueError(
+                    f"存档的调度器是 {saved_kind or '无'}，当前是 "
+                    f"{current_kind or '无'}；学习率轨迹不同，不能接着续训"
+                )
+            if "schedule_config" in saved_meta:
+                saved_cfg = str(saved_meta["schedule_config"])
+                current_cfg = self._schedule_config()
+                if saved_cfg != current_cfg:
+                    raise ValueError(
+                        f"存档的调度器配置 {saved_cfg} 与当前 {current_cfg} 不一致；"
+                        "类型相同但超参不同，学习率轨迹不是同一条"
+                    )
 
         pending = int(saved_meta.get("accum_pending", 0))
         if not 0 <= pending <= self.accumulate_steps:

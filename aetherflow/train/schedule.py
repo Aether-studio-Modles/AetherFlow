@@ -58,6 +58,14 @@ class CosineDecay:
         progress = step / self.total_steps
         return self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1.0 + math.cos(math.pi * progress))
 
+    def hyperparams(self) -> dict:
+        """配置凭证：续训时据此判断"还是不是同一个调度器"。"""
+        return {
+            "base_lr": self.base_lr,
+            "total_steps": self.total_steps,
+            "min_lr": self.min_lr,
+        }
+
     def __repr__(self) -> str:
         return (
             f"CosineDecay(base_lr={self.base_lr:g}, total_steps={self.total_steps}, "
@@ -93,6 +101,15 @@ class StepDecay:
             return self.base_lr
         return max(self.base_lr * self.gamma ** (step // self.step_size), self.min_lr)
 
+    def hyperparams(self) -> dict:
+        """配置凭证：续训时据此判断"还是不是同一个调度器"。"""
+        return {
+            "base_lr": self.base_lr,
+            "step_size": self.step_size,
+            "gamma": self.gamma,
+            "min_lr": self.min_lr,
+        }
+
     def __repr__(self) -> str:
         return (
             f"StepDecay(base_lr={self.base_lr:g}, step_size={self.step_size}, "
@@ -118,6 +135,14 @@ class ExponentialDecay:
         if step <= 0:
             return self.base_lr
         return max(self.base_lr * self.gamma ** step, self.min_lr)
+
+    def hyperparams(self) -> dict:
+        """配置凭证：续训时据此判断"还是不是同一个调度器"。"""
+        return {
+            "base_lr": self.base_lr,
+            "gamma": self.gamma,
+            "min_lr": self.min_lr,
+        }
 
     def __repr__(self) -> str:
         return (
@@ -159,6 +184,18 @@ class Warmup:
             return self.start_lr
         frac = step / self.steps
         return self.start_lr + (self.target_lr - self.start_lr) * frac
+
+    def hyperparams(self) -> dict:
+        """配置凭证：内层递归进来，否则"换了内层、warmup 参数不变"会被放过。"""
+        inner = getattr(self.schedule, "hyperparams", None)
+        return {
+            "steps": self.steps,
+            "start_lr": self.start_lr,
+            "inner": {
+                "kind": type(self.schedule).__name__,
+                "hyperparams": inner() if callable(inner) else None,
+            },
+        }
 
     def __repr__(self) -> str:
         return f"Warmup({self.schedule!r}, steps={self.steps}, start_lr={self.start_lr:g})"
