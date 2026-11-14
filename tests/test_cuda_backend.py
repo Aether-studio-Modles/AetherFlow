@@ -9,6 +9,7 @@
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -950,6 +951,63 @@ class TestCudaConv(CudaTestCase):
             CudaBackend(conv_impl="tiled").execute(g, feed)
 
 
+class TestCudnnFallback(unittest.TestCase):
+    """auto 的回落面不依赖 GPU：engine 构造失败只记录、不冒泡。
+
+    真机上会撞到的形态是"库在、符号没了"：cuDNN 版本不匹配时，取
+    ``cudnnGetConvolutionForwardAlgorithm_v7`` 会抛 ``AttributeError``。
+    它和"库不在"是同一类事实（这台机器用不了这条快路径），auto 必须回落；
+    漏掉它会让默认的 ``conv_impl="auto"`` 在构造期就整体失败。
+
+    这里用 ``__new__`` 绕过 ``__init__``，只测判定逻辑，不碰 GPU。
+    """
+
+    @staticmethod
+    def _backend(impl: str):
+        backend = CudaBackend.__new__(CudaBackend)
+        backend.conv_impl = impl
+        backend._cudnn = None
+        backend._cudnn_broken = None
+        backend._capturing = False
+        return backend
+
+    def test_auto_falls_back_when_symbols_are_missing(self):
+        backend = self._backend("auto")
+        with mock.patch(
+            "aetherflow.backends.cuda.backend.CudnnConv",
+            side_effect=AttributeError("no cudnnGetConvolutionForwardAlgorithm_v7"),
+        ):
+            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1))
+        self.assertIn("AttributeError", backend._cudnn_broken)
+        # 失败只试一次：第二次不该再构造 engine
+        with mock.patch(
+            "aetherflow.backends.cuda.backend.CudnnConv",
+            side_effect=AssertionError("不该再尝试构造"),
+        ):
+            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1))
+
+    def test_explicit_cudnn_reports_the_reason(self):
+        """显式 cudnn 不做回落：构造期就把原因报出来，别让排障的人猜。"""
+        backend = self._backend("cudnn")
+        with mock.patch(
+            "aetherflow.backends.cuda.backend.CudnnConv",
+            side_effect=AttributeError("no v7"),
+        ):
+            with self.assertRaises(BackendCapabilityError) as ctx:
+                backend._cudnn_engine()
+        self.assertIn("cuDNN", str(ctx.exception))
+
+    def test_f64_and_grouped_never_pick_cudnn(self):
+        backend = self._backend("auto")
+        self.assertFalse(backend._pick_cudnn(np.dtype("float64"), 1))
+        self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 2))
+
+    def test_capture_keeps_the_path_fixed(self):
+        backend = self._backend("auto")
+        backend._capturing = True
+        self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1))
+
+
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")
 class TestCudaConvCudnn(unittest.TestCase):
     """cuDNN 快路径（5.74）：只覆盖 groups=1 的 f32/f16，结果与 im2col 逐点一致。
@@ -966,6 +1024,28 @@ class TestCudaConvCudnn(unittest.TestCase):
             raise unittest.SkipTest("系统里没有可用的 cuDNN")
         cls.fast = CudaBackend(conv_impl="cudnn")
         cls.im2col = CudaBackend(conv_impl="im2col")
+        # 库能加载不等于这台机器跑得动：cuDNN 9.28 要求 Linux 驱动 >= 570.26，
+        # 在驱动 550 上句柄、描述符、v7 算法选择全部返回 0，执行期才报 5003
+        # （CUDNN_STATUS_EXECUTION_FAILED_CUDART）。这让"显式要求 cuDNN"的
+        # 一组用例整组变红，而根因是机器能力，与"没有 cuDNN"同性质——
+        # 所以先用一个最小卷积探一次，能力不足就整组跳过（5.230）。
+        try:
+            probe = Graph()
+            px = probe.input("x", f32[(1, 1, 3, 3)])
+            pw = probe.input("w", f32[(1, 1, 1, 1)])
+            probe.output(probe.add_node("conv2d", [px, pw], {}), "y")
+            cls.fast.execute(
+                probe,
+                {
+                    "x": np.ones((1, 1, 3, 3), np.float32),
+                    "w": np.ones((1, 1, 1, 1), np.float32),
+                },
+            )
+        except RuntimeError as exc:
+            text = str(exc)
+            if "5003" in text or "EXECUTION_FAILED" in text:
+                raise unittest.SkipTest(f"cuDNN 可加载但执行失败（驱动代际不足）: {exc}")
+            raise
 
     def _check(self, x_shape, w_shape, attrs=None, bias=True, dtype=f32, tol=1e-3):
         g = Graph()

@@ -315,12 +315,17 @@ class CudaBackend(DeviceBackend):
             return None
         try:
             self._cudnn = CudnnConv()
-        except (CudnnUnavailable, OSError) as exc:
+        except (CudnnUnavailable, OSError, AttributeError) as exc:
+            # AttributeError 是"库在、符号没了"：cuDNN 版本不匹配时
+            # ``CudnnConv.__init__`` 里取 legacy 符号（如
+            # ``cudnnGetConvolutionForwardAlgorithm_v7``）会抛它。它和"库不在"
+            # 是同一类事实（这台机器用不了这条快路径），auto 必须回落；
+            # 漏在这里会让默认 ``conv_impl="auto"`` 在构造期就整体失败。
             if self.conv_impl == "cudnn":
                 raise BackendCapabilityError(
                     f"{self._LABEL} 的 conv_impl='cudnn' 需要可用的 cuDNN：{exc}"
                 ) from exc
-            self._cudnn_broken = str(exc)
+            self._cudnn_broken = f"{type(exc).__name__}: {exc}"
             return None
         return self._cudnn
 
