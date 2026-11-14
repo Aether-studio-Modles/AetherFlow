@@ -92,7 +92,7 @@ def _require_torch() -> TorchCompatibility:
     return check_torch(torch)
 
 
-def _to_dtype(dtype: Any) -> DType:
+def _to_dtype(dtype: Any, row: Optional[TorchCompatibility] = None) -> DType:
     key = str(dtype).replace("torch.", "")
     if key not in _TORCH_DTYPE:
         supported = "、".join(sorted(_TORCH_DTYPE))
@@ -100,10 +100,17 @@ def _to_dtype(dtype: Any) -> DType:
             f"不支持的 dtype: {dtype}；矩阵内的 dtype 是 {supported}"
             "（bool 没有对应的张量语义；int64 会按 i32 承载，越界值在入口拒绝）"
         )
+    if row is not None and not row.accepts_dtype(key):
+        raise UnsupportedOperatorError(
+            f"dtype {key} 不在 torch 兼容矩阵的 {row.span} 行里"
+            f"（该行声明 {list(row.dtypes)}）；声明与入口共用同一份事实来源"
+        )
     return _TORCH_DTYPE[key]
 
 
-def _constant_node(g: Graph, value: Any, source: str) -> Value:
+def _constant_node(
+    g: Graph, value: Any, source: str, row: Optional[TorchCompatibility] = None
+) -> Value:
     """把 torch 常量张量落成 IR 的 ``constant`` 节点。
 
     常量写进 attrs（``data``），所以图仍然自包含、可序列化。超过上限就显式
@@ -114,7 +121,7 @@ def _constant_node(g: Graph, value: Any, source: str) -> Value:
             f"{source} 不是常量张量（{type(value).__name__}），无法落成 constant 节点"
         )
     tensor = value.detach().cpu()
-    dtype = _to_dtype(tensor.dtype)
+    dtype = _to_dtype(tensor.dtype, row)
     # numpy 没有 bfloat16：先转 float32 取位；执行器在节点边界按 bf16 量化。
     if str(tensor.dtype) == "torch.bfloat16":
         tensor = tensor.float()
@@ -123,6 +130,15 @@ def _constant_node(g: Graph, value: Any, source: str) -> Value:
         raise UnsupportedOperatorError(
             f"{source} 有 {arr.size} 个元素，超过导入上限 "
             f"{MAX_IMPORTED_CONSTANT_ELEMENTS}；请改成显式输入或参数"
+        )
+    if dtype is i32 and arr.size and (
+        int(arr.min()) < -(2 ** 31) or int(arr.max()) > 2 ** 31 - 1
+    ):
+        # 直接落成 constant 会绕过执行器入口的范围检查：在这里拒绝，
+        # 而不是让 numpy 构造时溢出或静默截断。
+        raise UnsupportedOperatorError(
+            f"{source} 的整数值超出 i32 范围（IR 只有 i32 载体）；"
+            "请改成显式输入，让执行器入口报出具体越界值"
         )
     attrs = {
         "dtype": dtype,
@@ -176,7 +192,7 @@ def import_exported(
     exported_program: Any, name: str = "imported", param_prefix: str = "p_"
 ) -> ImportedModel:
     """把 ``torch.export.ExportedProgram`` 翻译成 IR 图。"""
-    _require_torch()
+    row = _require_torch()
 
     gm = exported_program.graph_module
     sig = exported_program.graph_signature
@@ -268,11 +284,11 @@ def import_exported(
                         f"提升常量 {key!r}（节点 {node.name}）不在导出的常量表里"
                     )
                 env[node.name] = _constant_node(
-                    g, lifted_constants[key], f"常量 {key!r}"
+                    g, lifted_constants[key], f"常量 {key!r}", row
                 )
                 continue
             val = node.meta["val"]
-            t = TensorType(_to_dtype(val.dtype), _shape_of(val))
+            t = TensorType(_to_dtype(val.dtype, row), _shape_of(val))
             env[node.name] = g.input(node.name, t)
             if node.name in state_by_input:
                 key = state_by_input[node.name]
@@ -293,7 +309,7 @@ def import_exported(
                 raise UnsupportedOperatorError(
                     f"节点 {node.name} 引用的属性 {node.target!r} 不在 GraphModule 上"
                 )
-            env[node.name] = _constant_node(g, raw, f"属性 {node.target!r}")
+            env[node.name] = _constant_node(g, raw, f"属性 {node.target!r}", row)
         elif node.op == "output":
             names = list(getattr(sig, "user_outputs", ()) or ())
             for i, v in enumerate(kept_slots):
@@ -780,6 +796,10 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
     if target == "aten.embedding.default":
         # (weight, indices, padding_idx=None, scale_grad_by_freq=False, sparse=False)
         padding_idx = _aten_arg(args, kwargs, 2, "padding_idx", None)
+        if isinstance(padding_idx, Value):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 padding_idx 是图内值；只支持静态缺省（None / -1）"
+            )
         if padding_idx is not None and int(padding_idx) >= 0:
             raise UnsupportedOperatorError(
                 f"节点 {node.name} 带 padding_idx={padding_idx}：IR 的 embedding 是"

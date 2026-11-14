@@ -1180,27 +1180,36 @@ class Trainer:
 
         # 数据迭代位置与权重是同一份状态的两半：存档记了位置就必须恢复，
         # 没记位置就不能假装"从头开始"是续训。两边的存在性必须一致。
-        # 存档 meta 只收标量，所以 loader 状态按 ``data_<键>`` 铺平。
-        saved_data = {
-            str(key)[len("data_"):]: value
-            for key, value in saved_meta.items()
-            if str(key).startswith("data_") and str(key) != "data_kind"
-        }
+        # 存档 meta 只收标量，所以位置序列化成单个 JSON 字符串键
+        # ``loader_state``——用一个专属键而不是 ``data_*`` 前缀，避免占用
+        # 调用方自己的 meta 命名空间（``data_dir`` 之类不应被当成游标）。
+        saved_state = saved_meta.get("loader_state")
+        saved_data = None
+        if saved_state is not None:
+            try:
+                parsed = json.loads(str(saved_state))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"存档里的 loader_state 不是合法 JSON（{exc}）；存档已损坏"
+                ) from exc
+            if not isinstance(parsed, Mapping):
+                raise ValueError("存档里的 loader_state 不是映射；存档已损坏")
+            saved_data = parsed
         if loader is not None and not isinstance(loader, DataLoader):
             raise TypeError(f"loader 必须是 DataLoader，得到 {type(loader).__name__}")
         if loader is not None:
             if not saved_data:
                 raise KeyError(
-                    "存档里没有数据迭代位置（data_*）；它来自没有记录 DataLoader "
-                    "状态的训练，不能按当前 loader 续接"
+                    "存档里没有数据迭代位置（loader_state）；它来自没有记录 "
+                    "DataLoader 状态的训练，不能按当前 loader 续接"
                 )
-            saved_kind = str(saved_meta.get("data_kind", ""))
+            saved_kind = str(saved_meta.get("loader_kind", ""))
             if saved_kind != type(loader).__name__:
                 raise ValueError(
                     f"存档的数据迭代位置来自 {saved_kind or '未知类型'}，当前是 "
                     f"{type(loader).__name__}；游标不能接到另一种数据流上"
                 )
-            # 只校验、不写：真正的恢复放到 ``load_checkpoint`` 之后。
+            # 只校验、不写：真正的恢复放到所有提交完成之后。
             loader.validate_state_dict(saved_data)
         elif saved_data:
             raise KeyError(
@@ -1369,9 +1378,6 @@ class Trainer:
         )
         if "trainer_steps" in meta:
             self.steps = int(meta["trainer_steps"])
-        if loader is not None:
-            # 权重已经提交；这一步在检查阶段验过，不会再失败。
-            loader.load_state_dict(saved_data)  # type: ignore[arg-type]
 
         if pending:
             self._accumulator.load_state_dict(
@@ -1400,6 +1406,11 @@ class Trainer:
 
         self._refresh_resident()
         self._host_stale = False
+        if loader is not None:
+            # 所有提交（权重、累积窗口、BN、AMP、驻留副本）都完成后才推进游标：
+            # 排在中间的话，后面的步骤一旦失败就会留下"权重已恢复、数据位置
+            # 已前进、其余状态是旧的"的半现场。
+            loader.load_state_dict(saved_data)  # type: ignore[arg-type]
         return meta
 
     def save_checkpoint(
@@ -1425,19 +1436,19 @@ class Trainer:
             if not isinstance(loader, DataLoader):
                 raise TypeError(f"loader 必须是 DataLoader，得到 {type(loader).__name__}")
             occupied = [
-                key
-                for key in merged
-                if key == "data" or str(key).startswith("data_")
+                key for key in merged if key in ("loader_state", "loader_kind")
             ]
             if occupied:
                 raise ValueError(
                     f"meta 里已经有 {occupied}；不要再同时传 loader，"
                     "否则两份数据位置会互相覆盖"
                 )
-            merged["data_kind"] = type(loader).__name__
-            # 存档 meta 只收标量：把 loader 位置按 ``data_<键>`` 铺平。
-            for key, value in loader.state_dict().items():
-                merged[f"data_{key}"] = int(value)
+            merged["loader_kind"] = type(loader).__name__
+            # 存档 meta 只收标量：位置整体序列化成一个 JSON 字符串。
+            merged["loader_state"] = json.dumps(
+                {key: int(value) for key, value in loader.state_dict().items()},
+                sort_keys=True,
+            )
         snapshot = self.snapshot(meta=merged or None)
         if blocking:
             snapshot.save(path)
@@ -1456,18 +1467,9 @@ class Trainer:
         存档、恢复后从同一批继续"不用调用方手工记位置——把 loader 一起交给
         :meth:`save_checkpoint` / :meth:`load_training_state` 即可。
         """
-        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
-            raise ValueError(f"epochs 必须是正整数，得到 {epochs!r}")
         if not isinstance(loader, DataLoader):
             raise TypeError(f"loader 必须是 DataLoader，得到 {type(loader).__name__}")
-        losses: List[float] = []
-        for _ in range(epochs):
-            for batch in loader:
-                loss = self.step(batch)
-                losses.append(loss)
-                if on_step is not None:
-                    on_step(len(losses) - 1, loss)
-        return losses
+        return self.run(loader, epochs=epochs, on_step=on_step)
 
     def run(
         self,

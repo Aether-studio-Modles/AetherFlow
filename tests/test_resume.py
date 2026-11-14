@@ -302,13 +302,28 @@ class TestLoaderHandoff(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "没有传 loader"):
             fresh.load_training_state(self._path("with.npz"))
 
+    def test_user_meta_is_not_confused_with_loader_state(self):
+        """loader 状态用专属键，调用方的 ``data_*`` 不会被当成游标。"""
+        loader = DataLoader(_pairs(8), 4)
+        trainer, _ = _trainer()
+        trainer.save_checkpoint(
+            self._path(), meta={"data_dir": "/tmp/shard", "epoch": 3}, loader=loader
+        )
+        fresh, _ = _trainer()
+        meta = fresh.load_training_state(self._path(), loader=DataLoader(_pairs(8), 4))
+        self.assertEqual(meta["data_dir"], "/tmp/shard")
+        self.assertEqual(int(meta["epoch"]), 3)
+        self.assertIn("loader_state", meta)
+
     def test_invalid_arguments_are_rejected(self):
         loader = DataLoader(_pairs(8), 4)
         trainer, _ = _trainer()
         with self.assertRaises(TypeError):
             trainer.save_checkpoint(self._path(), loader="loader")
         with self.assertRaisesRegex(ValueError, "互相覆盖"):
-            trainer.save_checkpoint(self._path(), meta={"data": {}}, loader=loader)
+            trainer.save_checkpoint(
+                self._path(), meta={"loader_state": "{}"}, loader=loader
+            )
         with self.assertRaises(ValueError):
             trainer.run_loader(loader, epochs=0)
         with self.assertRaises(TypeError):

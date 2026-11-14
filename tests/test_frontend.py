@@ -800,6 +800,39 @@ class TestTorchExport(unittest.TestCase):
         with self.assertRaisesRegex(UnsupportedOperatorError, "导入上限"):
             self.import_exported(ep)
 
+    def test_out_of_range_integer_constant_is_rejected(self):
+        """常量不进执行器入口，所以 i32 范围检查必须在导入时做。"""
+        from types import SimpleNamespace
+
+        from aetherflow.frontend import UnsupportedOperatorError
+        from torch.fx import Graph, GraphModule
+
+        class Holder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.big = torch.tensor([2 ** 40], dtype=torch.int64)
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.zeros(1, dtype=torch.int32)
+        big = graph.get_attr("big")
+        out = graph.call_function(torch.ops.aten.add.Tensor, (x, big))
+        graph.output((out,))
+        gm = GraphModule(Holder(), graph)
+        ep = SimpleNamespace(
+            graph_module=gm,
+            graph_signature=SimpleNamespace(
+                inputs_to_parameters={},
+                inputs_to_buffers={},
+                inputs_to_lifted_tensor_constants={},
+                user_inputs=("x",),
+                user_outputs=(),
+            ),
+            state_dict={},
+        )
+        with self.assertRaisesRegex(UnsupportedOperatorError, "i32"):
+            self.import_exported(ep)
+
     def test_int64_input_beyond_i32_is_rejected_at_entry(self):
         """i64 → i32 是收窄：越界值在入口报错，不静默包成别的下标。"""
 
