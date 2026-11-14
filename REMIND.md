@@ -12,7 +12,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2242 个用例 / 410 跳过，WSL HIP 2242 个用例 / 369 跳过。
+当前基线：本地 2255 个用例 / 410 跳过，WSL HIP 2255 个用例 / 369 跳过。
 
 ## CUDA 真机
 
@@ -32,6 +32,8 @@ CUDA 侧只能做离线 / 伪 runtime 验证；涉及 `cufftExec*`、真机耗�
 - 分片只省主机内存；流水只有"顺序"层面的重叠，单进程串行切卡没有真并发。
 - `fft` 没有 VJP（IR 缺 `conj`）；HIP 没有 rocFFT，复数只在容器层面可承载。
 - `spike_linear` 的 `dspikes` 必须稠密：替代梯度在未发放位置同样非零。
+- `topk_mask`（5.218 MoE 路由用）只有参考实现，CUDA / HIP 没有对应内核。
+- MoE 采用稠密参考语义：所有 token 过全部专家再按 top-k 门控加权，只支持单设备。
 
 ## 临时脚本
 
