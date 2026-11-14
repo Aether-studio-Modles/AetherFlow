@@ -42,7 +42,13 @@ class TestCusparseRegistry(unittest.TestCase):
             self.assertIn(str(np.dtype(dtype)), message)
 
     def test_int32_index_maps_to_32i(self):
-        self.assertEqual(index_type(np.int32), 1)
+        """``cusparseIndexType_t``：16U=1 / 32I=2 / 64I=3 / 8I=4。
+
+        写成 1 会被 cuSPARSE 当成 uint16 读 ``rowOffsets``：真机上不报参数
+        错误，而是内核越界访问（``cudaErrorIllegalAddress``）。这个数字必须
+        钉在用例里，不能靠"跑得动"来判断。
+        """
+        self.assertEqual(index_type(np.int32), 2)
 
     def test_int64_index_is_refused_with_reason(self):
         with self.assertRaises(CusparseUnsupported) as caught:

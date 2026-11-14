@@ -2142,12 +2142,18 @@ class TestCudaEvents(CudaTestCase):
             self.assertTrue(np.all(seg[1:] > seg[:-1]), f"第 {t} 行没有按列递增")
 
     def test_many_rows_stay_on_serial_path(self):
-        """行数超过 SM×32 时留在串行铺法：这条分支也要有真机用例。"""
+        """行数超过 SM×32 时留在串行铺法：这条分支也要有真机用例。
+
+        阈值是 ``SM 数 × 32``，所以行数必须按当前卡算，不能写死 1024：
+        M40（24 SM，阈值 768）上 1024 行已经在串行侧，V100（80 SM，阈值 2560）
+        上同样的 1024 行仍是并行侧。
+        """
+        steps = max(1024, self.cuda.sm_count * 32 + 8)
         self.assertFalse(
-            plan_csr_scan_enabled(1024, self.cuda.sm_count),
-            "用例前提是 1024 行判给串行铺法",
+            plan_csr_scan_enabled(steps, self.cuda.sm_count),
+            f"用例前提是 {steps} 行判给串行铺法",
         )
-        self._check(1024, 64, density=0.1)
+        self._check(steps, 64, density=0.1)
 
     def test_capacity_overflow_is_reported(self):
         """容量不足：设备侧记 ``err``，主机侧抛错，绝不静默丢事件。"""

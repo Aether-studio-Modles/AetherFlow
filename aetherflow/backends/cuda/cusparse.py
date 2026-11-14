@@ -44,8 +44,9 @@ __all__ = [
 
 # cudaDataType_t
 _CUDA_R_32F = 0
-# cusparseIndexType_t
-_CUSPARSE_INDEX_32I = 1
+# cusparseIndexType_t：16U=1 / 32I=2 / 64I=3 / 8I=4。写成 1 会被当成 uint16
+# 去读 int32 的 rowOffsets，越界读在真机上就是 cudaErrorIllegalAddress。
+_CUSPARSE_INDEX_32I = 2
 # cusparseIndexBase_t
 _CUSPARSE_INDEX_BASE_ZERO = 0
 # cusparseOperation_t
@@ -340,7 +341,7 @@ class CusparseSpMM:
                     self.handle,
                     _CUSPARSE_OPERATION_NON_TRANSPOSE,
                     _CUSPARSE_OPERATION_NON_TRANSPOSE,
-                    ctypes.byref(alpha), a, b, c,
+                    ctypes.byref(alpha), a, b,
                     ctypes.byref(beta), c,
                     _CUDA_R_32F, _CUSPARSE_SPMM_ALG_DEFAULT,
                     ctypes.c_void_p(0) if workspace is None

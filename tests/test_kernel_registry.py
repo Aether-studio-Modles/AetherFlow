@@ -17,6 +17,7 @@ import numpy as np
 
 from aetherflow import BackendCapabilityError, KernelRegistry
 from aetherflow.backends.cuda import CUDA_AVAILABLE, CUDA_OPS, CudaBackend
+from aetherflow.backends.cuda.cufft import available as cufft_available
 from aetherflow.ir import Graph, f32
 from aetherflow.ir.ops import OPS
 
@@ -178,10 +179,17 @@ class TestCudaRegistry(unittest.TestCase):
         cls.backend = CudaBackend()
 
     def test_capabilities_come_from_registry(self):
-        self.assertEqual(
-            self.backend.capabilities(), self.backend.kernels.capabilities()
-        )
-        self.assertEqual(self.backend.capabilities(), CUDA_OPS)
+        """能力面 = 内核注册表 + **可用**的 cuFFT（5.210）。
+
+        ``fft`` / ``rfft`` 走 cuFFT 库节点、不在内核表里，所以这里不能要求
+        两边恒等；cuFFT 缺失时也不能声明——能力面必须如实反映"能不能算"。
+        """
+        caps = self.backend.capabilities()
+        base = self.backend.kernels.capabilities()
+        self.assertLessEqual(base, caps)
+        self.assertLessEqual(CUDA_OPS, caps)
+        self.assertLessEqual(caps, CUDA_OPS | {"fft", "rfft"})
+        self.assertEqual(caps - base == {"fft", "rfft"}, cufft_available())
 
     def test_kernels_are_bound_methods(self):
         self.assertEqual(self.backend.kernels.get("add").__name__, "_op_add")

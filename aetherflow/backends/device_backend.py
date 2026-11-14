@@ -1220,8 +1220,9 @@ class DeviceBackend(Executor):
             if a.dtype == self.cp.float16 and name in self._f16_ops:
                 continue
             hint = ""
-            if a.dtype == self.cp.float16:
-                hint = f"（{name} 目前只支持 float32）"
+            if a.dtype in (self.cp.float16, self.cp.float64):
+                accept = "float16 / float32" if name in self._f16_ops else "float32"
+                hint = f"（{name} 目前只支持 {accept}）"
             raise BackendCapabilityError(
                 f"{self._LABEL}的 {name} 不支持 {a.dtype}{hint}。"
                 "不做隐式降级：请在前端显式插入 cast。"
