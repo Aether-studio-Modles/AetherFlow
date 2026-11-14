@@ -856,6 +856,42 @@ class TestBatchGeneration(unittest.TestCase):
         for fed in rec.fed:
             self.assertNotIn("embed", fed)
 
+    def test_constraint_is_per_row(self):
+        """约束按行生效：受约束行只吐许可 token，未约束行与单条生成一致。"""
+        spec = self._spec(batch=2)
+        params = spec.init_params(seed=24)
+        prompts = [[3], [3, 4]]
+        got = generate_batch(
+            BACKEND, params, prompts, spec, max_new_tokens=2,
+            constraint=[_OnlyToken(3, spec.vocab_size), None],
+        )
+        self.assertEqual(got[0], [3, 3])
+        free = list(generate(
+            BACKEND, params, prompts[1], self._spec(batch=1), max_new_tokens=2
+        ))
+        self.assertEqual(got[1], free)
+
+    def test_row_constraint_sequence_must_match_batch(self):
+        spec = self._spec(batch=2)
+        params = spec.init_params()
+        with self.assertRaisesRegex(ValueError, "受约束"):
+            generate_batch(BACKEND, params, [[3], [3, 4]], spec,
+                           max_new_tokens=1,
+                           constraint=[_OnlyToken(3, spec.vocab_size)])
+        with self.assertRaisesRegex(ValueError, "受约束"):
+            generate_batch(BACKEND, params, [[3], [3, 4]], spec,
+                           max_new_tokens=1,
+                           constraint=[_OnlyToken(3, spec.vocab_size), object()])
+
+    def test_unfinished_row_constraint_is_an_error(self):
+        spec = self._spec(batch=2)
+        params = spec.init_params()
+        with self.assertRaisesRegex(ValueError, "第 1 行"):
+            generate_batch(
+                BACKEND, params, [[3], [3, 4]], spec, max_new_tokens=1,
+                constraint=[_OnlyToken(3, spec.vocab_size), _NeverDone()],
+            )
+
     def test_invalid_batch_requests_are_rejected(self):
         spec = self._spec(batch=2)
         params = spec.init_params()
@@ -974,6 +1010,23 @@ class TestLMRunner(unittest.TestCase):
         # 单条入口在非 1 的会话上显式拒绝，并指向正确的入口
         with self.assertRaisesRegex(ValueError, "generate_batch"):
             runner.generate([3], max_new_tokens=1)
+        runner.close()
+
+    def test_batch_session_row_constraints_match_plain_call(self):
+        """会话复用不改变逐行约束的结果：与无状态入口逐 token 相同。"""
+        spec = _small(batch=2, steps=4)
+        params = spec.init_params(seed=18)
+        prompts = [[3], [3, 4]]
+        held = [_OnlyToken(3, spec.vocab_size), None]
+        want = generate_batch(
+            BACKEND, params, prompts, spec, max_new_tokens=2, constraint=held
+        )
+        runner = LMRunner(BACKEND, params, spec)
+        got = runner.generate_batch(
+            prompts, max_new_tokens=2,
+            constraint=[_OnlyToken(3, spec.vocab_size), None],
+        )
+        self.assertEqual(got, want)
         runner.close()
 
     def test_invalid_request_is_rejected_before_any_graph(self):
@@ -1417,11 +1470,16 @@ class TestBeamRunnerGuards(unittest.TestCase):
 
 
 class _OnlyToken:
-    """只允许一个 token 的玩具约束：验证约束是**按请求**生效的。"""
+    """只允许一个 token 的玩具约束：验证约束是**按请求**生效的。
+
+    ``feed`` 之后把 ``done`` 置真：与 ``JsonGrammar`` 一样，走完文法才允许
+    结束；批量路径会逐行检查这一位。
+    """
 
     def __init__(self, token, vocab):
         self.token = int(token)
         self.vocab = int(vocab)
+        self.done = False
 
     def allowed(self):
         return np.asarray([self.token], dtype=np.int64)
@@ -1429,6 +1487,19 @@ class _OnlyToken:
     def feed(self, token):
         if int(token) != self.token:
             raise AssertionError(f"约束被违反：{token}")
+        self.done = True
+
+
+class _NeverDone:
+    """永不完成的玩具文法：批量路径必须把"没走完"当成错误而不是半截结果。"""
+
+    done = False
+
+    def allowed(self):
+        return np.asarray([3], dtype=np.int64)
+
+    def feed(self, token):
+        pass
 
 
 class TestServingEngine(unittest.TestCase):

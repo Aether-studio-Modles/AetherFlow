@@ -693,6 +693,42 @@ def _require_resident(backend, resident: bool, who: str) -> None:
         )
 
 
+def _row_constraints(constraint, batch: int) -> List[Optional[Any]]:
+    """把 ``constraint`` 规范成逐行的文法列表（长度等于 ``batch``）。
+
+    三种合法形态：``None``（不受约束）、长度等于 ``batch`` 的序列（元素为
+    文法或 ``None``）、以及 ``batch=1`` 时的单个文法。**单个实例不能共享给
+    多行**：文法的推进状态是逐序列的，共享会把两条序列的写法搅在一起。
+    """
+    if constraint is None:
+        return [None] * batch
+    if isinstance(constraint, Sequence) and not isinstance(constraint, (str, bytes)):
+        items = list(constraint)
+        if len(items) != batch:
+            raise ValueError(
+                f"受约束解码的 constraint 序列有 {len(items)} 项，"
+                f"与 batch={batch} 不符；每行要一份独立的文法实例（或 None）"
+            )
+    else:
+        if batch != 1:
+            raise ValueError(
+                "受约束解码在批量里需要逐行的文法实例："
+                f"batch={batch} 时要传入长度相同的序列（元素为文法或 None），"
+                "不能共用一个实例（文法状态是逐序列的）"
+            )
+        items = [constraint]
+    for index, item in enumerate(items):
+        if item is None:
+            continue
+        for attr in ("allowed", "feed", "done"):
+            if not hasattr(item, attr):
+                raise ValueError(
+                    f"受约束解码的第 {index} 行对象缺少 {attr}；"
+                    "需要 models.lm_tools 的文法接口（allowed / feed / done）"
+                )
+    return items
+
+
 def _check_batch_request(
     spec: LMSpec,
     prompts: Sequence[Sequence[int]],
@@ -700,12 +736,13 @@ def _check_batch_request(
     max_new_tokens: int,
     eos_id: Optional[int],
     constraint,
-) -> Tuple[List[List[int]], int, int, int]:
-    """校验一次批量请求，返回 ``(prompts, chunk, limit, stop)``。
+) -> Tuple[List[List[int]], int, int, int, List[Optional[Any]]]:
+    """校验一次批量请求，返回 ``(prompts, chunk, limit, stop, constraints)``。
 
     逐条复用 :func:`_check_request` 的规则（空 prompt、块长、上限、停止符），
-    因此单条与批量的报错文本一致。受约束解码在批量里显式拒绝：文法的推进
-    状态是逐序列的，共享一个实例会把两条序列的写法搅在一起。
+    因此单条与批量的报错文本一致。受约束解码按行接受：``constraint`` 可以
+    是长度等于 ``batch`` 的序列（元素为文法或 ``None``），``batch=1`` 时也
+    可以直接给一个文法实例；单个实例共享给多行是显式拒绝的。
     """
     rows = [[int(token) for token in row] for row in prompts]
     if not rows:
@@ -715,21 +752,17 @@ def _check_batch_request(
             f"prompts 有 {len(rows)} 条，与 spec.batch={spec.batch} 不符；"
             "图按固定 batch 构建，请用匹配的 spec 或补齐序列"
         )
-    if constraint is not None:
-        raise ValueError(
-            "批量生成不支持受约束解码：文法状态是逐序列的；"
-            "请逐条调用 generate / LMRunner.generate"
-        )
+    constraints = _row_constraints(constraint, spec.batch)
     checked = [
-        _check_request(spec, row, chunk_size, max_new_tokens, eos_id, None)
-        for row in rows
+        _check_request(spec, row, chunk_size, max_new_tokens, eos_id, held)
+        for row, held in zip(rows, constraints)
     ]
     _, chunk, limit, stop = checked[0]
     if chunk_size is None:
         # "整段一次算完"对批量意味着按最长的那条来：用第一条的长度会让
         # 短 prompt 决定所有行的块长，白白多切几块。
         chunk = max(len(row) for row in checked)
-    return [item[0] for item in checked], chunk, limit, stop
+    return [item[0] for item in checked], chunk, limit, stop, constraints
 
 
 def _run_stateless(
@@ -900,11 +933,13 @@ def generate_batch(
     返回**生成的部分**（不含 prompt），形状是 ragged 的 ``List[List[int]]``，
     第 ``i`` 条就是第 ``i`` 行的结果。
 
-    受约束解码（``constraint``）在批量里显式拒绝：文法状态是逐序列的，
-    共享一个实例会把两条序列的写法搅在一起。
+    受约束解码（``constraint``）**按行接受**：给一个长度等于 ``spec.batch``
+    的序列，元素是该行的文法实例或 ``None``（该行不受约束）。文法的推进
+    状态是逐序列的，因此不能把同一个实例共享给多行；``batch=1`` 时仍可直接
+    传单个文法（等价于长度为 1 的序列）。
     """
     spec = spec or LMSpec()
-    checked, chunk, limit, stop = _check_batch_request(
+    checked, chunk, limit, stop, constraints = _check_batch_request(
         spec, prompts, chunk_size, max_new_tokens, eos_id, constraint
     )
     if limit == 0:
@@ -922,7 +957,7 @@ def generate_batch(
         top_p=top_p,
         repetition_penalty=repetition_penalty,
         seed=seed,
-        constraint=None,
+        constraint=constraints,
         resident=resident,
         who="generate_batch(resident=True)",
     )
@@ -1327,6 +1362,7 @@ def _sample(
     它从来没有被"生成"过）。
     """
     batch = spec.batch
+    constraints = _row_constraints(constraint, batch)
     rngs = [np.random.default_rng(seed + index) for index in range(batch)]
     generated: List[List[int]] = [[] for _ in range(batch)]
     history: List[List[int]] = [list(row) for row in prompts]
@@ -1334,8 +1370,9 @@ def _sample(
 
     def _pick(index: int, logits_row) -> int:
         row = _host_row(backend, logits_row)
-        if constraint is not None:
-            row = _masked(row, constraint.allowed())
+        held = constraints[index]
+        if held is not None:
+            row = _masked(row, held.allowed())
         token = int(sample_next_token(
             row,
             temperature=temperature,
@@ -1345,17 +1382,19 @@ def _sample(
             recent=history[index],
             rng=rngs[index],
         ))
-        if constraint is not None:
-            constraint.feed(token)
+        if held is not None:
+            held.feed(token)
         return token
 
     def _finish():
         # 半截 JSON 比"报错"危险得多：调用方会把它当成功结果去解析。
-        if constraint is not None and not constraint.done:
-            raise ValueError(
-                "受约束解码没有在 max_new_tokens 内走完文法；请提高上限，"
-                "或检查 prompt 是否预置了半个结构（约束从第一个生成 token 起生效）"
-            )
+        for index, held in enumerate(constraints):
+            if held is not None and not held.done:
+                raise ValueError(
+                    f"第 {index} 行的受约束解码没有在 max_new_tokens 内走完文法；"
+                    "请提高上限，或检查 prompt 是否预置了半个结构"
+                    "（约束从第一个生成 token 起生效）"
+                )
         return generated
 
     # 本轮只采一次：结束后不再采样的行会进入 inactive，不再消耗随机数。
@@ -1669,7 +1708,7 @@ class LMRunner:
                 "会话里已有缓存前缀；请先 reset() 再批量生成"
                 "（批量路径不做前缀续接）"
             )
-        checked, chunk, limit, stop = _check_batch_request(
+        checked, chunk, limit, stop, constraints = _check_batch_request(
             self.spec, prompts, chunk_size, max_new_tokens, eos_id, constraint
         )
         if limit == 0:
@@ -1687,7 +1726,7 @@ class LMRunner:
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             seed=seed,
-            constraint=None,
+            constraint=constraints,
             resident=self.resident,
             graph_for=self._graph_for,
         )
