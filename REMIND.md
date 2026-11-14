@@ -12,7 +12,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2224 个用例 / 410 跳过，WSL HIP 2224 个用例 / 369 跳过。
+当前基线：本地 2229 个用例 / 410 跳过，WSL HIP 2229 个用例 / 369 跳过。
 
 ## CUDA 真机
 
