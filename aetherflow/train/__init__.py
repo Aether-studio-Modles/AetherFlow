@@ -34,6 +34,8 @@ from .parallel import (
     copy_across_devices,
 )
 from .params import ParameterStore, default_init, init_array
+from .pipeline import PipelineStage, PipelineTrainer
+from .sharded import ShardedOptimizer, shard_params
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
 
 __all__ = [
@@ -43,9 +45,13 @@ __all__ = [
     "Optimizer",
     "SGD",
     "Adam",
+    "ShardedOptimizer",
+    "shard_params",
     "Trainer",
     "TrainingState",
     "DataParallelTrainer",
+    "PipelineStage",
+    "PipelineTrainer",
     "allreduce",
     "allreduce_grads",
     "copy_across_devices",

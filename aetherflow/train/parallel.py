@@ -45,6 +45,7 @@ from ..ir.grad import backward
 from ..ir.graph import Graph
 from .optim import Optimizer
 from .params import ParameterStore
+from .sharded import ShardedOptimizer
 
 __all__ = [
     "copy_across_devices",
@@ -237,8 +238,11 @@ class DataParallelTrainer:
             raise TypeError(f"graph 必须是 Graph，得到 {type(graph).__name__}")
         if not isinstance(store, ParameterStore):
             raise TypeError(f"store 必须是 ParameterStore，得到 {type(store).__name__}")
-        if not isinstance(optimizer, Optimizer):
-            raise TypeError(f"optimizer 必须是 Optimizer，得到 {type(optimizer).__name__}")
+        if not isinstance(optimizer, (Optimizer, ShardedOptimizer)):
+            raise TypeError(
+                f"optimizer 必须是 Optimizer 或 ShardedOptimizer，"
+                f"得到 {type(optimizer).__name__}"
+            )
         _check_multi_device_backend(backend)
         if reduction not in _REDUCTIONS:
             raise ValueError(
