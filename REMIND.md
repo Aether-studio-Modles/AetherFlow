@@ -12,7 +12,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2269 个用例 / 410 跳过，WSL HIP 2269 个用例 / 369 跳过。
+当前基线：本地 2285 个用例 / 410 跳过，WSL HIP 2285 个用例 / 369 跳过。
 
 ## CUDA 真机
 
@@ -37,6 +37,14 @@ CUDA 侧只能做离线 / 伪 runtime 验证；涉及 `cufftExec*`、真机耗�
 - 注意力反向按 query 行分块（5.219，块长 128）；`dropout > 0` 与符号序列维退回整块。
 - `ServingEngine` 的超时只在 `step` 边界生效（协作式），单步长内核打断不了；超时记录走
   `take_timed_out()`，绝不混进完成列表。
+- 集合通信（5.221）只做了能力声明与设备侧 provider 缝：没有接入真 NCCL / RCCL，
+  `overlap` 恒为 `False`（计算/通信重叠未实现），未注入 provider 时显式报
+  `DeviceCollectiveUnavailable`。
+- 跨进程 ZeRO（5.222）只把优化器槽位按 rank 切分落地（npz + `__meta__`），不省显存、
+  不做 all-gather；`load_shard` 靠片号 / 分片数 / 归属表三道校验兜底（优化器自身不查）。
+- torch 兼容矩阵（5.223）是声明式区间（2.9–2.13，四个 dtype）；区间内非 verified 版本
+  不保证回归覆盖，越界或 dtype 缺席显式抛 `UnsupportedTorchVersion` /
+  `UnsupportedOperatorError`。
 
 ## 临时脚本
 
