@@ -131,13 +131,59 @@ def import_exported(
     # torch.export 会把所有 buffer 提升为 placeholder，包括与推理无关的
     # ``num_batches_tracked``（int64 标量）。它们不进 IR 的 dtype 体系，
     # 也不该变成用户必须喂的输入——先算出真正被引用的 placeholder。
-    used: set = set()
+    #
+    # 训练态 BatchNorm 还会在 SSA 图里留下 ``add_(num_batches_tracked, 1)``：
+    # 输出 0 使用者，唯一可观测的效果是改那个 buffer。IR 的值不可变、也没有
+    # "图外状态"，这类节点只能跳过（running stats 由训练循环维护，5.26 /
+    # 5.208）。只放行"目标确实是 buffer"的节点：写到用户输入或参数上的原地
+    # 写仍然交给翻译器明确拒绝，而不是悄悄丢掉。
+    #
+    # ``ep.run_decompositions()`` 之后还会多出取 save_mean / save_invstd 的
+    # ``getitem``：同样是 0 使用者。它们没有可观测效果，跳过即可，否则会在
+    # "只保留第 0 个输出"的约定上报错。
+    no_op_mutations: set = set()
     for node in gm.graph.nodes:
-        if node.op in ("call_function", "call_method", "output"):
-            for inp in node.all_input_nodes:
-                used.add(inp.name)
+        if node.op != "call_function" or node.users or not node.args:
+            continue
+        if getattr(node.target, "__name__", "") == "getitem":
+            no_op_mutations.add(node.name)
+            continue
+        first = node.args[0]
+        if getattr(first, "name", None) in buffer_by_input:
+            no_op_mutations.add(node.name)
+
+    # 图输出也分两类：用户输出，以及 torch.export 附带的 buffer 更新 / save
+    # 中间量（训练态 BN 的 num_batches_tracked、save_mean / save_invstd）。
+    # 后者不属于张量语义——它们甚至可能是 IR 不支持的 int64——连同只服务它们
+    # 的那部分子图一起不翻译。用户输出的可达闭包用来决定哪些 placeholder
+    # 真正需要、哪些节点要翻译。
+    def _closure(roots):
+        seen: Dict[str, Any] = {}
+        stack = list(roots)
+        while stack:
+            v = stack.pop()
+            if v.name in seen:
+                continue
+            seen[v.name] = v
+            stack.extend(getattr(v, "all_input_nodes", ()))
+        return seen
+
+    user_outs = set(getattr(sig, "user_outputs", ()) or ())
+    output_node = next(n for n in gm.graph.nodes if n.op == "output")
+    slots = list(output_node.args[0])
+    if user_outs:
+        kept_slots = [v for v in slots if v.name in user_outs]
+        dropped_slots = [v for v in slots if v.name not in user_outs]
+    else:
+        kept_slots, dropped_slots = slots, []
+    live = _closure(kept_slots)
+    dead = {k: v for k, v in _closure(dropped_slots).items() if k not in live}
+
+    used: set = set(live)
 
     for node in gm.graph.nodes:
+        if node.name in dead:
+            continue
         if node.op == "placeholder":
             if node.name not in used:
                 continue
@@ -152,15 +198,16 @@ def import_exported(
             else:
                 user_inputs.append(node.name)
         elif node.op == "call_function":
+            if node.name in no_op_mutations:
+                continue  # buffer 的原地自增/写回：图外语义，见上面的说明
             env[node.name] = _translate(g, node, env)
         elif node.op == "get_attr":
             raise UnsupportedOperatorError(
                 f"暂不支持 get_attr 常量节点（{node.name}）；torch.export 通常会把参数提升为 placeholder"
             )
         elif node.op == "output":
-            outs = node.args[0]
             names = list(getattr(sig, "user_outputs", ()) or ())
-            for i, v in enumerate(outs):
+            for i, v in enumerate(kept_slots):
                 out_name = names[i] if i < len(names) else f"out{i}"
                 g.output(env[v.name], out_name)
         else:
@@ -413,6 +460,38 @@ def _batch_norm_inference(
     return (g.add(g.mul(x, scale), shift),)
 
 
+def _batch_norm_training(g: Graph, node: Any, args: List[Any], a, n) -> Value:
+    """训练态 BN -> IR 的 ``batch_norm``（用当前 batch 的统计量，axis=1）。
+
+    ``momentum`` 与 ``running_mean`` / ``running_var`` 不进图：IR 没有"图外
+    状态"，BN 的 running stats 由训练循环用 ``batch_norm_stats`` 自己维护
+    （5.26 的边界，5.208 把导入口打开）。这不是静默降级——训练态 BN 的输出
+    只依赖 batch 统计量、``weight``、``bias``、``eps``，这四样都在图里；
+    导出图里本来就没有 stats 更新那一步。
+
+    ``torch.export`` 会在图里留下 ``add_(num_batches_tracked, 1)`` 这类对
+    buffer 的原地写，由 :func:`import_exported` 统一跳过（0 使用者且目标
+    是 buffer），不经过这里。
+    """
+    x, weight, bias = a(0), a(1), a(2)
+    eps = float(n(7)) if len(args) > 7 and args[7] is not None else 1e-5
+    if x.type.rank < 2:
+        raise UnsupportedOperatorError(f"节点 {node.name} 的 BN 输入秩必须 >= 2")
+    channels = x.type.shape[1]
+    if not isinstance(channels, int):
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 的 BN 通道维含符号 {channels!r}，"
+            "IR 的 batch_norm 只接受静态通道维"
+        )
+    for label, value in (("weight", weight), ("bias", bias)):
+        if value.type.rank != 1 or value.type.shape[0] != channels:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 BN {label} 形状应为 ({channels},)，"
+                f"得到 {value.type.shape}"
+            )
+    return g.add_node("batch_norm", [x, weight, bias], {"axis": 1, "eps": eps})
+
+
 def _clamp(g: Graph, x: Value, lo: Optional[float], hi: Optional[float]) -> Value:
     """``clamp(x, lo, hi) = lo + relu(x-lo) - relu(x-hi)``。
 
@@ -579,19 +658,24 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
     if target == "aten._native_batch_norm_legit_no_training.default":
         return _batch_norm_inference(g, node, args, a, n)
 
+    if target == "aten._native_batch_norm_legit_functional.default":
+        # ``ep.run_decompositions()`` 之后的形态：返回 (out, save_mean,
+        # save_invstd)，我们只保留第 0 槽；后两者是 running stats 的中间量，
+        # 不属于张量语义（取它们的 getitem 若真是死节点已在入口跳过）。
+        training = bool(n(5)) if len(args) > 5 and args[5] is not None else False
+        if training:
+            return (_batch_norm_training(g, node, args, a, n),)
+        return _batch_norm_inference(g, node, args, a, n, eps_index=7)
+
     if target == "aten.batch_norm.default":
         # 新版 torch.export 对 eval 态的 BatchNorm 直接保留 aten.batch_norm：
         # (input, weight, bias, running_mean, running_var, training, momentum,
-        #  eps, cudnn_enabled)。训练态要同时更新 running stats 且返回多值，
-        # IR 的 batch_norm 不承接这部分，明确拒绝而不是悄悄按推理态算。
+        #  eps, cudnn_enabled)。推理态必须用冻结的 running stats，走下面的
+        # 仿射展开；训练态用当前 batch 的统计量，与 IR 的 batch_norm 语义一致，
+        # 直接映射（running stats 的维护不在张量语义里，见 5.26 / 5.208）。
         training = bool(n(5)) if len(args) > 5 and args[5] is not None else False
         if training:
-            raise UnsupportedOperatorError(
-                f"节点 {node.name} 是训练态 aten.batch_norm；"
-                "IR 的 batch_norm 不更新 running_mean/running_var，请换成 eval 态导出"
-            )
-        # aten.batch_norm 是单输出，而 _native_batch_norm_legit_no_training
-        # 是三输出；把展开结果按各自的槽位约定返回。
+            return _batch_norm_training(g, node, args, a, n)
         return _batch_norm_inference(g, node, args, a, n, eps_index=7)[0]
 
     if target == "aten.avg_pool2d.default":

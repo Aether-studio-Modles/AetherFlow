@@ -322,6 +322,95 @@ class TestTorchExport(unittest.TestCase):
             model.bn.running_var.uniform_(0.5, 1.5)
         self._roundtrip(model, torch.randn(2, 4, 8, 8), atol=1e-6)
 
+    def test_batch_norm_training(self):
+        """训练态 BN 用当前 batch 的统计量，与 IR 的 batch_norm 语义相同（5.208）。"""
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bn = nn.BatchNorm2d(4)
+
+            def forward(self, x):
+                return self.bn(x)
+
+        model = M().train()
+        imported = self._roundtrip(model, torch.randn(3, 4, 6, 6), atol=1e-6)
+        self.assertEqual(imported.graph.op_names(), ["batch_norm"])
+        # 只把 x 当用户输入：running stats 是参数表里的常量，num_batches_tracked
+        # 的原地自增被跳过，不该冒出来要求喂一个 int64 标量。
+        self.assertEqual(imported.user_inputs, ["x"])
+
+    def test_batch_norm_training_after_decompositions(self):
+        """``run_decompositions()`` 之后的训练态 BN 走同一条导入口。"""
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bn = nn.BatchNorm2d(4)
+
+            def forward(self, x):
+                return self.bn(x)
+
+        model = M().train()
+        example = torch.randn(3, 4, 6, 6)
+        ep = torch.export.export(model, (example,)).run_decompositions()
+        imported = self.import_exported(ep)
+        self.assertEqual(imported.graph.op_names(), ["batch_norm"])
+        self.assertEqual(imported.user_inputs, ["x"])
+        with torch.no_grad():
+            expected = model(example).numpy()
+        got = list(self.ref.execute(imported.graph, imported.feed(x=example.numpy())).values())[0]
+        np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-6)
+
+    def test_batch_norm_training_is_trainable(self):
+        """训练态 BN 导入后要能求导：dx / dweight / dbias 与 torch 对拍。"""
+        from aetherflow import backward
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bn = nn.BatchNorm2d(4)
+
+            def forward(self, x):
+                return self.bn(x)
+
+        torch.manual_seed(3)
+        model = M().train()
+        example = torch.randn(3, 4, 6, 6, requires_grad=True)
+        ep = torch.export.export(model, (example,))
+        imported = self.import_exported(ep)
+        out_name = imported.graph.output_names[0]
+        x_name = imported.user_inputs[0]
+        # 训练态 BN 会把 running_mean / running_var 也提升成图输入（它们是
+        # buffer，不是用户输入），但它们不在输出依赖路径上；默认 wrt=全部
+        # 输入会按 5.19x 的契约报 NoGradientError，所以要显式挑目标。
+        param_inputs = {v: k for k, v in ep.graph_signature.inputs_to_parameters.items()}
+        w_name = next(v for k, v in param_inputs.items() if k.split(".")[-1] == "weight")
+        b_name = next(v for k, v in param_inputs.items() if k.split(".")[-1] == "bias")
+        wanted = {x_name, w_name, b_name}
+        bwd = backward(
+            imported.graph, wrt=[v for v in imported.graph.inputs if v.name in wanted]
+        )
+
+        rng = np.random.default_rng(5)
+        seed = rng.standard_normal((3, 4, 6, 6)).astype(np.float32)
+        out = model(example)
+        (out * torch.from_numpy(seed)).sum().backward()
+
+        feed = imported.feed(**{x_name: example.detach().numpy()})
+        feed["d" + out_name] = seed
+        got = self.ref.execute(bwd, feed)
+
+        np.testing.assert_allclose(
+            got["d" + x_name], example.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            got["d" + w_name], model.bn.weight.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            got["d" + b_name], model.bn.bias.grad.numpy(), rtol=1e-4, atol=1e-4
+        )
+
     def test_avg_pool_and_cat(self):
         class M(nn.Module):
             def forward(self, x, y):
