@@ -28,6 +28,7 @@ from ..passes.autocast import Autocast
 from ..runtime.bf16 import pack_bf16, unpack_bf16
 from ._arrays import array_module
 from .amp import GradScaler
+from .bn import RunningStats, bn_sites, build_stats_graph
 from .checkpoint import TrainingSnapshot, inspect_checkpoint, load_checkpoint
 from .grads import GradientAccumulator
 from .optim import Optimizer
@@ -185,6 +186,15 @@ class Trainer:
     反缩放再交给优化器；溢出时跳过更新并减半 scale。与累积叠加时，反缩放
     发生在**每个微批**上（否则一个窗口里混着不同 scale 的梯度），任意微批
     出现非有限值就整窗作废——被污染的累加和没法只减掉出错的那一批。
+
+    ``bn_momentum`` 维护训练态 BN 的 running stats（默认 0.1，与 torch 一致）。
+    IR 的 ``batch_norm`` 只用当前 batch 的统计量，eval 需要的 running mean/var
+    不在图里；不维护它，"训练输出对齐"就只是训练态对齐。开启后每步前向之后
+    额外执行一张统计子图（只算到 BN 输入），按
+    ``running = (1-m) * running + m * batch`` 更新，方差用无偏估计。
+    ``None`` 表示显式关闭（例如图里没有 BN，或调用方自己维护）。**设备态
+    训练暂不支持**：捕获计划要求每步地址固定，而 running stats 是主机侧
+    EMA；含 BN 的图请用主机态，或用 ``bn_momentum=None`` 明确关掉。
     """
 
     def __init__(
@@ -207,6 +217,7 @@ class Trainer:
         schedule: Optional[Any] = None,
         accumulate_steps: int = 1,
         scaler: Optional[GradScaler] = None,
+        bn_momentum: Optional[float] = 0.1,
     ) -> None:
         if not isinstance(graph, Graph):
             raise TypeError(f"graph 必须是 Graph，得到 {type(graph).__name__}")
@@ -218,6 +229,13 @@ class Trainer:
             raise ValueError(f"accumulate_steps 必须是 >= 1 的整数，得到 {accumulate_steps!r}")
         if scaler is not None and not isinstance(scaler, GradScaler):
             raise TypeError(f"scaler 必须是 GradScaler，得到 {type(scaler).__name__}")
+        if bn_momentum is not None:
+            if isinstance(bn_momentum, bool) or not 0.0 <= float(bn_momentum) <= 1.0:
+                raise ValueError(
+                    f"bn_momentum 必须落在 [0, 1] 内（或 None 表示关闭），"
+                    f"得到 {bn_momentum!r}"
+                )
+            bn_momentum = float(bn_momentum)
         if schedule is not None and not callable(getattr(schedule, "lr_at", None)):
             raise TypeError(
                 f"schedule 必须有 lr_at(step)，得到 {type(schedule).__name__}"
@@ -296,6 +314,21 @@ class Trainer:
         self.graph = graph
         self.store = store
         self.optimizer = optimizer
+        # 训练态 BN 的 running stats：IR 的 batch_norm 只要当前 batch 的统计量，
+        # eval 需要的那对累积值由这里维护（见 ``train/bn.py``）。
+        self.bn_momentum = bn_momentum
+        self._bn_sites = bn_sites(graph)
+        self._bn_running: Optional[RunningStats] = None
+        self._bn_stats_graph: Optional[Graph] = None
+        if self._bn_sites and bn_momentum is not None:
+            if device_state:
+                raise ValueError(
+                    "设备态训练不支持训练态 BN 的 running stats 维护：捕获计划要求"
+                    "每步地址固定，而 running stats 是主机侧 EMA。请使用主机态，"
+                    "或显式传 bn_momentum=None 关掉（此后 eval 状态需自行维护）"
+                )
+            self._bn_stats_graph = build_stats_graph(graph, self._bn_sites)
+            self._bn_running = RunningStats(self._bn_sites)
         self.master_weights = bool(master_weights)
         self.mixed_precision = mixed_precision
         # 低精度驻留缓冲：只有 master weights 模式才有。``store`` 是 f32 主副本，
@@ -416,6 +449,9 @@ class Trainer:
             raise ValueError(
                 f"训练目标必须是标量，输出 {self.output!r} 的形状是 {out.shape}"
             )
+        # BN 统计量属于"观察到的数据"，与这一步是否真的更新参数无关：
+        # 累积窗口未满或 AMP 溢出跳过更新时，batch 统计量照样要进 EMA。
+        self._observe_bn(feed)
 
         if self._plan is None:
             result = self.backend.execute(
@@ -463,6 +499,34 @@ class Trainer:
                 feed[name] = self._resident_feed(name)
         feed.update(self._rng_feed())
         return feed
+
+    def _observe_bn(self, feed: Mapping[str, np.ndarray]) -> None:
+        """执行统计子图，按 momentum 推进每个站点的 running stats。
+
+        统计子图只覆盖 BN 输入之前的依赖闭包，因此代价远小于整张前向；
+        没有开启 ``bn_momentum`` 或图里没有 BN 时是空操作。
+        """
+        if self._bn_running is None or self._bn_stats_graph is None:
+            return
+        stats = self.backend.execute(
+            self._bn_stats_graph,
+            {value.name: feed[value.name] for value in self._bn_stats_graph.inputs},
+        )
+        for site in self._bn_sites:
+            self._bn_running.update(site.name, stats[site.output], self.bn_momentum)
+
+    def bn_running_stats(self) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+        """各站点的 ``(running_mean, running_var)`` 副本，可直接喂给 ``bn_infer``。
+
+        训练态与推理态是两张图：把它们接起来的唯一状态就是这对统计量。
+        没有开启维护时抛错，而不是返回初始值（那会让 eval 永远算错）。
+        """
+        if self._bn_running is None:
+            raise ValueError(
+                "训练器没有维护 BN running stats：图里没有 batch_norm 节点，"
+                "或构造时传了 bn_momentum=None"
+            )
+        return self._bn_running.arrays()
 
     def _refresh_resident(self) -> None:
         """把 f32 主副本覆盖写回低精度驻留缓冲（主机态）。"""
@@ -1030,6 +1094,14 @@ class Trainer:
             "" if self.schedule is None else type(self.schedule).__name__,
         )
         merged.setdefault("schedule_config", self._schedule_config())
+        if self._bn_sites:
+            # momentum 是"这条轨迹"的一部分：0.1 与 0.01 的 EMA 在同样数据上
+            # 收敛到不同的 eval 统计量。站点集合不必单记，图指纹已经覆盖。
+            merged.setdefault(
+                "bn_momentum", "" if self.bn_momentum is None else self.bn_momentum
+            )
+            if self._bn_running is not None:
+                aux.update(self._bn_running.state_dict())
         source: Mapping[str, Any]
         if self._device_ready:
             # master weights 模式下存档存的必须是 f32 主副本：f16 驻留缓冲
@@ -1092,10 +1164,11 @@ class Trainer:
                 "请在第一次 step 之前加载，或重建 Trainer 后再加载"
             )
         like = {name: self.store[name] for name in self.store.names}
-        template = {
-            f"grad/{name}": np.zeros(tuple(like[name].shape), dtype=np.float32)
-            for name in self.store.names
-        }
+        # BN running stats 的模板（形状对、值占位）；实际是否进 ``extra``
+        # 取决于存档里的累积窗口，见下面的 pending 分支。
+        bn_template = (
+            self._bn_running.template() if self._bn_running is not None else {}
+        )
 
         # 第一步只读 meta 与附加数组键名，把所有"是不是同一条轨迹"的检查做完。
         # ``load_checkpoint`` 一旦通过就已经覆盖了参数与优化器状态，任何排在
@@ -1152,6 +1225,34 @@ class Trainer:
                         "类型相同但超参不同，学习率轨迹不是同一条"
                     )
 
+        saved_bn_keys = {str(key) for key in saved_aux if str(key).startswith("bn/")}
+        if self._bn_sites:
+            saved_m = saved_meta.get("bn_momentum")
+            if saved_m is None:
+                raise KeyError(
+                    "存档 meta 里没有 bn_momentum：无法判断这份存档的 BN running "
+                    "stats 是不是按当前策略维护的"
+                )
+            saved_str = "" if str(saved_m) == "" else float(saved_m)
+            current_str = "" if self.bn_momentum is None else self.bn_momentum
+            if saved_str != current_str:
+                raise ValueError(
+                    f"存档的 bn_momentum={saved_str!r} 与当前 {current_str!r} 不一致；"
+                    "同一批数据上 EMA 会收敛到不同的 eval 统计量"
+                )
+            want_bn = set(bn_template)
+            if saved_bn_keys != want_bn:
+                raise KeyError(
+                    "存档里的 BN running stats 与当前图不一致：缺少 "
+                    f"{sorted(want_bn - saved_bn_keys)}，多出 "
+                    f"{sorted(saved_bn_keys - want_bn)}"
+                )
+        elif saved_bn_keys:
+            raise ValueError(
+                f"存档带 {len(saved_bn_keys)} 个 BN running stats 条目，"
+                "但当前图里没有 batch_norm 节点；请用同一张图重建训练器"
+            )
+
         pending = int(saved_meta.get("accum_pending", 0))
         if not 0 <= pending <= self.accumulate_steps:
             raise ValueError(
@@ -1175,17 +1276,30 @@ class Trainer:
                     f"存档里的累积权重 {saved_meta['accum_weight']!r} 不是有限正数"
                 )
             want_aux = {f"grad/{name}" for name in self.store.names}
-            if set(saved_aux) != want_aux:
+            saved_grad = {str(key) for key in saved_aux} - saved_bn_keys
+            if saved_grad != want_aux:
                 raise KeyError(
                     "存档里的梯度累加和与当前参数集合不一致：缺少 "
-                    f"{sorted(want_aux - set(saved_aux))}，多出 "
-                    f"{sorted(set(saved_aux) - want_aux)}"
+                    f"{sorted(want_aux - saved_grad)}，多出 "
+                    f"{sorted(saved_grad - want_aux)}"
                 )
-        elif saved_aux:
-            raise ValueError(
-                f"存档里已累积微批数为 0，却带了 {len(saved_aux)} 个梯度累加和；"
-                "两份计数互相矛盾，无法判断该不该接着旧窗口"
-            )
+        else:
+            saved_grad = {str(key) for key in saved_aux} - saved_bn_keys
+            if saved_grad:
+                raise ValueError(
+                    f"存档里已累积微批数为 0，却带了 {len(saved_grad)} 个梯度累加和；"
+                    "两份计数互相矛盾，无法判断该不该接着旧窗口"
+                )
+
+        # ``extra`` 必须与存档里的 ``aux/`` 键集合完全一致，所以它只能包含
+        # "这份存档真的会有的条目"：没提交的累积窗口不写梯度模板。
+        template: Dict[str, np.ndarray] = {}
+        if pending:
+            for name in self.store.names:
+                template[f"grad/{name}"] = np.zeros(
+                    tuple(like[name].shape), dtype=np.float32
+                )
+        template.update(bn_template)
 
         amp_keys = [key for key in saved_meta if str(key).startswith("amp_")]
         if self.scaler is not None:
@@ -1239,6 +1353,13 @@ class Trainer:
             )
         elif self._accumulator is not None:
             self._accumulator.discard()
+
+        if self._bn_running is not None:
+            # ``load_checkpoint`` 已把存档值原地写进 template，这里再拷进
+            # running stats（与梯度窗口同一条"先校验、后提交"的顺序）。
+            self._bn_running.load_state_dict(
+                {key: template[key] for key in bn_template}
+            )
 
         if self.scaler is not None:
             self.load_amp_state(meta)

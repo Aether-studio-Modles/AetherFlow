@@ -469,6 +469,12 @@ def _batch_norm_training(g: Graph, node: Any, args: List[Any], a, n) -> Value:
     只依赖 batch 统计量、``weight``、``bias``、``eps``，这四样都在图里；
     导出图里本来就没有 stats 更新那一步。
 
+    导入后的图交给 ``Trainer`` 时，``bn_momentum`` 会扫描这些 ``batch_norm``
+    节点、每步执行一张统计子图并按 EMA 维护 running mean/var
+    （``train/bn.py``），训练完可以用 ``Trainer.bn_running_stats()`` 取出来
+    喂给推理图（``models/cnn.py:bn_infer``）。也就是说"训练输出对齐"与
+    "训练后 eval 状态对齐"现在是同一套闭环。
+
     ``torch.export`` 会在图里留下 ``add_(num_batches_tracked, 1)`` 这类对
     buffer 的原地写，由 :func:`import_exported` 统一跳过（0 使用者且目标
     是 buffer），不经过这里。
