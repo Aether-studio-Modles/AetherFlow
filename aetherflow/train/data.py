@@ -124,6 +124,19 @@ class DataLoader:
         拒绝而不是"尽量对上"：配置不同意味着同一个游标指向另一批样本，
         静默恢复会把数据顺序悄悄换掉，而这种偏差在损失曲线上看不出来。
         """
+        epoch, batch = self._parse_state(state)
+        self._epoch = epoch
+        self._cursor = batch
+
+    def validate_state_dict(self, state: Mapping[str, object]) -> None:
+        """只校验"这个位置能不能接上"，不改动任何状态。
+
+        训练器需要在提交权重**之前**确认数据位置与配置一致；那时若调用
+        :meth:`load_state_dict` 就可能出现"数据位置已改、权重没恢复"的半现场。
+        """
+        self._parse_state(state)
+
+    def _parse_state(self, state: Mapping[str, object]):
         required = ("epoch", "batch", "seed", "batch_size", "size", "shuffle", "drop_last")
         missing = [key for key in required if key not in state]
         if missing:
@@ -152,8 +165,7 @@ class DataLoader:
             raise ValueError(
                 "存档的数据迭代位置与当前 DataLoader 的配置不一致：" + "；".join(bad)
             )
-        self._epoch = epoch
-        self._cursor = batch
+        return epoch, batch
 
     # -- 迭代 ---------------------------------------------------------
 

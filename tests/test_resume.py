@@ -222,5 +222,98 @@ class TestResumeCredentials(unittest.TestCase):
             np.testing.assert_allclose(fresh_store[name], store[name], rtol=0, atol=0)
 
 
+def _pairs(n=8):
+    rng = np.random.default_rng(11)
+    return {
+        "x": rng.normal(size=(n, 2)).astype(np.float32),
+        "t": rng.normal(size=(n, 1)).astype(np.float32),
+    }
+
+
+class TestLoaderHandoff(unittest.TestCase):
+    """训练存档与数据迭代位置必须一起走（5.225）。
+
+    审计指出"完整续训"的最后一环：权重、优化器、AMP、图与调度器都能校验，
+    但"下一批是哪批"仍要调用方手工管理。这里把 loader 交给 Trainer 的存档
+    与恢复入口，位置与权重同进同出。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def _path(self, name="handoff.npz"):
+        return os.path.join(self.dir.name, name)
+
+    def test_run_loader_advances_the_loader_position(self):
+        loader = DataLoader(_pairs(8), 4, shuffle=True, seed=5)
+        trainer, _ = _trainer()
+        losses = trainer.run_loader(loader)
+        self.assertEqual(len(losses), 2)
+        self.assertEqual((loader.epoch, loader.cursor), (1, 0))
+        self.assertEqual(trainer.steps, 2)
+
+    def test_checkpoint_restores_the_same_next_batch(self):
+        data = _pairs(8)
+        loader = DataLoader(data, 4, shuffle=True, seed=3)
+        trainer, store = _trainer()
+        trainer.step(next(iter(loader)))  # 吃掉第一批，游标停在第 1 批
+        trainer.save_checkpoint(self._path(), loader=loader)
+
+        fresh, fresh_store = _trainer()
+        resumed = DataLoader(data, 4, shuffle=True, seed=3)
+        fresh.load_training_state(self._path(), loader=resumed)
+        self.assertEqual(resumed.state_dict(), loader.state_dict())
+        for name in store.names:
+            np.testing.assert_array_equal(fresh_store[name], store[name])
+        # 中断点之后的第一批与原 loader 的下一批完全相同
+        np.testing.assert_array_equal(
+            next(iter(resumed))["x"], next(iter(loader))["x"]
+        )
+
+    def test_loader_config_change_is_rejected_before_any_write(self):
+        data = _pairs(8)
+        loader = DataLoader(data, 4, shuffle=True, seed=3)
+        trainer, _ = _trainer()
+        trainer.step(next(iter(loader)))
+        trainer.save_checkpoint(self._path(), loader=loader)
+
+        fresh, fresh_store = _trainer()
+        before = {
+            name: np.array(fresh_store[name], copy=True) for name in fresh_store.names
+        }
+        wrong = DataLoader(data, 2, shuffle=True, seed=3)
+        with self.assertRaisesRegex(ValueError, "配置不一致"):
+            fresh.load_training_state(self._path(), loader=wrong)
+        # 检查失败不能留下"权重换了、位置没换"的半现场
+        for name in before:
+            np.testing.assert_array_equal(fresh_store[name], before[name])
+        self.assertEqual(wrong.state_dict()["batch"], 0)
+
+    def test_missing_or_extra_loader_is_rejected(self):
+        trainer, _ = _trainer()
+        trainer.save_checkpoint(self._path())
+        fresh, _ = _trainer()
+        with self.assertRaisesRegex(KeyError, "没有数据迭代位置"):
+            fresh.load_training_state(self._path(), loader=DataLoader(_pairs(8), 4))
+
+        loader = DataLoader(_pairs(8), 4)
+        trainer.save_checkpoint(self._path("with.npz"), loader=loader)
+        with self.assertRaisesRegex(KeyError, "没有传 loader"):
+            fresh.load_training_state(self._path("with.npz"))
+
+    def test_invalid_arguments_are_rejected(self):
+        loader = DataLoader(_pairs(8), 4)
+        trainer, _ = _trainer()
+        with self.assertRaises(TypeError):
+            trainer.save_checkpoint(self._path(), loader="loader")
+        with self.assertRaisesRegex(ValueError, "互相覆盖"):
+            trainer.save_checkpoint(self._path(), meta={"data": {}}, loader=loader)
+        with self.assertRaises(ValueError):
+            trainer.run_loader(loader, epochs=0)
+        with self.assertRaises(TypeError):
+            trainer.run_loader([])
+
+
 if __name__ == "__main__":
     unittest.main()
