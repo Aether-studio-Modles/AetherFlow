@@ -1073,7 +1073,14 @@ class Trainer:
 
         # 全部检查通过，下面才开始提交。
         meta = load_checkpoint(
-            path, self.store, self.optimizer, state=state, extra=template
+            path,
+            self.store,
+            self.optimizer,
+            state=state,
+            extra=template,
+            # 有调度器时 lr 是"训练走到哪"的一部分，必须从存档恢复；
+            # 没有调度器时 lr 是静态配置，换了就不算同一条轨迹。
+            restore_lr=self.schedule is not None,
         )
         if "trainer_steps" in meta:
             self.steps = int(meta["trainer_steps"])

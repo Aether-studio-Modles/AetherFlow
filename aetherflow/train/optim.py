@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Mapping, MutableMapping
+from typing import Dict, Mapping, MutableMapping, Optional
 
 import numpy as np
 
@@ -66,12 +66,11 @@ class Optimizer:
 
     # -- 对外接口 -----------------------------------------------------
 
-    def step(self, grads: Mapping[str, np.ndarray]) -> None:
-        """用一批梯度走一步。``grads`` 必须覆盖全部参数。
+    def prepare_step(self, grads: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """校验并整理这一批梯度，**不改参数、不加步数**。
 
-        先对**全部**参数做形状 / dtype 校验，再统一更新。逐个"校验一个更新
-        一个"会在中途失败时留下半步状态：前面的参数已经走了一步，步数却还是
-        旧的，续训与调试都会看到不一致的参数。
+        与 :meth:`apply_step` 配对，是为了让"多片/多组"的调用方先把全部
+        准备工作做完再统一提交：任何一处校验失败都不该留下走了半步的参数。
         """
         missing = [n for n in self.params if n not in grads]
         if missing:
@@ -83,13 +82,25 @@ class Optimizer:
         if unknown:
             raise KeyError(f"梯度里出现了不认识的参数: {unknown}")
 
-        prepared = {
+        return {
             name: self._coerce_grad(name, param, grads[name])
             for name, param in self.params.items()
         }
+
+    def apply_step(self, prepared: Mapping[str, np.ndarray]) -> None:
+        """用 :meth:`prepare_step` 的结果更新参数并推进步数。"""
         for name, param in self.params.items():
             self._update(name, param, prepared[name])
         self.step_count += 1
+
+    def step(self, grads: Mapping[str, np.ndarray]) -> None:
+        """用一批梯度走一步。``grads`` 必须覆盖全部参数。
+
+        先对**全部**参数做形状 / dtype 校验，再统一更新。逐个"校验一个更新
+        一个"会在中途失败时留下半步状态：前面的参数已经走了一步，步数却还是
+        旧的，续训与调试都会看到不一致的参数。
+        """
+        self.apply_step(self.prepare_step(grads))
 
     @staticmethod
     def _coerce_grad(name: str, param: np.ndarray, grad) -> np.ndarray:
@@ -141,7 +152,7 @@ class Optimizer:
             },
         }
 
-    def load_state_dict(self, state: Mapping) -> None:
+    def load_state_dict(self, state: Mapping, *, restore_lr: bool = False) -> None:
         """恢复步数与槽位。槽位名、参数名、形状任何一处不匹配都直接报错。
 
         不"能恢复多少恢复多少"：少一个动量数组，续训的轨迹就与没存过不同，
@@ -152,18 +163,49 @@ class Optimizer:
         训练过的存档必须带上全部槽位、且每个槽位覆盖全部参数——只检查
         "存档里出现的名字"，会让 ``{'step': 100, 'slots': {}}`` 这种残缺
         存档把旧槽位原封不动地留下来。
+
+        ``restore_lr=True`` 用于**带学习率调度**的训练：``lr`` 是调度器的
+        输出（当前位置），不是静态配置，必须从存档恢复；其余超参仍然严格
+        比较。没有调度时 ``lr`` 是人为选的配置，换了就不算同一条轨迹，
+        默认的严格比较才是对的。
+        """
+        prepared, step, restored_lr = self._prepare_state_dict(
+            state, restore_lr=restore_lr
+        )
+        self._commit_state(prepared, step, restored_lr)
+
+    def _prepare_state_dict(
+        self, state: Mapping, *, restore_lr: bool = False
+    ) -> tuple:
+        """校验存档并构造待提交的槽位；**不改任何状态**。
+
+        分片优化器会先把每一片都跑一遍这里，全部通过后再逐片
+        ``_commit_state``：否则"前几片已经换掉、最后一片才报错"会留下
+        各片步数与槽位不一致的半加载现场。
         """
         slots = dict(state.get("slots") or {})
+        restored_lr: Optional[float] = None
         if "hyper" in state:
             saved = {
                 key: (value.item() if hasattr(value, "item") else value)
                 for key, value in dict(state.get("hyper") or {}).items()
             }
+            if restore_lr:
+                if "lr" not in saved:
+                    raise KeyError(
+                        "要求恢复学习率，但存档的超参里没有 lr；"
+                        "这份存档不足以确定调度器的当前位置"
+                    )
+                candidate = float(saved["lr"])
+                if not math.isfinite(candidate) or candidate <= 0.0:
+                    raise ValueError(f"存档里的学习率 {saved['lr']!r} 不是有限正数")
+                restored_lr = candidate
             current = self.hyperparams()
             bad = [
                 f"{key}: 存档 {saved.get(key)!r} / 当前 {current.get(key)!r}"
                 for key in sorted(set(saved) | set(current))
-                if saved.get(key) != current.get(key)
+                if not (restore_lr and key == "lr")
+                and saved.get(key) != current.get(key)
             ]
             if bad:
                 raise ValueError(
@@ -171,6 +213,11 @@ class Optimizer:
                     + "；".join(bad)
                     + "）。超参决定更新语义，换了超参不能接着旧状态续训"
                 )
+        elif restore_lr:
+            raise KeyError(
+                "要求恢复学习率，但存档里没有优化器超参；"
+                "这份存档不足以确定调度器的当前位置"
+            )
         known = self._slots()
         unknown = set(slots) - set(known)
         if unknown:
@@ -210,10 +257,22 @@ class Optimizer:
                 )
             prepared[slot] = bucket
 
+        return prepared, step, restored_lr
+
+    def _commit_state(
+        self,
+        prepared: Dict[str, Dict[str, np.ndarray]],
+        step: int,
+        restored_lr: Optional[float],
+    ) -> None:
+        """把 ``_prepare_state_dict`` 的结果一次性换上去（这一步不会再失败）。"""
+        known = self._slots()
         for slot, bucket in prepared.items():
             known[slot].clear()
             known[slot].update(bucket)
         self.step_count = step
+        if restored_lr is not None:
+            self.lr = restored_lr
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(lr={self.lr:g}, steps={self.step_count})"

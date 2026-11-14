@@ -184,6 +184,59 @@ class ShardedOptimizerTest(unittest.TestCase):
         for name in reference:
             np.testing.assert_array_equal(reference[name], live[name])
 
+    def test_bad_grad_in_a_later_shard_leaves_no_half_step(self):
+        """后面某片的梯度不合法时，前面几片不能已经走了一步（F08）。"""
+        params = _params()
+        opt = ShardedOptimizer(lambda p: Adam(p, lr=1e-2), params, world_size=2)
+        before = {name: value.copy() for name, value in params.items()}
+        later = next(name for name in params if opt.assignments[name] == 1)
+        grads = _grads(params, seed=3)
+        grads[later] = np.zeros((99,), np.float32)
+
+        with self.assertRaises(ValueError):
+            opt.step(grads)
+
+        for name, value in params.items():
+            np.testing.assert_array_equal(value, before[name])
+        self.assertEqual(opt.step_count, 0)
+        for shard in opt.shards:
+            self.assertEqual(shard.step_count, 0)
+
+    def test_bad_shard_payload_leaves_no_half_load(self):
+        """第二片存档不合法时，第一片不能被换掉（F08）。"""
+        params = _params()
+        opt = ShardedOptimizer(lambda p: Adam(p, lr=1e-2), params, world_size=2)
+        opt.step(_grads(params, seed=0))
+        saved = opt.state_dict()
+
+        payload = saved["shards"][1]
+        slot = next(iter(payload["slots"]))
+        name = next(iter(payload["slots"][slot]))
+        bad = {
+            **payload,
+            "slots": {key: dict(arrays) for key, arrays in payload["slots"].items()},
+        }
+        bad["slots"][slot][name] = np.zeros((99,), np.float32)
+
+        target = ShardedOptimizer(lambda p: Adam(p, lr=1e-2), _params(), world_size=2)
+        target.step(_grads({n: target.params[n] for n in target.params}, seed=7))
+        frozen = {
+            index: {
+                slot: {key: np.array(value, copy=True) for key, value in arrays.items()}
+                for slot, arrays in shard._slots().items()
+            }
+            for index, shard in enumerate(target.shards)
+        }
+        with self.assertRaises(ValueError):
+            target.load_state_dict({**saved, "shards": [saved["shards"][0], bad]})
+
+        self.assertEqual(target.step_count, 1)
+        for index, shard in enumerate(target.shards):
+            self.assertEqual(shard.step_count, 1)
+            for slot, arrays in shard._slots().items():
+                for key, value in arrays.items():
+                    np.testing.assert_array_equal(value, frozen[index][slot][key])
+
     def test_load_refuses_different_world_size(self):
         params = _params()
         opt = ShardedOptimizer(lambda p: Adam(p, lr=1e-2), params, world_size=2)

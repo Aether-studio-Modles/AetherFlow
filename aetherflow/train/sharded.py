@@ -290,8 +290,14 @@ class ShardedOptimizer:
         if unknown:
             raise KeyError(f"梯度里出现了不认识的参数: {unknown}")
 
-        for names, shard in zip(self._names, self._shards):
-            shard.step({name: grads[name] for name in names})
+        # 先让每一片都把校验与整理做完，再统一提交：任何一片的梯度不合法
+        # 都不该让前面的片先走半步（各片步数会就此分叉）。
+        prepared = [
+            shard.prepare_step({name: grads[name] for name in names})
+            for names, shard in zip(self._names, self._shards)
+        ]
+        for shard, batch in zip(self._shards, prepared):
+            shard.apply_step(batch)
 
     # -- 状态 ---------------------------------------------------------
 
@@ -311,7 +317,7 @@ class ShardedOptimizer:
             "shards": [shard.state_dict() for shard in self._shards],
         }
 
-    def load_state_dict(self, state: Mapping) -> None:
+    def load_state_dict(self, state: Mapping, *, restore_lr: bool = False) -> None:
         world = int(state.get("world_size", 0))
         if world != self._world_size:
             raise ValueError(
@@ -335,10 +341,14 @@ class ShardedOptimizer:
             raise ValueError(
                 f"存档有 {len(shards)} 片，当前有 {len(self._shards)} 片"
             )
-        # 先全部校验一遍再提交：Optimizer.load_state_dict 自己已经做到
-        # "校验完再换"，逐片调用不会有中间态暴露给调用方。
-        for shard, payload in zip(self._shards, shards):
-            shard.load_state_dict(payload)
+        # 先全部校验一遍再提交：任一片的存档不合法时，前面几片不能已经换掉，
+        # 否则各片的步数与槽位会互相矛盾（续训第一发就对不上）。
+        prepared = [
+            shard._prepare_state_dict(payload, restore_lr=restore_lr)
+            for shard, payload in zip(self._shards, shards)
+        ]
+        for shard, batch in zip(self._shards, prepared):
+            shard._commit_state(*batch)
 
     def __repr__(self) -> str:
         sizes = [len(names) for names in self._names]

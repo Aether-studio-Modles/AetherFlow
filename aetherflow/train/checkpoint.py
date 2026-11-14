@@ -290,6 +290,8 @@ def load_checkpoint(
     optimizer: Optional[Optimizer] = None,
     state: Optional[Mapping[str, np.ndarray]] = None,
     extra: Optional[Mapping[str, np.ndarray]] = None,
+    *,
+    restore_lr: bool = False,
 ) -> Dict[str, object]:
     """从 ``.npz`` 读回参数（可选的优化器状态、流式状态），返回 meta 字典。
 
@@ -460,7 +462,8 @@ def load_checkpoint(
                 "只加载权重请把 optimizer 留空"
             )
         optimizer.load_state_dict(
-            {"step": step, "slots": slots, **({"hyper": hyper} if hyper else {})}
+            {"step": step, "slots": slots, **({"hyper": hyper} if hyper else {})},
+            restore_lr=restore_lr,
         )
 
     for name, prepared in prepared_params.items():

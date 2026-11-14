@@ -217,6 +217,30 @@ class TestOptimizers(unittest.TestCase):
         np.testing.assert_array_equal(params["b"], [1.0, 1.0])
         self.assertEqual(opt.step_count, 0)
 
+    def test_lr_is_restored_only_on_request(self):
+        """带调度器时 lr 是训练状态的一部分，静态配置时仍是硬约束（F06）。"""
+        base = {"w": np.ones(1, dtype=np.float32)}
+        state = SGD(dict(base), lr=0.1).state_dict()
+        state["hyper"]["lr"] = 0.01
+
+        strict = SGD({"w": np.ones(1, dtype=np.float32)}, lr=0.1)
+        with self.assertRaisesRegex(ValueError, "超参"):
+            strict.load_state_dict(state)
+        self.assertEqual(strict.lr, 0.1)
+
+        resumed = SGD({"w": np.ones(1, dtype=np.float32)}, lr=0.1)
+        resumed.load_state_dict(state, restore_lr=True)
+        self.assertEqual(resumed.lr, 0.01)
+
+        # 非法 lr 必须在提交之前拒绝：不能留下"步数已恢复、lr 没恢复"
+        bad = SGD({"w": np.ones(1, dtype=np.float32)}, lr=0.1)
+        with self.assertRaisesRegex(ValueError, "有限正数"):
+            bad.load_state_dict(
+                {"step": 5, "slots": {}, "hyper": {"lr": 0.0}}, restore_lr=True
+            )
+        self.assertEqual(bad.step_count, 0)
+        self.assertEqual(bad.lr, 0.1)
+
     def test_adam_rejects_half_precision_parameters(self):
         """f16 参数 + eps=1e-8：零梯度会得到 0/0。
 

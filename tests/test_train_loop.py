@@ -729,6 +729,39 @@ class TestTrainerSchedule(unittest.TestCase):
         self.assertEqual(seen, [0.1, 1.0, 1.0, 0.5])
         self.assertEqual(trainer.optimizer.step_count, 2)
 
+    def test_scheduled_lr_resumes_from_the_checkpoint(self):
+        """带调度器时存档里的 lr 是当前位置，必须恢复而不是拿构造值（F06）。"""
+        x, t = _data(n=8)
+        schedule = StepDecay(base_lr=1.0, step_size=2, gamma=0.5)
+        trainer, store = self._trainer(schedule=schedule)
+        for _ in range(3):
+            trainer.step({"x": x, "t": t})
+        self.assertEqual(trainer.optimizer.lr, 0.5)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "sched.npz")
+            trainer.save_checkpoint(path)
+
+            g = _graph(batch=8)
+            fresh = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+            resumed = Trainer(
+                g,
+                fresh,
+                SGD(fresh.arrays(), lr=0.1),
+                schedule=StepDecay(base_lr=1.0, step_size=2, gamma=0.5),
+            )
+            resumed.load_training_state(path)
+            self.assertEqual(resumed.optimizer.lr, 0.5)
+            self.assertEqual(resumed.optimizer.step_count, 3)
+
+            trainer.step({"x": x, "t": t})
+            resumed.step({"x": x, "t": t})
+
+        for name in store.names:
+            np.testing.assert_allclose(
+                fresh[name], store[name], rtol=1e-6, atol=1e-7
+            )
+
 
 class TestTrainerAccumulation(unittest.TestCase):
     """梯度累积的判据是"与等效大 batch 走一步逐位一致"，不是"步数对"。"""
