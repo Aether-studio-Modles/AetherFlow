@@ -16,9 +16,29 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
 
 ## CUDA 真机
 
-显卡已拆、NVIDIA 驱动未加载（`nvidia-smi` 无法通信、`lsmod` 里没有 nvidia 模块），
-CUDA 侧只能做离线 / 伪 runtime 验证；涉及 `cufftExec*`、真机耗时与多卡切换的结论
-本轮都没有复跑，恢复后再补。
+本机显卡已拆、NVIDIA 驱动未加载（`nvidia-smi` 无法通信、`lsmod` 里没有 nvidia 模块）。
+现在改用远程多卡机（用户提供，见下），CUDA 侧结论在那里复跑。
+
+- 主机：`223.109.239.36`（移动）/ `180.127.11.177`（电信），端口 `24636`，用户 `root`
+  （另有 `vipuser` 同密码；密码见对话记录，不写进版本库）。
+- 系统：Ubuntu 22.04.3，16 核 / 31 GB / 196 GB，2× Tesla V100-PCIE-16GB（sm_70），
+  驱动 550.127.05，CUDA 12.4 toolkit（含 libnvrtc / libcudart），**没有** NCCL 库。
+- 环境：系统 python3.10 + numpy 2.2.6（apt 的 python3-numpy 只有 1.21，不满足
+  `numpy>=1.24`，要用 pip 覆盖安装）；`cupy-cuda12x 14.2.0` 由官方 PyPI 装好
+  （日志 `/root/pip_cupy2.log`，`getDeviceCount()==2`、sm 7.0）；无 Docker、无 cuDNN、
+  无 NCCL。
+- 代码同步：`tar czf - --exclude=__pycache__ --exclude=.git . | ssh ... 'tar xzf - -C /root/aetherflow'`，
+  远端目录 `/root/aetherflow`。
+- 已验证：远端全量 `Ran 2295 tests / OK (skipped=119)` 全绿；CUDA 组
+  `Ran 332 tests / OK (skipped=1)`，唯一跳过来自系统没有 cuDNN。收集到的用例比本地
+  少 5 条（与 torch 版本相关）。
+- 真机踩过的坑（已修，结论见 DESIGN 5.227）：`cusparseIndexType_t` 的
+  `CUSPARSE_INDEX_32I` 是 **2** 不是 1——写成 1 会被当成 uint16 读 int32 的
+  `rowOffsets`，表现为内核 `cudaErrorIllegalAddress` 而不是参数错误；一旦发生，
+  上下文中毒会连带后续用例报 E。`cusparseSpMM` 是 11 个形参，别多传 C 描述符。
+- 机器相关用例要按卡现算：CSR 铺法的阈值是 `SM 数 × 32`（M40 24 SM / V100 80 SM），
+  行数写死会在另一张卡上走错分支。
+
 
 ## 提交约定
 
