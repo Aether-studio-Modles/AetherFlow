@@ -87,6 +87,18 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
 - 续训的数据迭代位置（5.225）用专属标量键 `loader_state`（JSON）+ `loader_kind`，
   冲突检查只看这两个键；位置只到"第几轮第几批"，batch 内偏移不在协议内；流式 loader 的
   `size` 是构造时快照。游标在所有提交完成后才推进（5.226）。
+- cuDNN（5.230）：远端 pip 装的是 `nvidia-cudnn-cu12` 9.28.1.4（`cudnnGetVersion`
+  报 92801）。它要求 Linux 驱动 ≥570.26，这台机器是 550.127.05，于是句柄 / 描述符 /
+  v7 算法选择全返回 0，**执行期**才报 `cudnnStatus_t=5003`
+  （`CUDNN_STATUS_EXECUTION_FAILED_CUDART`）。结论：`available()` 只代表"库能加载"，
+  不代表"这台机器跑得动"；`conv_impl="auto"` 会回落自研核（与 im2col 最大差 4.8e-7），
+  显式 `conv_impl="cudnn"` 抛出带状态码的错误。`TestCudaConvCudnn` 因此在 `setUpClass`
+  里加了一次最小卷积探测，命中 5003 就整组跳过，避免同一个环境问题把一组用例打成红。
+- cuDNN 9.1.0.70（仍支持 sm_70、只要求驱动 ≥525）的 wheel 试过四种源：官方
+  `files.pythonhosted.org` 单线程约 0.3 MB/s，8 段并发会被 429 限流；阿里 / 清华 /
+  USTC 镜像要么 429、要么 TLS 握手超时。最终只下到 121/159 段（每段 4 MB）就停了，
+  **卷积真机对拍与 `benchmarks/cudnn_compare.py` 的逐形状数据仍是空白**。下次别再用
+  8 并发抓同一个 URL（429 会越退越久），也别把 `pip download` 与分段下载同时跑。
 
 ## 临时脚本
 
