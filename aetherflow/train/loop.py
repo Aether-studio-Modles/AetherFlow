@@ -24,7 +24,7 @@ from ..ir.graph import Graph
 from ..passes.autocast import Autocast
 from ._arrays import array_module
 from .amp import GradScaler
-from .checkpoint import TrainingSnapshot, load_checkpoint
+from .checkpoint import TrainingSnapshot, inspect_checkpoint, load_checkpoint
 from .grads import GradientAccumulator
 from .optim import Optimizer
 from .params import ParameterStore
@@ -504,7 +504,17 @@ class Trainer:
         return self._accumulator.flush()
 
     def _apply(self, grads: Mapping[str, np.ndarray], *, already_unscaled: bool) -> bool:
-        """钩子 → 调度 → 优化器。返回值表示这一步是否更新了参数。"""
+        """反缩放 → 有限性 → 钩子 → 调度 → 优化器。返回值表示这一步是否更新了参数。
+
+        顺序是刻意的：先反缩放再交给钩子，裁剪上限才对得上真实梯度量级；
+        溢出时立刻回退并跳过，钩子与调度器都不会看到一批已经不可信的算术。
+        钩子可能把梯度改坏（裁剪之外的加噪等），所以 ``update`` 会再查一次。
+        """
+        if self.scaler is not None and not already_unscaled:
+            grads = self.scaler.unscale(grads)
+            if self.scaler.found_nonfinite:
+                self.scaler.backoff()
+                return False
         if self.grad_hook is not None:
             grads = self.grad_hook(grads)
             if grads is None:
@@ -516,10 +526,8 @@ class Trainer:
         if self.scaler is None:
             self.optimizer.step(grads)
             return True
-        if already_unscaled:
-            # 累积路径已经除过 scale；再调 ``step`` 会二次相除。
-            return self.scaler.update(self.optimizer, grads)
-        return self.scaler.step(self.optimizer, grads)
+        # 到这里梯度必然已经反缩放过（累积路径在 ``_accumulate`` 里做）。
+        return self.scaler.update(self.optimizer, grads)
 
     # -- 设备态 -------------------------------------------------------
 
@@ -913,6 +921,7 @@ class Trainer:
         merged.setdefault("accum_pending", 0)
         if self._accumulator is not None:
             merged["accum_pending"] = self._accumulator.pending
+            merged["accum_weight"] = self._accumulator.weight
             for name, arr in self._accumulator.state_dict()["sum"].items():
                 aux[f"grad/{name}"] = arr
         merged.setdefault("rng_seed", self.rng_seed)
@@ -982,36 +991,99 @@ class Trainer:
             f"grad/{name}": np.zeros(tuple(like[name].shape), dtype=np.float32)
             for name in self.store.names
         }
-        meta = load_checkpoint(
-            path, self.store, self.optimizer, state=state, extra=template
-        )
 
-        saved_acc = int(meta.get("accum_steps", self.accumulate_steps))
+        # 第一步只读 meta 与附加数组键名，把所有"是不是同一条轨迹"的检查做完。
+        # ``load_checkpoint`` 一旦通过就已经覆盖了参数与优化器状态，任何排在
+        # 它之后的校验失败都会留下半加载现场（权重是新的、累积窗口是旧的）。
+        inspected = inspect_checkpoint(path)
+        saved_meta: Mapping[str, object] = inspected["meta"]  # type: ignore[assignment]
+        saved_aux: list = inspected["aux"]  # type: ignore[assignment]
+
+        saved_acc = int(saved_meta.get("accum_steps", self.accumulate_steps))
         if saved_acc != self.accumulate_steps:
             raise ValueError(
                 f"存档的累积窗口长度是 {saved_acc}，当前训练器是 "
                 f"{self.accumulate_steps}；两者的等效 batch 不同，不能接着续训"
             )
         for key, current in (("rng_seed", self.rng_seed), ("rng_rank", self.rng_rank)):
-            if key in meta and int(meta[key]) != int(current):
+            if key in saved_meta and int(saved_meta[key]) != int(current):
                 raise ValueError(
-                    f"存档的 {key}={meta[key]} 与当前 {current} 不一致；"
+                    f"存档的 {key}={saved_meta[key]} 与当前 {current} 不一致；"
                     "随机流不同，dropout 与重算的掩码都对不上"
                 )
-        if "trainer_steps" in meta:
-            self.steps = int(meta["trainer_steps"])
 
-        pending = int(meta.get("accum_pending", 0))
+        pending = int(saved_meta.get("accum_pending", 0))
+        if not 0 <= pending <= self.accumulate_steps:
+            raise ValueError(
+                f"存档里的已累积微批数 {pending} 不在 [0, {self.accumulate_steps}]"
+            )
+        accum_weight = 0.0
         if pending:
             if self._accumulator is None:
                 raise ValueError(
                     f"存档里有 {pending} 个未提交的微批，但当前训练器 "
                     "accumulate_steps=1，没有累积窗口可以接"
                 )
+            if "accum_weight" not in saved_meta:
+                raise KeyError(
+                    "存档里有未提交的累积窗口，却没有 accum_weight；"
+                    "窗口平均的分母无法恢复，续训会得到被整体缩放的梯度"
+                )
+            accum_weight = float(saved_meta["accum_weight"])
+            if not np.isfinite(accum_weight) or accum_weight <= 0.0:
+                raise ValueError(
+                    f"存档里的累积权重 {saved_meta['accum_weight']!r} 不是有限正数"
+                )
+            want_aux = {f"grad/{name}" for name in self.store.names}
+            if set(saved_aux) != want_aux:
+                raise KeyError(
+                    "存档里的梯度累加和与当前参数集合不一致：缺少 "
+                    f"{sorted(want_aux - set(saved_aux))}，多出 "
+                    f"{sorted(set(saved_aux) - want_aux)}"
+                )
+        elif saved_aux:
+            raise ValueError(
+                f"存档里已累积微批数为 0，却带了 {len(saved_aux)} 个梯度累加和；"
+                "两份计数互相矛盾，无法判断该不该接着旧窗口"
+            )
+
+        amp_keys = [key for key in saved_meta if str(key).startswith("amp_")]
+        if self.scaler is not None:
+            missing = [
+                f"amp_{key}"
+                for key in ("scale", "growth", "skipped")
+                if f"amp_{key}" not in saved_meta
+            ]
+            if missing:
+                raise KeyError(
+                    f"存档 meta 里缺少 {missing}；这份存档不是带 AMP 的训练存档"
+                )
+            amp_scale = float(saved_meta["amp_scale"])
+            if not np.isfinite(amp_scale) or amp_scale <= 0.0:
+                raise ValueError(f"存档里的 AMP scale {saved_meta['amp_scale']!r} 不是有限正数")
+            if float(saved_meta["amp_growth"]) < 0.0:
+                raise ValueError(f"存档里的 AMP growth {saved_meta['amp_growth']!r} 不能为负")
+            if int(saved_meta["amp_skipped"]) < 0:
+                raise ValueError(f"存档里的 AMP skipped {saved_meta['amp_skipped']!r} 不能为负")
+        elif amp_keys:
+            raise ValueError(
+                "存档带 AMP 缩放状态，但当前训练器没有 GradScaler；"
+                "请用同一个 scaler 重建 Trainer 后再加载"
+            )
+
+        # 全部检查通过，下面才开始提交。
+        meta = load_checkpoint(
+            path, self.store, self.optimizer, state=state, extra=template
+        )
+        if "trainer_steps" in meta:
+            self.steps = int(meta["trainer_steps"])
+
+        if pending:
             self._accumulator.load_state_dict(
                 {
                     "steps": self.accumulate_steps,
                     "count": pending,
+                    "weight": accum_weight,
                     "sum": {
                         name: template[f"grad/{name}"] for name in self.store.names
                     },
@@ -1021,14 +1093,8 @@ class Trainer:
         elif self._accumulator is not None:
             self._accumulator.discard()
 
-        amp_keys = [key for key in meta if str(key).startswith("amp_")]
         if self.scaler is not None:
             self.load_amp_state(meta)
-        elif amp_keys:
-            raise ValueError(
-                "存档带 AMP 缩放状态，但当前训练器没有 GradScaler；"
-                "请用同一个 scaler 重建 Trainer 后再加载"
-            )
 
         self._refresh_resident()
         self._host_stale = False

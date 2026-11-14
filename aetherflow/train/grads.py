@@ -211,6 +211,7 @@ class GradientAccumulator:
         count = self._count
         self._sum.clear()
         self._count = 0
+        self._weight = 0.0
         return count
 
     def state_dict(self) -> Dict[str, object]:

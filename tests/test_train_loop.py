@@ -886,6 +886,74 @@ class TestTrainerAccumulation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "rng_seed"):
                 reseeded.load_training_state(path)
 
+    def test_failed_validation_leaves_parameters_untouched(self):
+        """配置校验必须先于提交（F05）。
+
+        先更新过一个窗口、再留下 1 个未提交微批存档；拿窗口长度不同的训练器
+        去加载必须报错，且**参数与优化器步数都不能变**——否则现场是"权重已
+        换成存档、累积窗口还是旧的"，续训的动量与梯度对不上。
+        """
+        x, t = _data(n=8)
+        g = _graph(batch=2)
+        store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+        trainer = Trainer(
+            g, store, SGD(store.arrays(), lr=0.1), accumulate_steps=2
+        )
+        for start in (0, 2, 4):
+            trainer.step({"x": x[start : start + 2], "t": t[start : start + 2]})
+        self.assertEqual(trainer.optimizer.step_count, 1)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "pending.npz")
+            trainer.save_checkpoint(path)
+
+            fresh = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+            before = {name: fresh[name].copy() for name in fresh.names}
+            longer = Trainer(
+                g, fresh, SGD(fresh.arrays(), lr=0.1), accumulate_steps=4
+            )
+            with self.assertRaisesRegex(ValueError, "累积窗口长度"):
+                longer.load_training_state(path)
+            self.assertEqual(longer.optimizer.step_count, 0)
+            self.assertEqual(longer.steps, 0)
+            for name in fresh.names:
+                np.testing.assert_array_equal(fresh[name], before[name])
+
+    def test_inconsistent_window_metadata_is_rejected_before_committing(self):
+        """缺 ``accum_weight`` 或累加和键对不上时，先报错、不落任何写入。"""
+        x, t = _data(n=8)
+        g = _graph(batch=2)
+        store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+        trainer = Trainer(
+            g, store, SGD(store.arrays(), lr=0.1), accumulate_steps=2
+        )
+        trainer.step({"x": x[:2], "t": t[:2]})  # 窗口 1/2
+
+        with tempfile.TemporaryDirectory() as folder:
+            missing = os.path.join(folder, "missing.npz")
+            snapshot = trainer.snapshot()
+            snapshot.meta.pop("accum_weight")
+            snapshot.save(missing)
+
+            fresh = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+            before = {name: fresh[name].copy() for name in fresh.names}
+            resumed = Trainer(
+                g, fresh, SGD(fresh.arrays(), lr=0.1), accumulate_steps=2
+            )
+            with self.assertRaisesRegex(KeyError, "accum_weight"):
+                resumed.load_training_state(missing)
+            for name in fresh.names:
+                np.testing.assert_array_equal(fresh[name], before[name])
+
+            bogus = os.path.join(folder, "bogus.npz")
+            snapshot = trainer.snapshot()
+            snapshot.aux["grad/not_a_param"] = np.zeros(1, np.float32)
+            snapshot.save(bogus)
+            with self.assertRaisesRegex(KeyError, "参数集合不一致"):
+                resumed.load_training_state(bogus)
+            for name in fresh.names:
+                np.testing.assert_array_equal(fresh[name], before[name])
+
     def test_hook_runs_once_per_window(self):
         """钩子在 flush 之后、更新之前：窗口内看不到梯度，满窗才看到一次。"""
         x, t = _data(n=8)
@@ -990,6 +1058,70 @@ class TestWeightedAccumulation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "有限正数"):
                 acc.add(grads, bad)
         self.assertEqual(acc.pending, 0)
+
+    def test_discard_resets_the_weight(self):
+        """作废窗口必须连权重一起清零（F03）。
+
+        只清累加和与计数、留下旧的权重和，下一个窗口的 flush 会除以一个
+        包含了已作废微批的分母，梯度整体被缩小。
+        """
+        acc = GradientAccumulator(2)
+        grads = {"w": np.ones((2, 1), np.float32)}
+
+        acc.add(grads, 3.0)
+        self.assertEqual(acc.weight, 3.0)
+        self.assertEqual(acc.discard(), 1)
+        self.assertEqual(acc.pending, 0)
+        self.assertEqual(acc.weight, 0.0)
+
+        # 新窗口只该按自己的 2 + 2 归一，不该带着被丢掉的 3
+        acc.add(grads, 2.0)
+        acc.add(grads, 2.0)
+        np.testing.assert_allclose(acc.flush()["w"], np.ones((2, 1), np.float32))
+
+    def test_weighted_window_survives_the_checkpoint(self):
+        """存档必须带上窗口的权重和，否则续训的分母变成微批数（F04）。
+
+        窗口里两批权重 3 与 1：存档前只有第一批，恢复后补上第二批，flush
+        的梯度必须是 ``(3*dw_a + 1*dw_b) / 4``，不是 ``(dw_a + dw_b) / 2``。
+        """
+        x, t = _data(n=8)
+        g = _graph(batch=4)
+        store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+        seen = {}
+
+        def capture(grads):
+            seen.update({name: np.array(value) for name, value in grads.items()})
+            return grads
+
+        w0, b0 = store["w"].copy(), store["b"].copy()
+        trainer = Trainer(
+            g, store, SGD(store.arrays(), lr=0.1),
+            accumulate_steps=2, grad_hook=capture,
+        )
+        trainer.step({"x": x[:4], "t": t[:4]}, weight=3.0)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "weighted.npz")
+            trainer.save_checkpoint(path)
+            fresh = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+            resumed = Trainer(
+                g, fresh, SGD(fresh.arrays(), lr=0.1),
+                accumulate_steps=2, grad_hook=capture,
+            )
+            meta = resumed.load_training_state(path)
+            self.assertEqual(float(meta["accum_weight"]), 3.0)
+            self.assertEqual(resumed._accumulator.weight, 3.0)
+            resumed.step({"x": x[4:], "t": t[4:]}, weight=1.0)
+
+        dw_a, db_a = self._analytic(x[:4], t[:4], w0, b0)
+        dw_b, db_b = self._analytic(x[4:], t[4:], w0, b0)
+        np.testing.assert_allclose(
+            seen["w"], (3.0 * dw_a + 1.0 * dw_b) / 4.0, rtol=1e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            seen["b"], (3.0 * db_a + 1.0 * db_b) / 4.0, rtol=1e-5, atol=1e-6
+        )
 
 
 class TestTrainerAmp(unittest.TestCase):
@@ -1107,6 +1239,78 @@ class TestTrainerAmp(unittest.TestCase):
         _, _, trainer = self._pair()
         with self.assertRaises(ValueError):
             trainer.load_amp_state({"amp_scale": 1.0})
+
+    def test_grad_hook_sees_unscaled_gradients(self):
+        """钩子必须在反缩放之后运行（F02）。
+
+        否则裁剪的 ``max_norm`` 量的是 scale 倍的梯度，scale 变大时同一个
+        ``max_norm`` 会突然开始"裁"，训练轨迹随 AMP 的缩放历史漂移。
+        """
+        x, t = _data(n=8)
+        plain_seen, scaled_seen = {}, {}
+        _, _, plain = self._pair(
+            grad_hook=lambda grads: plain_seen.update(
+                {k: np.array(v) for k, v in grads.items()}
+            )
+            or grads
+        )
+        _, _, scaled = self._pair(
+            scaler=GradScaler(init_scale=8.0, growth_interval=100),
+            grad_hook=lambda grads: scaled_seen.update(
+                {k: np.array(v) for k, v in grads.items()}
+            )
+            or grads,
+        )
+        plain.step({"x": x, "t": t})
+        scaled.step({"x": x, "t": t})
+
+        for name in plain_seen:
+            np.testing.assert_allclose(
+                scaled_seen[name], plain_seen[name], rtol=1e-6, atol=1e-7
+            )
+
+    def test_overflow_does_not_advance_the_schedule(self):
+        """溢出跳过的步不能消耗一次调度（F02）。
+
+        调度用的是"真实更新次数"，若在溢出判定之前就 ``apply_lr``，被跳过
+        的那一步会白白把 lr 推一格，续训的曲线与未溢出时对不上。
+        """
+        _, _, trainer = self._pair(
+            scaler=GradScaler(init_scale=8.0, growth_interval=100),
+            schedule=StepDecay(base_lr=1.0, step_size=1, gamma=0.5),
+        )
+        before = trainer.optimizer.lr
+        bad = {
+            name: np.full(shape.shape, np.inf, dtype=np.float32)
+            for name, shape in trainer.store.arrays().items()
+        }
+        self.assertFalse(trainer._apply(bad, already_unscaled=False))
+        self.assertEqual(trainer.optimizer.lr, before)
+        self.assertEqual(trainer.optimizer.step_count, 0)
+        self.assertEqual(trainer.scaler.skipped, 1)
+        self.assertEqual(trainer.scaler.scale, 4.0)
+
+    def test_amp_mismatch_fails_before_committing(self):
+        """不带 scaler 的训练器加载 AMP 存档：报错且参数不动（F05）。"""
+        x, t = _data(n=8)
+        _, _, trainer = self._pair(
+            scaler=GradScaler(init_scale=4.0, growth_interval=100)
+        )
+        trainer.step({"x": x, "t": t})
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "amp.npz")
+            trainer.save_checkpoint(path)
+            fresh = ParameterStore.from_graph(
+                _graph(batch=8), exclude=("x", "t"), seed=0
+            )
+            before = {name: fresh[name].copy() for name in fresh.names}
+            plain = Trainer(_graph(batch=8), fresh, SGD(fresh.arrays(), lr=0.1))
+            with self.assertRaisesRegex(ValueError, "GradScaler"):
+                plain.load_training_state(path)
+            self.assertEqual(plain.optimizer.step_count, 0)
+            for name in fresh.names:
+                np.testing.assert_array_equal(fresh[name], before[name])
 
     def test_load_amp_state_rejects_a_checkpoint_without_scaling(self):
         _, _, trainer = self._pair(scaler=GradScaler())

@@ -37,7 +37,7 @@ from ._arrays import array_module, to_host
 from .optim import Optimizer
 from .params import ParameterStore
 
-__all__ = ["save_checkpoint", "load_checkpoint", "TrainingSnapshot"]
+__all__ = ["save_checkpoint", "load_checkpoint", "inspect_checkpoint", "TrainingSnapshot"]
 
 
 _PARAM = "param/"
@@ -258,6 +258,30 @@ class TrainingSnapshot:
             f"TrainingSnapshot(step={self.step}, steps={self.steps}, "
             f"params={len(self.params)})"
         )
+
+
+def inspect_checkpoint(path) -> Dict[str, object]:
+    """只读地取出存档的 meta 与附加数组键名，不触碰任何目标对象。
+
+    续训的配置校验必须在**提交之前**完成：``load_checkpoint`` 一旦通过，
+    参数与优化器状态就已经被覆盖。若"累积窗口长度对不上"之类的检查排在它
+    之后，现场会留下"权重已是新存档、训练状态还是旧的"半加载状态。这里
+    只读 ``meta/`` 与 ``aux/`` 两类条目，让调用方先判断"这是不是同一条轨迹"。
+
+    返回 ``{"meta": {...}, "aux": [键名, ...]}``；键名不含 ``aux/`` 前缀。
+    """
+    meta: Dict[str, object] = {}
+    aux: list = []
+    with np.load(str(path)) as data:
+        for key in data.files:
+            if key.startswith(_META):
+                meta[key[len(_META):]] = data[key].item()
+            elif key.startswith(_AUX):
+                name = key[len(_AUX):]
+                if not name:
+                    raise KeyError(f"存档里的附加数组条目 {key!r} 不完整")
+                aux.append(name)
+    return {"meta": meta, "aux": sorted(aux)}
 
 
 def load_checkpoint(
