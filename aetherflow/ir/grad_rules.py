@@ -520,44 +520,44 @@ def _sum_to_mask(b, ds, mask):
     return ds
 
 
-@vjp("attention")
-def _attention(ctx):
-    """融合注意力的反向：完全由已有 PORTABLE 算子组合出来。
+ATTENTION_BACKWARD_CHUNK_ROWS = 128
+"""反向重算时沿 query 序列维一次算多少行。
 
-    前向是 ``softmax(q k^T * scale [+ mask]) @ v``，中间量（分数、概率）在
-    反向图里按同样步骤重算——这是"反向图自包含"的既定做法：代价是重复
-    计算，收益是 attention 不需要反向专用内核，随便哪个能跑 ``matmul`` /
-    ``softmax`` 的后端都能跑它的反向。
+反向图是"复用已有算子重算中间量"，所以峰值不取决于总计算量，而取决于
+**同时活着**的 ``(...,S,T)`` 缓冲数：整块重算时分数、概率、``dp``、``ds``
+在一段区间里并存（5.117 量到 3.4 份）。按 query 行切块后，这些缓冲缩成
+``(块行数, T)``，块贡献完就被 liveness 回收，峰值降到"每块一份"量级。
 
-    链式展开四步：
-    ``dv = p^T dy``、``dp = dy v^T``、``ds = p * (dp - sum(dp*p))``、
-    ``dq = (ds*scale) k``、``dk = (ds*scale)^T q``。
+切块只影响乘法顺序，不改变语义：softmax 沿 key 维归一化，各行互相独立，
+所以任意切分都逐位等价（同一后端上）。
+"""
 
-    dropout 作用在概率上，反向要按同一 ``(p, seed)`` 重建掩码；
-    ``dropout_mask`` 对输入没有梯度，被乘掉的那一份由乘法那条边负责。
+
+def _slice_rows(b, value, start: int, stop: int):
+    """沿倒数第二维（序列维）切出一段行。"""
+    return b.add_node("slice", [value], {"dim": -2, "start": start, "stop": stop})
+
+
+def _attention_block(b, q, k, v, g, mask, scale, p, seed, dtype, kt, vt):
+    """一个 query 行块上的反向重算。
+
+    返回 ``(dq, dk, dv, dmask)``；``dmask`` 在 mask 不需要梯度时为 None。
+    ``kt`` / ``vt`` 是 k、v 的转置，由调用方建一次共用——切块后若每块都
+    再转置一次，同一份转置会被算 N 遍。
     """
-    b, g = ctx.b, ctx.g
-    q, k, v = ctx.input(0), ctx.input(1), ctx.input(2)
-    dtype = q.type.dtype
-    scale = float(ctx.attrs.get("scale", 1.0))
-
-    scores = b.add_node("matmul", [q, _transpose_last_two(b, k)])
+    scores = b.add_node("matmul", [q, kt])
     scores = b.add_node("mul", [scores, _const(b, scale, dtype)])
-    mask = ctx.input(3) if len(ctx.node.inputs) > 3 else None
     if mask is not None:
         scores = b.add_node("add", [scores, mask])
     probs = b.add_node("softmax", [scores], {"axis": -1})
 
     applied, keep = probs, None
-    p = float(ctx.attrs.get("dropout", 0.0))
     if p > 0.0:
-        keep = b.add_node(
-            "dropout_mask", [probs], {"p": p, "seed": int(ctx.attrs.get("seed", 0))}
-        )
+        keep = b.add_node("dropout_mask", [probs], {"p": p, "seed": seed})
         applied = b.add_node("mul", [probs, keep])
 
     dv = b.add_node("matmul", [_transpose_last_two(b, applied), g])
-    dp = b.add_node("matmul", [g, _transpose_last_two(b, v)])
+    dp = b.add_node("matmul", [g, vt])
     if keep is not None:
         dp = b.add_node("mul", [dp, keep])
 
@@ -573,12 +573,125 @@ def _attention(ctx):
     scaled = b.add_node("mul", [ds, _const(b, scale, dtype)])
     dq = b.add_node("matmul", [scaled, k])
     dk = b.add_node("matmul", [_transpose_last_two(b, scaled), q])
+    dmask = _sum_to_mask(b, ds, mask) if mask is not None else None
+    return dq, dk, dv, dmask
+
+
+def _attention_chunk_rows(q) -> Optional[int]:
+    """返回按行切块的行数；不该切块（或切不了）时返回 ``None``。
+
+    切不了的情况只有符号序列维：``slice`` 的区间要静态整数，而运行期
+    形状表达式 IR 还没有（与 conv 拒绝符号维同一条理由）。这类图退回整块
+    重算，语义完全一致，只是峰值按 5.117 的口径。
+    """
+    shape = q.type.shape
+    if not isinstance(shape[-2], int):
+        return None
+    if int(shape[-2]) <= ATTENTION_BACKWARD_CHUNK_ROWS:
+        return None
+    return ATTENTION_BACKWARD_CHUNK_ROWS
+
+
+@vjp("attention")
+def _attention(ctx):
+    """融合注意力的反向：完全由已有 PORTABLE 算子组合出来。
+
+    前向是 ``softmax(q k^T * scale [+ mask]) @ v``，中间量（分数、概率）在
+    反向图里按同样步骤重算——这是"反向图自包含"的既定做法：代价是重复
+    计算，收益是 attention 不需要反向专用内核，随便哪个能跑 ``matmul`` /
+    ``softmax`` 的后端都能跑它的反向。
+
+    链式展开四步：
+    ``dv = p^T dy``、``dp = dy v^T``、``ds = p * (dp - sum(dp*p))``、
+    ``dq = (ds*scale) k``、``dk = (ds*scale)^T q``。
+
+    dropout 作用在概率上，反向要按同一 ``(p, seed)`` 重建掩码；
+    ``dropout_mask`` 对输入没有梯度，被乘掉的那一份由乘法那条边负责。
+
+    序列维够长时按行分块重算（见 ``ATTENTION_BACKWARD_CHUNK_ROWS``）：
+    ``dq`` 与 mask 梯度沿行维 ``concat`` 回去，``dk`` / ``dv`` 沿块累加。
+    行之间互不影响，所以分块与整块在同一后端上逐位等价。
+    """
+    b, g = ctx.b, ctx.g
+    q, k, v = ctx.input(0), ctx.input(1), ctx.input(2)
+    dtype = q.type.dtype
+    scale = float(ctx.attrs.get("scale", 1.0))
+    mask = ctx.input(3) if len(ctx.node.inputs) > 3 else None
+    p = float(ctx.attrs.get("dropout", 0.0))
+    seed = int(ctx.attrs.get("seed", 0))
+
+    kt = _transpose_last_two(b, k)
+    vt = _transpose_last_two(b, v)
+
+    size = _attention_chunk_rows(q)
+    if p > 0.0:
+        # dropout 掩码按"输入的形状 + seed"重建：切块后每块的掩码是另一组
+        # 采样，与整块图不再给出同一结果。"同 seed 同结果"是 5.29 的约定，
+        # 不能让一次显存优化悄悄换掉它——所以带 dropout 的反向退回整块。
+        size = None
+    rows = int(q.type.shape[-2]) if size is not None else 0
+    mask_rows = None
+    if size is not None and mask is not None:
+        # mask 的序列维要么等于 S（逐行不同），要么是 1（广播）：前者按行切，
+        # 后者整块复用；其余形状 _sum_to_mask 本来就给不出梯度，走整块路径
+        # 让那条规则自己判断。
+        if mask.type.is_static and int(mask.type.shape[-2]) in (1, rows):
+            mask_rows = int(mask.type.shape[-2])
+        else:
+            size = None
+
+    if size is None:
+        dq, dk, dv, dmask = _attention_block(
+            b, q, k, v, g, mask, scale, p, seed, dtype, kt, vt
+        )
+    else:
+        dq_parts, dmask_parts = [], []
+        dk = dv = None
+        for start in range(0, rows, size):
+            stop = min(start + size, rows)
+            m_c = None
+            if mask is not None:
+                m_c = mask if mask_rows == 1 else _slice_rows(b, mask, start, stop)
+            dq_c, dk_c, dv_c, dm_c = _attention_block(
+                b,
+                _slice_rows(b, q, start, stop),
+                k,
+                v,
+                _slice_rows(b, g, start, stop),
+                m_c,
+                scale,
+                p,
+                seed,
+                dtype,
+                kt,
+                vt,
+            )
+            dq_parts.append(dq_c)
+            dk = dk_c if dk is None else b.add_node("add", [dk, dk_c])
+            dv = dv_c if dv is None else b.add_node("add", [dv, dv_c])
+            if m_c is not None:
+                dmask_parts.append(dm_c)
+        if len(dq_parts) == 1:
+            dq = dq_parts[0]
+        else:
+            dq = b.add_node("concat", dq_parts, {"axis": -2})
+        if not dmask_parts:
+            dmask = None
+        elif any(part is None for part in dmask_parts):
+            dmask = None
+        elif mask_rows == rows and len(dmask_parts) > 1:
+            dmask = b.add_node("concat", dmask_parts, {"axis": -2})
+        else:
+            # 广播 mask：每块贡献形状都是 (...,1,T)，按块相加
+            dmask = dmask_parts[0]
+            for part in dmask_parts[1:]:
+                dmask = b.add_node("add", [dmask, part])
 
     # q / k / v 的批维在 attention 里不允许广播（见 _infer_attention），
     # 三个梯度的形状因此天然等于输入形状，不需要再归约。
     grads = [dq, dk, dv]
     if mask is not None:
-        grads.append(_sum_to_mask(b, ds, mask))
+        grads.append(dmask)
     return tuple(grads)
 
 

@@ -12,6 +12,7 @@
 """
 
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 
 import numpy as np
@@ -22,9 +23,11 @@ from aetherflow import (
     backward,
     f32,
     f64,
+    plan_memory,
     verify,
     verify_portable_only,
 )
+from aetherflow.ir import grad_rules
 from aetherflow.models import (
     BlockSpec,
     TransformerSpec,
@@ -473,5 +476,140 @@ class TestFusedDecoder(unittest.TestCase):
             np.testing.assert_allclose(b, a, rtol=1e-4, atol=1e-6, err_msg=name)
 
 
+# --------------------------------------------------------------------------
+# 分块反向（AF-30 补）：等价性与峰值
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def _chunk_rows(rows):
+    """临时改分块行数；块大小是模块级常量，用例结束后必须还原。"""
+    old = grad_rules.ATTENTION_BACKWARD_CHUNK_ROWS
+    grad_rules.ATTENTION_BACKWARD_CHUNK_ROWS = rows
+    try:
+        yield
+    finally:
+        grad_rules.ATTENTION_BACKWARD_CHUNK_ROWS = old
+
+
+class TestAttentionChunkedBackward(unittest.TestCase):
+    """按 query 行分块重算反向，数值必须与整块图一致。
+
+    用例里的序列维都远小于默认阈值（128），所以显式把阈值压到 2 来触发
+    分块——真实场景（S=512，阈值 128）的分块图有相同的结构。
+    """
+
+    def _build(self, q_shape, k_shape, v_shape, *, mask_shape=None, scale=0.5):
+        g = Graph("attn")
+        q = g.input("q", f64[q_shape])
+        k = g.input("k", f64[k_shape])
+        v = g.input("v", f64[v_shape])
+        args = [q, k, v]
+        if mask_shape is not None:
+            args.append(g.input("mask", f64[mask_shape]))
+        g.output(g.attention(*args, scale=scale), "y")
+        return g
+
+    def _feed(self, seed, q_shape, k_shape, v_shape, mask_shape=None):
+        rng = np.random.default_rng(seed)
+        feed = {
+            "q": rng.standard_normal(q_shape),
+            "k": rng.standard_normal(k_shape),
+            "v": rng.standard_normal(v_shape),
+        }
+        if mask_shape is not None:
+            feed["mask"] = rng.standard_normal(mask_shape) * 0.1
+        return feed
+
+    def test_chunked_gradient_matches_numeric(self):
+        """S=5、块=2（5=2+2+1）时 dq/dk/dv 仍与中心差分一致。"""
+        shapes = (1, 1, 5, 2), (1, 1, 4, 2), (1, 1, 4, 2)
+        g = self._build(*shapes)
+        feed = self._feed(40, *shapes)
+        with _chunk_rows(2):
+            grads = _analytic_grad(g, feed, ["q", "k", "v"])
+        for name, got in zip(("q", "k", "v"), grads):
+            np.testing.assert_allclose(got, _numeric_grad(g, feed, name), atol=1e-7)
+
+    def test_chunked_matches_whole_graph(self):
+        """同一份输入：分块图与整块图的 dq/dk/dv 只有求和顺序带来的末位差。"""
+        shapes = (2, 2, 7, 3), (2, 2, 5, 3), (2, 2, 5, 3)
+        g = self._build(*shapes)
+        feed = self._feed(41, *shapes)
+        whole = _analytic_grad(g, feed, ["q", "k", "v"])
+        with _chunk_rows(3):
+            chunked = _analytic_grad(g, feed, ["q", "k", "v"])
+        for a, b in zip(whole, chunked):
+            np.testing.assert_allclose(b, a, rtol=1e-12, atol=1e-12)
+
+    def test_chunked_broadcast_mask_gradient_sums_all_blocks(self):
+        """序列维被广播的 mask（1,1,1,T）的梯度要跨块求和，而不是丢掉某几块。"""
+        shapes = (1, 1, 5, 2), (1, 1, 4, 2), (1, 1, 4, 2)
+        g = self._build(*shapes, mask_shape=(1, 1, 1, 4))
+        feed = self._feed(42, *shapes, mask_shape=(1, 1, 1, 4))
+        with _chunk_rows(2):
+            dmask, = _analytic_grad(g, feed, ["mask"])
+        self.assertEqual(dmask.shape, (1, 1, 1, 4))
+        np.testing.assert_allclose(dmask, _numeric_grad(g, feed, "mask"), atol=1e-7)
+
+    def test_row_mask_gradient_matches_whole_graph(self):
+        """mask 的序列维等于 S 时按行切、再 concat 回去。"""
+        shapes = (1, 1, 6, 2), (1, 1, 3, 2), (1, 1, 3, 2)
+        g = self._build(*shapes, mask_shape=(1, 1, 6, 3))
+        feed = self._feed(43, *shapes, mask_shape=(1, 1, 6, 3))
+        whole, = _analytic_grad(g, feed, ["mask"])
+        with _chunk_rows(4):
+            chunked, = _analytic_grad(g, feed, ["mask"])
+        np.testing.assert_allclose(chunked, whole, rtol=1e-12, atol=1e-12)
+
+    def test_dropout_backward_is_not_chunked(self):
+        """带 dropout 时不给反向切块：掩码按块重建会换掉采样流。
+
+        "同 seed 同结果"是 5.29 定的约定；这里钉住"优化没有悄悄改它"。
+        """
+        g = Graph("attn")
+        q = g.input("q", f64[1, 1, 5, 2])
+        k = g.input("k", f64[1, 1, 5, 2])
+        v = g.input("v", f64[1, 1, 5, 2])
+        g.output(g.attention(q, k, v, scale=0.5, dropout=0.25, seed=5), "y")
+        with _chunk_rows(2):
+            bwd = backward(g, wrt=[q, k, v])
+        self.assertNotIn("concat", [n.op for n in bwd.nodes])
+
+    def test_symbolic_sequence_falls_back_to_whole(self):
+        """序列维是符号时切不了：退回整块重算，图仍可校验。"""
+        g = Graph("attn")
+        q = g.input("q", f32[2, 2, "S", 2])
+        k = g.input("k", f32[2, 2, "S", 2])
+        v = g.input("v", f32[2, 2, "S", 2])
+        g.output(g.attention(q, k, v, scale=0.5), "y")
+        with _chunk_rows(2):
+            bwd = backward(g, wrt=[q, k, v])
+        self.assertEqual(verify(bwd), [])
+        self.assertNotIn("concat", [n.op for n in bwd.nodes])
+
+    def test_chunked_peak_memory_is_lower(self):
+        """真实规模（S=T=512, D=64）：分块把二次缓冲的峰值压下去。
+
+        基线必须显式关掉分块（阈值抬到序列维之上），否则两次构图都是分块图，
+        比较的其实是同一张图。
+        """
+        g = Graph("attn")
+        q = g.input("q", f32[8, 4, 512, 64])
+        k = g.input("k", f32[8, 4, 512, 64])
+        v = g.input("v", f32[8, 4, 512, 64])
+        g.output(g.attention(q, k, v, scale=0.125), "y")
+
+        with _chunk_rows(10**9):
+            whole = plan_memory(backward(g, wrt=[q, k, v]))
+        with _chunk_rows(128):
+            chunked = plan_memory(backward(g, wrt=[q, k, v]))
+        self.assertLess(chunked.peak_live_bytes, whole.peak_live_bytes)
+        # 一块 (BH,128,T) 是整块 (BH,S,T) 的四分之一，四份二次缓冲随之缩小；
+        # 留足余量，钉住"至少省四分之一"。
+        self.assertLess(chunked.peak_live_bytes * 4, whole.peak_live_bytes * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
+
