@@ -472,6 +472,27 @@ class TestReferenceExecution(unittest.TestCase):
         )["y"]
         np.testing.assert_array_equal(out, np.array([6, 8], np.int32))
 
+    def test_same_width_sign_change_still_checks_the_range(self):
+        """uint32 -> int32 位宽相同，但一半取值会包成负数（F10）。
+
+        旧实现只在"源更宽"时才验范围，同位宽的符号变化被漏掉：
+        ``2**31`` 会静默变成 ``-2**31``，下标由此指向完全不同的行。
+        """
+        backend = ReferenceBackend()
+        with self.assertRaisesRegex(ValueError, "超出范围"):
+            backend.execute(self._ids_graph(), {"ids": np.array([2**31, 1], np.uint32)})
+        out = backend.execute(
+            self._ids_graph(), {"ids": np.array([3, 4], np.uint32)}
+        )["y"]
+        np.testing.assert_array_equal(out, np.array([6, 8], np.int32))
+
+        # 目标类型能覆盖源类型全部取值时，无需扫描、也不该报错
+        g = Graph()
+        ids = g.input("ids", i32[2])
+        g.output(g.add(ids, ids), "y")
+        out = backend.execute(g, {"ids": np.array([250, 1], np.uint8)})["y"]
+        np.testing.assert_array_equal(out, np.array([500, 2], np.int32))
+
     def test_boolean_is_not_an_index(self):
         with self.assertRaisesRegex(TypeError, "布尔"):
             ReferenceBackend().execute(

@@ -116,8 +116,13 @@ def _check_input_dtype(arr: Any, want: np.dtype, name: str) -> None:
                 f"输入 %{name} 声明为 {want.name}，收到浮点 {src.name}；"
                 "浮点转整数必须由调用方显式转换"
             )
-        if src.kind in "iu" and src.itemsize > want.itemsize and arr.size:
+        if src.kind in "iu" and arr.size:
             info = np.iinfo(want)
+            # 用"目标能否表示源类型的全部取值"判断，而不是比位宽：
+            # uint32 -> int32 位宽相同，却有一半取值落在负区（会包成负数）。
+            src_info = np.iinfo(src)
+            if src_info.min >= info.min and src_info.max <= info.max:
+                return
             low, high = int(arr.min()), int(arr.max())
             if low < info.min or high > info.max:
                 raise ValueError(
