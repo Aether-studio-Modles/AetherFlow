@@ -621,6 +621,74 @@ class TestBackwardGraph(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# 反向图的最小化：只对求导目标的下游调用 vjp
+# --------------------------------------------------------------------------
+
+
+class TestBackwardMinimization(unittest.TestCase):
+    """``minimize=True`` 的判据：节点更少、梯度逐位相同、非法参数显式拒绝。"""
+
+    def _two_branch(self):
+        g = Graph("two_branch")
+        x = g.input("x", f64[4])
+        y = g.input("y", f64[4])
+        a = g.mul(x, x)
+        b = g.tanh(y)  # 与 x 无关，但可微：默认路径会为它建反向节点
+        g.output(g.add(a, g.mul(b, b)), "loss")
+        feed = {
+            "x": np.array([0.5, -1.5, 2.0, 0.25]),
+            "y": np.array([0.3, -0.7, 1.1, 0.2]),
+            "dloss": np.ones(4),  # loss 是向量
+        }
+        return g, feed
+
+    def test_irrelevant_branch_loses_its_backward_nodes(self):
+        g, feed = self._two_branch()
+        x = g.find("x")
+        full = backward(g, wrt=[x])
+        small = backward(g, wrt=[x], minimize=True)
+        self.assertLess(len(small.nodes), len(full.nodes))
+        want = _execute(full, feed)
+        got = _execute(small, feed)
+        self.assertEqual(sorted(got), ["dx"])
+        np.testing.assert_array_equal(got["dx"], want["dx"])
+        np.testing.assert_array_equal(got["dx"], 2.0 * feed["x"])
+
+    def test_intermediate_target_stops_upstream_propagation(self):
+        g = Graph("mid")
+        x = g.input("x", f64[3])
+        h = g.mul(x, x)
+        g.output(g.reduce_sum(h, axis=-1, keepdims=False), "l")
+        full = backward(g, wrt=[h])
+        small = backward(g, wrt=[h], minimize=True)
+        self.assertLess(len(small.nodes), len(full.nodes))
+        feed = {"x": np.array([2.0, -3.0, 0.5]), "dl": np.ones(())}
+        got = _execute(small, feed)["d" + h.name]
+        np.testing.assert_array_equal(got, np.ones(3))
+
+    def test_all_inputs_as_targets_is_unchanged(self):
+        g, feed = self._two_branch()
+        full = backward(g)
+        small = backward(g, minimize=True)
+        self.assertEqual(len(small.nodes), len(full.nodes))
+        want = _execute(full, feed)
+        got = _execute(small, feed)
+        for name in want:
+            np.testing.assert_array_equal(got[name], want[name])
+
+    def test_minimized_graph_is_valid_ir(self):
+        g, _ = self._two_branch()
+        small = backward(g, wrt=[g.find("x")], minimize=True)
+        verify(small, ReferenceBackend().capabilities())
+
+    def test_minimize_rejects_non_bool(self):
+        g, _ = self._two_branch()
+        for bad in (1, 0, "yes", None):
+            with self.assertRaises(TypeError):
+                backward(g, minimize=bad)
+
+
+# --------------------------------------------------------------------------
 # 端到端：训练一步
 # --------------------------------------------------------------------------
 

@@ -13,6 +13,10 @@ pass、或按配置挑一串，只能 import 具体类自己拼。注册表把"�
 实例化，再和名字一起交给 :func:`build_pipeline`（管线元素允许是 ``Pass``
 实例）。
 
+三条管线：默认、融合、反向图（``backward_pipeline``）。反向图那条不含任何
+融合 pass——融合会改变算子输入形态、要求目标后端承接，而反向图的设计前提是
+"任何承接前向的后端都能直接跑它"。
+
 每条执行入口都走 :class:`~aetherflow.passes.base.PassManager`，因此每个
 pass 之后都会过一次 verifier——单独跑一个 pass 也不能绕开这条约定。
 """
@@ -23,7 +27,7 @@ from typing import Callable, Dict, Iterable, List, Union
 
 from ..ir.graph import Graph
 from .base import Pass, PassManager
-from .cse import CommonSubexpressionElimination
+from .cse import CommonSubexpressionElimination, CommutativeCSE
 from .dce import DeadCodeElimination
 from .fold import ConstantFolding
 from .fusion import FuseLayerNormResidual, FuseSiLU, FuseSoftmaxScale
@@ -40,6 +44,10 @@ __all__ = [
     "run_passes",
     "DEFAULT_PASS_NAMES",
     "FUSED_PASS_NAMES",
+    "BACKWARD_PASS_NAMES",
+    "default_pipeline",
+    "fused_pipeline",
+    "backward_pipeline",
 ]
 
 PassFactory = Callable[[], Pass]
@@ -154,6 +162,7 @@ def run_passes(
 register_pass("simplify-shape-ops", SimplifyShapeOps)
 register_pass("constant-folding", ConstantFolding)
 register_pass("cse", CommonSubexpressionElimination)
+register_pass("cse-commutative", CommutativeCSE)
 register_pass("dce", DeadCodeElimination)
 register_pass("fuse_softmax_scale", FuseSoftmaxScale)
 register_pass("fuse_layernorm_residual", FuseLayerNormResidual)
@@ -184,3 +193,21 @@ def default_pipeline() -> PassManager:
 def fused_pipeline() -> PassManager:
     """带融合的优化管线（要求后端承接融合后的输入形态）。"""
     return build_pipeline(FUSED_PASS_NAMES)
+
+
+# 反向图专用管线。它与默认管线的差别只有一处：CSE 换成交换律规范化版本。
+# 反向图里 cotangent 的累加顺序由逆拓扑遍历决定，同一个值的多份贡献会以
+# ``add(a, b)`` / ``add(b, a)`` 两种形态出现，普通 CSE 认不出它们同源。
+# 不跑融合：反向图要能在任何承接前向的后端上执行，融合会引入新的输入形态，
+# 那要求后端额外承诺。
+BACKWARD_PASS_NAMES = (
+    "simplify-shape-ops",
+    "constant-folding",
+    "cse-commutative",
+    "dce",
+)
+
+
+def backward_pipeline() -> PassManager:
+    """反向图专用优化管线（无融合、无后端额外假设）。"""
+    return build_pipeline(BACKWARD_PASS_NAMES)

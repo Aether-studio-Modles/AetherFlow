@@ -67,6 +67,7 @@ def backward(
     seeds: Optional[Mapping[str, str]] = None,
     name: Optional[str] = None,
     active: Optional[Sequence[str]] = None,
+    minimize: bool = False,
 ) -> Graph:
     """返回 ``graph`` 的反向图。
 
@@ -87,6 +88,11 @@ def backward(
         不传播。``loss=sum(x*x)`` 配一个诊断输出 ``sum(log(x))``，在 x=0 处
         零种子仍然算出 ``0/x``，得到 NaN，把对的梯度污染成 NaN。剪枝是在
         构图期按可达性做的，不存在"算出来再丢掉"的那一步。
+    minimize
+        只对"求导目标的下游"调用 vjp：``wrt`` 无关的分支不产生反向节点。
+        默认 ``False``（保持既有构图行为）；``True`` 时反向图的数值与默认
+        路径逐位一致，节点数不增。前向重放范围不变——被剪掉的分支仍可能
+        作为某个 vjp 的输入值被读取，而"读值"与"求它的导数"是两件事。
 
     返回图的输出命名为 ``d<wrt 的 SSA 名>``，顺序与 ``wrt`` 一致。
 
@@ -94,6 +100,11 @@ def backward(
     之类的假节点，那会把"这个参数与损失无关"这件事藏进图里。这里选择报错，
     让调用方自己决定是删掉这个参数还是显式给零。
     """
+    if not isinstance(minimize, bool):
+        raise TypeError(
+            f"minimize 必须是 bool，得到 {type(minimize).__name__}；"
+            "这个开关改变的是构图范围，不接受『真值即可』的隐式转换"
+        )
     if wrt is None:
         wrt = graph.inputs
     wrt = tuple(wrt)
@@ -157,6 +168,26 @@ def backward(
         args = [fwd[a.id] for a in node.inputs]
         fwd[node.output.id] = b.add_node(node.op.name, args, dict(node.attrs))
 
+    # 2b) ``minimize``：算出"求导目标的下游"值集合，vjp 只在这个集合上调用。
+    #     沿消费者方向从前向图 BFS 一次即可：某个值若不能从任何 ``wrt`` 沿前向
+    #     走到，它的 cotangent 就永远不会影响被求导的值。这不是"梯度为零"，
+    #     而是"不在任何一条通往目标的链上"——跳过它不改变结果，也不改变累加
+    #     顺序：留下来的节点仍按原逆拓扑序处理，浮点加法逐位相同。
+    downstream: Optional[set] = None
+    if minimize:
+        consumers: Dict[int, List[Value]] = {}
+        for node in graph.nodes:
+            for a in node.inputs:
+                consumers.setdefault(a.id, []).append(node.output)
+        downstream = set()
+        frontier = [v.id for v in wrt]
+        while frontier:
+            vid = frontier.pop()
+            for out in consumers.get(vid, ()):
+                if out.id not in downstream:
+                    downstream.add(out.id)
+                    frontier.append(out.id)
+
     # 3) 多个输出指向同一个 Value 时，种子必须相加而不是后者覆盖前者。
     cot: Dict[int, Value] = {}
     for value, seed in seed_pairs:
@@ -171,6 +202,8 @@ def backward(
     wanted = {v.id for v in wrt}
     saved: Dict[int, Value] = {}
     for node in reversed(graph.nodes):
+        if downstream is not None and node.output.id not in downstream:
+            continue  # 这个节点到不了任何求导目标：不求它的导数
         g = cot.pop(node.output.id, None)
         if g is None:
             continue  # 这个节点不在任何求导路径上

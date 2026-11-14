@@ -10,20 +10,26 @@
 融合（``fused_pipeline``）单独提供：它会改变算子的输入形态，
 需要目标后端承接，因此不放进"无硬件假设"的默认管线。
 
-两条管线的名字序列与"单独跑某个 pass"的入口都收在 ``registry`` 里，
+反向图（``backward_pipeline``）是第三条：CSE 换成交换律规范化版本（反向图里
+cotangent 的累加顺序不定，``add(a, b)`` 与 ``add(b, a)`` 常见），并且不含任何
+融合 pass——反向图要能在任何承接前向的后端上直接执行。
+
+三条管线的名字序列与"单独跑某个 pass"的入口都收在 ``registry`` 里，
 不再由各模块各写一份——名字与顺序只有一处定义。
 """
 
 from .base import GraphRewriter, Pass, PassManager
 from .autocast import Autocast
-from .cse import CommonSubexpressionElimination
+from .cse import CommonSubexpressionElimination, CommutativeCSE
 from .dce import DeadCodeElimination
 from .fold import ConstantFolding
 from .fusion import FuseLayerNormResidual, FuseSiLU, FuseSoftmaxScale
 from .registry import (
+    BACKWARD_PASS_NAMES,
     DEFAULT_PASS_NAMES,
     FUSED_PASS_NAMES,
     available_passes,
+    backward_pipeline,
     build_pipeline,
     default_pipeline,
     fused_pipeline,
@@ -42,14 +48,17 @@ __all__ = [
     "Autocast",
     "DeadCodeElimination",
     "CommonSubexpressionElimination",
+    "CommutativeCSE",
     "SimplifyShapeOps",
     "ConstantFolding",
     "FuseSoftmaxScale",
     "FuseLayerNormResidual",
     "FuseSiLU",
+    "BACKWARD_PASS_NAMES",
     "DEFAULT_PASS_NAMES",
     "FUSED_PASS_NAMES",
     "available_passes",
+    "backward_pipeline",
     "build_pipeline",
     "default_pipeline",
     "fused_pipeline",

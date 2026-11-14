@@ -11,15 +11,17 @@ import unittest
 
 import numpy as np
 
-from aetherflow import Graph, ReferenceBackend, dumps, f32, loads, verify
+from aetherflow import Graph, ReferenceBackend, backward, dumps, f32, f64, loads, verify
 from aetherflow.ir.ops import OPS, Effect, Op
 from aetherflow.ir.verifier import VerifierError
 from aetherflow.models import BlockSpec, build_transformer_block
 from aetherflow.passes import (
+    BACKWARD_PASS_NAMES,
     DEFAULT_PASS_NAMES,
     FUSED_PASS_NAMES,
     Autocast,
     CommonSubexpressionElimination,
+    CommutativeCSE,
     ConstantFolding,
     DeadCodeElimination,
     FuseLayerNormResidual,
@@ -29,6 +31,7 @@ from aetherflow.passes import (
     PassManager,
     SimplifyShapeOps,
     available_passes,
+    backward_pipeline,
     build_pipeline,
     default_pipeline,
     fused_pipeline,
@@ -115,6 +118,57 @@ class TestCommonSubexpressionElimination(unittest.TestCase):
         res = ReferenceBackend().execute(out, {"x": xv})
         self.assertEqual(sorted(res), ["a", "b"])
         np.testing.assert_allclose(res["a"], res["b"])
+
+
+class TestCommutativeCSE(unittest.TestCase):
+    """交换律规范化的 CSE：反向图里 cotangent 的累加顺序不定，靠它收拢。"""
+
+    def _swapped(self):
+        g = Graph("swapped")
+        x = g.input("x", f32[4])
+        y = g.input("y", f32[4])
+        a = g.add(x, y)
+        b = g.add(y, x)
+        g.output(g.add(a, b), "z")
+        return g
+
+    def test_plain_cse_keeps_swapped_additions(self):
+        g = self._swapped()
+        self.assertEqual(CommonSubexpressionElimination().duplicates(g), 0)
+        self.assertEqual(len(CommonSubexpressionElimination().run(g).nodes), 3)
+
+    def test_swapped_additions_merge_with_identical_numerics(self):
+        g = self._swapped()
+        self.assertEqual(CommutativeCSE().duplicates(g), 1)
+        out = CommutativeCSE().run(g)
+        self.assertEqual(out.op_names(), ["add", "add"])
+        xv = np.array([1.5, -2.0, 0.25, 3.0], dtype=np.float32)
+        yv = np.array([0.5, 4.0, -1.0, 2.0], dtype=np.float32)
+        got = ReferenceBackend().execute(out, {"x": xv, "y": yv})["z"]
+        np.testing.assert_array_equal(got, (xv + yv) + (xv + yv))
+
+    def test_mul_merges_but_sub_does_not(self):
+        g = Graph("mixed")
+        x = g.input("x", f32[4])
+        y = g.input("y", f32[4])
+        g.output(g.mul(y, x), "a")
+        g.output(g.mul(x, y), "b")
+        g.output(g.sub(y, x), "c")
+        g.output(g.sub(x, y), "d")
+        out = CommutativeCSE().run(g)
+        self.assertEqual(out.op_names(), ["mul", "sub", "sub"])
+
+        xv = np.array([1.5, -2.0, 0.25, 3.0], dtype=np.float32)
+        yv = np.array([0.5, 4.0, -1.0, 2.0], dtype=np.float32)
+        res = ReferenceBackend().execute(out, {"x": xv, "y": yv})
+        np.testing.assert_array_equal(res["a"], xv * yv)
+        np.testing.assert_array_equal(res["b"], xv * yv)
+        np.testing.assert_array_equal(res["c"], yv - xv)
+        np.testing.assert_array_equal(res["d"], xv - yv)
+
+    def test_is_registered_by_name(self):
+        self.assertIn("cse-commutative", available_passes())
+        self.assertIsInstance(get_pass("cse-commutative"), CommutativeCSE)
 
 
 class TestSimplifyShapeOps(unittest.TestCase):
@@ -812,6 +866,54 @@ class TestPassRegistry(unittest.TestCase):
         with self.assertRaises(VerifierError):
             run_pass(g, _Broken())
         self.assertEqual(len(run_pass(g, _Broken(), check=False).nodes), 0)
+
+
+class TestBackwardPipeline(unittest.TestCase):
+    """反向图专用管线：无融合、数值逐位不变、节点数不增。"""
+
+    def _forward(self):
+        g = Graph("mlp")
+        x = g.input("x", f64[4, 3])
+        w1 = g.input("w1", f64[3, 5])
+        w2 = g.input("w2", f64[5, 2])
+        h = g.relu(g.matmul(x, w1))
+        g.output(g.matmul(h, w2), "y")
+        return g
+
+    def _bwd(self):
+        bwd = backward(self._forward())
+        rng = np.random.default_rng(7)
+        feed = {
+            "x": rng.standard_normal((4, 3)),
+            "w1": rng.standard_normal((3, 5)),
+            "w2": rng.standard_normal((5, 2)),
+            "dy": np.ones((4, 2)),
+        }
+        return bwd, feed
+
+    def test_names_and_no_fusion(self):
+        self.assertEqual(
+            [p.name for p in backward_pipeline().passes], list(BACKWARD_PASS_NAMES)
+        )
+        self.assertNotIn("fuse_softmax_scale", BACKWARD_PASS_NAMES)
+        self.assertNotIn("fuse_layernorm_residual", BACKWARD_PASS_NAMES)
+        self.assertIn("cse-commutative", BACKWARD_PASS_NAMES)
+
+    def test_optimized_backward_is_bitwise_identical(self):
+        bwd, feed = self._bwd()
+        want = ReferenceBackend().execute(bwd, feed)
+        opt = backward_pipeline().run(bwd)
+        got = ReferenceBackend().execute(opt, feed)
+        self.assertEqual(sorted(got), sorted(want))
+        for name in want:
+            np.testing.assert_array_equal(got[name], want[name])
+        self.assertLessEqual(len(opt.nodes), len(bwd.nodes))
+
+    def test_result_is_valid_ir(self):
+        bwd, _ = self._bwd()
+        opt = backward_pipeline().run(bwd)
+        verify(opt, ReferenceBackend().capabilities())
+        self.assertTrue(all(n.op.portability.value == "portable" for n in opt.nodes))
 
 
 if __name__ == "__main__":
