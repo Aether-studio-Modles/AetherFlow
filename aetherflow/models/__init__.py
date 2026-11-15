@@ -18,6 +18,7 @@
 """
 
 from .cnn import CNNSpec, bn_conv_block, bn_infer, build_cnn, conv_block, residual_block
+from .cached_attention import build_cached_decoder_step, cached_forward
 from .lm import (
     LMSpec,
     LMRunner,
@@ -78,6 +79,7 @@ from .snn import (
     mean_rate,
 )
 from .ssm import build_selective_scan, build_selective_scan_stateful
+from .speculative import DraftModel, SpeculativeDecoder, greedy_draft
 from .transformer import (
     BlockSpec,
     TransformerSpec,
@@ -153,4 +155,9 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "parse_tool_call",
+    "build_cached_decoder_step",
+    "cached_forward",
+    "DraftModel",
+    "SpeculativeDecoder",
+    "greedy_draft",
 ]

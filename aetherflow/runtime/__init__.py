@@ -8,6 +8,7 @@ from .events import (
     event_mean_rate,
     events_to_dense,
 )
+from .paged_cache import PagedCacheFullError, PagedKVCache
 from .reference import ReferenceExecutor, ShapeMismatchError
 from .telemetry import (
     InstrumentedBackend,
@@ -31,4 +32,6 @@ __all__ = [
     "dense_to_events",
     "events_to_dense",
     "event_mean_rate",
+    "PagedKVCache",
+    "PagedCacheFullError",
 ]
