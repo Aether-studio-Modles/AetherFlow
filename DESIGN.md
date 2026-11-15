@@ -15251,8 +15251,12 @@ AetherFlow 是"全 NCHW、无布局传播"——IR 里根本没有 `layout` 这�
   度检查因此重新全绿——声明了却没用例会报 untested。
 - `verify_cuda.py` 加两条真机用例：`cumsum_mid_axis`、`tril_negative_diagonal`。
 - 本地全量 2675 个用例 / 416 跳过，全绿（此前唯一失败就是这两个算子的覆盖断言，
-  现在消失）。WSL HIP（RX 7650 GRE / ROCm 7.2）2675 个用例 / 373 跳过，全绿，
-  conformance 里 `cumsum` / `tril` 的 err 均为 `0.0e+00`（位级一致）。
+  现在消失）。WSL HIP（RX 7650 GRE / ROCm 7.2）2675 个用例 / 373 跳过，全绿。
+  真机 conformance 报告实测：`cumsum` / `tril` 均为 `status=executed`、
+  `max_error=0.000e+00`，`contract` / `portability` / `serialization` /
+  `explicit_failure` / `coverage` 五项检查全为 `True`。f16 口径：两者都随
+  `DType` 渲染 f16 变体（累加在 float、存回走 `af_st_f`），因此计入"f16 覆盖
+  59 个"（62 个设备端算子 − 3 个 int8 语义算子）。
 - IR 算子总数 63 → 65；设备端承接数 60 → 62（61 个自研内核 + 由反量化与 GEMM
   组合的 `linear_i8`）。`fft` / `rfft` 仍只有 CUDA 的 cuFFT 路径。
 
@@ -15306,7 +15310,7 @@ AetherFlow 是"全 NCHW、无布局传播"——IR 里根本没有 `layout` 这�
 
 | 缺口 | 影响 |
 |---|---|
-| 两条直算路径只覆盖 f32 | 分块直算与隐式 GEMM 的 shared 与累加器都是 float：显式选择且输入为 f16 时以 `BackendCapabilityError` 失败（f16 的 conv2d 走 im2col + hgemm）。其余 57 个算子的 f16 自 5.121 起全覆盖——attention 是混合精度（q/k/v/mask/out 存半精度，点积、在线 softmax 与输出累加在 float） |
+| 两条直算路径只覆盖 f32 | 分块直算与隐式 GEMM 的 shared 与累加器都是 float：显式选择且输入为 f16 时以 `BackendCapabilityError` 失败（f16 的 conv2d 走 im2col + hgemm）。其余 59 个算子的 f16 自 5.121 起全覆盖（62 个设备端算子去掉 3 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8`）——attention 是混合精度（q/k/v/mask/out 存半精度，点积、在线 softmax 与输出累加在 float） |
 | 累积与更新仍在 f32 | f16 只降低存储与带宽，归约与 GEMM 的累加都在 f32 完成；master 权重与优化器状态必须保持 f32（5.28），f16 参数直接更新会被量化吞掉 |
 | softmax / layernorm / reduce_sum 只支持最后一维 | 覆盖 Transformer，不覆盖全部模型。**已由 5.153 关闭**：任意单轴可跑，多轴 `reduce_*` 与 `argmax` 仍限末维 |
 | 广播折叠后上限 4 维 | 超高维张量的非常规广播会被明确拒绝 |
