@@ -134,10 +134,33 @@ def collective_support(
         device_allreduce=False,
         overlap=False,
         provider=None,
-        reason=(
-            "设备侧集合通信（NCCL / RCCL）未接入：跨卡归约一律经主机中转"
-            "（D2H → 主机求和 → H2D）；计算/通信重叠也未实现"
-        ),
+        reason=_device_collective_reason(),
+    )
+
+
+def _device_collective_reason() -> str:
+    """说清"为什么仍走主机中转"，并把本机的真实情况带出来。
+
+    5.228 起 ``train/nccl.py`` 已经能加载 NCCL，5.244 起同一份绑定也认 RCCL；
+    但**数据并行路径没有接它**（``DeviceDataParallel`` 的归约仍是每卡拉回主机
+    求和再传回去）。因此能力声明必须保持 ``device_allreduce=False``，理由里
+    再区分"本机连库都没有"与"库在、只是没接线"——这两种情况该做的事不同。
+    """
+    from . import nccl
+
+    try:
+        label = "RCCL" if nccl.vendor() == "hip" else "NCCL"
+        version = nccl.version_string()
+    except nccl.NcclUnavailable:
+        return (
+            "设备侧集合通信（NCCL / RCCL）未接入：本机也加载不到这两套库；"
+            "跨卡归约一律经主机中转（D2H → 主机求和 → H2D）；"
+            "计算/通信重叠也未实现"
+        )
+    return (
+        f"{label} {version} 已可加载并已绑定调用面，但数据并行路径还没接它："
+        "跨卡归约仍经主机中转（D2H → 主机求和 → H2D）；"
+        "计算/通信重叠也未实现"
     )
 
 

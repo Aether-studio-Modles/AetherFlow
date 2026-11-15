@@ -1,12 +1,16 @@
-"""NCCL 绑定：登记表、参数校验与真机四集合对拍。
+"""NCCL / RCCL 绑定：登记表、参数校验、厂商判定与真机四集合对拍。
 
 两层：
 
 - **离线**：dtype / 归约登记表、``ncclUniqueId`` 的字节往返、communicator 的
-  非法 rank / world_size、主机数组与不连续数组的拒绝。这些不需要 GPU，也
-  不需要加载库（参数校验发生在 ``_load`` 之前，或是纯函数）。
+  非法 rank / world_size、主机数组与不连续数组的拒绝、按库文件名判定厂商
+  （``librccl`` → HIP）、以及能力声明的理由文本。这些不需要 GPU，也不需要
+  加载库（参数校验发生在 ``_load`` 之前，或是纯函数）。
 - **真机**：两个子进程各占一张卡，跑 AllReduce / AllGather / ReduceScatter /
-  Broadcast，与主机侧期望值对拍。没有 NCCL 或不到两块卡时整组跳过。
+  Broadcast，与主机侧期望值对拍。没有 NCCL / RCCL 或卡数不够时整组跳过。
+  CUDA 用 cupy 数组（``_nccl_worker``），HIP 用项目自己的 ``DeviceArray``
+  （``_rccl_worker``）；后者只有一块卡时按 world=1 跑，验证的是加载、版本、
+  comm 初始化与四个调用面，而不是跨卡数值。
 """
 
 import os
@@ -15,11 +19,13 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
 from aetherflow.backends.cuda import CUDA_AVAILABLE
 from aetherflow.train import nccl
+from aetherflow.train.parallel import collective_support
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -126,6 +132,127 @@ class TestBufferValidation(unittest.TestCase):
         nccl._contiguous(buffer, "输入")
 
 
+class TestVendorDetection(unittest.TestCase):
+    """厂商只由库文件名决定：不 import cupy、不碰设备。"""
+
+    def test_rccl_names_are_hip(self):
+        for path in (
+            "librccl.so.2",
+            "librccl.so.1",
+            "/opt/rocm/lib/librccl.so.1",
+            "C:\\Windows\\System32\\rccl.dll",
+        ):
+            self.assertEqual(nccl._vendor_from_path(path), "hip", path)
+
+    def test_nccl_names_are_cuda(self):
+        for path in (
+            "libnccl.so.2",
+            "nccl.dll",
+            "/usr/lib/x86_64-linux-gnu/libnccl.so.2",
+            "C:/Program Files/nccl/nccl.dll",
+        ):
+            self.assertEqual(nccl._vendor_from_path(path), "cuda", path)
+
+    def test_candidates_cover_both_sonames(self):
+        """NCCL 的 soname 是 .so.2，RCCL 的是 .so.1：两边都要在候选里。"""
+        names = list(nccl._CANDIDATES)
+        self.assertIn("libnccl.so.2", names)
+        self.assertIn("librccl.so.1", names)
+        self.assertIn("rccl.dll", names)
+
+
+class TestVersionFormat(unittest.TestCase):
+    def test_integer_version_becomes_dotted(self):
+        self.assertEqual(nccl._format_version(22707), "2.27.7")
+        self.assertEqual(nccl._format_version(21803), "2.18.3")
+        self.assertEqual(nccl._format_version(10000), "1.0.0")
+
+    @unittest.skipIf(nccl.available(), "本机有 NCCL / RCCL：这条只验证库缺失")
+    def test_missing_library_makes_vendor_explicit(self):
+        for call in (nccl.vendor, nccl.version_string):
+            with self.assertRaises(nccl.NcclUnavailable) as caught:
+                call()
+            self.assertIn("NCCL", str(caught.exception))
+
+    @unittest.skipUnless(nccl.available(), "本机没有 NCCL / RCCL")
+    def test_loaded_vendor_and_version_are_consistent(self):
+        self.assertIn(nccl.vendor(), ("cuda", "hip"))
+        self.assertRegex(nccl.version_string(), r"^\d+\.\d+\.\d+$")
+
+
+class _HipLikeBuffer:
+    """``DeviceArray`` 的最小形态：只提供绑定层要的四个属性。"""
+
+    class _Data:
+        ptr = 8192
+
+    def __init__(self, size=4):
+        self.size = size
+        self.dtype = np.dtype("float32")
+        self.data = self._Data()
+        self.flags = SimpleNamespace(c_contiguous=True)
+
+
+class TestHipArrayShape(unittest.TestCase):
+    """RCCL 的输入是 ``backends.hip`` 的 DeviceArray，不是 cupy 数组。"""
+
+    def test_device_array_minimum_is_accepted(self):
+        buffer = _HipLikeBuffer(8)
+        ptr = nccl._pointer(buffer, "输入")
+        self.assertEqual(ptr.value, 8192)
+        nccl._contiguous(buffer, "输入")
+
+
+class _FakeMultiDevice:
+    """只满足"多设备后端"契约的替身：能力声明不看它，只看库。"""
+
+    def enumerate_devices(self):
+        return ()
+
+    def current_device(self):
+        return 0
+
+    def set_device(self, index):
+        return None
+
+    def execute(self, graph, feed):
+        raise NotImplementedError
+
+    def to_array(self, value):
+        return value
+
+    def to_host(self, value):
+        return value
+
+
+class TestCollectiveCapability(unittest.TestCase):
+    """声明仍是 False（路径没接线），但理由要说出本机的真实情况。"""
+
+    def test_reason_names_the_loaded_library(self):
+        with mock.patch.object(nccl, "vendor", return_value="hip"), mock.patch.object(
+            nccl, "version_string", return_value="2.27.7"
+        ):
+            support = collective_support(_FakeMultiDevice())
+        self.assertFalse(support.device_allreduce)
+        self.assertIn("RCCL 2.27.7", support.reason)
+        self.assertIn("主机中转", support.reason)
+
+    def test_reason_says_when_library_is_absent(self):
+        with mock.patch.object(
+            nccl, "vendor", side_effect=nccl.NcclUnavailable("没有库")
+        ):
+            support = collective_support(_FakeMultiDevice())
+        self.assertFalse(support.device_allreduce)
+        self.assertIn("加载不到", support.reason)
+
+    def test_cuda_vendor_keeps_nccl_name(self):
+        with mock.patch.object(nccl, "vendor", return_value="cuda"), mock.patch.object(
+            nccl, "version_string", return_value="2.18.3"
+        ):
+            support = collective_support(_FakeMultiDevice())
+        self.assertIn("NCCL 2.18.3", support.reason)
+
+
 def _device_count():
     if not CUDA_AVAILABLE:
         return 0
@@ -137,15 +264,30 @@ def _device_count():
         return 0
 
 
-@unittest.skipUnless(
-    CUDA_AVAILABLE and nccl.available() and _device_count() >= 2,
-    "需要 NCCL 与至少两块 CUDA 设备",
-)
-class TestCollectivesOnDevice(unittest.TestCase):
-    """真机：两个进程各占一张卡，四个集合操作与主机期望值对拍。"""
+def _hip_device_count():
+    """HIP 侧的设备数；没有 ROCm 时为 0，不抛错。"""
+    try:
+        from aetherflow.backends.hip import runtime
+
+        return int(runtime.device_count())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _vendor_or_none():
+    try:
+        return nccl.vendor()
+    except nccl.NcclUnavailable:
+        return None
+
+
+class _CollectiveWorkerCheck:
+    """两份真机 worker 共用的启动与对拍逻辑（world 泛化到 1）。"""
+
+    WORKER = ""
 
     def test_four_collectives(self):
-        world = 2
+        world = self.WORLD
         with tempfile.TemporaryDirectory() as workdir:
             uid_path = os.path.join(workdir, "uid.bin")
             outs = [os.path.join(workdir, f"rank{rank}.npz") for rank in range(world)]
@@ -154,7 +296,7 @@ class TestCollectivesOnDevice(unittest.TestCase):
             procs = [
                 subprocess.Popen(
                     [
-                        sys.executable, "-m", "tests._nccl_worker",
+                        sys.executable, "-m", self.WORKER,
                         str(rank), str(world), uid_path, outs[rank],
                     ],
                     cwd=_ROOT, env=env,
@@ -168,7 +310,7 @@ class TestCollectivesOnDevice(unittest.TestCase):
                 logs.append(output.decode("utf-8", "replace"))
                 if proc.returncode != 0:
                     self.fail(
-                        f"NCCL worker 退出码 {proc.returncode}：\n"
+                        f"{self.WORKER} 退出码 {proc.returncode}：\n"
                         + "\n".join(logs)
                     )
             results = [
@@ -214,6 +356,32 @@ class TestCollectivesOnDevice(unittest.TestCase):
             np.testing.assert_allclose(
                 results[rank]["broadcast"], expected, rtol=0, atol=1e-5
             )
+
+
+@unittest.skipUnless(
+    CUDA_AVAILABLE and _vendor_or_none() == "cuda" and _device_count() >= 2,
+    "需要 NCCL 与至少两块 CUDA 设备",
+)
+class TestCollectivesOnDevice(_CollectiveWorkerCheck, unittest.TestCase):
+    """真机：两个进程各占一张卡，四个集合操作与主机期望值对拍。"""
+
+    WORKER = "tests._nccl_worker"
+    WORLD = 2
+
+
+@unittest.skipUnless(
+    _vendor_or_none() == "hip" and _hip_device_count() >= 1,
+    "需要 RCCL 与至少一块 HIP 设备",
+)
+class TestRcclOnDevice(_CollectiveWorkerCheck, unittest.TestCase):
+    """真机：RCCL 单 rank 跑通加载 / 版本 / comm 初始化与四个调用面。
+
+    跨卡数值只能靠 ``TestCollectivesOnDevice``；这里在一块卡上验的是
+    "同一份 ctypes 绑定确实能被 RCCL 接住"，world=1 时期望值等于输入。
+    """
+
+    WORKER = "tests._rccl_worker"
+    WORLD = 1
 
 
 if __name__ == "__main__":

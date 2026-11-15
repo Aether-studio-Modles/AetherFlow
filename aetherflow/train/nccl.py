@@ -11,6 +11,14 @@
 靠线程同时进入初始化，还会把 cupy 的"当前设备"变成线程局部状态，失败时
 很难判断是哪一层没设对。单进程多卡的路径仍走 5.190 的主机中转。
 
+**同一份绑定也用于 RCCL。** AMD 的 RCCL 实现了同一套 ``nccl*`` C 接口
+（函数名、枚举值、``ncclUniqueId`` 的 128 字节布局都一致），所以这里不写第二份
+ctypes 声明，只在加载时按库文件名判定厂商：命中 ``librccl`` 就是 HIP，其余是
+CUDA。两者的差异只在两处——库的 soname（NCCL 是 ``libnccl.so.2``，RCCL 是
+``librccl.so.1``）与"怎么同步当前流"（CUDA 用 cupy，HIP 用项目自己的
+``backends.hip.runtime``）。**判定按文件名而不是按"能不能 import cupy"**：
+设备上装了什么库与 Python 侧装了哪个包是两件独立的事。
+
 **数组是外部输入，先在主机侧校验完再碰驱动。** NCCL 只认"连续设备缓冲 +
 元素个数 + dtype 枚举"。dtype 不在登记表、数组不是 C 连续、收发缓冲长度
 与 rank 数对不上，都在调用之前抛错——设备端越界读的代价是上下文中毒，
@@ -38,7 +46,9 @@ __all__ = [
     "NcclUnavailable",
     "NcclUnsupported",
     "available",
+    "vendor",
     "version",
+    "version_string",
     "unique_id",
     "NcclComm",
 ]
@@ -53,9 +63,12 @@ _DATA_TYPES = {
 _RED_OPS = {"sum": 0, "prod": 1, "max": 2, "min": 3}
 _NCCL_SUCCESS = 0
 
-_CANDIDATES = ("libnccl.so.2", "libnccl.so", "nccl.dll")
+_CANDIDATES = (
+    "libnccl.so.2", "libnccl.so", "nccl.dll",
+    "librccl.so.2", "librccl.so.1", "librccl.so", "rccl.dll",
+)
 
-_loaded: Optional[Tuple[Any, str]] = None
+_loaded: Optional[Tuple[Any, str, str]] = None
 _load_error: Optional[str] = None
 
 
@@ -115,8 +128,18 @@ def red_op(name: Any) -> int:
         ) from None
 
 
-def _load() -> Tuple[Any, str]:
-    """加载 libnccl；失败抛 ``NcclUnavailable``（结果缓存，只试一次）。"""
+def _vendor_from_path(path: str) -> str:
+    """按库文件名判定厂商：``librccl`` / ``rccl.dll`` 是 HIP，其余是 CUDA。
+
+    只看 basename 且转小写：``ctypes.util.find_library`` 可能返回绝对路径，
+    Windows 上还会带盘符。这条路必须能在没有设备的机器上回答，所以是纯函数。
+    """
+    name = str(path).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return "hip" if "rccl" in name else "cuda"
+
+
+def _load() -> Tuple[Any, str, str]:
+    """加载 NCCL / RCCL；失败抛 ``NcclUnavailable``（结果缓存，只试一次）。"""
     global _loaded, _load_error
     if _loaded is not None:
         return _loaded
@@ -124,9 +147,17 @@ def _load() -> Tuple[Any, str]:
         raise NcclUnavailable(_load_error)
 
     names = list(_CANDIDATES)
-    found = ctypes.util.find_library("nccl")
-    if found:
-        names.insert(0, found)
+    # ``find_library`` 的结果放最前，但保持"先 NCCL 后 RCCL"的优先级：
+    # 一台机器同时装了两套库时，按候选顺序的第一份当作事实来源。
+    found = [
+        name
+        for name in (
+            ctypes.util.find_library("nccl"),
+            ctypes.util.find_library("rccl"),
+        )
+        if name
+    ]
+    names[0:0] = found
     try:  # pip install nvidia-nccl-cu12 的包内 so 不在 ldconfig 路径里
         import nvidia.nccl as _pkg
 
@@ -142,10 +173,12 @@ def _load() -> Tuple[Any, str]:
         except OSError as exc:
             tried.append(f"{name}: {exc}")
             continue
-        _loaded = (lib, name)
+        _loaded = (lib, name, _vendor_from_path(name))
         _bind(lib)
         return _loaded
-    _load_error = "找不到 NCCL 动态库，尝试过：\n  " + "\n  ".join(tried)
+    _load_error = (
+        "找不到 NCCL / RCCL 动态库，尝试过：\n  " + "\n  ".join(tried)
+    )
     raise NcclUnavailable(_load_error)
 
 
@@ -205,25 +238,50 @@ def available() -> bool:
     return True
 
 
+def vendor() -> str:
+    """``"cuda"``（NCCL）或 ``"hip"``（RCCL）；库缺失时抛 ``NcclUnavailable``。"""
+    _, _, kind = _load()
+    return kind
+
+
+def _format_version(number: int) -> str:
+    """``ncclGetVersion`` 的整数 → ``"2.27.7"``（major×10⁴ + minor×10² + patch）。"""
+    return f"{number // 10000}.{number // 100 % 100}.{number % 100}"
+
+
 def version() -> int:
-    """NCCL 版本号（如 21803 表示 2.18.3）；库缺失时抛 ``NcclUnavailable``。"""
-    lib, _ = _load()
+    """NCCL / RCCL 版本号（如 22707 表示 2.27.7）；库缺失时抛 ``NcclUnavailable``。"""
+    lib, _, _ = _load()
     number = ctypes.c_int()
     _check(lib.ncclGetVersion(ctypes.byref(number)), "ncclGetVersion")
     return int(number.value)
 
 
+def version_string() -> str:
+    """``version()`` 的可读形式；库缺失时抛 ``NcclUnavailable``。"""
+    return _format_version(version())
+
+
 def unique_id() -> NcclUniqueId:
     """生成一次性的 communicator id；由 rank 0 生成并分发给其余 rank。"""
-    lib, _ = _load()
+    lib, _, _ = _load()
     value = NcclUniqueId()
     _check(lib.ncclGetUniqueId(ctypes.byref(value)), "ncclGetUniqueId")
     return value
 
 
+def _label() -> str:
+    """错误信息里的库名：加载失败时两套都提，加载成功时按厂商只提一个。"""
+    try:
+        _, _, kind = _load()
+    except NcclUnavailable:
+        return "NCCL / RCCL"
+    return "RCCL" if kind == "hip" else "NCCL"
+
+
 def _message(status: int) -> str:
     try:
-        lib, _ = _load()
+        lib, _, _ = _load()
         text = lib.ncclGetErrorString(status)
         if text:
             return text.decode("utf-8", "replace")
@@ -234,7 +292,7 @@ def _message(status: int) -> str:
 
 def _check(status: int, what: str) -> None:
     if status != _NCCL_SUCCESS:
-        raise RuntimeError(f"NCCL {what} 失败（{status}）：{_message(status)}")
+        raise RuntimeError(f"{_label()} {what} 失败（{status}）：{_message(status)}")
 
 
 def _pointer(array: Any, label: str) -> ctypes.c_void_p:
@@ -286,7 +344,7 @@ class NcclComm:
         if not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} 越界：world_size={world_size}")
 
-        lib, self.name = _load()
+        lib, self.name, self.vendor = _load()
         required = (
             "ncclCommInitRank",
             "ncclAllReduce",
@@ -478,7 +536,18 @@ class NcclComm:
         return NcclGroup(self)
 
     def synchronize(self) -> None:
-        """等当前流上的集合调用完成（依赖 cupy）。"""
+        """等当前流上的集合调用完成。
+
+        厂商由加载到的库决定：RCCL 走项目自己的 HIP 运行时（设备级同步），
+        NCCL 走 cupy 的当前流。**不能两边都试**——HIP 机器上通常没有可用的
+        cupy，CUDA 机器上 import 项目的 HIP 运行时也只会失败，靠 try/except
+        猜厂商会把"同步失败"变成"同步被静默跳过"。
+        """
+        if self.vendor == "hip":
+            from ..backends.hip import runtime
+
+            runtime.synchronize()
+            return
         import cupy as cp
 
         cp.cuda.get_current_stream().synchronize()
