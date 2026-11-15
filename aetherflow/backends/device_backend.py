@@ -129,6 +129,8 @@ GPU_OPS: FrozenSet[str] = frozenset(
     "batch_norm_stats",
     "scan_linear",
     "scan_linear_backward",
+    "cumsum",
+    "tril",
     "sparse_linear",
     "sparse_linear_weight_grad",
     "sparse_linear_values_grad",
@@ -742,6 +744,8 @@ class DeviceBackend(Executor):
         r.register("batch_norm_stats", self._op_batch_norm_stats)
         r.register("scan_linear", self._op_scan_linear)
         r.register("scan_linear_backward", self._op_scan_linear_backward)
+        r.register("cumsum", self._op_cumsum)
+        r.register("tril", self._op_tril)
         r.register("sparse_linear", self._op_sparse_linear)
         r.register("sparse_linear_weight_grad", self._op_sparse_linear_weight_grad)
         r.register("sparse_linear_values_grad", self._op_sparse_linear_values_grad)
@@ -3069,6 +3073,94 @@ class DeviceBackend(Executor):
 
     def _op_scan_linear_backward(self, node, args, attrs):
         return self._scan(args[0], args[1], None, backward=True)
+
+    # ------------------------------------------------------------------
+    # 前缀和 / 三角掩码（分块 SSM 的块内权重）
+    # ------------------------------------------------------------------
+
+    def _op_cumsum(self, node, args, attrs):
+        """沿单个轴的前缀和：一个线程一条 ``(outer, inner)`` 链。
+
+        张量按 ``(outer, steps, inner)`` 切分，内核里的 ``work`` 就是并行链数
+        ``outer * inner``，grid 因此按它铺——与 ``scan_linear`` 是同一套铺法，
+        区别只在没有 ``a_t`` 乘法。axis 为负时先归一化再折维度；轴越界在设备
+        端也拦一次，避免快路径绕过 verifier 时把错误轴当成合法轴。
+        """
+        cp = self.cp
+        x = self._contig(args[0])
+        axis = attrs.get("axis", -1)
+        if isinstance(axis, bool) or not isinstance(axis, int):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 cumsum 的 axis 必须是整数，收到 {axis!r}"
+            )
+        axis = axis + x.ndim if axis < 0 else axis
+        if not 0 <= axis < x.ndim:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 cumsum 轴越界: {attrs.get('axis')!r}，秩为 {x.ndim}"
+            )
+        shape = tuple(int(d) for d in x.shape)
+        steps = shape[axis]
+        outer = int(np.prod(shape[:axis], dtype=np.int64))
+        inner = int(np.prod(shape[axis + 1 :], dtype=np.int64))
+        out = cp.empty_like(x)
+        work = outer * inner
+        if work == 0 or steps == 0:
+            return out
+        kernel = self._kernel(
+            ("cumsum", self._kind(x)),
+            lambda: self.codegen.render(self.codegen.cumsum_source(), x.dtype),
+            "cumsum",
+        )
+        block, grid = self._grid("cumsum", work)
+        kernel(
+            (grid,),
+            (block,),
+            (x, out, np.int64(work), np.int64(steps), np.int64(inner)),
+        )
+        return out
+
+    def _op_tril(self, node, args, attrs):
+        """最后两维保留下三角、其余置零：一个线程一个元素。
+
+        C 布局下线性下标满足 ``c = idx % cols``、``r = (idx / cols) % rows``，
+        前导维被 ``% rows`` 自然吸收，所以不需要额外传 batch；条件外写 0
+        而不是跳过，输出才不会带着未初始化值。
+        """
+        cp = self.cp
+        x = self._contig(args[0])
+        if x.ndim < 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 tril 至少需要秩 2，收到 {tuple(x.shape)}"
+            )
+        diagonal = attrs.get("diagonal", 0)
+        if isinstance(diagonal, bool) or not isinstance(diagonal, int):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 tril 的 diagonal 必须是整数，收到 {diagonal!r}"
+            )
+        rows, cols = int(x.shape[-2]), int(x.shape[-1])
+        out = cp.empty_like(x)
+        n = int(x.size)
+        if n == 0 or rows == 0 or cols == 0:
+            return out
+        kernel = self._kernel(
+            ("tril", self._kind(x)),
+            lambda: self.codegen.render(self.codegen.tril_source(), x.dtype),
+            "tril",
+        )
+        block, grid = self._grid("tril", n)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                x,
+                out,
+                np.int64(n),
+                np.int64(rows),
+                np.int64(cols),
+                np.int64(diagonal),
+            ),
+        )
+        return out
 
 
 

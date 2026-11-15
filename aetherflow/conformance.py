@@ -618,6 +618,28 @@ def _scan_linear_backward(steps: int = 5, tail: tuple = (2, 3)):
     return build
 
 
+def _cumsum(shape: tuple = (2, 4, 3), axis: int = 1):
+    def build(rng):
+        g = Graph("cumsum")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("cumsum", [x], {"axis": axis}), "y")
+        # axis=1 而不是末轴：中间轴才能同时压到 outer 与 inner 两侧的折维
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
+def _tril(shape: tuple = (2, 5, 5), diagonal: int = -1):
+    def build(rng):
+        g = Graph("tril")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("tril", [x], {"diagonal": diagonal}), "y")
+        # 秩 3 + 负偏移：覆盖"前导维逐片独立"与"对角线以下"两种边界
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
 def _constant():
     def build(rng):
         g = Graph("constant")
@@ -1149,6 +1171,10 @@ def default_cases() -> List[Case]:
               note="SSM 的全部递归都收在这一个算子；时间维必须静态，否则后端无从展开"),
         _case("scan_linear_backward", _scan_linear_backward(),
               note="伴随递归：从后往前累积，是 scan_linear 反向的唯一手段"),
+        _case("cumsum", _cumsum(),
+              note="非末轴前缀和：折成 (outer, steps, inner) 后并行链数来自 outer*inner"),
+        _case("tril", _tril(),
+              note="前导维逐片独立；negative diagonal 覆盖对角线以下才保留的情况"),
         # SNN 事件驱动（稀疏）
         _case("spike_offsets", _spike_offsets(),
               note="统计每步非零数并给出起点表；与 spike_csr 拆成两个单输出节点"),

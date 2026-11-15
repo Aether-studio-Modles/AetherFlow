@@ -316,6 +316,20 @@ def _extra_cases() -> list:
             "dy": _rand(rng, 9, 4),
         }
 
+    def cumsum_mid_axis():
+        """中间轴前缀和：折成 (outer, steps, inner) 后两侧折维都不能省。"""
+        g = Graph()
+        x = g.input("x", f32[2, 5, 3])
+        g.output(g.add_node("cumsum", [x], {"axis": 1}), "y")
+        return g, {"x": _rand(rng, 2, 5, 3)}
+
+    def tril_negative_diagonal():
+        """对角线以下才保留 + 前导维逐片独立：掩码偏移与片号都不能串。"""
+        g = Graph()
+        x = g.input("x", f32[2, 5, 5])
+        g.output(g.add_node("tril", [x], {"diagonal": -1}), "y")
+        return g, {"x": _rand(rng, 2, 5, 5)}
+
     def silu_gate_odd():
         """SwiGLU 门控：元素总数 21 不是 block 维的倍数，跨步循环必须收尾。"""
         g = Graph()
@@ -364,6 +378,8 @@ def _extra_cases() -> list:
         ("scan_linear_single_step", scan_linear_single_step),
         ("scan_linear_wide", scan_linear_wide),
         ("scan_linear_backward_long", scan_linear_backward_long),
+        ("cumsum_mid_axis", cumsum_mid_axis),
+        ("tril_negative_diagonal", tril_negative_diagonal),
         ("silu_gate_odd_length", silu_gate_odd),
         ("layernorm_residual_odd_cols", layernorm_residual_odd),
     ]
