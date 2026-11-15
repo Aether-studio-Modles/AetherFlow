@@ -138,6 +138,18 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   参数分片与优化器槽位，`world_size` 变了要重新分片；`materialize` 返回的是**副本**，
   改它不会回头改分片。数值上拼回的完整参数与整份逐位相同，只有 `step` 的求和顺序
   由拓扑决定。
+- ZeRO-3 接进训练循环（5.234，`train/loop.py` + `train/recompute.py`）：`CheckpointPlan`
+  的 `forward` / `backward` 各多一个 `on_segment` 回调，每一段执行前**先**借出该段
+  `segment.inputs` 里出现的参数（`zero3.materialize(names)` 塞进 feed），执行完
+  `feed.pop` + `zero3.release(names)`。借用必须成对：只删引用不 release，缓存会一直
+  钉住这块显存；只 release 不删引用，下一段的 `_feed_of` 会捡到上一段的旧副本。
+  三条要点：①`store` 从"参数真身"降级为**借出的完整副本**，训练期间是旧值，
+  `sync_to_host()` 才拼回、`snapshot()` 发现 `_host_stale` 会先自动同步；②更新走
+  `zero3.step(grads)`，所以 `optimizer` 必须就是 `zero3.optimizer`；③零散的
+  `device_state` / `master_weights` / `GradScaler` 全部构造期拒绝——它们各自还要一份
+  完整参数或完整梯度，与"只常驻一块"直接冲突。强制要求 `segments`：整图前向本来就
+  要把所有参数拼回来，不切段就只是"看起来在分片"。`Trainer.steps` 是进程内计数，
+  `load_shard` 只带回 `Zero3Rank.steps`，续训用例断言别写错对象。
 - **工作区被旧缓冲覆盖（反复出现）**：提交后用 `git status` / `git diff --stat` 核对，
   出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
   已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
