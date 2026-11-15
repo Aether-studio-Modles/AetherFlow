@@ -17,7 +17,8 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 
 这一代**不**包括（下一代清单）：把 NCCL / RCCL 接进数据并行路径（5.244 只做到
 加载、厂商判定与四个集合调用面，`DeviceDataParallel` 仍走主机中转）、int8 / fp8
-**计算**、NHWC 布局传播、设备端控制流、把 schedule 搜索接进编译流水线（5.242
+**计算**、NHWC 布局传播、真正的设备端分支（5.245 的 `DeviceWhileLoop` 只是把
+条件与体各捕获一次、状态留在显存，每轮仍要读一次谓词）、把 schedule 搜索接进编译流水线（5.242
 只有离线成本模型与按估算排序的串行搜索）、开放式的包发布（CI 只在构建 wheel 后
 上传 artifact，没有 PyPI / GitHub Release 发布流程）。
 不要把这些当作"已经能用"去写示例。
@@ -44,7 +45,9 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2633 个用例 / 414 跳过，WSL HIP 2633 个用例 / 373 跳过。
+当前基线：本地 2652 个用例 / 415 跳过，WSL HIP 2652 个用例 / 373 跳过。
+（两者各有一条与功能无关的失败——`test_conformance.TestReferenceConformance.test_covers_all_operators`，
+是工作区里另一份未提交的 `cumsum` / `tril` 工作导致的，别去"修"它。）
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
 前端用例（不是代码问题）。
 
@@ -221,6 +224,34 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   `assertIn("NCCL", reason)`，在 HIP 机器上必红（理由是 `RCCL 2.27.7 …`）。
   改成了 `assertRegex(reason, "NCCL|RCCL")`。规律：凡是"理由文本由运行环境
   决定"的断言，都要接受本机能出现的全部形态，否则本地绿、真机红。
+
+## 设备端循环（5.245）
+
+- `runtime/device_loop.py` 的 `DeviceWhileLoop` **不是加速开关**。实测 64 轮：
+  4 KB 状态 host 8.6 ms / device 37 ms，4 MB 状态 host 26 ms / device 44～46 ms
+  （WSL HIP）。原因是在这张卡上捕获图 replay 的流同步比逐节点派发 + 默认流同步更贵。
+  交付的是"状态不再往返"的执行形态；写进性能结论前先自己测一遍。
+- **条件与体必须用同一条流捕获**（`backend.new_stream()` 一次，两次
+  `capture(..., stream=self._stream)`）。体的 replay 是异步的，下一轮条件的
+  replay 只有排在同一条流上，"体已完成"才有前提。负向对照里把体换成另一条流，
+  `test_both_graphs_are_captured_on_the_same_stream` 立刻红。
+- **每轮只有一次同步、一次 D2H**：读谓词标量。这是数据相关分支绕不过去的，
+  藏起来只会让"零同步"变成假话。判据写的是 `syncs == iterations + 1`、
+  `to_host_calls == iterations + 2`；体一旦改回 `run_device`（带同步）就多 n 次。
+  替身要注意：`_NumpyPlan.run_device` 必须给 `plan_syncs` 记账，否则"体也同步了"
+  这件事在第一版判据里根本看不出来。
+- **状态复位是身份复位，不是重新上传**：`_reset` 把 `state` 指回建计划时的初值
+  缓冲（`self._initial`），`to_array` 不调用；只有调用方显式给自由输入才上传并写回
+  常驻缓冲。HIP 的 `DeviceArray.__setitem__` 不接受 numpy 主机数组，只有设备数组
+  或标量——所以不能"把初值再写进状态缓冲"。
+- **重复 run 的判据要比数值更狠**：只比终值抓不到"状态没复位"——从终值再跑会
+  立刻退出、结果仍是 5。必须同时断言两次 `plan.iterations`，否则负向对照不红。
+- 替身要区分"假设备数组"与"主机 numpy 数组"（测试里的 `_Dev` 包装类带 `__array__`）。
+  两者混用会让 `to_array` 计数失真，"零重上传"那条判据就失去判别力。
+- 边界：只支持条件与体都是单张 `Graph` 的形态，嵌套区域显式抛 `DeviceLoopError`
+  （提示继续用 `WhileLoop.run`）；`max_steps` 用尽的 `ControlFlowError` 与宿主路径
+  同形状；一张捕获图只对应一组固定形状，换形状换 dtype 直接 `ValueError`；
+  未接进训练 / 推理主路径，CUDA 真机也未验证。
 
 ## 提交约定
 
