@@ -30,6 +30,7 @@ from .distributed import (
 )
 from .ema import EMA
 from .grads import GradientAccumulator, clip_global_norm, global_norm
+from .host_collective import HostCollective, HostRelay, launch
 from .loss import l2_penalty, mean, mse, softmax_cross_entropy
 from .lm import lm_batch
 from .loop import Trainer, TrainingState
@@ -40,6 +41,7 @@ from .parallel import (
     DataParallelTrainer,
     DeviceAllReduce,
     DeviceCollectiveUnavailable,
+    DistributedDataParallel,
     allreduce,
     allreduce_grads,
     collective_support,
@@ -75,6 +77,7 @@ __all__ = [
     "Trainer",
     "TrainingState",
     "DataParallelTrainer",
+    "DistributedDataParallel",
     "PipelineStage",
     "PipelineTrainer",
     "allreduce",
@@ -96,6 +99,9 @@ __all__ = [
     "UniqueIdServer",
     "fetch_unique_id",
     "spawn",
+    "HostRelay",
+    "HostCollective",
+    "launch",
     "env_rank",
     "env_world_size",
     "env_local_rank",

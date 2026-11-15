@@ -32,7 +32,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 __all__ = [
     "UID_SIZE",
@@ -276,6 +276,7 @@ def spawn(
     timeout: float = 600.0,
     check: bool = True,
     python: Optional[str] = None,
+    extra_env: Optional[Mapping[str, str]] = None,
 ) -> List[int]:
     """拉起 ``world_size`` 个进程，每个都拿到 rank 环境变量与同一份 uid。
 
@@ -285,6 +286,11 @@ def spawn(
 
     没给 ``uid`` 时用 ``secrets.token_bytes`` 生成 128 字节占位符：离线测试
     用它验证分发链路，真机上必须传 ``ncclUniqueId`` 的字节。
+
+    ``extra_env`` 是追加给子进程的环境变量（例如主机中转的端口）。**不允许
+    覆盖本函数自己写入的五个键**：``AF_RANK`` / ``AF_WORLD_SIZE`` /
+    ``AF_LOCAL_RANK`` / ``AF_MASTER_ADDR`` / ``AF_MASTER_PORT``——手滑覆盖
+    会让 W 个进程抢同一个 rank，症状是集合通信挂住而不是一条配置错误。
     """
     if isinstance(world_size, bool) or not isinstance(world_size, int):
         raise TypeError(f"world_size 必须是 int，收到 {world_size!r}")
@@ -304,6 +310,29 @@ def spawn(
                 f"spawn 的参数必须是字符串（跨进程不 pickle），收到 "
                 f"{type(value).__name__}: {value!r}"
             )
+    reserved = {
+        _RANK_KEY,
+        _WORLD_KEY,
+        _LOCAL_RANK_KEY,
+        _MASTER_ADDR_KEY,
+        _MASTER_PORT_KEY,
+    }
+    extra: Dict[str, str] = {}
+    if extra_env is not None:
+        if not isinstance(extra_env, Mapping):
+            raise TypeError(
+                f"extra_env 必须是名字到值的映射，得到 {type(extra_env).__name__}"
+            )
+        for key, value in extra_env.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise TypeError(
+                    f"extra_env 的键与值都必须是 str，收到 {key!r}: {value!r}"
+                )
+            if key in reserved:
+                raise ValueError(
+                    f"extra_env 不能覆盖 {key}：它由 spawn 按 rank 写入"
+                )
+            extra[key] = value
 
     server = UniqueIdServer(world_size, host=master_addr, timeout=timeout)
     server.serve(payload)
@@ -321,6 +350,7 @@ def spawn(
                     _MASTER_PORT_KEY: str(server.port),
                 }
             )
+            env.update(extra)
             processes.append(
                 subprocess.Popen(
                     [interpreter, "-c", code, *args],

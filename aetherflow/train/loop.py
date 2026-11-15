@@ -499,6 +499,21 @@ class Trainer:
 
     # -- 单步 ---------------------------------------------------------
 
+    def data_input_shapes(self) -> Dict[str, Tuple[int, ...]]:
+        """每批需要调用方提供的输入，及它们的静态形状。
+
+        排除参数（在 ``store`` 里）与随机状态输入（``rng_inputs``，由本类
+        每步按 ``(seed, step, rank)`` 派生）。数据并行要按这张表核对"分成
+        W 份后第 0 维是否等于图的静态 batch"——用"所有输入减参数"去猜会把
+        dropout 的 key 也算成数据，报出一条对不上号的错误。
+        """
+        return {
+            value.name: tuple(int(d) for d in value.type.shape)
+            for value in self.graph.inputs
+            if value.name not in self._param_names
+            and value.name not in self._rng_names
+        }
+
     def step(
         self,
         batch: Optional[Mapping[str, np.ndarray]] = None,

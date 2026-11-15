@@ -53,6 +53,7 @@ import numpy as np
 from ..backends.contracts import DeviceManagerContract
 from ..ir.grad import backward
 from ..ir.graph import Graph
+from .loop import Trainer
 from .optim import Optimizer
 from .params import ParameterStore
 from .sharded import ShardedOptimizer
@@ -66,6 +67,7 @@ __all__ = [
     "DeviceAllReduce",
     "DeviceCollectiveUnavailable",
     "DataParallelTrainer",
+    "DistributedDataParallel",
 ]
 
 _REDUCTIONS = ("mean", "sum")
@@ -562,4 +564,210 @@ class DataParallelTrainer:
             f"DataParallelTrainer(devices={self.devices}, "
             f"params={len(self.store)}, reduction={self.reduction!r}, "
             f"collective={self.collective!r})"
+        )
+
+
+class DistributedDataParallel:
+    """把 ``Trainer`` 的一步摊到多个**进程**上：各跑本片，梯度跨 rank 归约。
+
+    与 :class:`DataParallelTrainer` 的区别只在"进程数"与"通信"两处：
+
+    - 前者在一个进程里依次切卡，参数副本在显存里，梯度用主机侧求和；
+    - 本类每个 rank 一个进程、各自持有一份完整参数（主机态），梯度在
+      ``grad_hook`` 里经 :class:`HostCollective`（或任何同契约的集合通信）
+      归约后再交给优化器。
+
+    两者**数值上必须等价**：同样的总 batch、同样的初始参数、同样的 lr，
+    N 步之后的参数与损失要一致到浮点容差。这正是测试的判据。
+
+    **为什么挂在 ``grad_hook`` 上而不是另写一个训练循环。** ``Trainer.step``
+    已经把"前向 → 反向 → 反缩放 → 钩子 → 调度 → 优化器"的顺序固定下来；
+    归约的唯一正确位置是"反向算完、优化器更新之前"。用钩子接入，累积窗口
+    （``accumulate_steps``）、学习率调度、自定义裁剪 / EMA 都原样生效，也
+    不需要把那些逻辑复制一遍。用户原有的钩子会被保存下来，在归约**之后**
+    调用——它看到的必须是全局梯度，否则裁剪阈值在各 rank 上都不一样。
+
+    **只接受主机态。** 设备态训练的参数与梯度常驻显存，本层不做设备侧
+    集合通信（``collective_support`` 已声明未接入 NCCL）；``GradScaler``
+    也不行：某个 rank 溢出就跳过更新，其余 rank 却在集合调用上等它，直接
+    挂死。ZeRO-3 自带 ReduceScatter，再接一层归约等于把梯度算两遍。
+
+    **每卡 batch 仍按图构图。** 与 ``DataParallelTrainer`` 同一条前提：
+    ``graph`` 的第 0 维是分片后的大小，``step`` 收到的是 ``world_size`` 倍。
+    """
+
+    def __init__(
+        self,
+        trainer: Trainer,
+        collective: Any,
+        *,
+        reduction: str = "mean",
+    ) -> None:
+        if not isinstance(trainer, Trainer):
+            raise TypeError(f"trainer 必须是 Trainer，得到 {type(trainer).__name__}")
+        all_reduce = getattr(collective, "all_reduce", None)
+        if not callable(all_reduce):
+            raise TypeError(
+                "collective 必须提供 all_reduce(array, op='sum')，"
+                f"{type(collective).__name__} 没有"
+            )
+        rank = getattr(collective, "rank", None)
+        world = getattr(collective, "world_size", None)
+        for label, value in (("rank", rank), ("world_size", world)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"collective.{label} 必须是 int，收到 {value!r}"
+                )
+        if world < 1:
+            raise ValueError(f"collective.world_size 必须 >= 1，收到 {world}")
+        if not 0 <= rank < world:
+            raise ValueError(f"collective.rank {rank} 越界：world_size={world}")
+        if reduction not in _REDUCTIONS:
+            raise ValueError(
+                f"reduction 必须是 {_REDUCTIONS} 之一，收到 {reduction!r}"
+            )
+        if trainer.rng_rank != rank or trainer.rng_world_size != world:
+            raise ValueError(
+                f"Trainer 的随机流是 rng_rank={trainer.rng_rank}/"
+                f"rng_world_size={trainer.rng_world_size}，与集合通信的 "
+                f"{rank}/{world} 不一致；构造 Trainer 时要传 rng_rank=rank、"
+                "rng_world_size=world，否则各 rank 的 dropout 掩码会重合"
+            )
+        if trainer.device_state:
+            raise ValueError(
+                "DistributedDataParallel 只支持主机态 Trainer：设备态的参数与"
+                "梯度常驻显存，而本层只做主机侧集合通信（没有 NCCL 路径）"
+            )
+        if trainer.scaler is not None:
+            raise ValueError(
+                "DistributedDataParallel 不接受 GradScaler：某个 rank 溢出跳过"
+                "更新、其余 rank 却在集合调用上等它，会直接挂死；"
+                "要么关掉 AMP，要么先在单进程里把它跑稳"
+            )
+        if getattr(trainer, "_zero3", None) is not None:
+            raise ValueError(
+                "DistributedDataParallel 不能叠加 ZeRO-3：后者每步自己做 "
+                "ReduceScatter，再经过本层会把梯度归约两次"
+            )
+
+        self.trainer = trainer
+        self.collective = collective
+        self.reduction = reduction
+        self.steps = 0
+        self._shapes = trainer.data_input_shapes()
+        self._user_hook = trainer.grad_hook
+        # 组合而不是覆盖：归约必须在用户钩子之前，裁剪 / 加噪才看到全局梯度。
+        trainer.grad_hook = self._reduce_grads
+
+    # -- 只读面 -------------------------------------------------------
+
+    @property
+    def rank(self) -> int:
+        return int(self.collective.rank)
+
+    @property
+    def world_size(self) -> int:
+        return int(self.collective.world_size)
+
+    def _reduce_grads(
+        self, grads: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """把各 rank 的梯度求和 / 取平均，再交给用户钩子。
+
+        返回 ``None`` 的语义由用户钩子决定；但**各 rank 必须在同一步一起
+        返回 ``None``**，否则一方更新、另一方不更新，下一步的参数就分叉了。
+        """
+        reduced: Dict[str, np.ndarray] = {}
+        for name, value in grads.items():
+            array = np.asarray(value)
+            if not np.issubdtype(array.dtype, np.floating):
+                raise TypeError(
+                    f"梯度 {name!r} 的 dtype 是 {array.dtype}，"
+                    "集合通信只接受浮点"
+                )
+            total = np.asarray(
+                self.collective.all_reduce(array, op="sum")
+            )
+            if total.shape != array.shape:
+                raise ValueError(
+                    f"归约后的 {name!r} 形状是 {total.shape}，"
+                    f"本 rank 的梯度是 {array.shape}"
+                )
+            if total.dtype != array.dtype:
+                raise TypeError(
+                    f"归约后的 {name!r} dtype 是 {total.dtype}，"
+                    f"本 rank 的梯度是 {array.dtype}"
+                )
+            if self.reduction == "mean":
+                # 显式 astype：`f4 / int` 在 NEP 50 下仍是 f4，但别依赖版本行为。
+                total = (total / self.world_size).astype(array.dtype, copy=False)
+            reduced[name] = total
+        if self._user_hook is None:
+            return reduced
+        return self._user_hook(reduced)
+
+    def step(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        weight: Optional[float] = None,
+    ) -> float:
+        """跑一步：切本片 → ``Trainer.step`` → 损失跨 rank 取均值。
+
+        切分校验与 ``DataParallelTrainer`` 同源（不丢尾样本、图的静态 batch
+        必须等于分片大小）。``weight`` 只影响梯度累积的份量，**各 rank 必须
+        传同一个值**——这里按等分样本切，不同权重没有意义。
+        """
+        if not isinstance(batch, Mapping):
+            raise TypeError(
+                f"batch 必须是名字到数组的映射，得到 {type(batch).__name__}"
+            )
+        data = {name: np.asarray(value) for name, value in batch.items()}
+        missing = sorted(set(self._shapes) - set(data))
+        if missing:
+            raise KeyError(f"这些图输入没有提供数据: {missing}")
+        unknown = sorted(set(data) - set(self._shapes))
+        if unknown:
+            raise KeyError(f"这些名字不是数据输入: {unknown}")
+        sizes = {}
+        for name, array in data.items():
+            if array.ndim == 0:
+                raise ValueError(
+                    f"数据输入 {name!r} 至少要有 1 维（按第 0 维切片）"
+                )
+            sizes[name] = int(array.shape[0])
+        if len(set(sizes.values())) != 1:
+            raise ValueError(f"数据输入的第 0 维必须一致，得到 {sizes}")
+        total = next(iter(sizes.values()))
+        if total % self.world_size:
+            raise ValueError(
+                f"batch {total} 不能被 world_size {self.world_size} 整除；"
+                "数据并行不丢弃尾样本，请补齐或换 batch（DataLoader(drop_last=True)）"
+            )
+        chunk = total // self.world_size
+        # 执行器只认静态形状：图按每卡 batch 构，分片大小必须正好等于它。
+        for name, declared in self._shapes.items():
+            if int(declared[0]) != chunk:
+                raise ValueError(
+                    f"数据输入 {name!r} 分片后的第 0 维是 {chunk}，"
+                    f"但图的静态形状是 {declared}；"
+                    "数据并行的图要按每卡 batch 构图"
+                    "（总 batch = world_size × 图的静态 batch）"
+                )
+        start = self.rank * chunk
+        local = {
+            name: array[start : start + chunk] for name, array in data.items()
+        }
+        loss = float(self.trainer.step(local, weight=weight))
+        # 各 rank 的损失是"本片均值"，等分样本下全局均值就是跨 rank 取平均。
+        bucket = np.asarray([loss], dtype=np.float64)
+        total_loss = np.asarray(self.collective.all_reduce(bucket, op="sum"))
+        self.steps += 1
+        return float(total_loss[0]) / self.world_size
+
+    def __repr__(self) -> str:
+        return (
+            f"DistributedDataParallel(rank={self.rank}, "
+            f"world_size={self.world_size}, reduction={self.reduction!r}, "
+            f"params={len(self.trainer.store)})"
         )
