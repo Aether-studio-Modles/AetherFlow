@@ -423,6 +423,19 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   反向算子自己发现——它们会按 NCHW 的轴归约，产出"看着有值但全错"的梯度。
   布局传播按推理期优化设计，训练图保持 NCHW。
 
+- **L2 描述的"本地全绿"不等于渲染正确（5.247）**：`tril()` 的 `grid_stride(limit, *body)`
+  是**可变参数**，原写法把三条语句包成一个 tuple 传进去，渲染器报"未知语句类型:
+  tuple"。本地无 GPU 时这条路径从不执行，单测与 conformance（参考后端）都全绿，
+  只有 WSL HIP 真机 conformance 才暴露。写新的 `Kernel` 描述后，至少要在有设备的
+  一侧跑一次 conformance；只看本地结果会漏掉整类"渲染期才炸"的错误。
+- **设备端新算子的三处必须同时改**：`GPU_OPS` 声明、`_register_kernels` 登记、
+  handler 实现。顺序无关，但漏一处在**构造期**就失败（`_OPS` 与已注册集合对账），
+  比第一次推理才崩好。`HIP_OPS = GPU_OPS`，HIP 不用改代码。
+- **conformance 的覆盖度是硬要求**：`GPU_OPS` 里加了算子但 `default_cases()` 没有
+  用例，`test_all_declared_operators_exercised` 与套件的 coverage 检查都会报
+  `untested`；用例要选能覆盖折维/掩码边界的形状（`cumsum` 用非末轴、`tril` 用负
+  `diagonal`），否则等于没测。
+
 ## 临时脚本
 
 调试用的临时脚本（`_tmp_*.py` 等）用完即删，关键结论、问题与解法写进
