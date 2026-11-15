@@ -436,8 +436,24 @@ def _conv_attrs(attrs: dict) -> dict:
     return {k: attrs[k] for k in ("stride", "padding", "dilation", "groups") if k in attrs}
 
 
+def _require_nchw_backward(op: str, attrs: dict) -> None:
+    """NHWC 前向没有反向规则，这里显式拒绝而不是静默按 NCHW 算。
+
+    反向算子（``conv2d_input_grad`` 等）的语义与内核都是 NCHW 的；若把 NHWC
+    的形状原样喂进去，梯度会按错误的轴归约，结果看着有值但全错。因此宁可
+    在这里失败：布局传播是**推理期**优化（DESIGN 5.246），训练图保持 NCHW。
+    """
+    layout = attrs.get("layout", "nchw")
+    if layout != "nchw":
+        raise NoGradientError(
+            f"{op} 的 layout={layout!r} 没有反向规则：布局传播只覆盖前向"
+            "（DESIGN 5.246），梯度定义在 NCHW 上；训练图请保持 NCHW"
+        )
+
+
 @vjp("conv2d")
 def _conv2d(ctx):
+    _require_nchw_backward("conv2d", ctx.attrs)
     b, g = ctx.b, ctx.g
     x, w = ctx.input(0), ctx.input(1)
     geo = _conv_attrs(ctx.attrs)
@@ -456,12 +472,14 @@ def _conv2d(ctx):
 
 @vjp("maxpool2d")
 def _maxpool2d(ctx):
+    _require_nchw_backward("maxpool2d", ctx.attrs)
     attrs = {k: ctx.attrs[k] for k in ("kernel", "stride", "padding") if k in ctx.attrs}
     return (ctx.b.add_node("maxpool2d_backward", [ctx.input(0), ctx.g], attrs),)
 
 
 @vjp("avgpool2d")
 def _avgpool2d(ctx):
+    _require_nchw_backward("avgpool2d", ctx.attrs)
     x = ctx.input(0)
     attrs = {k: ctx.attrs[k] for k in ("kernel", "stride", "padding") if k in ctx.attrs}
     return (

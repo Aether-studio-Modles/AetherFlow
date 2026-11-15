@@ -1207,6 +1207,35 @@ def _pair(value, name: str) -> Tuple[int, int]:
     raise TypeError(f"{name} 必须是 int 或二元组，得到 {value!r}")
 
 
+#: 卷积 / 池化接受的张量布局。
+#:
+#: ``nhwc`` 不是第二套数学：参考语义把输入转成 NCHW 用**同一份实现**算，
+#: 再把输出转回 NHWC。这样两条路径逐位相同，位级差异不可能从布局里冒出来。
+#: 它的意义在 IR 表达力与传播 pass（``passes/layout.py``）上：通道在后时
+#: 卷积输出的通道维与下游逐元素算子共享同一根轴，传播因此不需要额外转置。
+_LAYOUTS: Tuple[str, ...] = ("nchw", "nhwc")
+
+
+def _layout_of(attrs: dict, op_name: str) -> str:
+    """读取并校验 ``layout`` 属性；缺省 NCHW。非法值当场拒绝。"""
+    layout = attrs.get("layout", "nchw")
+    if layout not in _LAYOUTS:
+        raise ValueError(f"{op_name} 的 layout 只能是 {_LAYOUTS}，得到 {layout!r}")
+    return layout
+
+
+def _nchw_type(t: TensorType) -> TensorType:
+    """(N,H,W,C) -> (N,C,H,W)，dtype 不变。"""
+    n, h, w, c = t.shape
+    return TensorType(t.dtype, (n, c, h, w))
+
+
+def _nhwc_type(t: TensorType) -> TensorType:
+    """(N,C,H,W) -> (N,H,W,C)，dtype 不变。"""
+    n, c, h, w = t.shape
+    return TensorType(t.dtype, (n, h, w, c))
+
+
 def _conv_out_dim(size: Dim, kernel: int, stride: int, padding: int, dilation: int) -> Dim:
     """NCHW 单个空间维的输出长度。
 
@@ -1233,6 +1262,20 @@ def _conv_out_dim(size: Dim, kernel: int, stride: int, padding: int, dilation: i
 
 
 def _infer_conv2d(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """按 ``layout`` 适配维度顺序，数学部分复用 NCHW 推导。
+
+    NHWC 下权重仍是 ``(O, C/groups, kh, kw)``——布局说的是**激活**的排列，
+    权重布局不随之前后颠倒，这与 cuDNN / TensorFlow 的惯例一致。
+    """
+    if _layout_of(attrs, "conv2d") == "nchw":
+        return _infer_conv2d_nchw(inputs, attrs)
+    x = inputs[0]
+    if x.rank != 4:
+        raise ValueError(f"conv2d 的 layout=nhwc 要求 x 是秩 4，得到秩 {x.rank}")
+    return _nhwc_type(_infer_conv2d_nchw((_nchw_type(x),) + inputs[1:], attrs))
+
+
+def _infer_conv2d_nchw(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (2, 3):
         raise ValueError(f"conv2d 需要 2 或 3 个输入（x, weight[, bias]），得到 {len(inputs)}")
     x, weight = inputs[0], inputs[1]
@@ -1310,6 +1353,14 @@ def _conv2d_cross(x, weight, sh, sw, ph, pw, dh, dw) -> np.ndarray:
 
 
 def _ref_conv2d(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """按 ``layout`` 适配维度顺序；数学部分复用 NCHW 参考实现。"""
+    if _layout_of(attrs, "conv2d") == "nchw":
+        return _ref_conv2d_nchw(args, attrs)
+    out = _ref_conv2d_nchw([np.transpose(args[0], (0, 3, 1, 2)), *args[1:]], attrs)
+    return np.transpose(out, (0, 2, 3, 1))
+
+
+def _ref_conv2d_nchw(args: List[np.ndarray], attrs: dict) -> np.ndarray:
     """NCHW 交叉相关（与 PyTorch ``conv2d`` 一致，不翻转核）。
 
     用 ``einsum`` 逐 (kh, kw) 位置累加，刻意不做 im2col：
@@ -1348,10 +1399,10 @@ register(
         name="conv2d",
         infer=_infer_conv2d,
         reference=_ref_conv2d,
-        attrs_schema=("stride", "padding", "dilation", "groups"),
-        doc="NCHW 二维交叉相关：x(N,C,H,W) * weight(O,C/groups,kh,kw) + bias(O,)"
-        " -> (N,O,Hout,Wout)；attrs 为 stride/padding/dilation 二元组与 groups，"
-        "groups>1 即分组卷积，groups==C==O 即 depthwise",
+        attrs_schema=("stride", "padding", "dilation", "groups", "layout"),
+        doc="二维交叉相关：layout='nchw'（默认）时 x(N,C,H,W)，layout='nhwc' 时"
+        " x(N,H,W,C)；weight 恒为 (O,C/groups,kh,kw)，输出布局与 x 一致。"
+        "attrs 另有 stride/padding/dilation 二元组与 groups（groups>1 即分组卷积）",
     )
 )
 
@@ -1405,6 +1456,15 @@ def _pool_flags(attrs: dict) -> Tuple[bool, bool]:
 
 
 def _infer_maxpool2d(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if _layout_of(attrs, "maxpool2d") == "nchw":
+        return _infer_maxpool2d_nchw(inputs, attrs)
+    x = inputs[0]
+    if x.rank != 4:
+        raise ValueError(f"maxpool2d 的 layout=nhwc 要求 x 是秩 4，得到秩 {x.rank}")
+    return _nhwc_type(_infer_maxpool2d_nchw((_nchw_type(x),), attrs))
+
+
+def _infer_maxpool2d_nchw(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     x = inputs[0]
     if x.rank != 4:
         raise ValueError(f"maxpool2d 要求 NCHW 秩 4 输入，得到秩 {x.rank}")
@@ -1426,6 +1486,13 @@ def _infer_maxpool2d(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
 
 
 def _ref_maxpool2d(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    if _layout_of(attrs, "maxpool2d") == "nchw":
+        return _ref_maxpool2d_nchw(args, attrs)
+    out = _ref_maxpool2d_nchw([np.transpose(args[0], (0, 3, 1, 2))], attrs)
+    return np.transpose(out, (0, 2, 3, 1))
+
+
+def _ref_maxpool2d_nchw(args: List[np.ndarray], attrs: dict) -> np.ndarray:
     """NCHW 最大池化；padding 区域不参与取 max（等价于填 -inf）。"""
     x = args[0]
     (kh, kw), (sh, sw), (ph, pw) = _pool_geometry(attrs)
@@ -1459,9 +1526,10 @@ register(
         name="maxpool2d",
         infer=_infer_maxpool2d,
         reference=_ref_maxpool2d,
-        attrs_schema=("kernel", "stride", "padding", "ceil_mode"),
-        doc="NCHW 最大池化：kernel 必填，stride 默认等于 kernel，padding 默认 0；"
-        "ceil_mode=True 时输出向上取整并去掉起点越界的多余窗口",
+        attrs_schema=("kernel", "stride", "padding", "ceil_mode", "layout"),
+        doc="二维最大池化：kernel 必填，stride 默认等于 kernel，padding 默认 0；"
+        "ceil_mode=True 时输出向上取整并去掉起点越界的多余窗口；"
+        "layout 默认 nchw，nhwc 时输入/输出为 (N,H,W,C)",
     )
 )
 
@@ -1480,6 +1548,15 @@ def _pool_geometry(attrs: dict) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple
 
 
 def _infer_avgpool2d(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if _layout_of(attrs, "avgpool2d") == "nchw":
+        return _infer_avgpool2d_nchw(inputs, attrs)
+    x = inputs[0]
+    if x.rank != 4:
+        raise ValueError(f"avgpool2d 的 layout=nhwc 要求 x 是秩 4，得到秩 {x.rank}")
+    return _nhwc_type(_infer_avgpool2d_nchw((_nchw_type(x),), attrs))
+
+
+def _infer_avgpool2d_nchw(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     x = inputs[0]
     if x.rank != 4:
         raise ValueError(f"avgpool2d 要求 NCHW 秩 4 输入，得到秩 {x.rank}")
@@ -1530,6 +1607,13 @@ def _pool_count_window(attrs: dict, h: int, w: int, ho: int, wo: int,
 
 
 def _ref_avgpool2d(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    if _layout_of(attrs, "avgpool2d") == "nchw":
+        return _ref_avgpool2d_nchw(args, attrs)
+    out = _ref_avgpool2d_nchw([np.transpose(args[0], (0, 3, 1, 2))], attrs)
+    return np.transpose(out, (0, 2, 3, 1))
+
+
+def _ref_avgpool2d_nchw(args: List[np.ndarray], attrs: dict) -> np.ndarray:
     """NCHW 平均池化。
 
     分母是窗口落在 padded 输入里的格数：``count_include_pad=True`` 时 padding
@@ -1568,10 +1652,11 @@ register(
         name="avgpool2d",
         infer=_infer_avgpool2d,
         reference=_ref_avgpool2d,
-        attrs_schema=("kernel", "stride", "padding", "ceil_mode", "count_include_pad"),
-        doc="NCHW 平均池化：kernel 必填，stride 默认等于 kernel，padding 默认 0；"
+        attrs_schema=("kernel", "stride", "padding", "ceil_mode", "count_include_pad", "layout"),
+        doc="平均池化：kernel 必填，stride 默认等于 kernel，padding 默认 0；"
         "count_include_pad=True（默认）时分母固定为 kernel 面积，False 时只数窗口"
-        "与输入的重叠面积；ceil_mode 与 maxpool2d 同规则",
+        "与输入的重叠面积；ceil_mode 与 maxpool2d 同规则；"
+        "layout 默认 nchw，nhwc 时输入/输出为 (N,H,W,C)",
     )
 )
 

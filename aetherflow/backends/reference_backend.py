@@ -29,6 +29,9 @@ from .capabilities import BackendCapabilities, OpCapability
 
 class ReferenceBackend:
     name = "reference"
+    #: 参考执行器按算子语义求值，维度顺序只影响 numpy 的轴排列，因此两种
+    #: 布局都承接。设备后端没有原生 NHWC 内核，不声明这一项（DESIGN 5.246）。
+    supported_layouts = frozenset({"nchw", "nhwc"})
 
     def __init__(self) -> None:
         self._executor = ReferenceExecutor()

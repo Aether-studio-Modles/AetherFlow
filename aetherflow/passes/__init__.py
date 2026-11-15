@@ -24,6 +24,7 @@ from .cse import CommonSubexpressionElimination, CommutativeCSE
 from .dce import DeadCodeElimination
 from .fold import ConstantFolding
 from .fusion import FuseLayerNormResidual, FuseSiLU, FuseSoftmaxScale
+from .layout import LayoutError, LayoutPropagation
 from .registry import (
     BACKWARD_PASS_NAMES,
     DEFAULT_PASS_NAMES,
@@ -54,6 +55,8 @@ __all__ = [
     "FuseSoftmaxScale",
     "FuseLayerNormResidual",
     "FuseSiLU",
+    "LayoutError",
+    "LayoutPropagation",
     "BACKWARD_PASS_NAMES",
     "DEFAULT_PASS_NAMES",
     "FUSED_PASS_NAMES",

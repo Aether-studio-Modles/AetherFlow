@@ -27,6 +27,24 @@ class BackendCapabilityError(RuntimeError):
     """目标后端无法承接给定图。"""
 
 
+#: 后端**未显式声明**布局时按这个最小承诺处理：只认 NCHW。
+#:
+#: 这一点刻意是"默认拒绝"而不是"默认放开"：布局传播 pass
+#: （``passes/layout.py``，DESIGN 5.246）会把卷积 / 池化翻成 NHWC 形态，
+#: 若后端没说自己承接得了，翻出来的图就只能作废。参考后端显式声明了
+#: ``{"nchw", "nhwc"}``；设备后端目前只有 NCHW 内核，因此保持默认值。
+DEFAULT_SUPPORTED_LAYOUTS: FrozenSet[str] = frozenset({"nchw"})
+
+
+def supported_layouts_of(backend: object) -> FrozenSet[str]:
+    """读取后端的布局声明；没声明就按最小承诺（只有 NCHW）。
+
+    用 ``getattr`` 而不是要求协议里必须写：布局声明是增量能力，第三方
+    后端不改代码也应当能继续工作——此时它的行为等于"只接 NCHW"。
+    """
+    return frozenset(getattr(backend, "supported_layouts", DEFAULT_SUPPORTED_LAYOUTS))
+
+
 @runtime_checkable
 class Backend(Protocol):
     """后端插件必须实现的最小接口。"""
