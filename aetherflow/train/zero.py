@@ -48,6 +48,83 @@ __all__ = [
 _META_KEY = "__meta__"
 
 
+def _save_shard(state: Mapping[str, Any], path: Any) -> str:
+    """把一份分片状态写成 npz：``slot::name`` 数组 + 一条 ``__meta__``。
+
+    ZeRO-1（按参数名分片）与 ZeRO-2（按元素段分片）的存档结构一致，差别只在
+    归属表，所以写盘逻辑抽在这里，两个类共用。
+    """
+    target = str(path)
+    if not target.endswith(".npz"):
+        target += ".npz"
+    arrays: Dict[str, np.ndarray] = {}
+    for slot, by_name in state["slots"].items():
+        for name, array in by_name.items():
+            arrays[f"{slot}::{name}"] = np.asarray(array)
+    arrays[_META_KEY] = np.array(
+        json.dumps(
+            {
+                "rank": state["rank"],
+                "world_size": state["world_size"],
+                "step": state["step"],
+                "hyper": state["hyper"],
+                "assignments": state["assignments"],
+            },
+            ensure_ascii=False,
+        )
+    )
+    np.savez(target, **arrays)
+    return target
+
+
+def _load_shard(
+    path: Any,
+    *,
+    rank: int,
+    world_size: int,
+    owners: Mapping[str, int],
+    optimizer: Optimizer,
+) -> None:
+    """装回一份分片状态；片号 / 分片数 / 归属表不符都是显式错误。"""
+    target = str(path)
+    if not target.endswith(".npz"):
+        target += ".npz"
+    with np.load(target, allow_pickle=False) as data:
+        if _META_KEY not in data.files:
+            raise ValueError(f"{target} 不是分片存档：缺少 {_META_KEY}")
+        meta = json.loads(str(data[_META_KEY]))
+        saved_rank = int(meta.get("rank", -1))
+        if saved_rank != rank:
+            raise ValueError(f"{target} 属于 rank {saved_rank}，不能装进 rank {rank}")
+        saved_world = int(meta.get("world_size", 0))
+        if saved_world != world_size:
+            raise ValueError(
+                f"存档的分片数 {saved_world} 与当前 world_size {world_size} 不一致"
+            )
+        saved = {
+            name: int(owner) for name, owner in dict(meta["assignments"]).items()
+        }
+        current = {name: owner for name, owner in owners.items() if owner == rank}
+        if saved != current:
+            raise ValueError(
+                f"rank {rank} 的参数归属与存档不同：存档 {saved}，当前 {current}"
+            )
+        slots: Dict[str, Dict[str, np.ndarray]] = {}
+        for key in data.files:
+            if key == _META_KEY:
+                continue
+            slot, _, name = key.partition("::")
+            if not name:
+                raise ValueError(f"{target} 里的键 {key!r} 不是 slot::name 形式")
+            slots.setdefault(slot, {})[name] = np.array(data[key], copy=True)
+        state = {
+            "step": int(meta["step"]),
+            "hyper": meta["hyper"],
+            "slots": slots,
+        }
+    optimizer.load_state_dict(state)
+
+
 def _same_array(left: Any, right: Any) -> bool:
     """两个名字指向的是不是同一块内存（参数更新必须原地生效）。"""
     if left is right:
@@ -329,77 +406,17 @@ class ZeroRank:
 
     def save_shard(self, path: Any) -> str:
         """只写本片的槽位；n 个进程各写一个文件，合起来是一份完整状态。"""
-        target = str(path)
-        if not target.endswith(".npz"):
-            target += ".npz"
-        state = self.shard_state()
-        arrays: Dict[str, np.ndarray] = {}
-        for slot, by_name in state["slots"].items():
-            for name, array in by_name.items():
-                arrays[f"{slot}::{name}"] = np.asarray(array)
-        arrays[_META_KEY] = np.array(
-            json.dumps(
-                {
-                    "rank": state["rank"],
-                    "world_size": state["world_size"],
-                    "step": state["step"],
-                    "hyper": state["hyper"],
-                    "assignments": state["assignments"],
-                },
-                ensure_ascii=False,
-            )
-        )
-        np.savez(target, **arrays)
-        return target
+        return _save_shard(self.shard_state(), path)
 
     def load_shard(self, path: Any) -> None:
         """装回本片槽位；片号 / 分片数 / 归属表不符都是显式错误。"""
-        target = str(path)
-        if not target.endswith(".npz"):
-            target += ".npz"
-        with np.load(target, allow_pickle=False) as data:
-            if _META_KEY not in data.files:
-                raise ValueError(f"{target} 不是分片存档：缺少 {_META_KEY}")
-            meta = json.loads(str(data[_META_KEY]))
-            saved_rank = int(meta.get("rank", -1))
-            if saved_rank != self._rank:
-                raise ValueError(
-                    f"{target} 属于 rank {saved_rank}，不能装进 rank {self._rank}"
-                )
-            saved_world = int(meta.get("world_size", 0))
-            if saved_world != self._world_size:
-                raise ValueError(
-                    f"存档的分片数 {saved_world} 与当前 world_size "
-                    f"{self._world_size} 不一致"
-                )
-            saved = {
-                name: int(owner)
-                for name, owner in dict(meta["assignments"]).items()
-            }
-            current = {
-                name: owner
-                for name, owner in self._owners.items()
-                if owner == self._rank
-            }
-            if saved != current:
-                raise ValueError(
-                    f"rank {self._rank} 的参数归属与存档不同：存档 {saved}，"
-                    f"当前 {current}"
-                )
-            slots: Dict[str, Dict[str, np.ndarray]] = {}
-            for key in data.files:
-                if key == _META_KEY:
-                    continue
-                slot, _, name = key.partition("::")
-                if not name:
-                    raise ValueError(f"{target} 里的键 {key!r} 不是 slot::name 形式")
-                slots.setdefault(slot, {})[name] = np.array(data[key], copy=True)
-            state = {
-                "step": int(meta["step"]),
-                "hyper": meta["hyper"],
-                "slots": slots,
-            }
-        self._optimizer.load_state_dict(state)
+        _load_shard(
+            path,
+            rank=self._rank,
+            world_size=self._world_size,
+            owners=self._owners,
+            optimizer=self._optimizer,
+        )
 
     def __repr__(self) -> str:
         return (
@@ -441,6 +458,60 @@ class LoopbackCollective:
         seq = self._next()
         return self._world._collect(seq, self.rank, np.asarray(array), root)
 
+    def reduce_scatter(
+        self, send: Any, recv: Any, *, op: str = "sum"
+    ) -> np.ndarray:
+        """把 ``send`` 等分成 world_size 段求和，本 rank 只收第 ``rank`` 段。
+
+        语义与 ``NcclComm.reduce_scatter`` 一致：``send`` 的元素数必须是
+        ``recv`` 的 ``world_size`` 倍，结果**原地写入** ``recv`` 并返回它。
+        """
+        if op != "sum":
+            raise ValueError(f"LoopbackCollective 只模拟 sum，收到 {op!r}")
+        target = np.asarray(recv)
+        total = int(np.size(send))
+        segment = int(target.size)
+        if total != segment * self.world_size:
+            raise ValueError(
+                f"reduce_scatter 的发送缓冲需要 {segment * self.world_size} 个元素"
+                f"（每段 {segment} × world_size {self.world_size}），得到 {total}"
+            )
+        parts = self._world._gather(self._next(), self.rank, np.asarray(send))
+        for part in parts:
+            if part.size != total:
+                raise ValueError(
+                    f"各 rank 的发送缓冲长度不一致：{part.size} != {total}"
+                )
+        blocks: List[np.ndarray] = []
+        for index in range(self.world_size):
+            block = np.array(
+                parts[0][index * segment : (index + 1) * segment], copy=True
+            )
+            for other in parts[1:]:
+                block += other[index * segment : (index + 1) * segment]
+            blocks.append(block)
+        target[...] = blocks[self.rank]
+        return recv
+
+    def all_gather(self, send: Any, recv: Any) -> np.ndarray:
+        """收集各 rank 的 ``send``，按 rank 顺序写入 ``recv`` 并返回它。"""
+        target = np.asarray(recv)
+        segment = int(np.size(send))
+        if int(target.size) != segment * self.world_size:
+            raise ValueError(
+                f"all_gather 的接收缓冲需要 {segment * self.world_size} 个元素"
+                f"（{segment} × world_size {self.world_size}），"
+                f"得到 {int(target.size)}"
+            )
+        parts = self._world._gather(self._next(), self.rank, np.asarray(send))
+        for index, part in enumerate(parts):
+            if part.size != segment:
+                raise ValueError(
+                    f"rank {index} 的发送缓冲长度 {part.size} != {segment}"
+                )
+            target[index * segment : (index + 1) * segment] = part
+        return recv
+
     def _next(self) -> int:
         seq = self._seq
         self._seq += 1
@@ -463,9 +534,10 @@ class LoopbackWorld:
     def collective(self, rank: int) -> LoopbackCollective:
         return LoopbackCollective(self, rank)
 
-    def _collect(
-        self, seq: int, rank: int, array: np.ndarray, root: Optional[int]
-    ) -> np.ndarray:
+    def _gather(
+        self, seq: int, rank: int, array: np.ndarray
+    ) -> List[np.ndarray]:
+        """收齐同一 ``seq`` 的全部提交，按 rank 顺序返回副本。"""
         with self._cond:
             entry = self._calls.setdefault(seq, {})
             if rank in entry:
@@ -483,17 +555,21 @@ class LoopbackWorld:
                         f"集合调用 {seq} 等不到这些 rank: {missing}"
                     )
                 self._cond.wait(remaining)
-            if root is None:
-                total = np.array(entry[0], copy=True)
-                for other in range(1, self.world_size):
-                    total += entry[other]
-                result = total
-            else:
-                result = np.array(entry[root], copy=True)
             # 不在这里删除 entry：先返回的 rank 可能还在等其余 rank 醒来，
             # 删掉共享状态会让它们的计算变成"少了一个 rank"。这是进程内的
             # 测试替身，调用次数有限，保留到 world 被回收即可。
-            return np.array(result, copy=True)
+            return [np.array(entry[i], copy=True) for i in range(self.world_size)]
+
+    def _collect(
+        self, seq: int, rank: int, array: np.ndarray, root: Optional[int]
+    ) -> np.ndarray:
+        parts = self._gather(seq, rank, array)
+        if root is None:
+            total = np.array(parts[0], copy=True)
+            for other in parts[1:]:
+                total += other
+            return total
+        return np.array(parts[root], copy=True)
 
 
 class NcclHostCollective:
@@ -536,3 +612,43 @@ class NcclHostCollective:
             self.comm.broadcast(buf, root=int(root))
             self.comm.synchronize()
             return cp.asnumpy(buf)
+
+    def reduce_scatter(
+        self, send: Any, recv: Any, *, op: str = "sum"
+    ) -> np.ndarray:
+        """等分求和，只把本 rank 的那一段写回 ``recv``（主机数组进出）。"""
+        import cupy as cp
+
+        with cp.cuda.Device(self.device):
+            src = self._buffer(send, copy=True)
+            dst = self._buffer(recv, copy=False)
+            self.comm.reduce_scatter(src, dst, op=op)
+            self.comm.synchronize()
+            values = cp.asnumpy(dst)
+        target = np.asarray(recv)
+        if tuple(target.shape) != tuple(values.shape):
+            raise ValueError(
+                f"reduce_scatter 的接收缓冲形状 {target.shape} 与 NCCL 结果 "
+                f"{values.shape} 不一致"
+            )
+        target[...] = values
+        return recv
+
+    def all_gather(self, send: Any, recv: Any) -> np.ndarray:
+        """收集各 rank 的 ``send``，按 rank 顺序写回 ``recv``。"""
+        import cupy as cp
+
+        with cp.cuda.Device(self.device):
+            src = self._buffer(send, copy=True)
+            dst = self._buffer(recv, copy=False)
+            self.comm.all_gather(src, dst)
+            self.comm.synchronize()
+            values = cp.asnumpy(dst)
+        target = np.asarray(recv)
+        if tuple(target.shape) != tuple(values.shape):
+            raise ValueError(
+                f"all_gather 的接收缓冲形状 {target.shape} 与 NCCL 结果 "
+                f"{values.shape} 不一致"
+            )
+        target[...] = values
+        return recv

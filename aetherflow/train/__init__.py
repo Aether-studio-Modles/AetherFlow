@@ -20,6 +20,14 @@
 from .amp import GradScaler
 from .checkpoint import TrainingSnapshot, load_checkpoint, save_checkpoint
 from .data import DataLoader
+from .distributed import (
+    UniqueIdServer,
+    env_local_rank,
+    env_rank,
+    env_world_size,
+    fetch_unique_id,
+    spawn,
+)
 from .ema import EMA
 from .grads import GradientAccumulator, clip_global_norm, global_norm
 from .loss import l2_penalty, mean, mse, softmax_cross_entropy
@@ -42,6 +50,7 @@ from .pipeline import PipelineStage, PipelineTrainer
 from .sharded import ShardedOptimizer, reduce_scatter_grads, shard_params
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
 from .zero import LoopbackWorld, NcclHostCollective, ZeroRank
+from .zero2 import Zero2Rank
 
 __all__ = [
     "ParameterStore",
@@ -54,6 +63,7 @@ __all__ = [
     "shard_params",
     "reduce_scatter_grads",
     "ZeroRank",
+    "Zero2Rank",
     "LoopbackWorld",
     "NcclHostCollective",
     "Trainer",
@@ -77,6 +87,12 @@ __all__ = [
     "load_checkpoint",
     "DataLoader",
     "GradScaler",
+    "UniqueIdServer",
+    "fetch_unique_id",
+    "spawn",
+    "env_rank",
+    "env_world_size",
+    "env_local_rank",
     "CosineDecay",
     "StepDecay",
     "ExponentialDecay",
