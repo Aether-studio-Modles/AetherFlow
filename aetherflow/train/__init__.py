@@ -51,6 +51,15 @@ from .params import ParameterStore, default_init, init_array
 from .pipeline import PipelineStage, PipelineTrainer
 from .sharded import ShardedOptimizer, reduce_scatter_grads, shard_params
 from .shard_io import ShardedCheckpoint, merge_shards, split_checkpoint
+from .tensor_parallel import (
+    TensorParallelBlock,
+    build_tensor_parallel_attention,
+    column_parallel_linear,
+    merge_axis,
+    row_parallel_linear,
+    shard_size,
+    split_axis,
+)
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
 from .zero import LoopbackWorld, NcclHostCollective, ZeroRank
 from .zero2 import Zero2Rank
@@ -69,6 +78,13 @@ __all__ = [
     "split_checkpoint",
     "shard_params",
     "reduce_scatter_grads",
+    "TensorParallelBlock",
+    "build_tensor_parallel_attention",
+    "column_parallel_linear",
+    "row_parallel_linear",
+    "shard_size",
+    "split_axis",
+    "merge_axis",
     "ZeroRank",
     "Zero2Rank",
     "Zero3Rank",
