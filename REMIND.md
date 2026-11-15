@@ -150,6 +150,16 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   完整参数或完整梯度，与"只常驻一块"直接冲突。强制要求 `segments`：整图前向本来就
   要把所有参数拼回来，不切段就只是"看起来在分片"。`Trainer.steps` 是进程内计数，
   `load_shard` 只带回 `Zero3Rank.steps`，续训用例断言别写错对象。
+- 分布式存档的合并与重分片（5.235，`train/shard_io.py`）：`save_shard` 只写本片，
+  合并/换 `world_size` 都是**纯文件操作**，不走通信——换卡数靠"先拼回完整状态、
+  再按新布局切"，而不是让两个不同规模的 world 对话。布局由 meta 判定：有 `plan`
+  是 ZeRO-3（带参数分片），有 `assignments` 是 ZeRO-1/2（**只带槽位、参数在模型
+  里**）。因此 names 布局合并出权重必须 `params=`，save() 缺参数直接报错，
+  不拿零填充。`elements` 合并后槽位要 reshape 回参数形状，否则
+  `Optimizer.load_state_dict` 按"形状不符"拒绝；切分时再 ravel，等价往返。
+  换 W：names 用 `shard_params`（需要形状），elements 用 `plan_chunks`；同 W 且
+  没给参数时可以沿用存档里的归属表。合并 `params=` 在 elements 布局下是 oracle：
+  逐位不等就报"分片来自另一份权重"。
 - **工作区被旧缓冲覆盖（反复出现）**：提交后用 `git status` / `git diff --stat` 核对，
   出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
   已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
