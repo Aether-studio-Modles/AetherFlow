@@ -217,6 +217,10 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
 - 能力声明（`collective_support`）仍是 `device_allreduce=False`：数据并行路径
   没接线，跨卡归约照旧走主机中转；理由文本会区分"本机加载不到库"与"库在、
   只是没接线"。
+- **判据里不要写死厂商名**：`tests/test_parallel.py` 里两条能力断言原本写
+  `assertIn("NCCL", reason)`，在 HIP 机器上必红（理由是 `RCCL 2.27.7 …`）。
+  改成了 `assertRegex(reason, "NCCL|RCCL")`。规律：凡是"理由文本由运行环境
+  决定"的断言，都要接受本机能出现的全部形态，否则本地绿、真机红。
 
 ## 提交约定
 

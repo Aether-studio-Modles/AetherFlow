@@ -15009,6 +15009,11 @@ API——它把 `nccl*` 的函数名、枚举值与 `ncclUniqueId` 的 128 字�
 - 真机（1）：`TestRcclOnDevice` 在 WSL HIP 上以 world=1 启动
   `tests/_rccl_worker.py`，跑通 unique id、comm 初始化与四个集合操作
   （world=1 时期望值等于输入）。
+- 既有判据的收紧（0 条新增，2 条改写）：`tests/test_parallel.py` 的两条能力
+  断言原本写着 `assertIn("NCCL", reason)`，理由是 5.228 年代理由文本固定叫
+  NCCL；5.244 起理由按本机真实加载到的库命名，这两条在 HIP 机器上必红（WSL
+  全量首跑就是它们变红，不是数值错）。改写为 `assertRegex(reason,
+  "NCCL|RCCL")`——判据要求的是"点名厂商"，不是"点名某一家"。
 
 **负向对照**
 
@@ -15022,7 +15027,9 @@ API——它把 `nccl*` 的函数名、枚举值与 `ncclUniqueId` 的 128 字�
 
 **验证**：本地 `python -m unittest discover -s tests -t .` → 2633 个用例 /
 414 跳过，本层离线 10 条全绿；WSL HIP → 2633 个用例 / 373 跳过，
-`TestRcclOnDevice` 真跑通过（RCCL 2.27.7，单卡 world=1）。两处唯一的失败都还是
+`TestRcclOnDevice` 真跑通过（RCCL 2.27.7，单卡 world=1）。WSL 全量首跑有 3 条
+失败：两条是上面那对写死 `NCCL` 的旧判据（改为接受两家后重跑
+`tests.test_parallel` + `tests.test_nccl` 55 条全绿 / 5 跳过），剩下一条仍是
 `test_conformance` 的算子覆盖断言（`cumsum` / `tril`），来自工作区里另一份
 未提交的工作，与本层无关。WSL 上运行前必须带 `HSA_ENABLE_DXG_DETECTION=1`，
 否则 RCCL 在 `ncclGetUniqueId` 处直接 FATAL（`no ROCm-capable device is

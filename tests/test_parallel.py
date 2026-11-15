@@ -434,12 +434,17 @@ class TestCollectiveSeam(unittest.TestCase):
     """
 
     def test_support_declares_host_only_without_provider(self):
-        """没有 provider 时：设备归约不可用、重叠不可用，原因点名 NCCL / RCCL。"""
+        """没有 provider 时：设备归约不可用、重叠不可用，原因点名 NCCL / RCCL。
+
+        5.244 起理由按本机真实加载到的库命名：HIP 机器上是 RCCL，CUDA 机器
+        上是 NCCL，两套都加载不到时是「NCCL / RCCL」。判据只要求点名，不
+        要求点名哪一家——写死一家在另一种卡上必红。
+        """
         support = collective_support(_FakeDevices(2))
         self.assertFalse(support.device_allreduce)
         self.assertFalse(support.overlap)
         self.assertIsNone(support.provider)
-        self.assertIn("NCCL", support.reason)
+        self.assertRegex(support.reason, "NCCL|RCCL")
         self.assertIn("重叠", support.reason)
 
     def test_support_reflects_injected_provider(self):
@@ -454,7 +459,7 @@ class TestCollectiveSeam(unittest.TestCase):
 
     def test_device_mode_without_provider_is_explicit(self):
         """请求设备路径但没有实现：抛能力错误并带原因，不静默退回主机。"""
-        with self.assertRaisesRegex(DeviceCollectiveUnavailable, "NCCL"):
+        with self.assertRaisesRegex(DeviceCollectiveUnavailable, "NCCL|RCCL"):
             DataParallelTrainer(
                 _linear_graph(),
                 _linear_store(),
