@@ -2,6 +2,23 @@
 
 规范与历史全部在 [DESIGN.md](DESIGN.md)；这里只记"再进来时先要知道的事"。
 
+## 第一代版本（v0.1.0）
+
+对外一页速览在 [README.md](README.md)；逐条现状在 DESIGN §1.2，已知边界在 §7。
+
+这一代交付的是**一条闭环**：静态图（或 torch.export 子集）→ 语义 IR → 中层优化 →
+可插拔后端（参考 / CUDA / HIP）→ 训练（反向、优化器、分布式最小闭环）→
+推理（会话、前缀缓存、连续批处理）。核心命题"一套 IR 落到不同硬件"已在
+NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
+
+读代码的顺序：`ir/graph.py` → `ir/ops.py` → `runtime/executor.py` →
+`backends/device_backend.py` → `lower/plan.py` → `lower/kernels.py` →
+`backends/cuda/backend.py`（HIP 是同构的第二份厂商钩子）。
+
+这一代**不**包括（下一代清单）：NCCL / RCCL 通信、张量并行、int8 / fp8 量化、
+NHWC 布局传播、设备端控制流、分页 KV cache、schedule 搜索、托管 CI 与发布。
+不要把这些当作"已经能用"去写示例。
+
 ## 验证命令
 
 ```powershell
