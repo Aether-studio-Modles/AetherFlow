@@ -8,6 +8,7 @@ from .events import (
     event_mean_rate,
     events_to_dense,
 )
+from .device_loop import DeviceLoopError, DeviceWhileLoop
 from .paged_cache import PagedCacheFullError, PagedKVCache
 from .reference import ReferenceExecutor, ShapeMismatchError
 from .telemetry import (
@@ -38,4 +39,6 @@ __all__ = [
     "event_mean_rate",
     "PagedKVCache",
     "PagedCacheFullError",
+    "DeviceWhileLoop",
+    "DeviceLoopError",
 ]
