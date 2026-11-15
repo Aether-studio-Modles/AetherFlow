@@ -16,8 +16,12 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 `backends/cuda/backend.py`（HIP 是同构的第二份厂商钩子）。
 
 这一代**不**包括（下一代清单）：NCCL / RCCL 通信、int8 / fp8 **计算**、
-NHWC 布局传播、设备端控制流、分页 KV cache、schedule 搜索、托管 CI 与发布。
+NHWC 布局传播、设备端控制流、schedule 搜索、托管 CI 与发布。
 不要把这些当作"已经能用"去写示例。
+
+分页 KV cache 与投机解码已有组件级交付（5.241），但**没有接进语言模型那条路**：
+主干是 Mamba，没有随上下文增长的 KV；两条能力各自有独立入口与逐位判据，
+写示例时别声称"`generate` 已经用上了分页缓存 / 投机加速"。
 
 张量并行只有**前向**的切分与对齐（5.240）：列 / 行并行、attention 头切分、
 段间归约。反向通信、优化器分片与"按需拼回参数"（FSDP 式）都还没接，写训练
@@ -37,7 +41,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2532 个用例 / 412 跳过，WSL HIP 2532 个用例 / 371 跳过。
+当前基线：本地 2561 个用例 / 412 跳过，WSL HIP 2561 个用例 / 371 跳过。
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
 前端用例（不是代码问题）。
 
@@ -112,6 +116,28 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
 - `split_axis` 返回副本；`split_dense` 的复制类参数（`ln*_g` / `ln*_b` / `scale`）
   也必须拷贝，否则优化器原地更新会跨 rank 污染。
 - 只做前向：反向通信与优化器分片没接，训练侧仍是数据并行 / 流水 / ZeRO。
+
+## 分页 KV cache 与投机解码（5.241）
+
+- 入口：`runtime/paged_cache.py` 的 `PagedKVCache`、`models/cached_attention.py` 的
+  `build_cached_decoder_step` / `cached_forward`、`models/speculative.py` 的
+  `SpeculativeDecoder` / `greedy_draft`。
+- **`append` 是"全部层 + 全有或全无"**：`keys` / `values` 都是长度 `num_layers` 的序列，
+  各层追加同样多的位置；页不够就整体抛 `PagedCacheFullError`，不改任何状态。
+  不要试图"先写一部分再说"——长度与内容会不一致，而显存检查看不出来。
+- 所有层共享**一张**块表（各层页号逐项相等）；`gather` 返回的是**副本**，
+  写回要靠 `append`，改返回值不会改到缓存。
+- `truncate` 只能缩短，按页释放、页内不清零；`length(rid)` 才是唯一真相。
+- 增量图里输入与输出**不能同名**，所以缓存输入是 `l{i}_k`、本步新算的是 `l{i}_k_out`；
+  `final_g` / `final_b` 也必须显式声明成输入，否则构图时 `KeyError`。
+- 掩码是加性 `-1e9`，补零位与未来位都靠它；别把 `pad_to` 的补零当成"合法历史"。
+- 投机解码被拒时**必须回到验证前的状态快照**：Mamba 的状态是递归的，不能按 token
+  截断。`accepted < k` 时重喂"接受的前缀 + bonus"，不要相信"被拒的那步没写进状态"。
+- 草稿可以返回空（下一步就是 EOS），这是合法弃权，会回退到目标的贪心 token；
+  不要把它当错误抛出。
+- 只做贪心验收与 batch=1；`temperature>0` 的采样验收没做。
+  `greedy_draft` 是正确性参照，不是性能路径。
+- 没有接进 `generate` / `LMRunner`：那条路径是 Mamba，没有增长 KV 可管。
 
 ## 提交约定
 
