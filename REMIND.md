@@ -174,6 +174,15 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   `enumerate` 拿下标。切片的形状靠新增的 `Trainer.data_input_shapes()`（非参数、
   非 `rng_inputs`），每卡分片第 0 维必须等于图声明值。构造期拒绝 rng 不一致、
   `device_state`、`scaler`、`zero3`——都是"看起来能跑其实语义不对"。
+- 静态执行快路径（5.237，`runtime/executor.py`）：`_GroupPlan.fast` 记录静态单节点组
+  的 `(内核, 节点, 输入 id, 属性, 期望形状, 输出 id, dtype, 是否量化)`，`Executor._fast_step`
+  在第一次执行时填。**三态语义**：`None` = 还没试过、`()`（`_NO_FAST`）= 已确认不能直连、
+  非空元组 = 直连记录——用空元组而不是再加一个布尔字段。踩过的坑：①测骨架必须让 no-op
+  执行器绑定 `kernels`（补一个 `_prepare_plan` 把 `group.kernels` 设成 `self.invoke`），
+  否则 `_fast_step` 一律返回 `None`，读数看起来"快路径完全没效果"（69.3 vs 71.4）；
+  ②`group.fast[0]` 不能用 `is` 和 `executor.invoke` 比较——绑定方法每次取都是新对象，
+  要 `assertEqual`；③负向对照要分别改坏 `if out.shape != shape` 与 `if out.dtype != dtype`
+  两处，各只变红 1 条，说明两道路径都在被执行。
 - **工作区被旧缓冲覆盖（反复出现）**：提交后用 `git status` / `git diff --stat` 核对，
   出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
   已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
