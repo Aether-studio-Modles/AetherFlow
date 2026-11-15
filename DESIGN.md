@@ -98,7 +98,7 @@
 | 静态图导入 | ✅ | torch.export → IR，覆盖 Transformer 与 CNN 的 aten 子集；未知算子明确报错 |
 | 动态图导入 | 🟡 | 不做 tape 式 define-by-run 执行：图必须静态，才能做构图期后端能力预检、让反向图自包含可序列化、并满足 CUDA Graph 的固定路径要求。补的是**构图手感**——`EagerGraph` / `Tensor` 用运算符直接写图，产物仍是同一份静态 IR（5.25）；数据相关的分支与循环由 `Conditional` / `WhileLoop` 显式表达，控制流是子图之间的关系、子图仍是普通静态图（5.201）；逐算子即时求值仍未做 |
 | 形状推导（含符号维） | ✅ | 编译期推导 + 运行期回校；空间维可以是 `floor((S + 2p - k) / s) + 1` 形式的派生表达式，一次构图多分辨率执行（5.53） |
-| 自动微分（含 SNN 非标准反传） | 🟡 | 语义 IR 层反向展开：42 条 VJP 规则，反向图仍是可序列化、可执行的普通 PORTABLE 图（5.17）；eager 前端可直接 `loss.backward()`，但它仍是这张图而不是 tape（5.77）；激活检查点由 `train/recompute.py` 的分段重算补上（5.75）；二阶导数由 `hessian_vector_product` 补上（对反向图再求导，判据是解析值 / 中心差分 / 二次目标一步 Newton，5.198），但只对具备 VJP 的算子成立；反向图专用优化自 5.207 起有两条：`backward(minimize=True)` 按求导目标限定 vjp 范围（无关分支不再建反向节点，梯度逐位不变），`backward_pipeline()` 用交换律 CSE + DCE 且不含融合；SNN 替代梯度只需替换算子 `vjp`，路已铺好 |
+| 自动微分（含 SNN 非标准反传） | 🟡 | 语义 IR 层反向展开：46 条 VJP 规则，反向图仍是可序列化、可执行的普通 PORTABLE 图（5.17）；eager 前端可直接 `loss.backward()`，但它仍是这张图而不是 tape（5.77）；激活检查点由 `train/recompute.py` 的分段重算补上（5.75）；二阶导数由 `hessian_vector_product` 补上（对反向图再求导，判据是解析值 / 中心差分 / 二次目标一步 Newton，5.198），但只对具备 VJP 的算子成立；反向图专用优化自 5.207 起有两条：`backward(minimize=True)` 按求导目标限定 vjp 范围（无关分支不再建反向节点，梯度逐位不变），`backward_pipeline()` 用交换律 CSE + DCE 且不含融合；SNN 替代梯度只需替换算子 `vjp`，路已铺好 |
 | 前端逻辑对所有后端一致 | ✅ | 执行骨架统一符号绑定与形状校验 |
 | 高层语义 IR | ✅ | 类型系统、verifier、可移植性标注 |
 | 中层优化 IR | ✅ | 独立一层：`passes/` 有八个可组合 pass（DCE / CSE / 交换律 CSE / simplify / 常量折叠 / 三个融合）、`PassManager` 在每个 pass 之后过 verifier、`registry.py` 提供注册表与按名入口（`run_pass` / `run_passes` / `build_pipeline`），三条管线（默认 / 融合 / 反向图）的名字序列只在 `DEFAULT_PASS_NAMES` / `FUSED_PASS_NAMES` / `BACKWARD_PASS_NAMES` 定义一处（5.36、5.197、5.207） |
@@ -14866,7 +14866,7 @@ HIP 只用来确认没有平台相关的导入问题）。
 
 **验证**：本地 `python -m unittest discover -s tests -t .` → 2602 个用例 /
 412 跳过；本层 41 条全绿（另有一条 `test_conformance` 的算子覆盖用例失败，
-来自工作区里另一份未提交的 `cumsum` / `tril` 工作，与本层无关）。
+来自工作区里另一份当时未提交的 `cumsum` / `tril` 工作（已在 5.247 提交），与本层无关）。
 WSL HIP 侧不跑设备路径，只用来确认没有平台相关的导入问题。
 
 **边界**
@@ -15030,8 +15030,8 @@ API——它把 `nccl*` 的函数名、枚举值与 `ncclUniqueId` 的 128 字�
 `TestRcclOnDevice` 真跑通过（RCCL 2.27.7，单卡 world=1）。WSL 全量首跑有 3 条
 失败：两条是上面那对写死 `NCCL` 的旧判据（改为接受两家后重跑
 `tests.test_parallel` + `tests.test_nccl` 55 条全绿 / 5 跳过），剩下一条仍是
-`test_conformance` 的算子覆盖断言（`cumsum` / `tril`），来自工作区里另一份
-未提交的工作，与本层无关。WSL 上运行前必须带 `HSA_ENABLE_DXG_DETECTION=1`，
+`test_conformance` 的算子覆盖断言（`cumsum` / `tril`），来自工作区里另一份当时
+未提交的工作（已在 5.247 提交），与本层无关。WSL 上运行前必须带 `HSA_ENABLE_DXG_DETECTION=1`，
 否则 RCCL 在 `ncclGetUniqueId` 处直接 FATAL（`no ROCm-capable device is
 detected`）。
 
@@ -15093,7 +15093,8 @@ detected`）。
 
 **验证**：本地 → 2652 个用例 / 415 跳过；WSL HIP（RX 7650 GRE / ROCm 7.2）→
 2652 个用例 / 373 跳过，真机那条通过。两处唯一失败仍是 `test_conformance` 的
-算子覆盖断言（`cumsum` / `tril`），来自工作区里另一份未提交的工作，与本层无关。
+算子覆盖断言（`cumsum` / `tril`），来自工作区里另一份当时未提交的工作
+（已在 5.247 提交），与本层无关。
 
 **耗时（负结果，如实记）**：WSL HIP，64 轮，每轮对 1 个元素做一次加法。
 状态 4 KB 时 host 8.6 ms / device 37 ms；状态 4 MB 时 host 26 ms / device
