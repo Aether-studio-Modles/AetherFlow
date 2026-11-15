@@ -64,6 +64,8 @@ __all__ = [
     "plan_csr_scan_enabled",
     "attention_block",
     "conv_oc_tile",
+    "conv_implicit_oc_tile",
+    "conv_implicit_fits",
     "plan_conv_tiled",
     "plan_conv_implicit",
     "conv_tiled_preferred",
@@ -439,6 +441,54 @@ def conv_tiled_preferred(k: int, work: int) -> bool:
     return k <= CONV_TILED_MAX_K and work >= CONV_TILED_MIN_WORK
 
 
+def conv_implicit_oc_tile(kh: int, kw: int, o: int, span: int) -> Optional[int]:
+    """隐式 GEMM 在 shared 预算内能放下的最大 OC tile，放不下返回 ``None``。
+
+    预算是"权重 + 输入窗口"两块之和，``span`` 由调用方按 tile_w 算好。
+    与 ``conv_oc_tile`` 分开而不是加参数：分块直算不暂存窗口，两者对同一个
+    ``o`` 会给出不同的答案，合在一起会让"谁该用哪个预算"变成调用方的责任。
+    """
+    for candidate in (32, 16, 8, 4, 2, 1):
+        if (
+            candidate <= o
+            and candidate * kh * kw * 4 + kh * span * 4 <= CONV_SHARED_LIMIT
+        ):
+            return candidate
+    return None
+
+
+def conv_implicit_fits(
+    *,
+    kh: int,
+    kw: int,
+    c: int,
+    o: int,
+    wo: int,
+    sw: int,
+    dw: int,
+    tile_w: Optional[int] = None,
+) -> bool:
+    """这个形状能不能被隐式 GEMM 接住（shared 预算与 block 上限一起判）。
+
+    只有 auto 用它：显式 ``conv_impl="implicit"`` 放不下时仍由
+    ``plan_conv_implicit`` 报错，不在这里静默改写意图。判据与
+    ``plan_conv_implicit`` 的前半段一致，改预算公式时两处要一起看。
+    """
+    if min(kh, kw, c, o, wo, sw, dw) <= 0:
+        return False
+    if tile_w is None:
+        tile_w = CONV_TILE_W
+    if tile_w <= 0:
+        return False
+    tile_w = min(tile_w, wo)
+    span = tile_w * sw + (kw - 1) * dw
+    toc = conv_implicit_oc_tile(kh, kw, o, span)
+    if toc is None:
+        return False
+    roc = min(CONV_ROC_MAX, toc)
+    return tile_w * (toc // roc) <= BLOCK_MAX
+
+
 def plan_conv_tiled(
     *,
     kh: int,
@@ -567,11 +617,7 @@ def plan_conv_implicit(
     khkw = kh * kw
     input_bytes = kh * span * 4
 
-    toc: Optional[int] = None
-    for candidate in (32, 16, 8, 4, 2, 1):
-        if candidate <= o and candidate * khkw * 4 + input_bytes <= CONV_SHARED_LIMIT:
-            toc = candidate
-            break
+    toc: Optional[int] = conv_implicit_oc_tile(kh, kw, o, span)
     if toc is None:
         raise ValueError(
             f"隐式 GEMM 卷积的 shared memory 放不下一个输出通道的权重加窗口"

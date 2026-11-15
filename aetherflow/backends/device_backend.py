@@ -44,6 +44,7 @@ from ..lower.plan import (
     CONV_ROC_MAX,
     CONV_SHARED_LIMIT,
     CONV_TILE_OPTIONS,
+    CONV_TILED_MAX_K,
     SHARED_LIMIT,
     VEC4_ALIGN,
     attention_block,
@@ -51,6 +52,7 @@ from ..lower.plan import (
     check_block,
     cdiv,
     conv_oc_tile,
+    conv_implicit_fits,
     conv_tiled_preferred,
     grid_for,
     plan_conv_implicit,
@@ -406,6 +408,10 @@ class DeviceBackend(Executor):
     _F16_OPS: Optional[FrozenSet[str]] = None
     # conv2d 的实现选择。子类可以收窄（HIP 没有 cuDNN）。
     CONV_IMPLS: Tuple[str, ...] = _CONV_IMPLS
+    # auto 是否允许在"K 超过分块阈值、核面积大于 1"时改走隐式 GEMM。
+    # 默认 False：M40 上 5.151 的 A/B 里隐式在 K >= 288 输给 im2col 1.37～2.32×，
+    # 不该由"规模大"自动触发。HIP 覆盖成 True，依据见 5.238 的实测。
+    CONV_AUTO_IMPLICIT = False
     # sparse_linear 的实现选择。子类可以扩展（CUDA 多一个 "cusparse"）。
     SPARSE_IMPLS: Tuple[str, ...] = _SPARSE_IMPLS
 
@@ -1996,18 +2002,35 @@ class DeviceBackend(Executor):
 
 
 
-    def _pick_conv_kernel(self, *, n, o, k, kh, kw, ho, wo, **_ignored) -> str:
+    def _pick_conv_kernel(self, *, n, o, k, kh, kw, ho, wo, c, sw, dw,
+                          **_ignored) -> str:
         """在 tiled / implicit / im2col 之间选一个实现。
 
         ``auto`` 只在分块直算的甜点区选 tiled，其余交给 im2col。隐式 GEMM
-        **不进 auto**：5.151 在 M40 上做了 7 个形状的同形状 A/B（K 从 27 到
-        4608），K >= 288 的 6 个形状全部输给 im2col（cuBLAS 分块 GEMM），慢
-        1.37×（K=288）到 2.32×（K=864）；唯一的例外是 K=27，那一档分块直算
+        **不进 CUDA 的 auto**：5.151 在 M40 上做了 7 个形状的同形状 A/B（K 从
+        27 到 4608），K >= 288 的 6 个形状全部输给 im2col（cuBLAS 分块 GEMM），
+        慢 1.37×（K=288）到 2.32×（K=864）；唯一的例外是 K=27，那一档分块直算
         本来就更快（1.69 ms vs 隐式 1.80 ms），轮不到隐式接管。它仍是显式
         ``conv_impl="implicit"`` 的对照路径（数值与 im2col 一致，相对误差
         ≤ 1.7e-6），但不该由"规模大"自动触发，否则等于用生产流量做实验。
+
+        HIP 的结论相反（5.238 实测：中等通道 3x3/5x5 上隐式比 im2col 快
+        1.33～1.63×，3x3_c128 快 1.33×），由子类的 ``CONV_AUTO_IMPLICIT``
+        打开。两条额外限制都来自实测：``kh*kw > 1``（1x1 没有窗口重叠，
+        implicit 反而慢 6%）、``k > CONV_TILED_MAX_K``（小 K 的分块直算仍更快）。
         """
         if self.conv_impl == "implicit":
+            return "implicit"
+        if (
+            self.conv_impl == "auto"
+            and self.CONV_AUTO_IMPLICIT
+            and kh * kw > 1
+            and k > CONV_TILED_MAX_K
+            and conv_implicit_fits(
+                kh=kh, kw=kw, c=c, o=o, wo=wo, sw=sw, dw=dw,
+                tile_w=self._conv_tile,
+            )
+        ):
             return "implicit"
         if self._use_tiled_conv(n=n, o=o, k=k, kh=kh, kw=kw, ho=ho, wo=wo):
             return "tiled"

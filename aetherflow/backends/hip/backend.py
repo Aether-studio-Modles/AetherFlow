@@ -54,6 +54,10 @@ class HipBackend(DeviceBackend):
     _LABEL = "HIP 后端"
     _OPS = HIP_OPS
     CONV_IMPLS = _HIP_CONV_IMPLS
+    # 中等通道的 3x3/5x5 在 ROCm 上走隐式 GEMM 更快（5.238 实测：比 im2col
+    # 快 1.33～1.63×，3x3_c128 快 1.33×）。CUDA 那边 5.151 的结论相反，
+    # 所以这里按厂商覆盖，而不是改基类的默认。
+    CONV_AUTO_IMPLICIT = True
     # 执行期分层分配器惰性创建；只在显式 ``memory_mode="tiered"`` 时才分配
     # 显存。写成类属性是为了让 ``__init__`` 仍然只设置容器相关字段。
     _tiered = None
