@@ -51,6 +51,7 @@ from .sharded import ShardedOptimizer, reduce_scatter_grads, shard_params
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
 from .zero import LoopbackWorld, NcclHostCollective, ZeroRank
 from .zero2 import Zero2Rank
+from .zero3 import Zero3Rank
 
 __all__ = [
     "ParameterStore",
@@ -64,6 +65,7 @@ __all__ = [
     "reduce_scatter_grads",
     "ZeroRank",
     "Zero2Rank",
+    "Zero3Rank",
     "LoopbackWorld",
     "NcclHostCollective",
     "Trainer",
