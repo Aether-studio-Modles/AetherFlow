@@ -2233,6 +2233,81 @@ register(
 
 
 # --------------------------------------------------------------------------
+# 前缀和 / 三角掩码
+# --------------------------------------------------------------------------
+
+
+def _infer_cumsum(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"cumsum 需要 1 个输入，得到 {len(inputs)}")
+    axes = _norm_axes(attrs.get("axis", -1), inputs[0].rank)
+    if len(axes) != 1:
+        raise ValueError(f"cumsum 只接受一个轴，得到 {axes}")
+    return inputs[0]
+
+
+def _ref_cumsum(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """沿单个轴的**含端点**前缀和。
+
+    f16 在 float32 里累加：前缀和的每一步都是最终输出，逐项 f16 累加在长序列
+    上会先溢出再失真，而这里没有"最后再 cast 一次"能补救的机会。这与 PyTorch
+    归约类算子的 acc_type 口径一致（累加用 float，结果落回原 dtype）。
+    """
+    x = args[0]
+    axis = _norm_axes(attrs.get("axis", -1), x.ndim)[0]
+    work = x.astype(np.float32) if x.dtype == np.float16 else x
+    return np.cumsum(work, axis=axis).astype(x.dtype, copy=False)
+
+
+register(
+    Op(
+        name="cumsum",
+        infer=_infer_cumsum,
+        reference=_ref_cumsum,
+        attrs_schema=("axis",),
+        doc="沿单个轴的含端点前缀和；SSM 分块扫描的块内 log-space 前缀和"
+        "（数值稳定性的命脉）与因果累积均值都靠它。与 scan_linear 不重复："
+        "后者是 a_t 可变的递归，这里是 a_t == 1 的纯累加，后端可以按纯前缀和"
+        "优化（分块 / 并行），不必套进递归的串行骨架",
+    )
+)
+
+
+def _infer_tril(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    t = inputs[0]
+    if t.rank < 2:
+        raise ValueError(f"tril 至少需要秩 2，得到 {t.rank}")
+    # diagonal 只影响取值，不影响形状；但拼错成字符串会让参考实现静默用 0，
+    # 所以在构图期就把类型钉住。
+    k = attrs.get("diagonal", 0)
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise TypeError(f"tril 的 diagonal 必须是整数，得到 {k!r}")
+    return t
+
+
+def _ref_tril(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """最后两维的下三角保留（``k`` 为对角线偏移），其余置零。
+
+    numpy 的 ``tril`` 对 ndim > 2 的数组正好作用在最后两维，与本算子的定义
+    一致：前导维（batch / head）逐片独立，不做跨片操作。
+    """
+    return np.tril(args[0], k=int(attrs.get("diagonal", 0)))
+
+
+register(
+    Op(
+        name="tril",
+        infer=_infer_tril,
+        reference=_ref_tril,
+        attrs_schema=("diagonal",),
+        doc="最后两维保留下三角（含对角线偏移 k），其余置零。"
+        "分块 SSM 的块内因果权重与窗口注意力的因果掩码都靠它；"
+        "反向是同一个算子（下三角是逐元素 0/1 掩码的乘法，掩码自伴）",
+    )
+)
+
+
+# --------------------------------------------------------------------------
 # 稀疏选择
 # --------------------------------------------------------------------------
 

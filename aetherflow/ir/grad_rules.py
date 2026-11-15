@@ -394,6 +394,39 @@ def _scan_linear(ctx):
     return (da, db, dh0)
 
 
+@vjp("cumsum")
+def _cumsum(ctx):
+    """含端点前缀和的反向：``dx_i = Σ_{j >= i} g_j``（后缀和）。
+
+    没有 ``flip`` 原语，用恒等式 ``后缀和 = 总和 - 不含端点前缀和`` 拼出来：
+    ``exclusive = shift(cumsum(g))``，其中 shift 是 ``pad + slice``——与
+    ``scan_linear`` 反向里的平移同一个手段，不引入新原语。
+
+    ``axis`` 的长度必须静态：pad 的补零宽度要写进输出类型。这与
+    ``scan_linear`` 要求静态时间维是同一条约束，报错点也一致。
+    """
+    b, g = ctx.b, ctx.g
+    raw = ctx.attrs.get("axis", -1)
+    axis = int(raw[0] if isinstance(raw, (list, tuple)) else raw)
+    shape = _static(g, "cumsum")
+    axis %= len(shape)
+    steps = shape[axis]
+    total = b.add_node("reduce_sum", [g], {"axis": axis, "keepdims": True})
+    inc = b.add_node("cumsum", [g], {"axis": axis})
+    shifted = b.add_node("pad", [inc], {"dim": axis, "before": 1, "after": 0})
+    excl = b.add_node(
+        "slice", [shifted], {"dim": axis, "start": 0, "stop": steps}
+    )
+    full = b.add_node("broadcast_to", [total], {"shape": list(shape)})
+    return (b.add_node("sub", [full, excl]),)
+
+
+@vjp("tril")
+def _tril(ctx):
+    """下三角是逐元素 0/1 掩码的乘法，掩码自伴：``dx = tril(g)``。"""
+    return (ctx.b.add_node("tril", [ctx.g], {"diagonal": int(ctx.attrs.get("diagonal", 0))}),)
+
+
 @vjp("constant")
 def _constant(ctx):
     return ()

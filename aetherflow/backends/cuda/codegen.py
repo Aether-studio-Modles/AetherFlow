@@ -33,6 +33,7 @@ from ...lower.kernels import (
     conv2d_implicit,
     conv2d_tiled,
     conv2d_weight_grad,
+    cumsum,
     dropout_mask,
     ew_binary,
     ew_broadcast,
@@ -62,6 +63,7 @@ from ...lower.kernels import (
     scan_linear_last,
     silu_gate,
     softmax_last,
+    tril,
     spike_csr,
     spike_csr_serial,
     spike_linear,
@@ -2001,6 +2003,23 @@ def scan_linear_last_source() -> Kernel:
 def scan_linear_chunk_last_source() -> Kernel:
     """分块末状态的 L2 描述。"""
     return scan_linear_chunk_last()
+
+
+def cumsum_source() -> Kernel:
+    """前缀和的 L2 描述（生产路径）。
+
+    没有手写模板对照物：它与 ``scan_linear`` 的铺法同构（一个线程一个尾元素
+    沿时间轴走），差别只在没有 ``a_t`` 乘法，抄一份模板只会多一处漂移点。
+    """
+    return cumsum()
+
+
+def tril_source() -> Kernel:
+    """下三角掩码的 L2 描述（生产路径）。
+
+    没有手写模板对照物：单趟逐元素写回，结构由 ``grid_stride`` 定死。
+    """
+    return tril()
 
 
 def conv2d_input_grad_source() -> Kernel:

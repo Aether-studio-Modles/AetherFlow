@@ -2334,6 +2334,120 @@ def scan_linear_backward() -> Kernel:
     )
 
 
+def cumsum() -> Kernel:
+    """沿单个轴的前缀和：一个线程负责一个 ``(outer, inner)`` 位置。
+
+    把张量看成 ``(outer, steps, inner)``，前缀和只沿 ``steps`` 走，所以并行度
+    来自 ``outer * inner``（batch / 其余维），与 ``scan_linear`` 的铺法同构。
+    累加用 ``float``：f16 逐项累加会在长序列上先溢出再失真，而前缀和每一步
+    都是最终输出，没有"最后再 cast 一次"能补救。
+    """
+    return Kernel(
+        name="cumsum",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "work"),
+            Scalar("long long", "steps"),
+            Scalar("long long", "inner"),
+        ),
+        body=_flat_loop(
+            (
+                Let("const long long", "o", Bin("/", Var("idx"), Var("inner"))),
+                Let("const long long", "j", Bin("%", Var("idx"), Var("inner"))),
+                Let(
+                    "const long long",
+                    "base",
+                    Bin(
+                        "+",
+                        Bin(
+                            "*",
+                            Var("o"),
+                            Bin("*", Var("steps"), Var("inner")),
+                        ),
+                        Var("j"),
+                    ),
+                ),
+                Let("float", "acc", Num("0.f")),
+                For(
+                    "t",
+                    Num("0"),
+                    Var("steps"),
+                    Num("1"),
+                    (
+                        Let(
+                            "const long long",
+                            "pos",
+                            Bin(
+                                "+",
+                                Var("base"),
+                                Bin("*", Var("t"), Var("inner")),
+                            ),
+                        ),
+                        Assign(
+                            Var("acc"),
+                            Bin("+", Var("acc"), Load("x", Var("pos"))),
+                        ),
+                        Store("out", Var("pos"), Var("acc")),
+                    ),
+                    incr="++",
+                ),
+            ),
+            index="idx",
+            count="work",
+            stride="step",
+        ),
+    )
+
+
+def tril() -> Kernel:
+    """最后两维的下三角掩码：一个线程一个元素。
+
+    ``idx`` 是 C 布局的线性下标，所以 ``c = idx % cols``、
+    ``r = (idx / cols) % rows``；前导维自然被 ``% rows`` 吃掉，不需要单独
+    传 batch。条件外写 0 而不是跳过，输出才不会带着未初始化值。
+    """
+    return Kernel(
+        name="tril",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "n"),
+            Scalar("long long", "rows"),
+            Scalar("long long", "cols"),
+            Scalar("long long", "diagonal"),
+        ),
+        # grid_stride 是可变参数（``*body``）：这里必须平铺传入，
+        # 包成一个 tuple 会被当成"一条语句"，渲染器不认识嵌套 tuple。
+        body=grid_stride(
+            Var("n"),
+            Let("long long", "c", Bin("%", Var("i"), Var("cols"))),
+            Let(
+                "long long",
+                "r",
+                Bin(
+                    "%",
+                    Bin("/", Var("i"), Var("cols")),
+                    Var("rows"),
+                ),
+            ),
+            Store(
+                "out",
+                Var("i"),
+                Cond(
+                    Bin(
+                        "<=",
+                        Var("c"),
+                        Bin("+", Var("r"), Var("diagonal")),
+                    ),
+                    Load("x", Var("i")),
+                    Num("0.f"),
+                ),
+            ),
+        ),
+    )
+
+
 def _chunk_coords() -> tuple:
     """把展平下标 ``j`` 拆成 ``(块号 k, 尾元素 i)``。
 
