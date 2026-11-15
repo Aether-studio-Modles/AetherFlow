@@ -99,6 +99,34 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   USTC 镜像要么 429、要么 TLS 握手超时。最终只下到 121/159 段（每段 4 MB）就停了，
   **卷积真机对拍与 `benchmarks/cudnn_compare.py` 的逐形状数据仍是空白**。下次别再用
   8 并发抓同一个 URL（429 会越退越久），也别把 `pip download` 与分段下载同时跑。
+- **远端那台 2×V100 已由用户释放**（2026-11-15）。下次做 CUDA 真机验证要重新开机器、
+  重装 NCCL 与 cuDNN，`DESIGN` §0 里的真机数字在此之前只能沿用上一轮（2335 / 120）。
+- ZeRO-2（5.231，`train/zero2.py`）：梯度也只留本片。关键是 NCCL 的
+  `ncclReduceScatter` 要求各段**等长**，而按参数名分片时每片大小不一 —— 因此按参数
+  边界分桶后把每段补零到 `pad = max(段长)`，通信缓冲固定 `pad × world_size`。
+  每步两步：`reduce_scatter` 拿回本片梯度 → 本地优化器更新 → `all_gather` 拼回完整
+  参数并原地写回。省的是常驻内存（梯度峰值 `N` → `N/W + pad`），通信量与 ZeRO-1 同
+  量级（每步收发各 `pad × W`）。数值不逐位保证（NCCL 归约顺序由拓扑决定）。
+  `LoopbackWorld` 与 `NcclHostCollective` 各补了 `reduce_scatter` / `all_gather` 两个面。
+- 存档：ZeRO-1 与 ZeRO-2 共用 `train/zero.py` 的模块级 `_save_shard` / `_load_shard`；
+  `Zero2Rank.steps` 是 `optimizer.step_count` 的只读视图，**不要再单独记一份计数**
+  （两份真相会让 `load_shard` 之后步数对不上）。
+- 多 rank 启动器（5.232，`train/distributed.py`）：环境变量 `AF_RANK` /
+  `AF_WORLD_SIZE` / `AF_LOCAL_RANK` / `AF_MASTER_ADDR` / `AF_MASTER_PORT` 优先，
+  torchrun 的 `RANK` / `WORLD_SIZE` / `LOCAL_RANK` 兜底，都没有且无默认值就报错
+  （不猜 0）。`ncclUniqueId` 的 128 字节只有 rank0 能生成，跨进程用 TCP 分发：
+  `UniqueIdServer` 每个 follower 连上来先发 1 字节 rank，服务端回 128 字节；
+  `fetch_unique_id` 从 rank ≥ 1 调用。
+- `spawn` 用 **`subprocess` + `python -c`** 而不是 `multiprocessing`：spawn 会重新
+  import `__main__`，在 `python -m unittest` 下等于递归重跑整份测试。入口写成
+  `"包.模块:函数"`，子进程里 `importlib.import_module` 后把 `sys.argv[1:]` 原样传进去。
+  注意把 `server.wait()` 放在**正常路径**里：放进 `finally` 会用它自己的异常盖掉
+  "子进程退出码非 0"那条更有诊断价值的错误。
+- 跨平台差异（HIP 全量第一次跑才暴露）：服务端 `close()` 之后，客户端 `connect`
+  在 Linux 上**仍会成功**（backlog 里还排着 SYN），紧接着 `recv` 抛
+  `ConnectionResetError`；Windows 上同一场景是静默等到超时。因此
+  `fetch_unique_id` 把"连上之后的收发"包进 `except OSError` 转成 `RuntimeError`。
+  教训：只在一个平台上跑的用例不算验证，涉及 socket 的用例必须过 WSL。
 
 ## 临时脚本
 
