@@ -25,6 +25,11 @@ class ShapeMismatchError(ValueError):
     pass
 
 
+# ``_GroupPlan.fast`` 的"已确认不能直连"标记。用空元组而不是 ``None``：
+# ``None`` 表示"还没试过"，第一次执行时才决定，整份计划因此不需要额外的标志位。
+_NO_FAST: Tuple = ()
+
+
 class _GroupPlan:
     """一个执行组里与运行期形状无关的部分。
 
@@ -36,7 +41,7 @@ class _GroupPlan:
 
     __slots__ = (
         "nodes", "args", "attrs", "expected", "dtype", "out_dtype",
-        "kernels", "constants", "_memo",
+        "kernels", "constants", "_memo", "fast",
     )
 
     def __init__(self, nodes: Tuple[Node, ...], static: bool) -> None:
@@ -63,6 +68,9 @@ class _GroupPlan:
         # 分组实现是设备后端，而它拒绝 bf16，这条前提因此不会被打破。
         self.out_dtype = nodes[-1].output.type.dtype
         self._memo = None
+        # 静态单节点组的直连记录，由 ``Executor._fast_step`` 在第一次执行时
+        # 填。``None`` = 这组仍走 ``invoke_group`` 的通用路径。
+        self.fast = None
 
     def resolve(self, binding: Dict[str, int]):
         """返回本组的 ``(attrs, expected)``。
@@ -253,6 +261,38 @@ class Executor:
             produced[node.output.id] = out
         return out
 
+    def _fast_step(self, group: "_GroupPlan"):
+        """把静态单节点组收成"运行期只做一次调用"的记录。
+
+        通用路径每节点要过 ``resolve`` → ``invoke_group``（可能两三层）→
+        ``cast`` → ``quantize``，其中绝大多数判断在静态图上恒为真：形状不随
+        绑定变、dtype 等于声明值、组里只有一个节点、也没有组内前序输出要补位。
+        这些都在第一次执行时定下来，之后每步只剩"取输入 → 调内核 → 写回环境"。
+
+        返回 ``None`` 表示这组不适合直连（含符号维、融合组、常量、后端没绑定
+        内核），调用方原路径不变。**不改变任何语义**：dtype 仍需确认（参考
+        执行器可能返回比声明更宽的类型），形状仍需比对，释放仍按最后一次使用
+        回收。
+        """
+        if group.attrs is None or group.kernels is None:
+            return None
+        if len(group.nodes) != 1:
+            return None
+        node = group.nodes[0]
+        if node.output.id in group.constants:
+            return None
+        used = tuple(a.id for a in node.inputs)
+        return (
+            group.kernels[0],
+            node,
+            used,
+            group.attrs[0],
+            group.expected.shape,
+            node.output.id,
+            group.dtype,
+            group.out_dtype is DType.BF16,
+        )
+
     # ---- 固定流程 ----
     def run(self, graph: Graph, inputs: Mapping[str, Any]) -> Dict[str, Any]:
         """跑完整张图，只返回输出。
@@ -331,6 +371,35 @@ class Executor:
             env[value.id] = arr
 
         for group in plan:
+            # 直连快路径：静态单节点组在第一次执行时把"每步都要做的判断"
+            # 收成一条记录，之后只取输入、调内核、写回。
+            if group.fast is None:
+                group.fast = self._fast_step(group)
+                if group.fast is None:
+                    group.fast = _NO_FAST
+            fast = group.fast
+            if fast:
+                kernel, node, used, node_attrs, shape, oid, dtype, quantize = fast
+                out = kernel(node, [env[i] for i in used], node_attrs)
+                if out.dtype != dtype:
+                    out = self.cast(out, dtype)
+                if quantize:
+                    out = self.quantize(out, group.out_dtype)
+                if out.shape != shape:
+                    raise ShapeMismatchError(
+                        f"节点 %{node.output.name}（{node.op.name}）运行期形状 "
+                        f"{tuple(out.shape)} 与 IR 推导 {shape} 不一致"
+                    )
+                env[oid] = out
+                out = None
+                if release:
+                    for aid in used:
+                        remaining[aid] -= 1
+                        if remaining[aid] == 0 and aid not in keep:
+                            dead = env.pop(aid, None)
+                            if dead is not None:
+                                self.dispose(dead)
+                continue
             # 组内前序节点的输出还没进环境（融合时它们甚至不会被物化），
             # 这里留 None 占位；``invoke_group`` 决定是内联计算还是逐个补读。
             # 单节点组不存在待补位的槽，直接按输入顺序取值，省掉一层循环。
