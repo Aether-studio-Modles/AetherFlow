@@ -12,7 +12,9 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2336 个用例 / 412 跳过，WSL HIP 2336 个用例 / 371 跳过。
+当前基线：本地 2484 个用例 / 412 跳过，WSL HIP 2484 个用例 / 371 跳过。
+本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
+前端用例（不是代码问题）。
 
 ## CUDA 真机
 
@@ -183,6 +185,21 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   ②`group.fast[0]` 不能用 `is` 和 `executor.invoke` 比较——绑定方法每次取都是新对象，
   要 `assertEqual`；③负向对照要分别改坏 `if out.shape != shape` 与 `if out.dtype != dtype`
   两处，各只变红 1 条，说明两道路径都在被执行。
+- 卷积实现选择（5.238，`lower/plan.py` + `backends/device_backend.py` +
+  `backends/hip/backend.py`）：**同一问题跨厂商结论可以相反**——M40 上 5.151
+  的 A/B 是隐式 GEMM 在 K ≥ 288 输给 im2col 1.37～2.32×，HIP（RX 7650 GRE /
+  ROCm 7.2）上中等通道 3x3/5x5 反过来赢 1.33～1.63×。所以加**厂商开关**
+  `CONV_AUTO_IMPLICIT`（基类 False、`HipBackend` True），而不是改 `auto` 的
+  全局默认，CUDA 行为逐字不变。两条限制都来自负向实测：`kh*kw > 1`（1x1 C=256
+  上隐式慢 3%）、`k > CONV_TILED_MAX_K`（C=3 的 3x3 持平，tiled 仍优）。
+  `conv_implicit_fits` 必须与 `plan_conv_implicit` **共用**同一份 shared 算式
+  （权重 tile + 输入窗口都算进 48 KB），改一处必须同步另一处，否则会出现
+  "选中了但规划抛 ValueError"。踩过的坑：①测量不能顺序单轮做，auto 与
+  im2col 的差距会被 10～17% 的顺序噪声盖住，要 5 次预热 + 3 轮交错、每轮
+  10 次中位再取最小；②负向对照的测试形状要能**区分**改坏的那一项，`kh=kw=40`
+  只看权重也给同一个 tile，改掉窗口项后不变红，换成
+  `conv_implicit_oc_tile(32, 48, 32, 79)`（只看权重 8、计入窗口 4）才行。
+  临时脚本 `_tmp_conv.py` 用完已删。
 - **工作区被旧缓冲覆盖（反复出现）**：提交后用 `git status` / `git diff --stat` 核对，
   出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
   已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
