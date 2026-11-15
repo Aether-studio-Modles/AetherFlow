@@ -26,6 +26,17 @@ backend.clear_tuning()          # 回到默认
 第二个后端才有意义。
 """
 
+from .cost import (
+    M40_LIKE,
+    V100_LIKE,
+    CostBreakdown,
+    MachineModel,
+    RankedTuningResult,
+    conv_tile_cost,
+    cost_ranked_tune,
+    elementwise_cost,
+    rank_configs,
+)
 from .paired import (
     ORDER_ALTERNATE,
     ORDER_SHUFFLE,
@@ -37,7 +48,13 @@ from .paired import (
     tune_replicated,
     tune_staged,
 )
-from .search import AllRejectedError, CandidateResult, TuningResult, tune
+from .search import (
+    AllRejectedError,
+    CandidateResult,
+    TuningResult,
+    measure_configs,
+    tune,
+)
 from .space import TuningSpace, canonical_signature
 from .store import STORE_VERSION, ConfigStore, TuningRecord
 
@@ -45,17 +62,27 @@ __all__ = [
     "AllRejectedError",
     "CandidateResult",
     "ConfigStore",
+    "CostBreakdown",
+    "M40_LIKE",
+    "MachineModel",
     "ORDER_ALTERNATE",
     "ORDER_SHUFFLE",
     "PairedCandidate",
     "PairedResult",
+    "RankedTuningResult",
     "STORE_VERSION",
     "TuningRecord",
     "TuningResult",
     "TuningSpace",
+    "V100_LIKE",
     "VOTE_ALL",
     "VOTE_MAJORITY",
     "canonical_signature",
+    "conv_tile_cost",
+    "cost_ranked_tune",
+    "elementwise_cost",
+    "measure_configs",
+    "rank_configs",
     "tune",
     "tune_paired",
     "tune_replicated",

@@ -36,6 +36,7 @@ __all__ = [
     "CandidateResult",
     "TuningResult",
     "AllRejectedError",
+    "measure_configs",
     "tune",
 ]
 
@@ -169,39 +170,42 @@ def _valid(value: Any) -> Optional[float]:
     return number
 
 
-def tune(
-    space: TuningSpace,
-    measure: Measure,
-    *,
-    op: str = "",
-    rounds: int = 1,
-    tie_epsilon: float = 0.02,
-) -> TuningResult:
-    """穷举 ``space`` 的配置，返回**典型延迟**最短者。
-
-    ``rounds > 1`` 时每个配置测多次：中位数作为排名依据，最小值与 p95
-    一并写进结果，分别回答"通常多快"和"最好能多快、抖动有多大"。旧实现
-    多轮取最小值却把字段叫 ``median_ms``，报出来的是"最佳可达"，不是典型
-    延迟；现在两者分开，排名不再被单轮抖动带偏。
-
-    ``tie_epsilon`` 是"显著更快"的判据：候选的中位数必须低于当前赢家
-    ``tie_epsilon``（默认 2%）才算超越。差距落在噪声范围内时保留先出现的
-    候选，默认配置因此不会被一次轻微的偶然领先替换掉。
-
-    ``measure`` 抛异常、返回 ``None`` / NaN / 负数，都记为**不可行**并继续；
-    只有全部候选都不可行时才抛 ``AllRejectedError``。
-    """
+def _check_measure_args(measure: Measure, rounds: int, tie_epsilon: float) -> Tuple[int, float]:
+    """搜索入口共用的参数校验：``rounds`` 与 ``tie_epsilon`` 的合法域只写一份。"""
     if not callable(measure):
         raise TypeError(f"measure 必须可调用，得到 {type(measure).__name__}")
     if isinstance(tie_epsilon, bool) or not isinstance(tie_epsilon, (int, float)):
         raise TypeError(f"tie_epsilon 必须是数，得到 {type(tie_epsilon).__name__}")
     if not 0.0 <= float(tie_epsilon) < 1.0:
         raise ValueError(f"tie_epsilon 必须在 [0, 1) 内，得到 {tie_epsilon!r}")
-    rounds = max(1, int(rounds))
-    tie_epsilon = float(tie_epsilon)
+    return max(1, int(rounds)), float(tie_epsilon)
+
+
+def measure_configs(
+    configs,
+    measure: Measure,
+    *,
+    op: str = "",
+    rounds: int = 1,
+    tie_epsilon: float = 0.02,
+) -> TuningResult:
+    """测一串**已经展开好的**配置，返回典型延迟最短者。
+
+    与 :func:`tune` 的区别只在"配置从哪来"：这里收的是一串确定的配置，
+    而不是一个参数空间。成本模型（``tuning/cost.py``，5.242）要靠它把
+    "按估算排序后只测前 N 个"落成真正的搜索——那种子集通常不是笛卡尔积，
+    硬塞回 ``TuningSpace`` 会展开出没被选中的组合。
+
+    **顺序仍然决定平局**：``configs[0]`` 是默认配置，``tie_epsilon`` 以内
+    的领先不会替换它。名次与拒绝语义与 :func:`tune` 完全一致。
+    """
+    rounds, tie_epsilon = _check_measure_args(measure, rounds, tie_epsilon)
+    configs = tuple(dict(config) for config in configs)
+    if not configs:
+        raise ValueError("measure_configs 至少需要一个配置")
 
     results = []
-    for config in space.configs():
+    for config in configs:
         reason = ""
         values: List[float] = []
         try:
@@ -248,3 +252,39 @@ def tune(
         if item.median_ms < winner.median_ms * (1.0 - tie_epsilon):  # type: ignore[operator]
             winner = item
     return TuningResult(best=winner, candidates=candidates, tie_epsilon=tie_epsilon)
+
+
+def tune(
+    space: TuningSpace,
+    measure: Measure,
+    *,
+    op: str = "",
+    rounds: int = 1,
+    tie_epsilon: float = 0.02,
+) -> TuningResult:
+    """穷举 ``space`` 的配置，返回**典型延迟**最短者。
+
+    ``rounds > 1`` 时每个配置测多次：中位数作为排名依据，最小值与 p95
+    一并写进结果，分别回答"通常多快"和"最好能多快、抖动有多大"。旧实现
+    多轮取最小值却把字段叫 ``median_ms``，报出来的是"最佳可达"，不是典型
+    延迟；现在两者分开，排名不再被单轮抖动带偏。
+
+    ``tie_epsilon`` 是"显著更快"的判据：候选的中位数必须低于当前赢家
+    ``tie_epsilon``（默认 2%）才算超越。差距落在噪声范围内时保留先出现的
+    候选，默认配置因此不会被一次轻微的偶然领先替换掉。
+
+    ``measure`` 抛异常、返回 ``None`` / NaN / 负数，都记为**不可行**并继续；
+    只有全部候选都不可行时才抛 ``AllRejectedError``。
+
+    具体的测量与判定在 :func:`measure_configs`：成本模型（5.242）需要一个
+    "只测这 N 个配置"的入口，而那两个入口必须共用同一套排名语义。
+    """
+    if not isinstance(space, TuningSpace):
+        raise TypeError(f"space 必须是 TuningSpace，得到 {type(space).__name__}")
+    return measure_configs(
+        tuple(space.configs()),
+        measure,
+        op=op,
+        rounds=rounds,
+        tie_epsilon=tie_epsilon,
+    )
