@@ -48,6 +48,7 @@ from .parallel import (
 from .params import ParameterStore, default_init, init_array
 from .pipeline import PipelineStage, PipelineTrainer
 from .sharded import ShardedOptimizer, reduce_scatter_grads, shard_params
+from .shard_io import ShardedCheckpoint, merge_shards, split_checkpoint
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
 from .zero import LoopbackWorld, NcclHostCollective, ZeroRank
 from .zero2 import Zero2Rank
@@ -61,6 +62,9 @@ __all__ = [
     "SGD",
     "Adam",
     "ShardedOptimizer",
+    "ShardedCheckpoint",
+    "merge_shards",
+    "split_checkpoint",
     "shard_params",
     "reduce_scatter_grads",
     "ZeroRank",
