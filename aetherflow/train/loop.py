@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -37,6 +38,7 @@ from .optim import Optimizer
 from .params import ParameterStore
 from .recompute import CheckpointPlan
 from .schedule import apply_lr
+from .zero3 import Zero3Rank
 
 __all__ = ["Trainer", "TrainingState"]
 
@@ -197,6 +199,24 @@ class Trainer:
     ``None`` 表示显式关闭（例如图里没有 BN，或调用方自己维护）。**设备态
     训练暂不支持**：捕获计划要求每步地址固定，而 running stats 是主机侧
     EMA；含 BN 的图请用主机态，或用 ``bn_momentum=None`` 明确关掉。
+
+    ``zero3`` 把参数本身也交给分片（``Zero3Rank``）：每段前向 / 反向之前
+    只把**这一段要读的参数**拼回来（一次 AllGather），执行完立刻释放，因此
+    任一时刻额外常驻的只有一段的参数，而不是整份。更新也只发生在本片
+    （``step`` 里 ReduceScatter 出本块梯度）。三条硬约束：
+
+    - **必须同时给 ``segments``**：整图前向要一次拼回全部参数，ZeRO-3 的
+      "只留一段"就不成立了，这里直接拒绝而不是给一个看起来在分片的假象。
+    - ``optimizer`` 必须是 ``zero3.optimizer``（分片优化器）：更新走
+      ``zero3.step``，它需要完整梯度做 ReduceScatter，与整份优化器的
+      ``step`` 不是同一条路。
+    - 与 ``device_state`` / ``master_weights`` / ``scaler`` 互斥：前两个
+      各自又要一份完整参数或显存缓冲，第三个的 unscale / 增长逻辑没有分片
+      版本。``grad_hook`` / 累积 / ``schedule`` 仍然可用——它们只看完整梯度。
+
+    ``store`` 里的参数在 ZeRO-3 下是**借出的完整副本**：训练期间它是旧值，
+    ``sync_to_host()`` 把分片拼回来覆盖它（``snapshot`` 会先做这一步，避免
+    存档静默写旧参数）。参数的真身始终是 ``zero3.shards``。
     """
 
     def __init__(
@@ -220,6 +240,7 @@ class Trainer:
         accumulate_steps: int = 1,
         scaler: Optional[GradScaler] = None,
         bn_momentum: Optional[float] = 0.1,
+        zero3: Optional[Zero3Rank] = None,
     ) -> None:
         if not isinstance(graph, Graph):
             raise TypeError(f"graph 必须是 Graph，得到 {type(graph).__name__}")
@@ -276,6 +297,56 @@ class Trainer:
                         "master weights 需要 f32 主副本（f16 上做更新会被量化吞掉）"
                     )
 
+        if zero3 is not None:
+            if not isinstance(zero3, Zero3Rank):
+                raise TypeError(
+                    f"zero3 必须是 Zero3Rank，得到 {type(zero3).__name__}"
+                )
+            if device_state:
+                raise ValueError(
+                    "ZeRO-3 与设备态训练互斥：显存里仍要放一份完整参数作为图输入"
+                    "缓冲，分片省下的常驻内存会被这份缓冲抵消；请用主机态"
+                )
+            if master_weights:
+                raise ValueError(
+                    "ZeRO-3 与 master_weights 互斥：低精度驻留缓冲是一份完整参数，"
+                    "与「参数只留一块」相矛盾"
+                )
+            if scaler is not None:
+                raise ValueError(
+                    "ZeRO-3 的更新走分片优化器（zero3.step），没有与 GradScaler "
+                    "的 unscale / 增长逻辑对接；请关闭 scaler"
+                )
+            if segments is None:
+                raise ValueError(
+                    "ZeRO-3 需要同时给 segments：整图前向要一次拼回全部参数，"
+                    "分片就白做了；请给出段数（例如 segments=2）"
+                )
+            if zero3.optimizer is not optimizer:
+                raise ValueError(
+                    "ZeRO-3 下 optimizer 必须是 zero3.optimizer（分片优化器）："
+                    "整份优化器会去改完整参数，而参数的真身是分片"
+                )
+            missing = sorted(set(zero3.param_names) - set(store.names))
+            extra = sorted(set(store.names) - set(zero3.param_names))
+            if missing or extra:
+                raise KeyError(
+                    f"分片与参数表的参数集合不一致：分片多 {missing}，"
+                    f"参数表多 {extra}"
+                )
+            shapes = zero3.shapes()
+            for name in store.names:
+                if tuple(store[name].shape) != tuple(shapes[name]):
+                    raise ValueError(
+                        f"参数 {name} 的形状 {store[name].shape} 与分片计划 "
+                        f"{shapes[name]} 不一致"
+                    )
+                if np.dtype(store[name].dtype) != np.dtype(zero3.shards[name].dtype):
+                    raise TypeError(
+                        f"参数 {name} 的 dtype {store[name].dtype} 与分片 "
+                        f"{zero3.shards[name].dtype} 不一致"
+                    )
+
         if mixed_precision is not None:
             # 先改图，再建反向图与捕获计划：下游看到的只有这一张前向图，
             # 不存在"前向 f16、反向 f32"的半套状态。
@@ -314,6 +385,9 @@ class Trainer:
         self.graph = graph
         self.store = store
         self.optimizer = optimizer
+        # 参数分片（ZeRO-3）：有它时 ``store`` 只是借出的完整副本，参数真身在
+        # ``self._zero3.shards``；更新与同步都要多走一步。
+        self._zero3 = zero3
         # 训练态 BN 的 running stats：IR 的 batch_norm 只要当前 batch 的统计量，
         # eval 需要的那对累积值由这里维护（见 ``train/bn.py``）。
         self.bn_momentum = bn_momentum
@@ -375,7 +449,9 @@ class Trainer:
         self._device_ready = False
         # 设备态下 ``store`` 何时变成旧值：只要走过一步参数更新就脏了，
         # ``sync_to_host()`` 之后重新一致。主机态永远是 False。
-        self._host_stale = False
+        # ZeRO-3 例外：训练期间 ``store`` 一直是借出的旧副本（真身在分片里），
+        # 所以一开始就是脏的，``sync_to_host()`` 才把它拼回来。
+        self._host_stale = self._zero3 is not None
         self._fwd_plan: Optional[Any] = None
         self._bwd_plan: Optional[Any] = None
         self._dev_params: Dict[str, Any] = {}
@@ -440,10 +516,15 @@ class Trainer:
         if self.device_state:
             return self._step_device(batch, weight=weight)
         feed = self._feed(batch)
+        borrow = (
+            (lambda segment: self._borrowed_params(feed, segment))
+            if self._zero3 is not None
+            else None
+        )
         if self._plan is None:
             out = np.asarray(self.backend.execute(self.graph, feed)[self.output])
         else:
-            acts = self._plan.forward(self.backend, feed)
+            acts = self._plan.forward(self.backend, feed, on_segment=borrow)
             out = np.asarray(acts[self._loss_value.name])
         if out.ndim != 0:
             raise ValueError(
@@ -463,10 +544,15 @@ class Trainer:
             # 分段反向也只喂损失那一个种子：CheckpointPlan 已按输出做了
             # 可达性剪枝，未参与损失的图输出不进任何段的反向图。
             seeds = {self._loss_value.name: self._seed(out.dtype)}
-            grads = self._plan.backward(self.backend, feed, acts, seeds)
+            grads = self._plan.backward(
+                self.backend, feed, acts, seeds, on_segment=borrow
+            )
         if self._update(grads, weight=weight):
             self._refresh_resident()
         self.steps += 1
+        if self._zero3 is not None:
+            # 更新只落在分片里，``store`` 里那份借出的完整副本已经旧了。
+            self._host_stale = True
         return float(out)
 
     def _to_resident(self, value: np.ndarray) -> np.ndarray:
@@ -494,11 +580,38 @@ class Trainer:
         （bf16 -> f32 是无损的，量化误差早已在打包时确定）。
         """
         feed = self.store.feed(dict(batch) if batch is not None else None)
+        if self._zero3 is not None:
+            # 参数不在 ``store`` 里取：真身在分片里，由每段执行前的借用回调
+            # 临时拼进来（见 :meth:`_borrowed_params`）。喂旧副本会让训练
+            # "看起来在跑"，权重却停在 materialize 的那一刻。
+            for name in self.store.names:
+                feed.pop(name, None)
         if self._resident is not None:
             for name in self.store.names:
                 feed[name] = self._resident_feed(name)
         feed.update(self._rng_feed())
         return feed
+
+    @contextmanager
+    def _borrowed_params(self, feed: Dict[str, Any], segment: Any):
+        """一段执行期间"借出"它要读的参数，退出时还回去（ZeRO-3）。
+
+        借出 = 一次 AllGather 把这几个参数拼成完整形状，写进 ``feed``；
+        还回 = 从 ``feed`` 删掉引用并 ``release`` 掉副本。两者必须在同一处
+        成对出现：只删 feed 不做 release，缓存会一直留着；反之只 release
+        不删 feed，``feed`` 里的引用会让那块内存根本回收不掉。
+        """
+        names = [orig for orig, _ in segment.inputs if orig in self._param_names]
+        if not names:
+            yield
+            return
+        feed.update(self._zero3.materialize(names))
+        try:
+            yield
+        finally:
+            for name in names:
+                feed.pop(name, None)
+            self._zero3.release(names)
 
     def _observe_bn(self, feed: Mapping[str, np.ndarray]) -> None:
         """执行统计子图，按 momentum 推进每个站点的 running stats。
@@ -508,10 +621,26 @@ class Trainer:
         """
         if self._bn_running is None or self._bn_stats_graph is None:
             return
-        stats = self.backend.execute(
-            self._bn_stats_graph,
-            {value.name: feed[value.name] for value in self._bn_stats_graph.inputs},
-        )
+        local: Dict[str, Any] = dict(feed)
+        borrowed: List[str] = []
+        if self._zero3 is not None:
+            # 统计子图只覆盖 BN 输入之前的那一小段，拼回这几个参数就够，
+            # 不必为一次 EMA 观察把整份参数借出来。
+            borrowed = [
+                value.name
+                for value in self._bn_stats_graph.inputs
+                if value.name in self._param_names
+            ]
+            if borrowed:
+                local.update(self._zero3.materialize(borrowed))
+        try:
+            stats = self.backend.execute(
+                self._bn_stats_graph,
+                {value.name: local[value.name] for value in self._bn_stats_graph.inputs},
+            )
+        finally:
+            if borrowed:
+                self._zero3.release(borrowed)
         for site in self._bn_sites:
             self._bn_running.update(site.name, stats[site.output], self.bn_momentum)
 
@@ -653,6 +782,11 @@ class Trainer:
             # 用 ``optimizer.step_count``（真实更新次数）：累积窗口内的几次
             # 反向不会让 warmup 提前用完。
             apply_lr(self.optimizer, self.schedule)
+        if self._zero3 is not None:
+            # 完整梯度 → ReduceScatter 出本块 → 只更本块。``zero3.step`` 自带
+            # ``/world_size``，与数据并行"梯度先求和再平均"的语义一致。
+            self._zero3.step(grads)
+            return True
         if self.scaler is None:
             self.optimizer.step(grads)
             return True
@@ -951,7 +1085,19 @@ class Trainer:
 
         master weights 模式下写回的是 f32 主副本（不是 f16 驻留缓冲），
         并顺手刷新主机侧的低精度副本。
+
+        ZeRO-3 下这是唯一把参数从分片搬回 ``store`` 的路径：拼回一次、
+        覆盖写、再释放，``store`` 因此重新是"完整且最新"的一份。
         """
+        if self._zero3 is not None:
+            full = self._zero3.materialize()
+            try:
+                for name in self.store.names:
+                    self.store[name][...] = full[name]
+            finally:
+                self._zero3.release()
+            self._host_stale = False
+            return
         if not self._device_ready:
             return
         source = self._dev_master if self._dev_master is not None else self._dev_params
@@ -1067,7 +1213,12 @@ class Trainer:
 
         前向图指纹与调度器类型 / 超参也一起进 meta：参数名、形状与 dtype
         全都相同，但计算图换了、或者衰减曲线换了，续训同样不是同一条轨迹。
+
+        ZeRO-3 下参数真身只在分片里，这里会先 ``sync_to_host()`` 拼回一次
+        （一次 AllGather，主线程上完成），避免 checkpoint 静默写进旧副本。
         """
+        if self._zero3 is not None and self._host_stale:
+            self.sync_to_host()
         merged: Dict[str, object] = dict(meta or {})
         if self.scaler is not None:
             for key, value in self.scaler.state_dict().items():

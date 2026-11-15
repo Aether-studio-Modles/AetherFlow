@@ -31,8 +31,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, ContextManager, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -255,11 +256,29 @@ class CheckpointPlan:
                 )
         return out
 
-    def forward(self, backend, feed: Mapping[str, Any]) -> Dict[str, Any]:
-        """逐段前向，返回"边界值 + 图输出"（原名 -> 容器值）。"""
+    def forward(
+        self,
+        backend,
+        feed: Mapping[str, Any],
+        *,
+        on_segment: Optional[
+            Callable[[Segment], ContextManager[None]]
+        ] = None,
+    ) -> Dict[str, Any]:
+        """逐段前向，返回"边界值 + 图输出"（原名 -> 容器值）。
+
+        ``on_segment(segment)`` 在**每段前向之前**进入、执行完退出，用来把
+        这一段要读的参数临时借进 ``feed``、用完再还（``Zero3Rank`` 的逐段
+        materialize / release 就走这里）。回调必须在 :meth:`_feed_of` 之前
+        生效，否则段内找不到参数会直接 ``KeyError``。
+        """
         acts: Dict[str, Any] = {}
         for segment in self._segments:
-            result = backend.execute(segment.graph, self._feed_of(segment, feed, acts))
+            scope = on_segment(segment) if on_segment is not None else nullcontext()
+            with scope:
+                result = backend.execute(
+                    segment.graph, self._feed_of(segment, feed, acts)
+                )
             for orig, local in segment.outputs:
                 acts[orig] = result[local]
         return acts
@@ -270,6 +289,10 @@ class CheckpointPlan:
         feed: Mapping[str, Any],
         acts: Mapping[str, Any],
         seeds: Optional[Mapping[str, Any]] = None,
+        *,
+        on_segment: Optional[
+            Callable[[Segment], ContextManager[None]]
+        ] = None,
     ) -> Dict[str, Any]:
         """逐段反向，返回 ``wrt`` 的梯度（原名 -> 数组）。
 
@@ -281,27 +304,29 @@ class CheckpointPlan:
         cot: Dict[str, Any] = {}  # 边界值的 cotangent 累加
         param_grads: Dict[str, Any] = {}
         for segment in reversed(self._segments):
-            seg_feed = self._feed_of(segment, feed, acts)
-            for orig, local in segment.outputs:
-                # 边界值可能同时是"外部给了种子"和"后段传回了 cotangent"。
-                # 两者必须**相加**：外部种子（例如辅助输出被喂零，或调用方对
-                # 某个输出另有目标）与下游梯度是同一条边上的两份贡献，任一
-                # 份都不能覆盖另一份。早先写成二选一，会让辅助输出的零种子
-                # 把整条后段梯度抹掉。
-                total = None
-                for bucket in (leftovers, cot):
-                    part = bucket.pop(orig, None)
-                    if part is None:
-                        continue
-                    total = part if total is None else total + part
-                if total is None:
-                    type_ = segment.types[orig]
-                    total = np.zeros(
-                        tuple(int(d) for d in type_.shape),
-                        dtype=type_.dtype.np_dtype,
-                    )
-                seg_feed["d" + local] = total
-            result = backend.execute(segment.backward, seg_feed)
+            scope = on_segment(segment) if on_segment is not None else nullcontext()
+            with scope:
+                seg_feed = self._feed_of(segment, feed, acts)
+                for orig, local in segment.outputs:
+                    # 边界值可能同时是"外部给了种子"和"后段传回了 cotangent"。
+                    # 两者必须**相加**：外部种子（例如辅助输出被喂零，或调用方对
+                    # 某个输出另有目标）与下游梯度是同一条边上的两份贡献，任一
+                    # 份都不能覆盖另一份。早先写成二选一，会让辅助输出的零种子
+                    # 把整条后段梯度抹掉。
+                    total = None
+                    for bucket in (leftovers, cot):
+                        part = bucket.pop(orig, None)
+                        if part is None:
+                            continue
+                        total = part if total is None else total + part
+                    if total is None:
+                        type_ = segment.types[orig]
+                        total = np.zeros(
+                            tuple(int(d) for d in type_.shape),
+                            dtype=type_.dtype.np_dtype,
+                        )
+                    seg_feed["d" + local] = total
+                result = backend.execute(segment.backward, seg_feed)
             for orig, local in segment.inputs:
                 key = "d" + local
                 if key not in result:
