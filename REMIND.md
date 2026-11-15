@@ -15,9 +15,13 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 `backends/device_backend.py` → `lower/plan.py` → `lower/kernels.py` →
 `backends/cuda/backend.py`（HIP 是同构的第二份厂商钩子）。
 
-这一代**不**包括（下一代清单）：NCCL / RCCL 通信、张量并行、int8 / fp8 **计算**、
+这一代**不**包括（下一代清单）：NCCL / RCCL 通信、int8 / fp8 **计算**、
 NHWC 布局传播、设备端控制流、分页 KV cache、schedule 搜索、托管 CI 与发布。
 不要把这些当作"已经能用"去写示例。
+
+张量并行只有**前向**的切分与对齐（5.240）：列 / 行并行、attention 头切分、
+段间归约。反向通信、优化器分片与"按需拼回参数"（FSDP 式）都还没接，写训练
+示例时不要把 TP 与数据并行混着讲。
 
 量化已有 weight-only int8（5.239）：`quantize_i8` / `dequantize_i8` / `linear_i8`。
 权重驻留 1 字节，**GEMM 仍走 f32 反量化**；没有 int8 累加、没有 fp8、没有 QAT、
@@ -33,7 +37,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2484 个用例 / 412 跳过，WSL HIP 2484 个用例 / 371 跳过。
+当前基线：本地 2532 个用例 / 412 跳过，WSL HIP 2532 个用例 / 371 跳过。
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
 前端用例（不是代码问题）。
 
@@ -92,6 +96,22 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   scale 物化成与权重同大的 f32（那会把"省 3/4"变成"多 1 倍临时量"）。
 - 非正 scale 的检查走 `to_host`（scale 只有 N 个元素）；量化是离线步骤，
   别把它放进每步推理的热路径。
+
+## 张量并行（5.240）
+
+- 入口：`train/tensor_parallel.py` 的 `column_parallel_linear` / `row_parallel_linear` /
+  `build_tensor_parallel_attention` / `TensorParallelBlock`。
+- **行并行返回的是部分和**，必须由调用方 `all_reduce`（求和）之后再用。当成完整输出
+  不会报错，只会得到 `1/W` 的结果。
+- **行并行不接受 bias**：每个 rank 各加一次，归约后放大 `W` 倍。构图期直接拒绝。
+- 头切分 = 列切分（q/k/v 的列按 `head * head_dim + i` 排列，`wo` 的行同理），
+  前提是 `num_heads % world_size == 0`；`d_ff % world_size == 0` 同理。
+- block 的 `dropout` 必须为 0：各 rank 头宽不同，同一 seed 采不到一致掩码。
+- block 拆成 `attn` / `ff` 两张图，段间归约在主机侧，图外只剩两次残差加法。
+  IR 里**没有** collective 节点，不要试图在 Graph 里找 `all_reduce`。
+- `split_axis` 返回副本；`split_dense` 的复制类参数（`ln*_g` / `ln*_b` / `scale`）
+  也必须拷贝，否则优化器原地更新会跨 rank 污染。
+- 只做前向：反向通信与优化器分片没接，训练侧仍是数据并行 / 流水 / ZeRO。
 
 ## 提交约定
 

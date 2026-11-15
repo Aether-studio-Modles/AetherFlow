@@ -84,7 +84,7 @@ python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后�
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
 ```
 
-当前基线：**2484 个用例**，本地 412 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）371 跳过，全绿。
+当前基线：**2532 个用例**，本地 412 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）371 跳过，全绿。
 
 ## 4. 第一代版本的能力面
 
@@ -94,7 +94,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 | 精度 | f32 全覆盖；f16 覆盖 57 个（attention 为混合精度：存储半精度、累加 float）；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
 | 自动微分 | 41 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机） |
-| 多卡 | 设备枚举 / 切换、跨卡拷贝、数据并行（主机中转归约）、ZeRO-1 分片、GPipe / 1F1B 流水 |
+| 多卡 | 设备枚举 / 切换、跨卡拷贝、数据并行（主机中转归约）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
 | 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚） |
 | 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb |
 | 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、CI 三作业配置、部署包、zip 硬件包 |
@@ -113,7 +113,8 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
 
 - **集合通信**：无 NCCL / RCCL 绑定，数据并行经主机中转，单进程串行切卡，无 P2P；
-- **并行策略**：无张量并行 / 模型并行，无跨进程参数分片（FSDP 式显存节省）；
+- **并行策略**：有张量并行的切分与对齐（列 / 行并行 + attention 头切分，仅前向、归约走主机缓冲），
+  但无列并行 / 行并行的反向通信，也没有"一份参数按 FSDP 式跨进程切分 + 按需拼回"的完整闭环；
 - **编译**：无 loop 级 IR 与 schedule 搜索，融合是规则表而非通用策略；
 - **布局**：全 NCHW，无布局传播，无 GEMM epilogue；
 - **量化推理**：只有 weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
@@ -139,7 +140,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                2484 个用例
+tests/                2532 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             再进来时先要知道的事
 ```
