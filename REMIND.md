@@ -15,10 +15,11 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 `backends/device_backend.py` → `lower/plan.py` → `lower/kernels.py` →
 `backends/cuda/backend.py`（HIP 是同构的第二份厂商钩子）。
 
-这一代**不**包括（下一代清单）：NCCL / RCCL 通信、int8 / fp8 **计算**、
-NHWC 布局传播、设备端控制流、把 schedule 搜索接进编译流水线（5.242 只有离线
-成本模型与按估算排序的串行搜索）、开放式的包发布（CI 只在构建 wheel 后上传
-artifact，没有 PyPI / GitHub Release 发布流程）。
+这一代**不**包括（下一代清单）：把 NCCL / RCCL 接进数据并行路径（5.244 只做到
+加载、厂商判定与四个集合调用面，`DeviceDataParallel` 仍走主机中转）、int8 / fp8
+**计算**、NHWC 布局传播、设备端控制流、把 schedule 搜索接进编译流水线（5.242
+只有离线成本模型与按估算排序的串行搜索）、开放式的包发布（CI 只在构建 wheel 后
+上传 artifact，没有 PyPI / GitHub Release 发布流程）。
 不要把这些当作"已经能用"去写示例。
 
 分页 KV cache 与投机解码已有组件级交付（5.241），但**没有接进语言模型那条路**：
@@ -43,7 +44,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2622 个用例 / 412 跳过，WSL HIP 2622 个用例 / 371 跳过。
+当前基线：本地 2633 个用例 / 414 跳过，WSL HIP 2633 个用例 / 373 跳过。
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
 前端用例（不是代码问题）。
 
@@ -187,6 +188,35 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   做一次 `import aetherflow` 冒烟，最后 `upload-artifact`。本地自查用
   `python -m pip wheel . --no-deps`；`pyproject.toml` 的 `packages.find`
   带了 `include = ["aetherflow*"]`，新增子包不需要改配置。
+
+## NCCL / RCCL 绑定（5.244）
+
+- **只有一份 ctypes 声明**。RCCL 实现的函数名、枚举值、`ncclUniqueId` 的 128
+  字节布局与 NCCL 相同，所以 `train/nccl.py` 直接加载 `librccl` 也能用；不要
+  为 HIP 再抄一份签名表，两份迟早漂移。
+- **soname 不同**：NCCL 是 `libnccl.so.2`，RCCL 是 `librccl.so.1`
+  （WSL 实测 `/opt/rocm/lib/librccl.so.1`，`ncclGetVersion()` 返回 22707 =
+  2.27.7）。候选表两种都列，`find_library("nccl")` 与 `find_library("rccl")`
+  的结果放最前且保持 NCCL 优先。
+- **厂商按库文件名判定**（`_vendor_from_path`），不看能不能 import cupy：
+  设备上装了什么库与 Python 侧装了哪个包是两件独立的事。`vendor()` 在库缺失时
+  抛 `NcclUnavailable`，不返回 `"unknown"`。
+- **WSL 前置**：`HSA_ENABLE_DXG_DETECTION=1`。没有它时 `ncclGetUniqueId`
+  不报错码，而是直接打印 `HIP failure: 'no ROCm-capable device is detected'`
+  并 FATAL；这正是"看起来是 RCCL 的问题、其实是环境没开"的那类现象。
+- **HIP 的数组不是 cupy**：`backends.hip.runtime.DeviceArray` 提供
+  `data.ptr` / `size` / `dtype` / `flags`，刚好是绑定层要求的四项，
+  `tests/_rccl_worker.py` 用它跑四个集合操作。
+- **`synchronize()` 必须按厂商分叉**：HIP 走 `backends.hip.runtime.synchronize()`
+  （设备级），CUDA 走 `cp.cuda.get_current_stream().synchronize()`。两边都试会
+  把"同步失败"变成"同步被静默跳过"——负向对照里把 HIP 分支改成 cupy 分支，
+  worker 立刻以 `ModuleNotFoundError` 退出。
+- **真机只验到 world=1**（WSL 单卡 RX 7650 GRE）：加载、版本、unique id、
+  comm 初始化与四个调用面都跑通了，但跨卡数值仍只有 CUDA 的 2×V100 结果。
+  写结论时不要说"RCCL 多卡已验证"。
+- 能力声明（`collective_support`）仍是 `device_allreduce=False`：数据并行路径
+  没接线，跨卡归约照旧走主机中转；理由文本会区分"本机加载不到库"与"库在、
+  只是没接线"。
 
 ## 提交约定
 
