@@ -160,6 +160,20 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   换 W：names 用 `shard_params`（需要形状），elements 用 `plan_chunks`；同 W 且
   没给参数时可以沿用存档里的归属表。合并 `params=` 在 elements 布局下是 oracle：
   逐位不等就报"分片来自另一份权重"。
+- 主机中转的多进程数据并行（5.236，`train/host_collective.py` + `train/parallel.py`）：
+  `HostRelay`（父进程 TCP 服务）+ `HostCollective`（子进程客户端）+ `launch`
+  一条命令拉起 W 个进程；`DistributedDataParallel` 挂在 `trainer.grad_hook` 上
+  做梯度 AllReduce，`step` 按 rank 切第 0 维并返回全局平均损失。帧格式
+  `struct("!QQ8s")` = `(seq, count, dtype)` + 裸字节，按 seq 归组、校验
+  count/dtype、按 rank 顺序求和；**只做 sum**，平均由调用方做。
+  踩过的坑：①`code.ljust(8, b"\x00")` 里 `code` 是 str，会抛 TypeError，
+  必须 `code.encode("ascii").ljust(8, b"\x00")`——这是真多进程用例失败的根因，
+  且表面上只表现为"两个 relay 不一致用例断言 `relay.error` 为 None 却失败"；
+  ②relay 测试的客户端必须在 `finally` 里 `close()`，否则 ResourceWarning；
+  ③`payloads.index(payload)` 对 dict 是相等查找（会命中第一个），要
+  `enumerate` 拿下标。切片的形状靠新增的 `Trainer.data_input_shapes()`（非参数、
+  非 `rng_inputs`），每卡分片第 0 维必须等于图声明值。构造期拒绝 rng 不一致、
+  `device_state`、`scaler`、`zero3`——都是"看起来能跑其实语义不对"。
 - **工作区被旧缓冲覆盖（反复出现）**：提交后用 `git status` / `git diff --stat` 核对，
   出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
   已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
