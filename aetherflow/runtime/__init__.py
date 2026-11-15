@@ -17,6 +17,7 @@ from .telemetry import (
     TelemetryRecorder,
     load_records,
 )
+from .trace import build_trace, trace_events, write_trace
 
 __all__ = [
     "ReferenceExecutor",
@@ -26,6 +27,9 @@ __all__ = [
     "TelemetryRecorder",
     "InstrumentedBackend",
     "load_records",
+    "trace_events",
+    "build_trace",
+    "write_trace",
     "SpikeEvents",
     "EventPool",
     "EventPoolStats",

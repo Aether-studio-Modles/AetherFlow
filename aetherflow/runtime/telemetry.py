@@ -57,21 +57,32 @@ class NodeTiming:
     name: str
     dispatch_ms: float
     gpu_ms: Optional[float] = None
+    start_ms: Optional[float] = None
+    """相对本次 ``execute`` 起点的派发开始时刻（5.243）。
+
+    只有时长没有时刻画不出时间轴：一串 0.1ms 的节点可能紧挨着，也可能中间
+    空着 3ms 在等设备。``None`` 表示这份记录没采集时刻（旧记录、或调用方
+    自己拼的 ``NodeTiming``），导出 trace 时按顺序累加补齐。
+    """
 
     def to_dict(self) -> Dict[str, Any]:
         out = {"op": self.op, "name": self.name, "dispatch_ms": self.dispatch_ms}
         if self.gpu_ms is not None:
             out["gpu_ms"] = self.gpu_ms
+        if self.start_ms is not None:
+            out["start_ms"] = self.start_ms
         return out
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "NodeTiming":
         gpu = payload.get("gpu_ms")
+        start = payload.get("start_ms")
         return cls(
             op=str(payload["op"]),
             name=str(payload["name"]),
             dispatch_ms=float(payload["dispatch_ms"]),
             gpu_ms=None if gpu is None else float(gpu),
+            start_ms=None if start is None else float(start),
         )
 
 
@@ -106,6 +117,8 @@ class RunRecord:
             raise ValueError("节点派发耗时不能为负")
         if any(item.gpu_ms is not None and item.gpu_ms < 0 for item in self.nodes):
             raise ValueError("节点 GPU 耗时不能为负")
+        if any(item.start_ms is not None and item.start_ms < 0 for item in self.nodes):
+            raise ValueError("节点起始时刻不能为负")
 
     def throughput(self) -> Dict[str, float]:
         """每个单位的每秒吞吐；没有单位或耗时为 0 时返回空字典。
@@ -215,6 +228,8 @@ class InstrumentedBackend(Executor):
         self.name = getattr(inner, "name", "unknown")
         self._recorder = recorder
         self._nodes: List[NodeTiming] = []
+        # 本次 execute 的起始时刻：``start_ms`` 的零点，与 ``wall_ms`` 同一起点。
+        self._t0 = 0.0
         # 逐节点 GPU 计时（5.161）：只有内层能提供 gpu_clock 才启用。
         self._gpu = None
         self._gpu_pairs: List[Tuple[Any, Any]] = []
@@ -282,7 +297,12 @@ class InstrumentedBackend(Executor):
         elapsed = (perf_counter() - t0) * 1e3
         stop = self._gpu.end() if self._gpu is not None else None
         self._nodes.append(
-            NodeTiming(node.op.name, node.output.name, round(elapsed, 6))
+            NodeTiming(
+                node.op.name,
+                node.output.name,
+                round(elapsed, 6),
+                start_ms=round((t0 - self._t0) * 1e3, 6),
+            )
         )
         if start is not None:
             # 与 ``_nodes`` 一一对应；收尾时统一同步再读 elapsed
@@ -307,6 +327,7 @@ class InstrumentedBackend(Executor):
         self._nodes = []
         self._gpu_pairs = []
         t0 = perf_counter()
+        self._t0 = t0
         try:
             out = self.run(graph, merged)
         finally:
