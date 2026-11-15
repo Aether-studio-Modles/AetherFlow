@@ -1,4 +1,4 @@
-"""IR 算子表。
+﻿"""IR 算子表。
 
 每个算子由三部分组成，缺一不可：
 
@@ -1008,6 +1008,182 @@ register(
         infer=_infer_matmul,
         reference=_ref_matmul,
         doc="批量矩阵乘：(..., M, K) x (..., K, N) -> (..., M, N)",
+    )
+)
+
+
+# --------------------------------------------------------------------------
+# 量化（weight-only int8）
+# --------------------------------------------------------------------------
+#
+# 语义边界写在这里，因为它是"能不能对外说支持量化"的分界线：
+#
+# - 对称量化，无零点：``q = clip(rint(w / scale), -127, 127)``。刻意不用
+#   -128：反量化后两端量程不对称，同一份权重在不同实现里会被舍到不同端点，
+#   逐位对拍就失去意义。
+# - ``rint`` 是 round-half-to-even，与 numpy / PyTorch 的 ``round`` 一致；
+#   四舍五入（half-away-from-zero）会在 .5 处产生系统性偏差。
+# - 缩放系数必须严格为正。``scale <= 0`` 不是"退化成另一种量化"，而是
+#   语义未定义（除零 / 符号翻转），因此参考实现与设备实现都显式拒绝。
+# - **权重驻留是 i8，计算仍是 f32**：``linear_i8`` 先反量化再走普通 GEMM。
+#   它省的是权重占用与读带宽，不是算力；int8 tensor-core GEMM 会改变累加
+#   精度，必须另立语义（舍入 / 饱和 / 累加器宽度），不在这一版里。
+
+_QUANT_MIN = -127
+_QUANT_MAX = 127
+
+
+def _check_scale_broadcast(target: TensorType, scale: TensorType, what: str) -> None:
+    """校验 scale 能广播到 target。
+
+    与 ``_broadcast_shape`` 同一套保守规则：符号维只在"等于 1 或两边相同"
+    时才放行，其余情形构图期拒绝——IR 没有能表达"这一维可能是 1"的广播维。
+    """
+    if scale.rank > target.rank:
+        raise ValueError(
+            f"{what} 的 scale 秩 {scale.rank} 大于被量化张量的秩 {target.rank}"
+        )
+    for s, d in zip(reversed(scale.shape), reversed(target.shape)):
+        if s == 1 or s == d:
+            continue
+        if isinstance(s, int) and isinstance(d, int):
+            raise ValueError(f"{what} 的 scale 形状 {scale.shape} 不能广播到 {target.shape}")
+        raise ValueError(
+            f"{what} 的 scale 符号维 {s} 与目标维 {d} 无法在 IR 里表达广播："
+            "请给出静态的 1 或相同的符号"
+        )
+
+
+def _infer_quantize_i8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(f"quantize_i8 需要 (weight, scale) 两个输入，得到 {len(inputs)}")
+    weight, scale = inputs
+    if weight.dtype != DType.F32:
+        raise TypeError(
+            f"quantize_i8 只接受 f32 权重，得到 {weight.dtype.value}；"
+            "bf16/f16 权重要先 cast 到 f32，量化语义只在 f32 上定义"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(f"quantize_i8 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    if weight.rank < 1:
+        raise ValueError("quantize_i8 至少需要 1 维权重")
+    _check_scale_broadcast(weight, scale, "quantize_i8")
+    return TensorType(DType.I8, weight.shape)
+
+
+def _ref_quantize_i8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    weight, scale = args
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"quantize_i8 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    q = np.rint(weight / scale)
+    return np.clip(q, _QUANT_MIN, _QUANT_MAX).astype(np.int8)
+
+
+register(
+    Op(
+        name="quantize_i8",
+        infer=_infer_quantize_i8,
+        reference=_ref_quantize_i8,
+        doc="对称 int8 量化：q = clip(rint(w / scale), -127, 127)，"
+        "scale 广播到权重（每输出通道给一个标量就是逐通道量化）；"
+        "输出 i8 与权重同形状",
+    )
+)
+
+
+def _infer_dequantize_i8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(f"dequantize_i8 需要 (q, scale) 两个输入，得到 {len(inputs)}")
+    q, scale = inputs
+    if q.dtype != DType.I8:
+        raise TypeError(f"dequantize_i8 的第一个输入必须是 i8，得到 {q.dtype.value}")
+    if scale.dtype != DType.F32:
+        raise TypeError(f"dequantize_i8 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    _check_scale_broadcast(q, scale, "dequantize_i8")
+    return TensorType(DType.F32, q.shape)
+
+
+def _ref_dequantize_i8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    q, scale = args
+    return q.astype(np.float32) * scale
+
+
+register(
+    Op(
+        name="dequantize_i8",
+        infer=_infer_dequantize_i8,
+        reference=_ref_dequantize_i8,
+        doc="反量化：f32(q) * scale（scale 广播到 q），输出与 q 同形状的 f32",
+    )
+)
+
+
+def _infer_linear_i8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) not in (3, 4):
+        raise ValueError(
+            f"linear_i8 需要 (x, qweight, scale[, bias]) 输入，得到 {len(inputs)}"
+        )
+    x, qweight, scale = inputs[0], inputs[1], inputs[2]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_i8 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加，混精度入口不在这一版"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_i8 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype != DType.I8:
+        raise TypeError(f"linear_i8 的权重必须是 i8，得到 {qweight.dtype.value}")
+    if qweight.rank != 2:
+        raise ValueError(f"linear_i8 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}")
+    if scale.dtype != DType.F32:
+        raise TypeError(f"linear_i8 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    _check_scale_broadcast(qweight, scale, "linear_i8")
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_i8 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_i8 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    if len(inputs) == 4:
+        bias = inputs[3]
+        if bias.dtype != DType.F32:
+            raise TypeError(f"linear_i8 的 bias 必须是 f32，得到 {bias.dtype.value}")
+        if bias.rank != 1:
+            raise ValueError(f"linear_i8 的 bias 必须是秩 1，得到秩 {bias.rank}")
+        if isinstance(bias.shape[0], int) and isinstance(n, int) and bias.shape[0] != n:
+            raise ValueError(f"linear_i8 的 bias 长度 {bias.shape[0]} 与 N={n} 不一致")
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_i8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, qweight, scale = args[0], args[1], args[2]
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"linear_i8 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    weight = qweight.astype(np.float32) * scale
+    out = np.matmul(x, weight)
+    if len(args) > 3:
+        out = out + args[3]
+    return out
+
+
+register(
+    Op(
+        name="linear_i8",
+        infer=_infer_linear_i8,
+        reference=_ref_linear_i8,
+        doc="weight-only int8 线性层：(..., K) x i8(K, N) -> (..., N)。"
+        "权重按 scale 反量化后在 f32 上做 GEMM，因此数值等于"
+        "``matmul(x, dequantize_i8(qweight, scale)) [+ bias]``；"
+        "省的是权重占用与读带宽，不是算力",
     )
 )
 

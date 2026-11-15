@@ -94,6 +94,9 @@ GPU_OPS: FrozenSet[str] = frozenset(
     "constant",
     "broadcast_to",
     "matmul",
+    "quantize_i8",
+    "dequantize_i8",
+    "linear_i8",
     "conv2d",
     "maxpool2d",
     "maxpool2d_indices",
@@ -149,11 +152,46 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "spike_linear": frozenset({2, 3}),
     "spike_linear_weight_grad": frozenset({2, 3}),
     "spike_csr": frozenset({1}),
+    # 量化：i8 是**数据**而不是下标，但它同样不能走"只支持浮点"的默认检查。
+    "dequantize_i8": frozenset({0}),
+    "linear_i8": frozenset({1}),
 }
 
 # 整数下标允许的 dtype。与 ir/ops.py 的 infer 保持一致：i32 是前端导入的
-# 常态，i8 是压缩标签的形态。
+# 常态，i8 是压缩标签 / 量化权重的形态。
 _INDEX_DTYPES = ("int32", "int8")
+
+# 量化只有两个内核：读权重、写权重。两份源码同时喂给 NVRTC 与 hipRTC——
+# "半偶舍入 + 端点饱和"是语义的一部分，不能让两个后端各写一次近似。
+# ``per_row`` 为 1 时按 ``s[i % cols]`` 取与输出通道对应的 scale，避免把
+# 逐通道 scale 物化成与权重同大的 f32。
+_QUANTIZE_I8_SRC = r"""
+extern "C" __global__ void af_quantize_i8(
+    const float* __restrict__ w,
+    const float* __restrict__ s,
+    signed char* __restrict__ out,
+    long long n, long long cols, long long per_row) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float sv = per_row ? s[i % cols] : s[i];
+  float q = rintf(w[i] / sv);
+  q = q > 127.0f ? 127.0f : (q < -127.0f ? -127.0f : q);
+  out[i] = (signed char)q;
+}
+"""
+
+_DEQUANTIZE_I8_SRC = r"""
+extern "C" __global__ void af_dequantize_i8(
+    const signed char* __restrict__ q,
+    const float* __restrict__ s,
+    float* __restrict__ out,
+    long long n, long long cols, long long per_row) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float sv = per_row ? s[i % cols] : s[i];
+  out[i] = (float)q[i] * sv;
+}
+"""
 
 
 def _chainable(node: Node) -> bool:
@@ -659,6 +697,9 @@ class DeviceBackend(Executor):
         r.register("constant", self._op_constant)
         r.register("broadcast_to", self._op_broadcast_to)
         r.register("matmul", self._op_matmul)
+        r.register("quantize_i8", self._op_quantize_i8)
+        r.register("dequantize_i8", self._op_dequantize_i8)
+        r.register("linear_i8", self._op_linear_i8)
         r.register("conv2d", self._op_conv2d)
         r.register("maxpool2d", self._op_maxpool2d)
         r.register("maxpool2d_indices", self._op_maxpool2d_indices)
@@ -1839,6 +1880,124 @@ class DeviceBackend(Executor):
             f"matmul {what}的批量维 {shape} 与输出批量维 {out_shape} 不匹配："
             "cuBLAS 的 strided batched 只能表达“完全一致”或“整体为 1”"
         )
+
+    # ------------------------------------------------------------------
+    # 量化（weight-only int8）
+    # ------------------------------------------------------------------
+
+    def _quant_scale_arg(self, scale, shape):
+        """把 scale 变成内核能吃的连续 f32 数组。
+
+        返回 ``(数组, cols, per_row)``。``per_row = 1`` 时内核按
+        ``s[i % cols]`` 取缩放系数，这样逐输出通道量化**不会**把 scale 物化成
+        与权重同大的 f32（那会让"省 3/4 权重"变成"多 1 倍临时量"）。
+        其余可广播形态（逐张量、或与权重同形）走广播拷贝；IR 已经保证
+        scale 能广播到权重，这里只是选择用哪条读法。
+        """
+        if not scale.flags.c_contiguous:
+            scale = self.cp.ascontiguousarray(scale)
+        if scale.ndim == 1 and int(scale.size) == int(shape[-1]):
+            return scale, int(shape[-1]), 1
+        if tuple(scale.shape) == tuple(shape):
+            return scale, 0, 0
+        return (
+            self.cp.ascontiguousarray(self.cp.broadcast_to(scale, shape)),
+            0,
+            0,
+        )
+
+    def _op_quantize_i8(self, node, args, attrs):
+        """对称 int8 量化：``rintf(w / s)`` 后饱和到 [-127, 127]。
+
+        用一段自研内核而不是 cupy 的逐元素原语：CUDA 侧的 ``cp`` 是 cupy，
+        HIP 侧是同一套接口的自家实现，而 HIP 那份没有 ``rint`` / ``clip``。
+        半偶舍入是语义的一部分，不能在两个后端各写一次近似——所以两边共用
+        这一份源码（NVRTC 与 hipRTC 都直接吃它）。
+
+        非正 scale 的检查走 ``to_host``：scale 只有 N 个元素，代价可忽略；
+        量化是离线步骤（导出权重时跑一次），不在每步推理的热路径上。
+        """
+        cp = self.cp
+        weight, scale = args
+        if weight.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 quantize_i8 只接受 f32 权重，收到 {weight.dtype}"
+            )
+        if weight.ndim < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 quantize_i8 要求权重至少 1 维，收到 {weight.shape}"
+            )
+        if float(np.min(self.to_host(scale))) <= 0.0:
+            raise BackendCapabilityError(
+                "quantize_i8 的 scale 必须严格为正；非正 scale 的量化为未定义"
+            )
+        w = self._contig(weight)
+        s, cols, per_row = self._quant_scale_arg(scale, w.shape)
+        out = cp.empty(w.shape, np.int8)
+        n = int(w.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(("quantize_i8", per_row), _QUANTIZE_I8_SRC, "af_quantize_i8")
+        block, grid = self._grid("quantize_i8", n)
+        kernel(
+            (grid,),
+            (block,),
+            (w, s, out, np.int64(n), np.int64(cols), np.int64(per_row)),
+        )
+        return out
+
+    def _op_dequantize_i8(self, node, args, attrs):
+        """i8 -> f32 的放大。输出必须连续：``linear_i8`` 要把它交给 GEMM。"""
+        cp = self.cp
+        q, scale = args
+        if q.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8 第一个输入必须是 i8，收到 {q.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8 的 scale 必须是 f32，收到 {scale.dtype}"
+            )
+        qq = self._contig(q)
+        s, cols, per_row = self._quant_scale_arg(scale, qq.shape)
+        out = cp.empty(qq.shape, np.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("dequantize_i8", per_row), _DEQUANTIZE_I8_SRC, "af_dequantize_i8"
+        )
+        block, grid = self._grid("dequantize_i8", n)
+        kernel(
+            (grid,),
+            (block,),
+            (qq, s, out, np.int64(n), np.int64(cols), np.int64(per_row)),
+        )
+        return out
+
+    def _op_linear_i8(self, node, args, attrs):
+        """weight-only int8 线性层：反量化权重后走既有 f32 GEMM。
+
+        "int8" 在这里只体现在**权重驻留与读带宽**上：读出 i8、就地放大成
+        f32、再交给 cuBLAS / hipBLAS。这就是 weight-only 量化的全部收益，
+        不宣称算力提升——真正的 int8 矩阵乘需要另一套累加语义。
+        """
+        cp = self.cp
+        x, qweight, scale = args[0], args[1], args[2]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8 要求 x 秩 >= 2、权重秩 2，"
+                f"收到 {x.shape} 与 {qweight.shape}"
+            )
+        weight = self._op_dequantize_i8(node, [qweight, scale], attrs)
+        out = self._op_matmul(node, [x, weight], {})
+        if len(args) > 3:
+            out = self._binary("add", [out, args[3]])
+        return out
 
     # ------------------------------------------------------------------
     # 卷积：分块直算 / im2col + cuBLAS

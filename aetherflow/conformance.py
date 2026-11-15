@@ -51,7 +51,7 @@ from .backends.reference_backend import ReferenceBackend
 from .ir.graph import Graph
 from .ir.ops import OPS
 from .ir.serialize import dumps, loads, to_dict
-from .ir.types import c64, f32, f64, i32
+from .ir.types import c64, f32, f64, i8, i32
 from .ir.verifier import verify_portable_only
 from .models.transformer import BlockSpec, build_transformer_block
 
@@ -242,6 +242,50 @@ def _matmul(shape_a: tuple, shape_b: tuple):
         b = g.input("b", f32[shape_b])
         g.output(g.matmul(a, b), "y")
         return g, {"a": _f32(rng, shape_a), "b": _f32(rng, shape_b)}
+
+    return build
+
+
+def _quantize_i8(shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("quantize_i8")
+        w = g.input("w", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        g.output(g.add_node("quantize_i8", [w, s]), "q")
+        # scale 必须严格为正；用一个与权重同量级的正数，避免整片饱和到端点
+        scale = (np.abs(_f32(rng, (shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {"w": _f32(rng, shape, scale=0.5), "s": scale}
+
+    return build
+
+
+def _dequantize_i8(shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("dequantize_i8")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        g.output(g.add_node("dequantize_i8", [q, s]), "w")
+        scale = (np.abs(_f32(rng, (shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {"q": rng.integers(-127, 128, size=shape, dtype=np.int8), "s": scale}
+
+    return build
+
+
+def _linear_i8(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("linear_i8")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_i8", [x, q, s, b]), "y")
+        scale = (np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": rng.integers(-127, 128, size=w_shape, dtype=np.int8),
+            "s": scale,
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
 
     return build
 
@@ -1149,6 +1193,15 @@ def default_cases() -> List[Case]:
               note="权重对所有 batch 共用"),
         _case("matmul_partial_batch", _matmul((2, 1, 4, 8), (2, 3, 8, 6)),
               note="批量的部分广播：可用标量 stride 的后端会拒绝"),
+        # weight-only int8
+        _case("quantize_i8_channel", _quantize_i8(),
+              note="RNE 舍入 + [-127,127] 饱和；i8 输出必须与参考逐位相同，"
+                   "不是近似对齐"),
+        _case("dequantize_i8_channel", _dequantize_i8(),
+              note="放大回 f32：权重驻留宽度从 4 字节降到 1 字节的唯一读出口"),
+        _case("linear_i8_bias", _linear_i8(),
+              note="反量化 GEMM 的完整形态（含 bias）：数值必须等于先 dequantize "
+                   "再 matmul"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

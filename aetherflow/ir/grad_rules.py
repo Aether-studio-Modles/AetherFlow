@@ -413,6 +413,25 @@ def _matmul(ctx):
     return (sum_to(b, da, a.type.shape), sum_to(b, dw, w.type.shape))
 
 
+@vjp("linear_i8")
+def _linear_i8(ctx):
+    """weight-only int8 线性层的反向：只对激活与 bias 求导。
+
+    量化权重与 scale 是**推理期常量**：int8 上不存在"沿量化误差求导"的
+    语义（那里没有连续变量），scale 若也可学就等价于重新训练量化参数，
+    属于 QAT 范畴，不在这一版。返回 ``None`` 让反向图把它当作"不接收梯度"，
+    而不是造一张零张量——后者会把"权重是冻结的"藏进图里。
+    """
+    b, g = ctx.b, ctx.g
+    x = ctx.input(0)
+    weight = b.add_node("dequantize_i8", [ctx.input(1), ctx.input(2)])
+    dx = b.add_node("matmul", [g, _transpose_last_two(b, weight)])
+    if len(ctx.node.inputs) < 4:
+        return (sum_to(b, dx, x.type.shape), None, None)
+    db = sum_axes(b, g, tuple(range(g.type.rank - 1)))
+    return (sum_to(b, dx, x.type.shape), None, None, db)
+
+
 def _conv_attrs(attrs: dict) -> dict:
     return {k: attrs[k] for k in ("stride", "padding", "dilation", "groups") if k in attrs}
 

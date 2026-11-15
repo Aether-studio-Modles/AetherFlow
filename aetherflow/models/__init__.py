@@ -54,6 +54,12 @@ from .mamba_reference import (
     official_selective_scan,
 )
 from .mlp import MLPSpec, build_mlp
+from .quantize import (
+    QUANT_MAX,
+    build_int8_linear,
+    dequantize_weight,
+    quantize_weight,
+)
 from .moe import (
     EXPERT_PARALLEL_SUPPORTED,
     MoESpec,
@@ -88,6 +94,10 @@ __all__ = [
     "causal_mask_bias",
     "MLPSpec",
     "build_mlp",
+    "QUANT_MAX",
+    "build_int8_linear",
+    "dequantize_weight",
+    "quantize_weight",
     "MoESpec",
     "build_moe",
     "require_expert_parallel",
