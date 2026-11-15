@@ -127,6 +127,21 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   `ConnectionResetError`；Windows 上同一场景是静默等到超时。因此
   `fetch_unique_id` 把"连上之后的收发"包进 `except OSError` 转成 `RuntimeError`。
   教训：只在一个平台上跑的用例不算验证，涉及 socket 的用例必须过 WSL。
+- ZeRO-3（5.233，`train/zero3.py`）：参数本身也只常驻一块。每个参数按**元素**均分
+  成 `W` 块，`chunk = ceil(n/W)`，rank `r` 只留第 `r` 块（一维、尾部补零）；
+  `materialize(names)` 每参数一次 AllGather 拼回完整形状进缓存，`release(names)`
+  丢副本，`step(grads)` 每参数一次 ReduceScatter 取本块梯度、只更本块，step 之后
+  必须 `_cache.clear()`（否则缓存与分片两份真相）。
+  **为什么不拍平成一条大缓冲**：参数边界与块边界错位会把参数劈成两半、逐参数超参
+  失效；代价是消息数随参数个数线性增长（与 ZeRO-1 的广播同量级）。
+  前提是各 rank 的模型定义顺序一致（按 `param_names` 的块号对齐）；存档必须同时带
+  参数分片与优化器槽位，`world_size` 变了要重新分片；`materialize` 返回的是**副本**，
+  改它不会回头改分片。数值上拼回的完整参数与整份逐位相同，只有 `step` 的求和顺序
+  由拓扑决定。
+- **工作区被旧缓冲覆盖（反复出现）**：提交后用 `git status` / `git diff --stat` 核对，
+  出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
+  已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
+  `git checkout HEAD -- <file>` 逐个恢复，再在其上继续编辑，不要靠重写整份文件。
 
 ## 临时脚本
 
