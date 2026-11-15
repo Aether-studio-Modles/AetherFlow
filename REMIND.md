@@ -17,7 +17,8 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 
 这一代**不**包括（下一代清单）：NCCL / RCCL 通信、int8 / fp8 **计算**、
 NHWC 布局传播、设备端控制流、把 schedule 搜索接进编译流水线（5.242 只有离线
-成本模型与按估算排序的串行搜索）、托管 CI 与发布。
+成本模型与按估算排序的串行搜索）、开放式的包发布（CI 只在构建 wheel 后上传
+artifact，没有 PyPI / GitHub Release 发布流程）。
 不要把这些当作"已经能用"去写示例。
 
 分页 KV cache 与投机解码已有组件级交付（5.241），但**没有接进语言模型那条路**：
@@ -42,7 +43,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2602 个用例 / 412 跳过，WSL HIP 2602 个用例 / 371 跳过。
+当前基线：本地 2622 个用例 / 412 跳过，WSL HIP 2622 个用例 / 371 跳过。
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
 前端用例（不是代码问题）。
 
@@ -161,6 +162,31 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   存在的唯一理由。平局语义一致：`configs[0]` 是默认，`tie_epsilon` 以内不替换。
 - 只覆盖 conv2d 的 `tile_w/roc/cb` 与逐元素 `block`；归约类（softmax / reduce_sum /
   layernorm）还没有成本函数，`cost_ranked_tune` 对它们无从排序。
+
+## Chrome Trace 导出（5.243）
+
+- 入口：`runtime/trace.py` 的 `trace_events` / `build_trace` / `write_trace`，
+  以及 `python -m aetherflow.runtime.trace telemetry.json [-o trace.json]`。
+  输入是 `TelemetryRecorder.save` 落的那份 JSON（走 `load_records`）。
+- 它不是采样 profiler：没有任何额外开销、也不新增观测，只是把已记录的东西
+  摆到时间轴上。因此看到的时长与 `runtime/telemetry.py` 里的数完全一致，
+  看不到的东西（内存、SM 占用、调用栈）也不会凭空出现。
+- `start_ms` 的零点是**本次 `execute` 的起点**，与 `wall_ms` 同一个 `perf_counter`。
+  两者对不齐时时间轴会出现负间隔或凭空长出的空白。旧记录没有这个字段，
+  导出时按"接上一个节点的结束点"补齐，并在 `otherData.synthesized_nodes` 计数。
+- 空白是**真实的**：CPU 轨道上的缝隙就是那段时间没在派发（等设备、等 Python）。
+  不要为了"好看"把间隔抹平。
+- GPU 轨道是**累计占位**，不是真实时间轴：逐节点的 `gpu_ms` 来自事件对，
+  只有耗时没有绝对时刻。线程名写死"GPU 内核（累计占位）"、事件带
+  `args.approximate: true`，就是为了防止有人从重叠关系里读出并行度。
+- `ts` / `dur` 的单位是**微秒**。Chrome Trace 只认微秒；写毫秒会得到一条
+  被压缩 1000 倍的图，且不会报错。
+- 一份 `RunRecord` 一个 `pid`，多条记录按 `wall_ms` 依次错开；这是"连跑多次"
+  能在同一张图里看的前提。
+- 打包与 CI：CI 的 `build` 作业跑 `python -m build`，再把 wheel 装到临时目录
+  做一次 `import aetherflow` 冒烟，最后 `upload-artifact`。本地自查用
+  `python -m pip wheel . --no-deps`；`pyproject.toml` 的 `packages.find`
+  带了 `include = ["aetherflow*"]`，新增子包不需要改配置。
 
 ## 提交约定
 
