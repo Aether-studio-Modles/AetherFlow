@@ -15,9 +15,13 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 `backends/device_backend.py` → `lower/plan.py` → `lower/kernels.py` →
 `backends/cuda/backend.py`（HIP 是同构的第二份厂商钩子）。
 
-这一代**不**包括（下一代清单）：NCCL / RCCL 通信、张量并行、int8 / fp8 量化、
+这一代**不**包括（下一代清单）：NCCL / RCCL 通信、张量并行、int8 / fp8 **计算**、
 NHWC 布局传播、设备端控制流、分页 KV cache、schedule 搜索、托管 CI 与发布。
 不要把这些当作"已经能用"去写示例。
+
+量化已有 weight-only int8（5.239）：`quantize_i8` / `dequantize_i8` / `linear_i8`。
+权重驻留 1 字节，**GEMM 仍走 f32 反量化**；没有 int8 累加、没有 fp8、没有 QAT、
+没有非对称零点。写示例时不要暗示"int8 算得更快"。
 
 ## 验证命令
 
@@ -67,6 +71,27 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   `ctypes.string_at` / `ctypes.memmove`；优化器槽位是懒分配的，未 `step` 前
   `owned_bytes()==0`，比较分片大小之前要先真的走一步。
 
+
+## weight-only int8（5.239）
+
+- 三个算子：`quantize_i8`（f32 + scale → i8）、`dequantize_i8`（i8 + scale → f32）、
+  `linear_i8`（x + i8 权重 + scale [+ bias] → f32）。语义只有一份，在
+  `ir/ops.py` 的 reference 里；`models/quantize.py` 直接调用它，不另写舍入。
+- 权重布局跟项目一致：`(K, N)`，不是 PyTorch 的 `(N, K)`。scale `(N,)` 就是
+  逐输出通道；`(1, 1)` 是逐张量。
+- 端点 `[-127, 127]`（不用 -128），舍入是 `rint` 的 **RNE**。要改这两条，
+  必须同时改 `_QUANT_MIN` / `_QUANT_MAX`、`ops.py` 的 reference 和
+  `device_backend.py` 里那两段 C 源码——三处不一致就会在 conformance 上炸。
+- HIP 侧的 `cp` 是自家迷你运行时，**没有** `rint` / `clip` / `min`。所以量化
+  不是 cupy 原语，而是 `_QUANTIZE_I8_SRC` / `_DEQUANTIZE_I8_SRC` 两段源码
+  同时喂 NVRTC 与 hipRTC（`self._kernel(..., source, "af_...")`）。
+- i8 是**数据输入**，不是下标：`_INDEX_ARGS` 必须声明
+  `dequantize_i8: {0}`、`linear_i8: {1}`，否则 invoke 的"非浮点输入"检查会在
+  派发前就以"不支持 int8"拦下（第一次跑 HIP conformance 就是这么红的）。
+- `_quant_scale_arg` 的 `per_row` 快路径按 `s[i % cols]` 取 scale，避免把逐通道
+  scale 物化成与权重同大的 f32（那会把"省 3/4"变成"多 1 倍临时量"）。
+- 非正 scale 的检查走 `to_host`（scale 只有 N 个元素）；量化是离线步骤，
+  别把它放进每步推理的热路径。
 
 ## 提交约定
 

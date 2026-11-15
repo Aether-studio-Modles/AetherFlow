@@ -90,9 +90,9 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 
 | 面 | 已交付 |
 |---|---|
-| 算子 | IR 里 60 个算子；CUDA / HIP 各自承接 57 个自研内核 + 库调用；参考后端承接全部 |
-| 精度 | f32 全覆盖；f16 覆盖 57 个（attention 为混合精度：存储半精度、累加 float）；f64 / 复数部分承接 |
-| 自动微分 | 40 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
+| 算子 | IR 里 63 个算子；CUDA / HIP 各自承接 60 个（59 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
+| 精度 | f32 全覆盖；f16 覆盖 57 个（attention 为混合精度：存储半精度、累加 float）；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
+| 自动微分 | 41 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、数据并行（主机中转归约）、ZeRO-1 分片、GPipe / 1F1B 流水 |
 | 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚） |
@@ -116,7 +116,8 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
 - **并行策略**：无张量并行 / 模型并行，无跨进程参数分片（FSDP 式显存节省）；
 - **编译**：无 loop 级 IR 与 schedule 搜索，融合是规则表而非通用策略；
 - **布局**：全 NCHW，无布局传播，无 GEMM epilogue；
-- **量化推理**：无 int8 / fp8 计算路径与量化工具链；
+- **量化推理**：只有 weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
+  权重驻留 1 字节、GEMM 仍走 f32 反量化），无 int8 张量核累加、无 fp8、无 QAT、无非对称零点；
 - **动态性**：形状必须静态（符号维只做多分辨率），控制流每次判定回主机；
 - **服务化**：无分页 KV cache、无投机解码、无 OpenAI 兼容 API；
 - **生态**：只吃 `torch.export` 的 aten 子集，无 define-by-run，无视觉化 profiler；
