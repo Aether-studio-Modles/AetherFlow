@@ -84,7 +84,7 @@ python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后�
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
 ```
 
-当前基线：**2561 个用例**，本地 412 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）371 跳过，全绿。
+当前基线：**2602 个用例**，本地 412 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）371 跳过，全绿。
 
 ## 4. 第一代版本的能力面
 
@@ -96,7 +96,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、数据并行（主机中转归约）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
 | 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码 |
-| 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb |
+| 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb；roofline 式成本模型（六项分解 + 可行性剪枝）先算再测，按估算排序只测前 N 个 |
 | 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、CI 三作业配置、部署包、zip 硬件包 |
 
 ## 5. 性能现状（同机口径，不跨机外推）
@@ -106,6 +106,8 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 - 卷积：自研分块核 / im2col 比 cuDNN 慢 **4～12×**（M40），比 MIOpen 慢 **4.52～37×**（RX 7650 GRE）。
 - HIP 上中等通道 3x3/5x5 走隐式 GEMM，比 im2col 快 **1.33～1.63×**；CUDA 上结论相反，按厂商开关隔离。
 - 调优：多轮采集显示"最优 block"在采集间不可复现，配置库只在同机同卡命中；尚未形成可复现的自动调优结论。
+  成本模型（5.242）只在 conv tile 与逐元素 block 上给出**排序依据**，不是性能预测器：
+  它能回答"哪些组合不必测"，单条估算与实测仍可能差数倍。
 
 ## 6. 与主流框架的边界
 
@@ -115,7 +117,8 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
 - **集合通信**：无 NCCL / RCCL 绑定，数据并行经主机中转，单进程串行切卡，无 P2P；
 - **并行策略**：有张量并行的切分与对齐（列 / 行并行 + attention 头切分，仅前向、归约走主机缓冲），
   但无列并行 / 行并行的反向通信，也没有"一份参数按 FSDP 式跨进程切分 + 按需拼回"的完整闭环；
-- **编译**：无 loop 级 IR 与 schedule 搜索，融合是规则表而非通用策略；
+- **编译**：无 loop 级 IR，schedule 搜索只有离线的成本模型与按估算排序的串行搜索（未接进编译流水线），
+  融合是规则表而非通用策略；
 - **布局**：全 NCHW，无布局传播，无 GEMM epilogue；
 - **量化推理**：只有 weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
   权重驻留 1 字节、GEMM 仍走 f32 反量化），无 int8 张量核累加、无 fp8、无 QAT、无非对称零点；
@@ -141,7 +144,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                2561 个用例
+tests/                2602 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             再进来时先要知道的事
 ```

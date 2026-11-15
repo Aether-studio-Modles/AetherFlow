@@ -16,7 +16,8 @@ NVIDIA sm_75 与 AMD gfx1100 上逐项对齐。
 `backends/cuda/backend.py`（HIP 是同构的第二份厂商钩子）。
 
 这一代**不**包括（下一代清单）：NCCL / RCCL 通信、int8 / fp8 **计算**、
-NHWC 布局传播、设备端控制流、schedule 搜索、托管 CI 与发布。
+NHWC 布局传播、设备端控制流、把 schedule 搜索接进编译流水线（5.242 只有离线
+成本模型与按估算排序的串行搜索）、托管 CI 与发布。
 不要把这些当作"已经能用"去写示例。
 
 分页 KV cache 与投机解码已有组件级交付（5.241），但**没有接进语言模型那条路**：
@@ -41,7 +42,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2561 个用例 / 412 跳过，WSL HIP 2561 个用例 / 371 跳过。
+当前基线：本地 2602 个用例 / 412 跳过，WSL HIP 2602 个用例 / 371 跳过。
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
 前端用例（不是代码问题）。
 
@@ -138,6 +139,28 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
 - 只做贪心验收与 batch=1；`temperature>0` 的采样验收没做。
   `greedy_draft` 是正确性参照，不是性能路径。
 - 没有接进 `generate` / `LMRunner`：那条路径是 Mamba，没有增长 KV 可管。
+
+## 成本模型与组合搜索（5.242）
+
+- 入口：`tuning/cost.py` 的 `MachineModel` / `conv_tile_cost` / `elementwise_cost` /
+  `rank_configs` / `cost_ranked_tune`，以及从 `tuning/search.py` 抽出的
+  `measure_configs`（收"已展开的配置序列"，与 `tune` 共用排名与拒绝语义）。
+- **它是排序依据，不是性能预测器**。单条估算与实测差数倍是正常的；它只负责
+  回答"哪些组合不必测"和"为什么按这个顺序测"。不要拿 `total_us` 写性能结论。
+- 派生量（`blocks` / `shared_bytes` / `threads` / `stages`）必须取自
+  `lower/plan.py`，不要在这里重推一遍：两处推导迟早漂移，而漂移只会在真机上
+  以"计划层拒绝、成本模型却认为可行"的形式暴露。
+- 六项成本固定顺序 `arith / read / staging / sync / tail / dead`。`tail` 与 `dead`
+  是**占空比**（按比例折算），不是绝对延迟；`sync` 按**波次**折算而不是按块数——
+  按块数算会把小图算成同步主导（1×64×56×56 上曾算出 896us，改正后 16us）。
+- `CostBreakdown.total_us` 对不可行项返回 `inf`，排序键里**必须**保留
+  `not feasible`：只靠 `inf` 时，一旦有人把返回值改成 0 就会静默把不可行项排到最前。
+- `cost_ranked_tune` 会把**默认配置提到有序列表最前**再裁剪：`TuningResult.speedup`
+  以 `candidates[0]` 为基准，默认配置被裁掉时加速比会整体漂移。
+- 裁剪后的候选集不是笛卡尔积，塞不回 `TuningSpace`——这是 `measure_configs`
+  存在的唯一理由。平局语义一致：`configs[0]` 是默认，`tie_epsilon` 以内不替换。
+- 只覆盖 conv2d 的 `tile_w/roc/cb` 与逐元素 `block`；归约类（softmax / reduce_sum /
+  layernorm）还没有成本函数，`cost_ranked_tune` 对它们无从排序。
 
 ## 提交约定
 
