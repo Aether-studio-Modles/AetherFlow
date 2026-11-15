@@ -45,7 +45,7 @@ py -3.14 -m unittest discover -s tests -t .
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_DETECTION=1 /opt/rocm-env/bin/python -m unittest discover -s tests -t ."
 ```
 
-当前基线：本地 2652 个用例 / 415 跳过，WSL HIP 2652 个用例 / 373 跳过。
+当前基线：本地 2675 个用例 / 416 跳过，WSL HIP 2675 个用例 / 373 跳过。
 （两者各有一条与功能无关的失败——`test_conformance.TestReferenceConformance.test_covers_all_operators`，
 是工作区里另一份未提交的 `cumsum` / `tril` 工作导致的，别去"修"它。）
 本地必须用 `py -3.14`：3.10 环境里的 torch 是 2.4.1，会被兼容矩阵拦下 51 条
@@ -406,6 +406,22 @@ wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/g/Cloumi/aetherflow && HSA_ENABLE_DXG_D
   出现过 `train/__init__.py` 退回旧版（丢 `Zero2Rank` / 启动器导出）、`DESIGN.md` 丢
   已提交小节的情况。发现 `git diff` 只是"删掉已提交内容"时，用
   `git checkout HEAD -- <file>` 逐个恢复，再在其上继续编辑，不要靠重写整份文件。
+
+- **NHWC 传播的两个易错点（5.246）**：第一，逐元素算子**不接受** `layout` 属性
+  （`check_attr_names` 会拒绝），传播时只给 conv / pool 设；第二，卷积的
+  weight / bias 不是激活，只有第 0 个输入进 NHWC 域——把权重也 `to_nhwc` 会让
+  6 条判据同时变红，而节点序列看起来**仍然是对的**，只有形状与数值对拍才抓得到。
+- **设备端拒绝布局要拦两处**：`DeviceBackend.invoke` 与 `_planned_kernel`
+  （图捕获 / 批量派发快路径）。只拦前者时快路径会拿 NCHW 内核去读 NHWC 缓冲区，
+  报出来的是"输入通道 8 与权重通道 3 * groups=1 不一致"这类误导性错误；
+  WSL HIP 上的负向对照已确认。
+- **布局传播不进默认管线**：`LayoutPropagation` 依赖目标后端的声明（带参数），
+  按约定不进 pass 注册表。默认 `supported_layouts` 是参考后端口径
+  （`{"nchw","nhwc"}`），设备后端必须显式传 `DeviceBackend.supported_layouts`
+  （只有 `nchw`，此时有可翻区域就抛 `LayoutError`，不静默跳过）。
+- **NHWC 没有反向规则**：三个算子的 VJP 开头显式抛 `NoGradientError`，不要指望
+  反向算子自己发现——它们会按 NCHW 的轴归约，产出"看着有值但全错"的梯度。
+  布局传播按推理期优化设计，训练图保持 NCHW。
 
 ## 临时脚本
 
