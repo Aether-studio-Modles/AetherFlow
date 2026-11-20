@@ -120,9 +120,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   慢 4～37×（详见 README §5）。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能**：HIP 上整图调度被 launch 开销主导，`graph_mode="auto"` 能把
-  Transformer block 从 5.9 ms 压到 0.83 ms；`maxpool2d` 在大形状上只有约
-  2.6 GB/s（20 MB 访存耗 7.7 ms），`matmul` 1024³ 约 264 GFLOPS，两者都
-  尚未优化（见 DESIGN 5.249，数据来自 RX 7650 GRE + ROCm 7.2）。
+  Transformer block 从 5.9 ms 压到 0.83 ms。其余绝对值请勿引用：WSL 里没有
+  amdgpu 内核模块（`rocm-smi` 报 driver not initialized），纯 `relu` 4M 元素
+  也只有 7.4 GB/s，全部数字都比预期低一到两个数量级；对外比较必须换原生
+  Linux 复测（见 DESIGN 5.249）。
 
 ### 兼容性策略
 
