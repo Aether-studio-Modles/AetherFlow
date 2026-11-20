@@ -22,6 +22,13 @@ ctypes 调 cuDNN 的 legacy API（v9 仍保留），只依赖系统里已有的 
    卷积核把 bias 融在里面，为对齐口径，cuDNN 侧也在计时窗口内用 cupy 做同一次加法。
 
 数值必须三路一致（rtol/atol 1e-4），否则表里的耗时没有意义。
+
+**只比设备侧**：本项目侧走 ``execute_device``（输出留在显存），cuDNN 侧也是
+直调库、结果不出卡。若用 ``execute``，每次都会多付一次 4 MB 的 D2H（A800 上
+约 1.4 ms），那是 PCIe 带宽而不是卷积速度（见 DESIGN 5.251）。
+
+**Ampere 及之后必须设 `NVIDIA_TF32_OVERRIDE=0`**：cuDNN 默认允许卷积走 TF32，
+结果与 f32 差 1e-3 量级，会被下面的数值一致性检查拦下；本项目没有 TF32 路径。
 """
 
 from __future__ import annotations
@@ -274,7 +281,7 @@ def run_aetherflow(impl: str, stages, rounds: int):
         g, feed = build(x_shape, w_shape, pad)
         best: Optional[Dict[str, float]] = None
         for _ in range(rounds):
-            stats = measure(lambda: backend.execute(g, feed), sync, 3, 10)
+            stats = measure(lambda: backend.execute_device(g, feed), sync, 3, 10)
             if best is None or stats["median_ms"] < best["median_ms"]:
                 best = stats
         out[name] = best
@@ -322,7 +329,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     tiled_ms, tiled_backend = run_aetherflow("tiled", SHAPES, args.rounds)
     im2col_ms, im2col_backend = run_aetherflow("im2col", SHAPES, args.rounds)
 
-    # 三路数值必须一致，否则耗时对照没有意义
+    # 三路数值必须一致，否则耗时对照没有意义。跑之前必须 ``NVIDIA_TF32_OVERRIDE=0``：
+    # cuDNN 在 Ampere 之后默认让卷积走 TF32，差值会到 1e-3，与实现正确性无关。
     for name, x_shape, w_shape, pad in SHAPES:
         g, feed = build(x_shape, w_shape, pad)
         ref = cudnn_out[name]
