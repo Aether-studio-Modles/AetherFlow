@@ -16,11 +16,11 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：65 个 IR 算子，CUDA / HIP 各自承接 62 个；
+- **一份语义 IR，多个硬件后端**：67 个 IR 算子，CUDA / HIP 各自承接 64 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
-- **自动微分**：46 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
+- **自动微分**：47 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行（主机中转）、
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
@@ -119,6 +119,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积自研内核比 cuDNN / MIOpen
   慢 4～37×（详见 README §5）。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
+- **性能**：HIP 上整图调度被 launch 开销主导，`graph_mode="auto"` 能把
+  Transformer block 从 5.9 ms 压到 0.83 ms；`maxpool2d` 在大形状上只有约
+  2.6 GB/s（20 MB 访存耗 7.7 ms），`matmul` 1024³ 约 264 GFLOPS，两者都
+  尚未优化（见 DESIGN 5.249，数据来自 RX 7650 GRE + ROCm 7.2）。
 
 ### 兼容性策略
 
