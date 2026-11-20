@@ -288,6 +288,91 @@ register(
 )
 
 
+def _infer_clamp(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """三参截断：``clamp(x, min=..., max=...)``，至少给出其中一侧。
+
+    上下界刻意放在**属性**里而不是输入里：它们在前端是 Python 常量
+    （``logA.clamp(-4, 0)``、``cum_in.clamp(min=-80)``），做成输入会白白多
+    两条图边与一次设备驻留。真要动态上下界，用 ``maximum`` / ``minimum``
+    语义自己拼（IR 没有这两个算子，用 ``step`` 的门也可以）。
+    """
+    if len(inputs) != 1:
+        raise ValueError(f"clamp 只接受 1 个输入，得到 {len(inputs)} 个；上下界由属性给出")
+    if not inputs[0].dtype.is_float:
+        raise TypeError(f"clamp 只支持浮点 dtype，得到 {inputs[0].dtype.value}")
+    lo, hi = attrs.get("min"), attrs.get("max")
+    if lo is None and hi is None:
+        raise ValueError("clamp 至少要给出 min 或 max 之一")
+    if lo is not None and hi is not None and float(lo) > float(hi):
+        raise ValueError(f"clamp 的 min 不能大于 max，得到 {lo} > {hi}")
+    return inputs[0]
+
+
+def _clamp_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x = args[0]
+    # 比较宽度统一到 f32：f16 输入先升宽比较、再舍回存储类型，与设备端
+    # "读成 float、比较、写回"逐位一致。直接在 f16 里比较会让"边界常量恰好
+    # 落在两个 f16 之间"的情形与设备端分叉。
+    cmp = np.float32 if x.dtype == np.float16 else x.dtype
+    out = np.clip(x.astype(cmp, copy=False), attrs.get("min"), attrs.get("max"))
+    return out.astype(x.dtype, copy=False)
+
+
+register(
+    Op(
+        name="clamp",
+        infer=_infer_clamp,
+        reference=_clamp_ref,
+        attrs_schema=("min", "max"),
+        doc="逐元素截断到 [min, max]：至少给出 min / max 之一。NaN 原样透传"
+        "（比较为假），边界点属于保留区间；反向是区间内的 0/1 门",
+    )
+)
+
+
+def _infer_mod(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """整数取模，语义与 Python / ``torch.remainder`` 一致（向下取整）。
+
+    为什么单独做算子而不是复用 ``div``：浮点 ``div`` 的语义是 IEEE 除法，
+    拿不到整数余数；而 C 的 ``%`` 是**截断取余**，与 Python 在负被除数上
+    差一个模数。Engram 的哈希（``(slot*131 + g) % n_slots``）依赖后者，
+    这条语义必须显式写出来，不能靠后端各自解释。
+    """
+    a, b = inputs
+    if a.dtype != b.dtype:
+        raise TypeError(
+            f"mod 要求两侧 dtype 一致，得到 {a.dtype.value} 与 {b.dtype.value}；"
+            "请显式插入 cast"
+        )
+    if a.dtype is not DType.I32:
+        raise TypeError(
+            f"mod 只承接 i32（整数哈希的常态），得到 {a.dtype.value}；"
+            "i8 请先 cast 到 i32，否则中间乘积会静默溢出"
+        )
+    return TensorType(a.dtype, _broadcast_shape(a.shape, b.shape))
+
+
+def _mod_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    a, b = args
+    if np.any(b == 0):
+        raise ValueError("mod 的模数不能为 0")
+    # numpy 的 ``mod`` 就是 floor 语义：结果与除数同号，与 Python 的 ``%``
+    # 和 torch.remainder 一致。C 的 ``%`` 在设备端另有修正，见 ew_mod_int。
+    return np.mod(a, b)
+
+
+register(
+    Op(
+        name="mod",
+        infer=_infer_mod,
+        reference=_mod_ref,
+        attrs_schema=(),
+        doc="整数取模（i32）：结果与除数同号，即 floor 语义，与 Python % / "
+        "torch.remainder 一致；模数为 0 显式拒绝",
+    )
+)
+
+
 def _infer_silu(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (1, 2):
         raise ValueError(f"silu 需要 (x) 或 (x, gate) 输入，得到 {len(inputs)}")

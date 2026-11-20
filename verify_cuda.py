@@ -353,6 +353,30 @@ def _extra_cases() -> list:
             "beta": _rand(rng, 7),
         }
 
+    def clamp_two_sided():
+        """双侧截断：输入跨度覆盖区间两侧，否则只验证了"原样透传"。"""
+        g = Graph()
+        x = g.input("x", f32[4, 6])
+        g.output(g.add_node("clamp", [x], {"min": -0.5, "max": 0.5}), "y")
+        return g, {"x": _rand(rng, 4, 6, scale=2.0)}
+
+    def mod_negative_floor():
+        """负被除数 / 负模数：C 的截断取余在这里会差一个模数。"""
+        g = Graph()
+        a = g.input("a", i32[3, 5])
+        b = g.input("b", i32[3, 5])
+        g.output(g.add_node("mod", [a, b]), "y")
+        return g, {
+            "a": np.array(
+                [[-7, 7, -7, 7, 0], [13, -13, 13, -13, 5], [-50, 50, -1, 1, 0]],
+                dtype=np.int32,
+            ),
+            "b": np.array(
+                [[3, 3, -3, -3, 4], [-8, 8, -8, 8, -8], [7, -7, 6, -6, 2]],
+                dtype=np.int32,
+            ),
+        }
+
     return [
         ("gelu_saturation", gelu),
         ("rmsnorm_rank3", rmsnorm),
@@ -380,6 +404,8 @@ def _extra_cases() -> list:
         ("scan_linear_backward_long", scan_linear_backward_long),
         ("cumsum_mid_axis", cumsum_mid_axis),
         ("tril_negative_diagonal", tril_negative_diagonal),
+        ("clamp_two_sided", clamp_two_sided),
+        ("mod_negative_floor", mod_negative_floor),
         ("silu_gate_odd_length", silu_gate_odd),
         ("layernorm_residual_odd_cols", layernorm_residual_odd),
     ]

@@ -38,6 +38,8 @@ from ...lower.kernels import (
     ew_binary,
     ew_broadcast,
     ew_cast,
+    ew_clamp,
+    ew_mod_int,
     ew_step,
     ew_unary,
     im2col,
@@ -1801,6 +1803,20 @@ def step_source() -> Kernel:
 def step_template() -> str:
     """手写模板——对照物，不参与生产。"""
     return STEP_SRC
+
+
+def clamp_source() -> Kernel:
+    """按标量上下界截断的 L2 描述（生产路径）。"""
+    return ew_clamp()
+
+
+def mod_source(*, scalar_a: bool = False, scalar_b: bool = False) -> Kernel:
+    """i32 floor 取模的 L2 描述（生产路径）。
+
+    整数参数在 L2 里用 ``type_name="int"`` 钉死，不跟随渲染 dtype；调用方
+    传 f32 只是为了拿到方言 prelude（见 ``ew_mod_int`` 的说明）。
+    """
+    return ew_mod_int(scalar_a=scalar_a, scalar_b=scalar_b)
 
 
 def softmax_source() -> Kernel:

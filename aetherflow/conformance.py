@@ -640,6 +640,40 @@ def _tril(shape: tuple = (2, 5, 5), diagonal: int = -1):
     return build
 
 
+def _clamp(lo=None, hi=None, shape: tuple = (5, 7)):
+    def build(rng):
+        g = Graph("clamp")
+        x = g.input("x", f32[shape])
+        attrs = {}
+        if lo is not None:
+            attrs["min"] = float(lo)
+        if hi is not None:
+            attrs["max"] = float(hi)
+        g.output(g.add_node("clamp", [x], attrs), "y")
+        # 跨度 4 倍区间：既覆盖两侧截断，也覆盖区间内的原样透传
+        return g, {"x": _f32(rng, shape, scale=4.0)}
+
+    return build
+
+
+def _mod_int(shape: tuple = (4, 6)):
+    def build(rng):
+        g = Graph("mod")
+        a = g.input("a", i32[shape])
+        b = g.input("b", i32[shape])
+        g.output(g.add_node("mod", [a, b]), "y")
+        # 被除数必须有负值，模数也要正负混合：只测正数就分不出
+        # "C 的截断取余"与 Python / torch 的 floor 语义
+        divisor = rng.integers(-7, 8, size=shape, dtype=np.int32)
+        divisor[divisor == 0] = 3
+        return g, {
+            "a": rng.integers(-50, 50, size=shape, dtype=np.int32),
+            "b": divisor,
+        }
+
+    return build
+
+
 def _constant():
     def build(rng):
         g = Graph("constant")
@@ -1175,6 +1209,15 @@ def default_cases() -> List[Case]:
               note="非末轴前缀和：折成 (outer, steps, inner) 后并行链数来自 outer*inner"),
         _case("tril", _tril(),
               note="前导维逐片独立；negative diagonal 覆盖对角线以下才保留的情况"),
+        # 数值稳定（SSM）与整数哈希（Engram）
+        _case("clamp_range", _clamp(-1.0, 1.0),
+              note="双侧截断：反向是闭区间 0/1 门，边界点必须保留梯度"),
+        _case("clamp_min_only", _clamp(lo=-2.0),
+              note="缺省上界：has_hi 开关必须真的关掉那一侧的比较"),
+        _case("clamp_max_only", _clamp(hi=2.0),
+              note="缺省下界：SSM 的 dt.clamp(max=2) 就是这一形态"),
+        _case("mod_int_floor", _mod_int(),
+              note="负被除数 / 负模数都取 floor 语义；C 的截断取余会算错"),
         # SNN 事件驱动（稀疏）
         _case("spike_offsets", _spike_offsets(),
               note="统计每步非零数并给出起点表；与 spike_csr 拆成两个单输出节点"),

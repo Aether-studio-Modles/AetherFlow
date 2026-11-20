@@ -738,6 +738,87 @@ def ew_step() -> Kernel:
     )
 
 
+def ew_clamp() -> Kernel:
+    """按标量上下界的逐元素截断。
+
+    上下界用两个 ``int`` 开关而不是把 ``None`` 编进源码：生成期的分支会把
+    同一个算子的四种形态（仅 min / 仅 max / 双侧 / 无界）拆成四份内核，
+    而"无界"其实不合法。运行期开关只多两次比较，源码只有一份。
+
+    用 ``cond ? bound : value`` 而不用 ``fminf`` / ``fmaxf``：后者对 NaN
+    有"返回另一侧"的语义（``fminf(NaN, 1) == 1``），而 ``clamp(NaN)`` 必须
+    仍是 NaN。比较为假正好把 NaN 原样透传。
+    """
+    x = Var("x")
+    # 先夹上界，再在结果上夹下界；两侧的顺序不影响结果（区间已保证 lo <= hi）。
+    upper = Cond(Bin("&&", Var("has_hi"), Bin(">", x, Var("hi"))), Var("hi"), x)
+    lower = Cond(Bin("&&", Var("has_lo"), Bin("<", Var("v"), Var("lo"))), Var("lo"), Var("v"))
+    return Kernel(
+        name="ew_clamp",
+        params=(
+            Tensor("in"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "n"),
+            Scalar("int", "has_lo"),
+            Scalar("int", "has_hi"),
+            Scalar("float", "lo"),
+            Scalar("float", "hi"),
+        ),
+        body=grid_stride(
+            Var("n"),
+            Let("float", "x", Load("in", Var("i"))),
+            Let("float", "v", upper),
+            Store("out", Var("i"), lower),
+        ),
+    )
+
+
+def ew_mod_int(*, scalar_a: bool = False, scalar_b: bool = False) -> Kernel:
+    """i32 取模，且必须是 **floor 语义**（C 的 ``%`` 是截断取余）。
+
+    修正只有一句：``r != 0 && (r < 0) != (y < 0)`` 时 ``r += y``。三种符号
+    组合都要成立——``-7 % 3`` 要给 2 而不是 -1，``7 % -3`` 要给 -2 而不是 1。
+    这与参考实现的 ``np.mod`` 逐位一致，是 Engram 哈希表下标正确的前提。
+
+    整数内核不经过 dtype 的存取 helper（``af_ld_f`` / ``af_st_h`` 都是浮点
+    语义），所以参数用 ``type_name="int"`` 钉死，读写走裸 ``Index`` 与
+    ``raw=True`` 的 ``Store``；打印时仍需要一个 dtype 参数，取 F32 只为拿到
+    prelude，不影响整数表达。
+    """
+    a_index = Num("0") if scalar_a else Var("i")
+    b_index = Num("0") if scalar_b else Var("i")
+    r = Var("r")
+    y = Var("y")
+    return Kernel(
+        name="ew_mod",
+        params=(
+            Tensor("a", type_name="int"),
+            Tensor("b", type_name="int"),
+            Tensor("out", read_only=False, type_name="int"),
+            Scalar("long long", "n"),
+        ),
+        body=grid_stride(
+            Var("n"),
+            Let("int", "x", Index("a", a_index)),
+            Let("int", "y", Index("b", b_index)),
+            Let("int", "r", Bin("%", Var("x"), y)),
+            If(
+                Bin(
+                    "&&",
+                    Bin("!=", r, Num("0")),
+                    Bin(
+                        "!=",
+                        Paren(Bin("<", r, Num("0"))),
+                        Paren(Bin("<", y, Num("0"))),
+                    ),
+                ),
+                (Assign(r, Bin("+", r, y)),),
+            ),
+            Store("out", Var("i"), r, raw=True),
+        ),
+    )
+
+
 def silu_gate() -> Kernel:
     """门控 SiLU（SwiGLU）：``silu(x) * gate``，一个内核算完、不落中间张量。"""
     xv = Var("xv")

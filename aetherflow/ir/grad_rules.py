@@ -193,6 +193,44 @@ def _neg(ctx):
     return (ctx.b.add_node("neg", [ctx.g]),)
 
 
+@vjp("clamp")
+def _clamp(ctx):
+    """区间门：``dx = g * [min <= x <= max]``。
+
+    边界点按 PyTorch 的约定**保留**（闭区间导数），与 ``relu`` 在 0 点取 0
+    的约定不同——两者各自的语义就是这么定义的，不要统一。门用
+    ``1 - step(lo - x)`` 构造而不是 ``step(x - lo)``：后者在 ``x == lo``
+    处返回 0，会把边界点错误地排除掉。
+    """
+    b, g = ctx.b, ctx.g
+    x = ctx.input(0)
+    dt = x.type.dtype
+    one = _const(b, 1.0, dt)
+
+    def ge(value, bound):
+        # x >= bound  <=>  not (bound - x > 0)
+        return b.add_node(
+            "sub",
+            [one, b.add_node("step", [b.add_node("sub", [bound, value])], {"threshold": 0.0})],
+        )
+
+    def le(value, bound):
+        # x <= bound  <=>  not (x - bound > 0)
+        return b.add_node(
+            "sub",
+            [one, b.add_node("step", [b.add_node("sub", [value, bound])], {"threshold": 0.0})],
+        )
+
+    lo, hi = ctx.attrs.get("min"), ctx.attrs.get("max")
+    mask = None
+    if lo is not None:
+        mask = ge(x, _const(b, float(lo), dt))
+    if hi is not None:
+        part = le(x, _const(b, float(hi), dt))
+        mask = part if mask is None else b.add_node("mul", [mask, part])
+    return (b.add_node("mul", [g, mask]),)
+
+
 @vjp("relu")
 def _relu(ctx):
     # 0 点导数取 0（与 PyTorch 的约定一致），所以用严格大于的 step。

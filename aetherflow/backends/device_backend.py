@@ -131,6 +131,8 @@ GPU_OPS: FrozenSet[str] = frozenset(
     "scan_linear_backward",
     "cumsum",
     "tril",
+    "clamp",
+    "mod",
     "sparse_linear",
     "sparse_linear_weight_grad",
     "sparse_linear_values_grad",
@@ -157,6 +159,8 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     # 量化：i8 是**数据**而不是下标，但它同样不能走"只支持浮点"的默认检查。
     "dequantize_i8": frozenset({0}),
     "linear_i8": frozenset({1}),
+    # 整数取模：两侧都是**整数数据**，不是下标。
+    "mod": frozenset({0, 1}),
 }
 
 # 整数下标允许的 dtype。与 ir/ops.py 的 infer 保持一致：i32 是前端导入的
@@ -746,6 +750,8 @@ class DeviceBackend(Executor):
         r.register("scan_linear_backward", self._op_scan_linear_backward)
         r.register("cumsum", self._op_cumsum)
         r.register("tril", self._op_tril)
+        r.register("clamp", self._op_clamp)
+        r.register("mod", self._op_mod)
         r.register("sparse_linear", self._op_sparse_linear)
         r.register("sparse_linear_weight_grad", self._op_sparse_linear_weight_grad)
         r.register("sparse_linear_values_grad", self._op_sparse_linear_values_grad)
@@ -1503,6 +1509,92 @@ class DeviceBackend(Executor):
 
     def _op_div(self, node, args, attrs):
         return self._binary("div", args)
+
+
+
+    def _op_clamp(self, node, args, attrs):
+        """按属性里的标量上下界截断；缺省的一侧由 ``has_lo`` / ``has_hi`` 关掉。
+
+        标量通过内核参数传入而不是写进源码：同一张图里 ``clamp(min=-80)``
+        与 ``clamp(0, 1)`` 很常见，按边界值生成源码会让编译缓存按数值增长。
+        """
+        cp = self.cp
+        x = args[0]
+        out = cp.empty_like(x)
+        n = int(x.size)
+        if n == 0:
+            return out
+        lo = attrs.get("min")
+        hi = attrs.get("max")
+        kernel = self._kernel(
+            ("clamp", self._kind(x)),
+            lambda: self.codegen.render(self.codegen.clamp_source(), x.dtype),
+            "ew_clamp",
+        )
+        block, grid = self._grid("clamp", n)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                x,
+                out,
+                np.int64(n),
+                np.int32(lo is not None),
+                np.int32(hi is not None),
+                np.float32(0.0 if lo is None else lo),
+                np.float32(0.0 if hi is None else hi),
+            ),
+        )
+        return out
+
+
+
+    def _op_mod(self, node, args, attrs):
+        """整数取模（floor 语义）。
+
+        只承接同形与标量广播：整数逐元素内核没有做多维 stride 广播的版本，
+        而 Engram 的哈希两侧同形、模数是标量。其它广播形态显式拒绝，避免
+        落到"按 f32 解释整数缓冲"的错误路径上。
+        """
+        a, b = args
+        try:
+            out_shape = tuple(np.broadcast_shapes(a.shape, b.shape))
+        except ValueError as exc:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 mod 无法广播 {a.shape} 与 {b.shape}"
+            ) from exc
+        if a.shape == b.shape:
+            return self._mod_kernel(a, b, mode=0)
+        if a.size == 1 and out_shape == b.shape:
+            return self._mod_kernel(a, b, mode=1)
+        if b.size == 1 and out_shape == a.shape:
+            return self._mod_kernel(a, b, mode=2)
+        raise BackendCapabilityError(
+            f"{self._LABEL}的 mod 只承接同形与标量广播，收到 {a.shape} 与 {b.shape}"
+        )
+
+
+
+    def _mod_kernel(self, a, b, mode: int):
+        cp = self.cp
+        tensor = b if mode == 1 else a
+        out = cp.empty_like(tensor)
+        n = int(tensor.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("mod", mode),
+            lambda: self.codegen.render(
+                self.codegen.mod_source(scalar_a=mode == 1, scalar_b=mode == 2),
+                np.float32,
+            ),
+            "ew_mod",
+        )
+        lhs = a.reshape(1) if mode == 1 else a
+        rhs = b.reshape(1) if mode == 2 else b
+        block, grid = self._grid("mod", n)
+        kernel((grid,), (block,), (lhs, rhs, out, np.int64(n)))
+        return out
 
 
 
