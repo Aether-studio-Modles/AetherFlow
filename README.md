@@ -84,7 +84,7 @@ python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后�
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
 ```
 
-当前基线：**2675 个用例**，本地 416 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）373 跳过，全绿。
+当前基线：**2677 个用例**，本地 416 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）373 跳过，全绿。
 
 ## 4. 第一代版本的能力面
 
@@ -101,13 +101,31 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 
 ## 5. 性能现状（同机口径，不跨机外推）
 
-- 整图：`transformer_block` 在 HIP 上与 CUDA 参考实现差约 **8%**，主体是逐节点提交开销；
-  图重放已交付（默认 `graph_mode="off"`，语义差异需使用者知情）。
-- 卷积：自研分块核 / im2col 比 cuDNN 慢 **4～12×**（M40），比 MIOpen 慢 **4.52～37×**（RX 7650 GRE）。
-- HIP 上中等通道 3x3/5x5 走隐式 GEMM，比 im2col 快 **1.33～1.63×**；CUDA 上结论相反，按厂商开关隔离。
-- 调优：多轮采集显示"最优 block"在采集间不可复现，配置库只在同机同卡命中；尚未形成可复现的自动调优结论。
-  成本模型（5.242）只在 conv tile 与逐元素 block 上给出**排序依据**，不是性能预测器：
-  它能回答"哪些组合不必测"，单条估算与实测仍可能差数倍。
+性能有三种口径，混用会把 PCIe 带宽当成算力（见 [DESIGN 5.251](DESIGN.md)）：
+
+- **端到端**：`execute()`，含输入 H2D 与输出 D2H；
+- **设备侧**：`execute_device()`，输出不回传（基准加 `--device-outputs`）；
+- **纯算**：输入常驻设备，只计内核。
+
+A800-SXM4-40GB（CUDA 12.9 / cupy 14.2 / `graph_mode="off"`，单位 ms）：
+
+| 用例 | 端到端 | 设备侧 | 裸 cupy 常驻 |
+| --- | --- | --- | --- |
+| matmul_1024 | 2.05 | 1.12 | 0.19 |
+| maxpool2x2 | 3.16 | 2.14 | — |
+| transformer_block | 1.80 | 1.67 | — |
+| cnn_lenet | 0.85 | 0.79 | — |
+| relu（4M 元素） | 1.98 | — | 0.05 |
+
+单次 `execute` 有约 1.5 ms 的固定成本，其中 1.4 ms 是 4 MB 输出的 D2H；设备侧
+口径剩下的是每轮 8 MB 输入的 H2D（约 0.9 ms，实测 PCIe 约 9 GB/s）。纯算内核
+与裸 cupy 同量级。此前"自研卷积比 cuDNN 慢 4～12×、比 MIOpen 慢 4.52～37×"的
+数字混入了这条固定开销，**需要按新口径重测后才能对外引用**。
+
+- 图重放：`transformer_block` 在 HIP 上 5.90 → 0.83 ms（节点多时收益显著）；
+  默认 `graph_mode="off"`，语义差异需使用者知情。
+- 调优：多轮采集显示"最优 block"在采集间不可复现，配置库只在同机同卡命中；
+  成本模型（5.242）只给排序依据，不是性能预测器。
 
 ## 6. 与主流框架的边界
 
@@ -148,7 +166,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                2675 个用例
+tests/                2677 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```

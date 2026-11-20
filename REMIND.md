@@ -81,8 +81,8 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 2675 个用例，416 跳过，全绿 |
-| HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1100`） | 2675 个用例，373 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 2677 个用例，416 跳过，全绿 |
+| HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1100`） | 2677 个用例，373 跳过，全绿 |
 | CUDA | Ubuntu 22.04 / 2× Tesla V100（`sm_70`）/ CUDA 12.4 / 驱动 550 | 全绿（cuDNN 因驱动版本不匹配按设计跳过） |
 
 ```bash
@@ -117,13 +117,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   显式拒绝。
 - **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_mask` 只有
   参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积自研内核比 cuDNN / MIOpen
-  慢 4～37×（详见 README §5）。
+  慢 4～37× 是**旧口径**（每轮混入了 D2H），需按 DESIGN 5.251 重测后才能引用。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
-- **性能**：HIP 上整图调度被 launch 开销主导，`graph_mode="auto"` 能把
-  Transformer block 从 5.9 ms 压到 0.83 ms。其余绝对值请勿引用：WSL 里没有
-  amdgpu 内核模块（`rocm-smi` 报 driver not initialized），纯 `relu` 4M 元素
-  也只有 7.4 GB/s，全部数字都比预期低一到两个数量级；对外比较必须换原生
-  Linux 复测（见 DESIGN 5.249）。
+- **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
+  4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
+  `--device-outputs`；两种口径的数字不能互相比较（见 DESIGN 5.251）。
+  `graph_mode="auto"` 对多节点图仍有效：HIP 上 Transformer block 5.9 → 0.83 ms。
 
 ### 兼容性策略
 
