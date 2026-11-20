@@ -90,9 +90,9 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 
 | 面 | 已交付 |
 |---|---|
-| 算子 | IR 里 65 个算子；CUDA / HIP 各自承接 62 个（61 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
-| 精度 | f32 全覆盖；f16 覆盖 59 个（62 个设备端算子去掉 3 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
-| 自动微分 | 46 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
+| 算子 | IR 里 67 个算子；CUDA / HIP 各自承接 64 个（63 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
+| 精度 | f32 全覆盖；f16 覆盖 60 个（64 个设备端算子去掉 3 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
+| 自动微分 | 47 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` 把条件与体各捕获一次、状态常驻显存，但每轮仍要读一次谓词（无 device-side 分支，且实测不比宿主路径快，见 DESIGN 5.245） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast，未接进数据并行路径）、数据并行（主机中转归约）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
 | 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码 |
