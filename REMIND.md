@@ -130,6 +130,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 ### 维护者备注
 
 - 临时脚本（`_tmp_*.py` 等）用完即删；结论写进 DESIGN 对应小节，凭证不落盘。
+- 提交后用 `git status` / `git diff --stat` 核对。曾出现工作区文件被旧版覆盖
+  （表现为 `git diff` 里只有"删除已提交内容"）：用 `git checkout HEAD -- <file>`
+  逐个恢复，再在其上继续编辑，不要重写整份文件。
 - 代码与文档（DESIGN / 本文件 / README）分开提交。
 - PowerShell 5.1 不支持 `&&` 与 heredoc：用 `;` 串联，`git commit` 用多个 `-m`。
 
