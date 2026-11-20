@@ -37,6 +37,9 @@ __all__ = [
     "CONV_SHARED_LIMIT",
     "CONV_TILED_MAX_K",
     "CONV_TILED_MIN_WORK",
+    "CONV_IMPLICIT_MID_K_MAX",
+    "CONV_IMPLICIT_MID_WORK",
+    "CONV_CUDNN_MIN_GFLOPS",
     "CONV_ROC_MAX",
     "CONV_CB_MAX",
     "SCAN_CHUNK",
@@ -69,6 +72,7 @@ __all__ = [
     "plan_conv_tiled",
     "plan_conv_implicit",
     "conv_tiled_preferred",
+    "conv_implicit_preferred",
     "scan_auto_chunk",
     "scan_last_auto_chunk",
     "scan_chunk",
@@ -133,6 +137,20 @@ CONV_TILED_MAX_K = 32
 
 # 输出总量太小的时候，一个 block 的权重 staging 抵不过计算本身。
 CONV_TILED_MIN_WORK = 4096
+
+# 隐式 GEMM 的甜点区（A800 实测，5.252）。分界不是像素数，而是 im2col 要
+# 物化的元素数 n*ho*wo*K：网格扫描里 <= 2.95M 的 15 个点在隐式上快 7～13%，
+# >= 3.61M 的 10 个点全部是 im2col 快 5～42%，与 n / K / ho*wo 各自的取值
+# 无关。3.2M 元素 ≈ 12.8 MB 的 f32 中间缓冲，正好卡在两组之间。
+# K 的上界另算：K > 400 时隐式内核的内层循环太长，小图上也会输（K=1152 输
+# 2.1×），所以甜点区封顶在 400。
+CONV_IMPLICIT_MID_K_MAX = 400
+CONV_IMPLICIT_MID_WORK = 3_200_000
+
+# cuDNN 快路径的启用门槛（A800 实测，5.252）：卷积本身 0.03～0.09 ms，但走
+# 框架要付描述符 / 算法查询 / 独立 bias 核的 host 开销。综合下来 1 GFLOP 以下
+# 自研核更快（0.3 GFLOP 的 3x3_c64 上 cuDNN 慢 1.4×），2.4 GFLOP 起快 2.5×。
+CONV_CUDNN_MIN_GFLOPS = 1.0
 
 # 每个线程负责的输出通道数上限。摞到 8 会让 block 线程数减半、
 # 占用率下降，反而比 4 慢（见 DESIGN 5.16）。
@@ -439,6 +457,31 @@ def conv_oc_tile(khkw: int, o: int) -> Optional[int]:
 def conv_tiled_preferred(k: int, work: int) -> bool:
     """auto 模式下是否该走分块核：K 足够小，且输出总量撑得起一次 staging。"""
     return k <= CONV_TILED_MAX_K and work >= CONV_TILED_MIN_WORK
+
+
+def conv_implicit_preferred(*, n: int, k: int, kh: int, kw: int,
+                            ho: int, wo: int) -> bool:
+    """auto 模式下是否该走隐式 GEMM（只覆盖中等 K 的带窗卷积）。
+
+    判据来自 A800 上的二维网格与 n 扫描（DESIGN 5.252）：隐式除以 im2col
+    的耗时比几乎是 ``n*ho*wo*K`` 的单调函数——2.36M～2.95M 元素时 0.87～
+    0.93，3.61M 起跳到 1.05 以上，9.44M 时 1.42。所以门槛直接落在这个物化
+    规模上，而不是单独给 K 或特征图设档：
+
+    - ``n*ho*wo*K <= 3.2M``（≈12.8 MB f32 中间缓冲）：隐式快 7～13%；
+    - 超过就交回 im2col：cuBLAS 的大矩阵调度赢过隐式的一次性 staging。
+
+    两个独立的排除项：
+
+    - ``K > 400``：隐式内核的内层循环太长，小图上也会输（K=1152 输 2.1×、
+      K=576+16x16 输 1.10×），所以甜点区封顶；
+    - ``kh*kw == 1``：没有窗口重叠，隐式只多一次 staging（慢 6%）。
+
+    ``K <= 32`` 仍归分块直算（``conv_tiled_preferred``），这里不碰。
+    """
+    if k <= CONV_TILED_MAX_K or kh * kw <= 1 or k > CONV_IMPLICIT_MID_K_MAX:
+        return False
+    return n * ho * wo * k <= CONV_IMPLICIT_MID_WORK
 
 
 def conv_implicit_oc_tile(kh: int, kw: int, o: int, span: int) -> Optional[int]:

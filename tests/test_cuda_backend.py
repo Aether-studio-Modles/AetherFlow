@@ -977,14 +977,15 @@ class TestCudnnFallback(unittest.TestCase):
             "aetherflow.backends.cuda.backend.CudnnConv",
             side_effect=AttributeError("no cudnnGetConvolutionForwardAlgorithm_v7"),
         ):
-            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1))
+            # flops 要越过启用门槛，否则 _pick_cudnn 在碰库之前就返回了
+            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1, 5.0))
         self.assertIn("AttributeError", backend._cudnn_broken)
         # 失败只试一次：第二次不该再构造 engine
         with mock.patch(
             "aetherflow.backends.cuda.backend.CudnnConv",
             side_effect=AssertionError("不该再尝试构造"),
         ):
-            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1))
+            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1, 5.0))
 
     def test_explicit_cudnn_reports_the_reason(self):
         """显式 cudnn 不做回落：构造期就把原因报出来，别让排障的人猜。"""
@@ -1005,7 +1006,17 @@ class TestCudnnFallback(unittest.TestCase):
     def test_capture_keeps_the_path_fixed(self):
         backend = self._backend("auto")
         backend._capturing = True
-        self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1))
+        self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1, 5.0))
+
+    def test_auto_requires_enough_flops(self):
+        """1 GFLOP 以下 cuDNN 的固定开销比省下的卷积还贵（5.252）。"""
+        backend = self._backend("auto")
+        with mock.patch("aetherflow.backends.cuda.backend.CudnnConv"):
+            self.assertFalse(backend._pick_cudnn(np.dtype("float32"), 1, 0.3))
+            self.assertTrue(backend._pick_cudnn(np.dtype("float32"), 1, 2.4))
+        # 显式指定不受门槛约束：使用者明确要 cuDNN 就给他
+        explicit = self._backend("cudnn")
+        self.assertTrue(explicit._pick_cudnn(np.dtype("float32"), 1, 0.0))
 
 
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")

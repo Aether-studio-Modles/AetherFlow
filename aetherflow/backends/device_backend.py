@@ -53,6 +53,7 @@ from ..lower.plan import (
     cdiv,
     conv_oc_tile,
     conv_implicit_fits,
+    conv_implicit_preferred,
     conv_tiled_preferred,
     grid_for,
     plan_conv_implicit,
@@ -464,6 +465,9 @@ class DeviceBackend(Executor):
     # 默认 False：M40 上 5.151 的 A/B 里隐式在 K >= 288 输给 im2col 1.37～2.32×，
     # 不该由"规模大"自动触发。HIP 覆盖成 True，依据见 5.238 的实测。
     CONV_AUTO_IMPLICIT = False
+    # auto 是否允许在中等 K 的甜点区改走隐式 GEMM（判据见 plan.conv_implicit_preferred）。
+    # 默认 False：这份阈值是 A800 上 16 个形状测出来的，只有 CUDA 覆盖成 True。
+    CONV_AUTO_IMPLICIT_MID = False
     # sparse_linear 的实现选择。子类可以扩展（CUDA 多一个 "cusparse"）。
     SPARSE_IMPLS: Tuple[str, ...] = _SPARSE_IMPLS
 
@@ -649,7 +653,7 @@ class DeviceBackend(Executor):
     # 可选的设备相关行为（默认无操作）
     # ------------------------------------------------------------------
 
-    def _pick_cudnn(self, dtype, groups: int) -> bool:
+    def _pick_cudnn(self, dtype, groups: int, flops: float = 0.0) -> bool:
         """是否走 cuDNN 卷积。默认没有这项加速。"""
         return False
 
@@ -2211,9 +2215,11 @@ class DeviceBackend(Executor):
             n=n, c=cg, h=h, w=w, o=og, kh=kh, kw=kw, ho=ho, wo=wo,
             sh=sh, sw=sw, ph=ph, pw=pw, dh=dh, dw=dw, k=k,
         )
-        # auto 模式下能加载 cuDNN 就优先用它：同一形状下卷积本体比自研分块核
-        # 快数倍（5.69 的实测）。加载不到或这一步失败都回落到下面的自研路径。
-        if self._pick_cudnn(x.dtype, groups):
+        # auto 模式下规模够大才用 cuDNN：卷积本体比自研核快数倍（5.69），但
+        # 走框架要付描述符 / 算法查询 / 独立 bias 核的固定开销，1 GFLOP 以下
+        # 反而更慢（5.252 的同形状 A/B）。加载不到或这一步失败都回落到自研路径。
+        flops = 2.0 * n * o * ho * wo * k / 1e9
+        if self._pick_cudnn(x.dtype, groups, flops):
             fast = self._conv2d_cudnn(x, weight, bias, **dims)
             if fast is not None:
                 return fast
@@ -2314,20 +2320,35 @@ class DeviceBackend(Executor):
                           **_ignored) -> str:
         """在 tiled / implicit / im2col 之间选一个实现。
 
-        ``auto`` 只在分块直算的甜点区选 tiled，其余交给 im2col。隐式 GEMM
-        **不进 CUDA 的 auto**：5.151 在 M40 上做了 7 个形状的同形状 A/B（K 从
-        27 到 4608），K >= 288 的 6 个形状全部输给 im2col（cuBLAS 分块 GEMM），
-        慢 1.37×（K=288）到 2.32×（K=864）；唯一的例外是 K=27，那一档分块直算
-        本来就更快（1.69 ms vs 隐式 1.80 ms），轮不到隐式接管。它仍是显式
-        ``conv_impl="implicit"`` 的对照路径（数值与 im2col 一致，相对误差
-        ≤ 1.7e-6），但不该由"规模大"自动触发，否则等于用生产流量做实验。
+        ``auto`` 先看隐式 GEMM 的甜点区，再看分块直算，最后回落到 im2col。
+        隐式有两条互斥的入口：
 
-        HIP 的结论相反（5.238 实测：中等通道 3x3/5x5 上隐式比 im2col 快
-        1.33～1.63×，3x3_c128 快 1.33×），由子类的 ``CONV_AUTO_IMPLICIT``
-        打开。两条额外限制都来自实测：``kh*kw > 1``（1x1 没有窗口重叠，
-        implicit 反而慢 6%）、``k > CONV_TILED_MAX_K``（小 K 的分块直算仍更快）。
+        - ``CONV_AUTO_IMPLICIT_MID``（CUDA，5.252）：K 在 (32, 400] 的
+          3x3/5x5，且 im2col 的物化缓冲 ``n*ho*wo*K`` 不超过 3.2M 元素
+          （``plan.conv_implicit_preferred``）。A800 上这一档比 im2col 快
+          7～13%，与同形状的分块直算持平或略快；
+        - ``CONV_AUTO_IMPLICIT``（HIP，5.238）：K 超过分块阈值就交给隐式，
+          5.238 的 A/B 显示中等通道 3x3/5x5 快 1.33～1.63×。
+
+        CUDA 的旧结论（5.151，M40）是"隐式在 K >= 288 输给 im2col 1.37×"，
+        它只在物化缓冲超过 12.8 MB 或 K > 400 时成立，所以甜点区之外仍交给
+        im2col——隐式仍是显式 ``conv_impl="implicit"`` 的对照路径（数值与
+        im2col 一致，相对误差 ≤ 1.7e-6）。
+
+        两条入口都要过 ``kh*kw > 1``（1x1 没有窗口重叠，隐式反而慢 6%）、
+        ``k > CONV_TILED_MAX_K``（小 K 的分块直算仍更快）与 shared 预算。
         """
         if self.conv_impl == "implicit":
+            return "implicit"
+        if (
+            self.conv_impl == "auto"
+            and self.CONV_AUTO_IMPLICIT_MID
+            and conv_implicit_preferred(n=n, k=k, kh=kh, kw=kw, ho=ho, wo=wo)
+            and conv_implicit_fits(
+                kh=kh, kw=kw, c=c, o=o, wo=wo, sw=sw, dw=dw,
+                tile_w=self._conv_tile,
+            )
+        ):
             return "implicit"
         if (
             self.conv_impl == "auto"

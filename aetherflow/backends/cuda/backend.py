@@ -16,6 +16,7 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 import numpy as np
 
 from ...ir.graph import Node
+from ...lower.plan import CONV_CUDNN_MIN_GFLOPS
 from ..base import BackendCapabilityError
 from ..contracts import DeviceInfo
 from ..device_backend import DeviceBackend, GPU_OPS
@@ -49,6 +50,10 @@ class CudaBackend(DeviceBackend):
     _OPS = CUDA_OPS
     CONV_IMPLS = _CONV_IMPLS
     SPARSE_IMPLS = _SPARSE_IMPLS
+    # 中等 K 的 3x3/5x5 交给隐式 GEMM：A800 上比 im2col 快 7～13%（5.252）。
+    # 与 HIP 的整体开关不同，这里的甜点区有物化规模与 K 上界，具体判据在
+    # ``plan.conv_implicit_preferred``。
+    CONV_AUTO_IMPLICIT_MID = True
 
     def __init__(
         self,
@@ -329,11 +334,14 @@ class CudaBackend(DeviceBackend):
             return None
         return self._cudnn
 
-    def _pick_cudnn(self, dtype, groups: int) -> bool:
+    def _pick_cudnn(self, dtype, groups: int, flops: float = 0.0) -> bool:
         """这一层 conv 走不走 cuDNN。
 
         只覆盖 groups=1 的 f32/f16：分组卷积与 f64 仍走自研路径，不为此多开
         一条只在部分机器上验证过的分支。
+
+        auto 还要过规模门槛：1 GFLOP 以下 cuDNN 的固定开销（描述符、算法查询、
+        独立 bias 核）比省下的卷积时间更贵（5.252）。
         """
         if groups != 1:
             return False
@@ -350,6 +358,8 @@ class CudaBackend(DeviceBackend):
                 )
             return True
         if self.conv_impl != "auto" or not supported:
+            return False
+        if flops < CONV_CUDNN_MIN_GFLOPS:
             return False
         if self._capturing:
             # 捕获期内不换实现：cuDNN 的 algo 查询是 host API，在捕获里调用
