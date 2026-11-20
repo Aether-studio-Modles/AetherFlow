@@ -33,7 +33,7 @@ from .memory import Arena
 # 抛错（见 ``_register_kernels``），所以不存在"声明与实现分叉"的中间状态。
 CUDA_OPS: FrozenSet[str] = GPU_OPS
 
-_CONV_IMPLS = ("auto", "im2col", "tiled", "implicit", "cudnn", "grouped")
+_CONV_IMPLS = ("auto", "im2col", "tiled", "implicit", "winograd", "cudnn", "grouped")
 _SPARSE_IMPLS = ("custom", "auto", "cusparse")
 
 # fft / rfft 由 cuFFT 承接。它们不在 ``CUDA_OPS`` 里：那张表是"自研内核模板
