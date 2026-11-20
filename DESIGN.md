@@ -15318,8 +15318,15 @@ AetherFlow 是"全 NCHW、无布局传播"——IR 里根本没有 `layout` 这�
   `clamp_max_only`（缺省一侧的开关必须真的生效）、`mod_int_floor`（被除数有负值、
   模数正负混合且非零——只测正数发现不了截断取余的偏差）。
 - `verify_cuda.py` 加两条真机用例：`clamp_two_sided`、`mod_negative_floor`。
-- 本地全量 2205 个用例 / 414 跳过，全绿；确认渲染源码：f32 / f16 的 clamp 都读成
-  float 比较、写回 `af_st_f` / `af_st_h`；mod 为 `const int*` + `b[0]` 的标量路径。
+- 本地全量 2675 个用例 / 416 跳过，全绿；WSL HIP（RX 7650 GRE / ROCm 7.2）
+  2675 个用例 / 373 跳过，全绿，`clamp` / `mod` 的 conformance 实测
+  `err=0.0e+00`。确认渲染源码：f32 / f16 的 clamp 都读成 float 比较、写回
+  `af_st_f` / `af_st_h`；mod 为 `const int*` + `b[0]` 的标量路径。
+- 真机抓到一个本地看不见的缺陷：`_mod_kernel` 渲染时把 `np.float32`（类）当
+  dtype 传进 `codegen.render`，`_dtype_key` 按 `.name` 取类型，于是直接抛
+  "只支持 f32/f16"（此前 REMIND 还把它当成正确写法记过一条）。改成
+  `np.dtype("float32")` 后通过。整数内核的 dtype 参数只为拿同一份 prelude，
+  类型由 `type_name="int"` 钉死。
 - IR 算子总数 65 → 67；设备端承接数 62 → 64；VJP 规则 46 → 47（`mod` 是整数，
   没有梯度，刻意不注册规则）；f16 覆盖 59 → 60（64 个设备算子里去掉 3 个 int8
   语义算子与整数 `mod`）。

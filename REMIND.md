@@ -135,11 +135,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   逐个恢复，再在其上继续编辑，不要重写整份文件。
 - 代码与文档（DESIGN / 本文件 / README）分开提交。
 - PowerShell 5.1 不支持 `&&` 与 heredoc：用 `;` 串联，`git commit` 用多个 `-m`。
-- **整数内核渲染**：`render(kernel, dtype)` 的 `_dtype_key` 只认 `f32` / `f16`，
-  传 int32（即使是 `np.int32`）会直接抛 `ValueError`。整数内核（如 `mod`）渲染时
-  固定传 `np.float32`，目的只是拿同一份 prelude——类型由 `Tensor(type_name="int")`
-  钉死，与传入的 dtype 无关。另注意 `grid_stride(limit, *body)` 是可变参数，
-  多个语句要平铺传入，不能包成一个列表（否则只渲染成一句、其余静默丢失）。
+- **整数内核渲染**：`render(kernel, dtype)` 的 `_dtype_key` 按 `dtype.name` 取
+  `f32` / `f16`，所以必须传 `np.dtype` 实例。传 `np.float32`（类）或 `DType`
+  枚举都会被拒（分别报"收到 `<class 'numpy.float32'>`"与"收到 `F32`"）；整数
+  内核（如 `mod`）的类型由 `Tensor(type_name="int")` 钉死，dtype 只为拿同一份
+  prelude。这个错误在参考后端的路径上不会触发，只有 HIP 真机跑 conformance
+  才暴露，与 5.247 的 `grid_stride` 属同一类"渲染期才炸"的问题。
 - **`mod` 必须做 floor 修正**：C 的 `%` 与 Python `%` / `torch.remainder` 在被除数
   为负时结果不同（C 是截断语义）。设备端在 `r = x % y` 之后必须补
   `r != 0 && (r < 0) != (y < 0) ⇒ r += y`，否则负槽位哈希会与参考实现分叉。
