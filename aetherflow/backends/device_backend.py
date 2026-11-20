@@ -1586,7 +1586,10 @@ class DeviceBackend(Executor):
             ("mod", mode),
             lambda: self.codegen.render(
                 self.codegen.mod_source(scalar_a=mode == 1, scalar_b=mode == 2),
-                np.float32,
+                # 整数内核把参数类型钉死成 int，dtype 只为拿到方言 prelude；
+                # 必须传 np.dtype 实例（codegen 按 ``.name`` 取 f32 / f16），
+                # 传 DType 枚举或 ``np.float32`` 类都会被拒绝。
+                np.dtype("float32"),
             ),
             "ew_mod",
         )
