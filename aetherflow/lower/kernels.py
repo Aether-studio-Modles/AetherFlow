@@ -4173,57 +4173,6 @@ def _tiled_accumulate() -> tuple:
     )
 
 
-def _tiled_store(dst: str = "dst", acc: Expr | None = None) -> tuple:
-    """写回一个线程的 ``ROC`` 个输出通道：``dst[j*HO*WO] = acc[j] + bias``。
-
-    ``conv2d_tiled`` 与隐式核（``tw == 1``）逐字共用同一条写回；``tw > 1``
-    时调用方给出第二个位置的目标指针与累加器索引，形状完全一样。
-    """
-    if acc is None:
-        acc = Var("j")
-    return (
-        For(
-            "j",
-            Num("0"),
-            Var("ROC"),
-            Num("1"),
-            (
-                If(
-                    Bin("<", Bin("+", Var("oc"), Var("j")), Var("O")),
-                    (
-                        Assign(
-                            Index(
-                                dst,
-                                Bin(
-                                    "*",
-                                    Cast("long long", Var("j")),
-                                    Bin("*", Var("HO"), Var("WO")),
-                                ),
-                            ),
-                            Bin(
-                                "+",
-                                Index("acc", acc),
-                                Paren(
-                                    Cond(
-                                        Var("has_bias"),
-                                        Index(
-                                            "b",
-                                            Bin("+", Var("oc"), Var("j")),
-                                        ),
-                                        Num("0.f"),
-                                    )
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-            incr="++",
-            type_name="int",
-        ),
-    )
-
-
 def conv2d_tiled() -> Kernel:
     """直接分块卷积（NCHW，互相关）：不物化列矩阵的那条路径。
 
@@ -4761,7 +4710,45 @@ def conv2d_tiled() -> Kernel:
                     ),
                 ),
             ),
-            *_tiled_store("dst", Var("j")),
+            For(
+                "j",
+                Num("0"),
+                Var("ROC"),
+                Num("1"),
+                (
+                    If(
+                        Bin("<", Bin("+", Var("oc"), Var("j")), Var("O")),
+                        (
+                            Assign(
+                                Index(
+                                    "dst",
+                                    Bin(
+                                        "*",
+                                        Cast("long long", Var("j")),
+                                        Bin("*", Var("HO"), Var("WO")),
+                                    ),
+                                ),
+                                Bin(
+                                    "+",
+                                    Index("acc", Var("j")),
+                                    Paren(
+                                        Cond(
+                                            Var("has_bias"),
+                                            Index(
+                                                "b",
+                                                Bin("+", Var("oc"), Var("j")),
+                                            ),
+                                            Num("0.f"),
+                                        )
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                incr="++",
+                type_name="int",
+            ),
         ),
     )
 
@@ -5005,7 +4992,7 @@ def conv2d_grouped() -> Kernel:
     )
 
 
-def conv2d_implicit(tw: int = 1) -> Kernel:
+def conv2d_implicit() -> Kernel:
     """隐式 GEMM 卷积：输入窗口与权重一起进 shared，累加阶段不再读全局。
 
     与 ``conv2d_tiled`` 只有两处不同：
@@ -5017,138 +5004,9 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
     2. 边界不在累加里逐点判断，而是在 staging 时把越界位置填 0。内层循环
        因此没有 ``if``——K 大时这几百次分支本身也是成本。
 
-    ``tw``（5.254）是**每个线程算几个空间位置**，在 Python 层展开：一个
-    block 覆盖 ``tw * tile_w`` 个输出列，线程 ``tx`` 负责列 ``tx`` 与
-    ``tx + nx``。两列相隔一个 tile 宽而不是相邻，是为了让两条写指令各自
-    地址连续——相邻列会让每条写指令的步长变成 2，合并访存失效。内层对
-    同一个 ``(c, ki, kj)`` 的权重读一次、乘 ``tw`` 次，算术强度翻倍。
-
-    两条路径共用 ``_tiled_weight``；``tw == 1`` 时累加仍走
-    ``_tiled_accumulate``，生成的源码与 5.254 之前逐字相同（除了索引里
-    多一个 ``*1`` 的常量乘法）。
-
-    全程 ``float`` 计算：这个内核不做 dtype 参数化，f16 走 im2col + GEMM。
+    两条路径共用 ``_tiled_weight`` / ``_tiled_accumulate``，累加顺序完全一致，
+    所以换实现不改变浮点结果（同一批乘加按同一顺序累加）。
     """
-    if tw not in (1, 2):
-        raise ValueError(f"tw 只支持 1 或 2，收到 {tw}")
-    # 一个 block 覆盖的列数；``wo`` 与 ``iw_base`` 都从它派生。
-    block_cols = Bin("*", Var("nx"), Num(str(tw)))
-    # 累加器个数：``tw * ROC``。``tw == 1`` 时保持原表达式，源码不出现多余的
-    # ``*1``。
-    acc_count = Var("ROC") if tw == 1 else Bin("*", Var("ROC"), Num(str(tw)))
-
-    def acc_index(p: int) -> Expr:
-        """第 ``p`` 个位置的累加器下标：``p * ROC + j``（p=0 时就是 ``j``）。"""
-        if p == 0:
-            return Var("j")
-        return Bin("+", Bin("*", Var("ROC"), Num(str(p))), Var("j"))
-
-    # 第 0 个位置在窗口里的起点：``sx + ((cc * KH + ki) * SPAN) + tid * SW``。
-    window_row = Bin(
-        "+",
-        Bin(
-            "+",
-            Var("sx"),
-            Bin(
-                "*",
-                Paren(Bin("+", Bin("*", Var("cc"), Var("KH")), Var("ki"))),
-                Var("SPAN"),
-            ),
-        ),
-        Bin("*", Axis("tid"), Var("SW")),
-    )
-
-    def window_rows() -> tuple:
-        """各位置的行指针：位置 1 比位置 0 远 ``nx * SW`` 列（相隔一个 tile）。
-
-        相隔一个 tile 宽、而不是相邻一列，是为了让两个位置的窗口起点都保持
-        ``tid`` 连续——累加时同一 warp 读 shared 的地址仍然连续，写回时两条
-        写指令各自的地址步长也仍然连续（相邻列会让步长变成 2，合并失效）。
-        """
-        rows = []
-        for p in range(tw):
-            name = "sr" if tw == 1 else f"sr{p}"
-            base = window_row
-            if p:
-                base = Bin(
-                    "+",
-                    window_row,
-                    Bin("*", Num(str(p)), Bin("*", Var("nx"), Var("SW"))),
-                )
-            rows.append(Let("const float*", name, base))
-        return tuple(rows)
-
-    def accumulate() -> tuple:
-        """``kj`` 的累加体：权重读一次，喂 ``tw`` 个位置。
-
-        ``tw == 1`` 时逐字复用 :func:`_tiled_accumulate`——单位置的源码不需要
-        变，避免把 5.16 调好的那条路径一起改掉。
-        """
-        if tw == 1:
-            value = Let(
-                "const float", "v", Index("sr", Bin("*", Var("kj"), Var("DW")))
-            )
-            return (value,) + _tiled_accumulate()
-        values = tuple(
-            Let(
-                "const float",
-                f"v{p}",
-                Index(f"sr{p}", Bin("*", Var("kj"), Var("DW"))),
-            )
-            for p in range(tw)
-        )
-        weight = Let(
-            "const float",
-            "wv",
-            Index(
-                "wb",
-                Bin(
-                    "+",
-                    Bin(
-                        "+",
-                        Var("off"),
-                        Bin("*", Bin("*", Var("j"), Var("cb")), Var("khkw")),
-                    ),
-                    Var("kj"),
-                ),
-            ),
-        )
-        updates = tuple(
-            AugAssign(Index("acc", acc_index(p)), "+", Bin("*", Var(f"v{p}"), Var("wv")))
-            for p in range(tw)
-        )
-        return values + (
-            For(
-                "j",
-                Num("0"),
-                Var("ROC"),
-                Num("1"),
-                (weight,) + updates,
-                incr="++",
-                type_name="int",
-            ),
-        )
-
-    def stores() -> tuple:
-        """位置 1 及以后的写回：起点 ``dst + nx``，同一 warp 内 ``tid`` 连续。
-
-        相隔一个 tile 宽而不是相邻一列，这条写才仍然是合并的；相邻列会让
-        步长变成 2，合并失效。越过 ``WO`` 的那一段整段挡掉。
-        """
-        result: tuple = ()
-        for p in range(1, tw):
-            name = f"dst{p}"
-            offset = Bin("*", Num(str(p)), Var("nx"))
-            result += (
-                Let("float*", name, Bin("+", Var("dst"), offset)),
-                If(
-                    Bin("<", Bin("+", Var("wo"), offset), Var("WO")),
-                    _tiled_store(name, acc_index(p)),
-                ),
-            )
-        return result
-
-
     # 输入窗口里第 j 列的全局列号：iw_base + j
     window_iw = Bin("+", Var("iw_base"), Var("j"))
     # 该列的全局行号：ih0 + ki * DH
@@ -5243,7 +5101,7 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
             Let(
                 "const int",
                 "wo",
-                Bin("+", Bin("*", Axis("bid"), block_cols), Axis("tid")),
+                Bin("+", Bin("*", Axis("bid"), Var("nx")), Axis("tid")),
             ),
             Let(
                 "const int",
@@ -5269,7 +5127,7 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
                 "iw_base",
                 Bin(
                     "-",
-                    Bin("*", Bin("*", Axis("bid"), block_cols), Var("SW")),
+                    Bin("*", Bin("*", Axis("bid"), Var("nx")), Var("SW")),
                     Var("PW"),
                 ),
             ),
@@ -5300,7 +5158,7 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
             For(
                 "j",
                 Num("0"),
-                acc_count,
+                Var("ROC"),
                 Num("1"),
                 (Assign(Index("acc", Var("j")), Num("0.f")),),
                 incr="++",
@@ -5400,8 +5258,34 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
                                 Num("0"),
                                 Var("KH"),
                                 Num("1"),
-                                window_rows()
-                                + (
+                                (
+                                    Let(
+                                        "const float*",
+                                        "sr",
+                                        Bin(
+                                            "+",
+                                            Bin(
+                                                "+",
+                                                Var("sx"),
+                                                Bin(
+                                                    "*",
+                                                    Paren(
+                                                        Bin(
+                                                            "+",
+                                                            Bin(
+                                                                "*",
+                                                                Var("cc"),
+                                                                Var("KH"),
+                                                            ),
+                                                            Var("ki"),
+                                                        )
+                                                    ),
+                                                    Var("SPAN"),
+                                                ),
+                                            ),
+                                            Bin("*", Axis("tid"), Var("SW")),
+                                        ),
+                                    ),
                                     Let(
                                         "const int",
                                         "off",
@@ -5428,7 +5312,17 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
                                         Num("0"),
                                         Var("KW"),
                                         Num("1"),
-                                        accumulate(),
+                                        (
+                                            Let(
+                                                "const float",
+                                                "v",
+                                                Index(
+                                                    "sr",
+                                                    Bin("*", Var("kj"), Var("DW")),
+                                                ),
+                                            ),
+                                        )
+                                        + _tiled_accumulate(),
                                         incr="++",
                                         type_name="int",
                                     ),
@@ -5471,8 +5365,45 @@ def conv2d_implicit(tw: int = 1) -> Kernel:
                     ),
                 ),
             ),
-            *_tiled_store("dst", Var("j")),
-            *stores(),
+            For(
+                "j",
+                Num("0"),
+                Var("ROC"),
+                Num("1"),
+                (
+                    If(
+                        Bin("<", Bin("+", Var("oc"), Var("j")), Var("O")),
+                        (
+                            Assign(
+                                Index(
+                                    "dst",
+                                    Bin(
+                                        "*",
+                                        Cast("long long", Var("j")),
+                                        Bin("*", Var("HO"), Var("WO")),
+                                    ),
+                                ),
+                                Bin(
+                                    "+",
+                                    Index("acc", Var("j")),
+                                    Paren(
+                                        Cond(
+                                            Var("has_bias"),
+                                            Index(
+                                                "b",
+                                                Bin("+", Var("oc"), Var("j")),
+                                            ),
+                                            Num("0.f"),
+                                        )
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                incr="++",
+                type_name="int",
+            ),
         ),
     )
 

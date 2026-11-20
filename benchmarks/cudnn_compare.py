@@ -299,10 +299,8 @@ def measure(fn: Callable[[], None], sync, warmup: int, repeat: int,
     }
 
 
-def run_aetherflow(impl: str, stages, rounds: int, *, tw: bool = True):
+def run_aetherflow(impl: str, stages, rounds: int):
     backend = CudaBackend(conv_impl=impl)
-    # 5.254 的对照开关：False 生成单位置隐式核（5.254 之前的内核）。
-    backend.CONV_IMPLICIT_TW = tw
     import cupy as cp
 
     sync = cp.cuda.get_current_stream().synchronize
@@ -354,10 +352,6 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         "--single", action="store_true",
         help="报单次延迟而不是稳态（单次含 0.08 ms 级固定开销，见 5.253）",
     )
-    parser.add_argument(
-        "--implicit", action="store_true",
-        help="加测隐式核的 TW=1/2 对照（5.254 的空间寄存器分块）",
-    )
     args = parser.parse_args(argv)
     key = "median_ms" if args.single else "burst_ms"
 
@@ -394,32 +388,6 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             f"{name:10s} {t:8.4f} {i:8.4f} {c:8.4f}"
             f" {t / c:11.2f}x {i / c:12.2f}x {cols:8.2f}"
         )
-
-    if args.implicit:
-        # 隐式核的两份源码：tw=2 让一个线程算两个空间位置（5.254），
-        # tw=1 是 5.254 之前的单位置内核。同一形状、同一份数据。
-        tw2_ms, tw2_backend = run_aetherflow("implicit", SHAPES, args.rounds)
-        tw1_ms, tw1_backend = run_aetherflow(
-            "implicit", SHAPES, args.rounds, tw=False
-        )
-        for name, x_shape, w_shape, pad in SHAPES:
-            g, feed = build(x_shape, w_shape, pad)
-            ref = cudnn_out[name]
-            for impl, backend in (
-                ("implicit/tw2", tw2_backend),
-                ("implicit/tw1", tw1_backend),
-            ):
-                got = backend.execute(g, feed)["y"]
-                np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-4)
-        print(f"\n隐式核的空间寄存器分块（{key}，ms）")
-        print(f"{'shape':10s} {'tw2':>8s} {'tw1':>8s} {'tw1/tw2':>9s} {'tw2/cuDNN':>11s}")
-        for name, x_shape, w_shape, pad in SHAPES:
-            a = tw2_ms[name][key]
-            b = tw1_ms[name][key]
-            c = cudnn_ms[name][key]
-            print(
-                f"{name:10s} {a:8.4f} {b:8.4f} {b / a:8.2f}x {a / c:10.2f}x"
-            )
     return 0
 
 

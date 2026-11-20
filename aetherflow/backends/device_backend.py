@@ -54,7 +54,6 @@ from ..lower.plan import (
     conv_oc_tile,
     conv_implicit_fits,
     conv_implicit_preferred,
-    conv_implicit_tw,
     conv_tiled_preferred,
     grid_for,
     plan_conv_implicit,
@@ -469,9 +468,6 @@ class DeviceBackend(Executor):
     # auto 是否允许在中等 K 的甜点区改走隐式 GEMM（判据见 plan.conv_implicit_preferred）。
     # 默认 False：这份阈值是 A800 上 16 个形状测出来的，只有 CUDA 覆盖成 True。
     CONV_AUTO_IMPLICIT_MID = False
-    # 隐式核是否允许每个线程算两个空间位置（5.254）。关掉它就是 5.254 之前
-    # 的单位置内核——形状判据与性能对照都靠这个开关，回退不需要改代码。
-    CONV_IMPLICIT_TW = True
     # sparse_linear 的实现选择。子类可以扩展（CUDA 多一个 "cusparse"）。
     SPARSE_IMPLS: Tuple[str, ...] = _SPARSE_IMPLS
 
@@ -2378,48 +2374,24 @@ class DeviceBackend(Executor):
         来自 ``plan.plan_conv_implicit``：它把权重与输入窗口两块预算一起算，
         只按权重挑 ``toc`` 会在宽核上把 shared 撑爆。
 
-        ``tw``（5.254）让一个线程算两个空间位置，权重的算术强度翻倍。它是
-        **编译期**常量（源码按它展开），所以内核缓存键要带上；形状判据在
-        ``plan.conv_implicit_tw``。加倍会把窗口撑大一倍，若因此把 ``toc``
-        挤小一档就退回单位置——少一档 OC tile 意味着多一轮 staging，通常
-        吃掉了加倍带来的收益。
-
         ``bias`` 的处理与分块核一致：传一个有效指针占位，由 ``has_bias`` 决定
         是否读它，写回时就地累加。
         """
         cp = self.cp
-        tw = (
-            conv_implicit_tw(
-                kh=kh, kw=kw, k=k, wo=wo, tile_w=self._conv_tile
-            )
-            if self.CONV_IMPLICIT_TW
-            else 1
-        )
         tiling = plan_conv_implicit(
             kh=kh, kw=kw, c=c, o=o, wo=wo, sw=sw, dw=dw,
             tile_w=self._conv_tile, roc=self._conv_roc, cb=self._conv_cb,
-            tw=tw,
         )
-        if tw > 1:
-            single = plan_conv_implicit(
-                kh=kh, kw=kw, c=c, o=o, wo=wo, sw=sw, dw=dw,
-                tile_w=self._conv_tile, roc=self._conv_roc, cb=self._conv_cb,
-            )
-            if single.toc > tiling.toc:
-                tw = 1
-                tiling = single
 
         out = cp.empty((n, o, ho, wo), dtype=x.dtype)
         kernel = self._kernel(
-            ("conv2d_implicit", self._kind(x), tw),
-            lambda: self.codegen.render(
-                self.codegen.conv2d_implicit_source(tw), x.dtype
-            ),
+            ("conv2d_implicit", self._kind(x)),
+            lambda: self.codegen.render(self.codegen.conv2d_implicit_source(), x.dtype),
             "conv2d_implicit",
         )
         bp = x if bias is None else self._contig(bias)
         kernel(
-            (cdiv(wo, tiling.tile_w * tiling.tw), ho, n * tiling.oc_tiles),
+            (cdiv(wo, tiling.tile_w), ho, n * tiling.oc_tiles),
             tiling.block,
             (
                 x, weight, out, bp,

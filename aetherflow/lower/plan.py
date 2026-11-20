@@ -69,7 +69,6 @@ __all__ = [
     "conv_oc_tile",
     "conv_implicit_oc_tile",
     "conv_implicit_fits",
-    "conv_implicit_tw",
     "plan_conv_tiled",
     "plan_conv_implicit",
     "conv_tiled_preferred",
@@ -229,14 +228,9 @@ class ConvTilePlan:
     cb: int
     oc_tiles: int
     shared_bytes: int
-    # 输入窗口宽度（隐式 GEMM 用）：
-    # ``tw * tile_w * stride_w + (kw - 1) * dilation_w``。
+    # 输入窗口宽度（隐式 GEMM 用）：``tile_w * stride_w + (kw - 1) * dilation_w``。
     # 分块直算不暂存输入，因此是 0——它在这里只是让两条路径共用同一个返回类型。
     span: int = 0
-    # 每个线程算几个空间位置（隐式 GEMM 用，5.254）：一个 block 覆盖
-    # ``tw * tile_w`` 个输出列，线程 ``tx`` 负责列 ``tx`` 与 ``tx + nx``。
-    # 分块直算恒为 1（它的相邻线程已经覆盖相邻列，再加一份只会翻倍寄存器）。
-    tw: int = 1
 
     @property
     def block(self) -> Tuple[int, int]:
@@ -506,37 +500,6 @@ def conv_implicit_oc_tile(kh: int, kw: int, o: int, span: int) -> Optional[int]:
     return None
 
 
-def conv_implicit_tw(*, kh: int, kw: int, k: int, wo: int,
-                     tile_w: Optional[int] = None) -> int:
-    """隐式 GEMM 每个线程算几个空间位置（5.254）：1 或 2。
-
-    位置数加倍换来的是**权重复用**：同一个 ``(c, ki, kj)`` 的权重现在喂
-    ``2 * roc`` 个累加器，算术强度翻倍。代价是 ``acc`` 从 ``roc`` 个涨到
-    ``2 * roc`` 个寄存器，以及窗口 staging 从 ``tile_w`` 列扩到
-    ``2 * tile_w`` 列——shared 预算会跟着变紧，``plan_conv_implicit`` 可能
-    因此把 ``toc`` 调小。
-
-    三个前提缺一不可：
-
-    - ``kh * kw > 1``：1x1 的权重本来只服务一个位置，复用它只是把写回多切
-      一段（5.252 已测到 1x1 走隐式本来慢 6%，再翻倍只会更差）；
-    - ``k > CONV_TILED_MAX_K``：K 小的时候分块直算才是主人，隐式只在显式
-      指定时跑，没必要为它承担双份寄存器；
-    - ``wo > tile_w``：输出宽度不足两个 tile 时第二个位置整段越界，线程白占
-      驻留槽、写回全被条件挡掉。
-
-    返回 2 只在 ``2 * CONV_ROC_MAX <= 8``（``acc`` 的定长上限）时成立。
-    """
-    if 2 * CONV_ROC_MAX > 8:
-        return 1
-    if kh * kw <= 1 or k <= CONV_TILED_MAX_K or wo <= 0:
-        return 1
-    width = CONV_TILE_W if tile_w is None else tile_w
-    if width <= 0:
-        return 1
-    return 2 if wo > width else 1
-
-
 def conv_implicit_fits(
     *,
     kh: int,
@@ -547,7 +510,6 @@ def conv_implicit_fits(
     sw: int,
     dw: int,
     tile_w: Optional[int] = None,
-    tw: int = 1,
 ) -> bool:
     """这个形状能不能被隐式 GEMM 接住（shared 预算与 block 上限一起判）。
 
@@ -559,10 +521,10 @@ def conv_implicit_fits(
         return False
     if tile_w is None:
         tile_w = CONV_TILE_W
-    if tile_w <= 0 or tw <= 0:
+    if tile_w <= 0:
         return False
     tile_w = min(tile_w, wo)
-    span = tw * tile_w * sw + (kw - 1) * dw
+    span = tile_w * sw + (kw - 1) * dw
     toc = conv_implicit_oc_tile(kh, kw, o, span)
     if toc is None:
         return False
@@ -672,23 +634,17 @@ def plan_conv_implicit(
     tile_w: Optional[int] = None,
     roc: Optional[int] = None,
     cb: Optional[int] = None,
-    tw: Optional[int] = None,
 ) -> ConvTilePlan:
     """隐式 GEMM 卷积的线程铺法：权重与输入窗口都进 shared。
 
     与 :func:`plan_conv_tiled` 的区别只有 shared 预算的算法：这里每个输入通道
     还要多放 ``kh * span`` 个 float，其中
-    ``span = tw * tile_w * stride_w + (kw - 1) * dilation_w`` 是一个 block
-    覆盖的输入列数。因此选 ``toc`` 时必须把两块一起算——只按权重挑会在宽核上
-    把 shared 撑爆。
+    ``span = tile_w * stride_w + (kw - 1) * dilation_w`` 是一个 block 覆盖的
+    输入列数。因此选 ``toc`` 时必须把两块一起算——只按权重挑会在宽核上把
+    shared 撑爆。
 
-    ``span`` 随 ``tile_w`` 与 ``tw`` 变化，而两者都可以在调优时被覆盖，所以
-    这里返回的计划把它们一起算好，内核与 launch 都不再自己推导。
-
-    ``tw``（每个线程几个空间位置，5.254）不占线程数：block 的 x 维仍是
-    ``tile_w``，一个 block 覆盖 ``tw * tile_w`` 个输出列，因此调用方的
-    ``grid.x`` 要按 ``tw * tile_w`` 算。它为 ``None`` 时取 1——是否加倍是
-    调用方的判断（``conv_implicit_tw`` 只回答"形状适合不适合"）。
+    ``span`` 随 ``tile_w`` 变化，而 ``tile_w`` 可以在调优时被覆盖，所以这里
+    返回的计划把它一起算好，内核不再自己推导。
     """
     if min(kh, kw, c, o, wo, sw, dw) <= 0:
         raise ValueError(
@@ -700,11 +656,7 @@ def plan_conv_implicit(
     else:
         tile_w = _positive(tile_w, "tile_w")
     tile_w = min(tile_w, wo)
-    if tw is None:
-        tw = 1
-    else:
-        tw = _positive(tw, "tw")
-    span = tw * tile_w * sw + (kw - 1) * dw
+    span = tile_w * sw + (kw - 1) * dw
     khkw = kh * kw
     input_bytes = kh * span * 4
 
@@ -755,7 +707,6 @@ def plan_conv_implicit(
         oc_tiles=cdiv(o, toc),
         shared_bytes=per_cb * cb,
         span=span,
-        tw=tw,
     )
 
 
