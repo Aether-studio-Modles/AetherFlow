@@ -15515,10 +15515,45 @@ JSON 里记录 `device_outputs`，`check_regression` 发现基线与当前口径
 与两个 4 MB 输入的 H2D 吻合（实测 8 MB / 0.9 ms ≈ 9 GB/s）。也就是说：
 **这台云主机的 PCIe 带宽才是当前最大的固定成本**，不是内核，也不是调度。
 
-**图重放在 A800 上没有收益**：同一批用例 `--graph-mode auto` 与 `off` 的
-设备侧中位数差 <5%（matmul_1024 1.163 vs 1.156，transformer_block 1.738 vs
-1.661，maxpool 2.482 vs 2.486）。WSL 上 7× 的收益来自那台机器更贵的逐节点
-launch，不能推广成"图重放总是更快"；默认保持 `off` 是对的。
+**图重放：对多节点图仍然是 3～6 倍，单节点图无收益**
+
+第一版的 `execute_device` 故意绕过了图捕获，于是"设备侧 + auto"测到的完全是
+逐节点 Python 开销——这不是流水线的真实吞吐。补齐之后（`execute_device` 现在
+与 `execute` 共用同一份捕获计划），A800 上同一批用例（设备侧，ms）：
+
+| 用例 | 逐节点 | 捕获重放 | 倍数 |
+| --- | --- | --- | --- |
+| transformer_block | 1.661 | 0.404 | 4.1× |
+| transformer_block_resident | 1.288 | 0.216 | 6.0× |
+| cnn_lenet | 0.801 | 0.239 | 3.4× |
+| cnn_lenet_resident | 0.592 | 0.135 | 4.4× |
+
+端到端口径一致（transformer_block 1.764 → 0.437，cnn_lenet 0.850 → 0.270）。
+单节点图（`matmul_*`、`conv2d_*`、`maxpool`）没有可省的东西：它们的成本是
+输入 H2D 与一次内核，捕获前后差 <5%。所以默认仍保持 `graph_mode="off"`，
+需要吞吐的路径显式打开。
+
+两条边界必须说清：
+
+- 捕获计划返回的是**计划持有的输出缓冲**，下一次 replay 会覆盖它。设备侧
+  流水线要么当场消费，要么自己 `copy()`。
+- `conv_impl="cudnn"` 与捕获互斥：algo 查询是 host API，捕获期不允许。显式
+  指定 cudnn 时捕获整图回落逐节点；`conv_impl="auto"` 在捕获期自动改走
+  tiled，所以 auto + auto 才是"捕获可用"的组合。
+
+**cuDNN 的 f32 卷积默认会掉到 TF32（已修）**
+
+在 A800 上按形状扫了一遍 cuDNN 快路径与参考语义的差：`c_in=3` 时 1e-6，
+`c_in=8/64/128` 时到 **5e-3**。这不是实现差异——cuDNN 在 Ampere 之后默认
+允许卷积走 TF32（10 位尾数）。多通道卷积正好是这条默认最容易命中的形状，
+而一致性套件里没有这么宽的单层卷积，所以一直没暴露。
+
+修法是在描述符上锁死 `CUDNN_FMA_MATH`（只允许 FP32 FMA 算法），f16 不动。
+修后同一组形状的最大绝对误差回到 1e-6～9e-6（纯累加顺序差），回归用例见
+`TestCudaConvCudnn.test_wide_channels_keep_f32_precision`。
+
+⚠️ 对外做 cuDNN 对照（`benchmarks/cudnn_compare.py`）时仍要
+`NVIDIA_TF32_OVERRIDE=0`：对照脚本直接调库，不受本项目的数学类型约束。
 
 **对 5.249 / 5.250 的修正**
 

@@ -123,8 +123,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
   `--device-outputs`；两种口径的数字不能互相比较（见 DESIGN 5.251）。
-  `graph_mode="auto"` 只在逐节点 launch 很贵时有效：HIP 上 Transformer block
-  5.9 → 0.83 ms，A800 上同一批用例与 `off` 差 <5%（见 DESIGN 5.251）。
+  `graph_mode="auto"` 收益取决于逐节点开销：HIP 上 Transformer block
+  5.9 → 0.83 ms，A800 设备侧多节点图 3.4～6.0×（1.66 → 0.40 ms），
+  单节点图无收益。显式 `conv_impl="cudnn"` 时整图无法捕获（algo 查询是
+  host API），`auto` 会在捕获期自动改走 tiled。
 
 ### 兼容性策略
 
