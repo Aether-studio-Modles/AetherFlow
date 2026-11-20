@@ -116,13 +116,15 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   无 `bool` 常量、无 `arange`、`padding_idx` / `sparse` / `scale_grad_by_freq`
   显式拒绝。
 - **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_mask` 只有
-  参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积自研内核比 cuDNN / MIOpen
-  慢 4～37× 是**旧口径**（每轮混入了 D2H），需按 DESIGN 5.251 重测后才能引用。
+  参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积是当前最大的性能差距：
+  设备侧口径下（A800 / cuDNN 9.1 / TF32 关闭）分块直算比 cuDNN 慢 2.3～14.7×、
+  im2col 慢 3.1～6.5×（见 DESIGN 5.251）。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
   `--device-outputs`；两种口径的数字不能互相比较（见 DESIGN 5.251）。
-  `graph_mode="auto"` 对多节点图仍有效：HIP 上 Transformer block 5.9 → 0.83 ms。
+  `graph_mode="auto"` 只在逐节点 launch 很贵时有效：HIP 上 Transformer block
+  5.9 → 0.83 ms，A800 上同一批用例与 `off` 差 <5%（见 DESIGN 5.251）。
 
 ### 兼容性策略
 
