@@ -54,6 +54,10 @@ class CudaBackend(DeviceBackend):
     # 与 HIP 的整体开关不同，这里的甜点区有物化规模与 K 上界，具体判据在
     # ``plan.conv_implicit_preferred``。
     CONV_AUTO_IMPLICIT_MID = True
+    # 3x3/stride1/dilation1 且 K 超过分块阈值时改走 Winograd：A800 上
+    # 0.133～0.136 ms，同形状 im2col 0.16～0.31 ms（5.255）。判据在
+    # ``plan.conv_winograd_preferred``。
+    CONV_AUTO_WINOGRAD = True
 
     def __init__(
         self,

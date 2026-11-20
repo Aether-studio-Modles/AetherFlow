@@ -74,6 +74,7 @@ __all__ = [
     "conv_tiled_preferred",
     "conv_implicit_preferred",
     "conv_winograd_supported",
+    "conv_winograd_preferred",
     "scan_auto_chunk",
     "scan_last_auto_chunk",
     "scan_chunk",
@@ -471,6 +472,28 @@ def conv_winograd_supported(
     不静默改写用户的 ``conv_impl``。
     """
     return kh == 3 and kw == 3 and sh == 1 and sw == 1 and dh == 1 and dw == 1
+
+
+def conv_winograd_preferred(*, k: int, kh: int, kw: int, sw: int, dw: int,
+                            work: int) -> bool:
+    """auto 模式下 3x3 是否该交给 Winograd（A800 实测，5.255）。
+
+    门槛与分块核共用：``k <= CONV_TILED_MAX_K`` 的分块直算在 3x3_c3 上
+    仍然更快（0.077 ms 对 0.133 ms），所以不抢；``work`` 太小的一次
+    staging 同样不值得付出三次变换的固定开销。
+
+    实测（A800 稳态，f32，NCHW）：3x3_c8/c16/c24/c32/c64/c128 上 Winograd
+    0.133～0.136 ms，im2col 0.16～0.31 ms；3x3_c3（K=27）分块 0.077 ms
+    仍然最快。K 越大优势越大，因为乘法从 ``9*K`` 降到 ``16*K/4 = 4*K``。
+    """
+    return (
+        kh == 3
+        and kw == 3
+        and sw == 1
+        and dw == 1
+        and k > CONV_TILED_MAX_K
+        and work >= CONV_TILED_MIN_WORK
+    )
 
 
 def conv_implicit_preferred(*, n: int, k: int, kh: int, kw: int,

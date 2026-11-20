@@ -140,6 +140,50 @@ class TestAutoConvImplPick(unittest.TestCase):
         self.assertFalse(DeviceBackend.CONV_AUTO_IMPLICIT_MID)
         self.assertTrue(CudaBackend.CONV_AUTO_IMPLICIT_MID)
         self.assertFalse(HipBackend.CONV_AUTO_IMPLICIT_MID)
+        self.assertFalse(DeviceBackend.CONV_AUTO_WINOGRAD)
+        self.assertTrue(CudaBackend.CONV_AUTO_WINOGRAD)
+        self.assertFalse(HipBackend.CONV_AUTO_WINOGRAD)
+
+    def test_cuda_auto_picks_winograd_for_3x3(self):
+        """3x3 且 K > 32 交给 Winograd（5.255）；K <= 32 仍留给分块直算。"""
+        backend = self._backend(CudaBackend)
+        cases = (
+            dict(n=4, o=32, k=8 * 9, kh=3, kw=3, ho=64, wo=64, c=8),
+            dict(n=4, o=32, k=16 * 9, kh=3, kw=3, ho=64, wo=64, c=16),
+            dict(n=4, o=64, k=64 * 9, kh=3, kw=3, ho=56, wo=56, c=64),
+            dict(n=2, o=128, k=128 * 9, kh=3, kw=3, ho=28, wo=28, c=128),
+        )
+        for kwargs in cases:
+            self.assertEqual(
+                backend._pick_conv_kernel(sw=1, dw=1, **kwargs),
+                "winograd",
+                msg=str(kwargs),
+            )
+        # 3x3_c3：K=27，分块直算 0.077 ms 仍然最快
+        self.assertEqual(
+            backend._pick_conv_kernel(
+                n=2, o=16, k=27, kh=3, kw=3, ho=64, wo=64, c=3, sw=1, dw=1
+            ),
+            "tiled",
+        )
+
+    def test_cuda_auto_keeps_winograd_out_of_other_kernels(self):
+        """5x5 / stride 2 不属于 Winograd，仍按原来的顺序选。"""
+        backend = self._backend(CudaBackend)
+        self.assertNotEqual(
+            backend._pick_conv_kernel(
+                n=4, o=32, k=16 * 25, kh=5, kw=5, ho=32, wo=32, c=16,
+                sw=1, dw=1,
+            ),
+            "winograd",
+        )
+        self.assertNotEqual(
+            backend._pick_conv_kernel(
+                n=4, o=32, k=16 * 9, kh=3, kw=3, ho=34, wo=34, c=16,
+                sw=2, dw=1,
+            ),
+            "winograd",
+        )
 
     def test_hip_auto_picks_implicit_for_mid_channel(self):
         """K > 32 的 3x3/5x5 在 HIP 上交给隐式 GEMM。"""
@@ -178,16 +222,15 @@ class TestAutoConvImplPick(unittest.TestCase):
         )
 
     def test_cuda_auto_picks_implicit_in_sweet_spot(self):
-        """A800 实测：K 在 (32, 400] 且物化缓冲不超过 3.2M 元素时走隐式（5.252）。"""
+        """A800 实测：K 在 (32, 400] 且物化缓冲不超过 3.2M 元素时走隐式（5.252）。
+
+        3x3 已由 Winograd 先接走（5.255），这里只验 5x5——它没有 Winograd
+        的系数矩阵，仍走隐式。
+        """
         backend = self._backend(CudaBackend)
         cases = (
-            # K=72/144/288/400，32x32：n*K*hw = 0.29M～1.64M
-            dict(n=4, o=32, k=8 * 9, kh=3, kw=3, ho=32, wo=32, c=8),
-            dict(n=4, o=32, k=16 * 9, kh=3, kw=3, ho=32, wo=32, c=16),
-            dict(n=4, o=32, k=32 * 9, kh=3, kw=3, ho=32, wo=32, c=32),
             dict(n=4, o=32, k=16 * 25, kh=5, kw=5, ho=32, wo=32, c=16),
-            # 64x64 上只要 batch 小到 2.36M 元素，隐式仍占优
-            dict(n=4, o=32, k=16 * 9, kh=3, kw=3, ho=64, wo=64, c=16),
+            dict(n=2, o=32, k=8 * 25, kh=5, kw=5, ho=64, wo=64, c=8),
         )
         for kwargs in cases:
             self.assertEqual(
@@ -197,16 +240,14 @@ class TestAutoConvImplPick(unittest.TestCase):
             )
 
     def test_cuda_auto_keeps_im2col_outside_sweet_spot(self):
-        """K > 400 或物化缓冲越过 3.2M：cuBLAS 更好，仍走 im2col。"""
+        """K > 400、物化缓冲越过 3.2M、或 1x1：仍走 im2col。
+
+        3x3 的大 K 形状改由 Winograd 承接（5.255），不再落到这里。
+        """
         backend = self._backend(CudaBackend)
         cases = (
-            # K=576 / 1152：隐式内核内层循环太长（K=1152 输 2.1×）
-            dict(n=4, o=32, k=64 * 9, kh=3, kw=3, ho=32, wo=32, c=64),
-            dict(n=4, o=32, k=128 * 9, kh=3, kw=3, ho=32, wo=32, c=128),
-            # K=288 + 64x64：4.72M 元素，同规模实测 im2col 快 5%
-            dict(n=4, o=32, k=32 * 9, kh=3, kw=3, ho=64, wo=64, c=32),
-            # 同一形状把 batch 提到 16 也越过门槛（实测 im2col 快 15%）
-            dict(n=16, o=32, k=32 * 9, kh=3, kw=3, ho=32, wo=32, c=32),
+            # 5x5 + K=400 越过甜点区的 K 上界
+            dict(n=4, o=32, k=16 * 25 + 25, kh=5, kw=5, ho=32, wo=32, c=17),
             # 1x1 没有窗口重叠
             dict(n=2, o=256, k=256, kh=1, kw=1, ho=28, wo=28, c=256),
         )

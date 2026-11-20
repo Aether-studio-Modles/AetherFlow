@@ -55,6 +55,7 @@ from ..lower.plan import (
     conv_implicit_fits,
     conv_implicit_preferred,
     conv_tiled_preferred,
+    conv_winograd_preferred,
     conv_winograd_supported,
     grid_for,
     plan_conv_implicit,
@@ -469,6 +470,10 @@ class DeviceBackend(Executor):
     # auto 是否允许在中等 K 的甜点区改走隐式 GEMM（判据见 plan.conv_implicit_preferred）。
     # 默认 False：这份阈值是 A800 上 16 个形状测出来的，只有 CUDA 覆盖成 True。
     CONV_AUTO_IMPLICIT_MID = False
+    # auto 是否允许 3x3/stride1/dilation1 走 Winograd（判据见
+    # plan.conv_winograd_preferred）。默认 False：阈值来自 A800 的七个形状，
+    # 且 HIP 侧没有实测过这条路径，只有 CUDA 覆盖成 True。
+    CONV_AUTO_WINOGRAD = False
     # sparse_linear 的实现选择。子类可以扩展（CUDA 多一个 "cusparse"）。
     SPARSE_IMPLS: Tuple[str, ...] = _SPARSE_IMPLS
 
@@ -2335,9 +2340,17 @@ class DeviceBackend(Executor):
 
     def _pick_conv_kernel(self, *, n, o, k, kh, kw, ho, wo, c, sw, dw,
                           **_ignored) -> str:
-        """在 tiled / implicit / im2col 之间选一个实现。
+        """在 winograd / tiled / implicit / im2col 之间选一个实现。
 
-        ``auto`` 先看隐式 GEMM 的甜点区，再看分块直算，最后回落到 im2col。
+        ``auto`` 先看 Winograd 的适用面，再看隐式 GEMM 的甜点区，再看分块
+        直算，最后回落到 im2col。
+
+        Winograd（``CONV_AUTO_WINOGRAD``，CUDA，5.255）：3x3 / stride=1 /
+        dilation=1 且 ``k > CONV_TILED_MAX_K``
+        （``plan.conv_winograd_preferred``）。A800 稳态上 0.133～0.136 ms，
+        同形状 im2col 0.16～0.31 ms；3x3_c3（K=27）仍留给分块直算
+        （0.077 ms）。
+
         隐式有两条互斥的入口：
 
         - ``CONV_AUTO_IMPLICIT_MID``（CUDA，5.252）：K 在 (32, 400] 的
@@ -2357,6 +2370,14 @@ class DeviceBackend(Executor):
         """
         if self.conv_impl == "implicit":
             return "implicit"
+        if (
+            self.conv_impl == "auto"
+            and self.CONV_AUTO_WINOGRAD
+            and conv_winograd_preferred(
+                k=k, kh=kh, kw=kw, sw=sw, dw=dw, work=n * o * ho * wo
+            )
+        ):
+            return "winograd"
         if (
             self.conv_impl == "auto"
             and self.CONV_AUTO_IMPLICIT_MID
