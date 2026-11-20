@@ -121,8 +121,12 @@ A800-SXM4-40GB（CUDA 12.9 / cupy 14.2 / `graph_mode="off"`，单位 ms）：
 8 MB / 0.9 ms ≈ 9 GB/s PCIe）；设备侧口径下 `matmul_1024` 从 2.13 降到 1.16 ms。
 纯算内核与裸 cupy 同量级（GEMM 1.16 ms 中 0.19 ms 是 cuBLAS，其余是输入上传）。
 
-卷积是当前最大的差距：设备侧口径下（A800 / cuDNN 9.1 / TF32 关闭）分块直算
-比 cuDNN 慢 2.3～14.7×、im2col 慢 3.1～6.5×，差距随通道数拉大（见 DESIGN 5.251）。
+卷积是当前最大的差距，但仍要按 `auto` 的实际选择来读：单实现对照里（A800 /
+cuDNN 9.1 / TF32 关闭）分块直算比 cuDNN 慢 2.3～14.7×、im2col 慢 3.1～6.5×，
+差距随通道数拉大（DESIGN 5.251）。`conv_impl="auto"` 现在按形状选实现
+（DESIGN 5.252）：K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` 不超过 3.2M
+元素时走隐式 GEMM（快 7～13%），1 GFLOP 以上交给 cuDNN；A800 上 auto 与同形状
+最优实现之比为 1.00～1.05（小/中）与 0.99～1.03（大）。
 
 - 图重放：多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
   A800 设备侧 1.66 → 0.40 ms，LeNet 常驻 0.59 → 0.14 ms），单节点图无收益；

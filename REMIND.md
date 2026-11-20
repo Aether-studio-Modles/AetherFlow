@@ -117,8 +117,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   显式拒绝。
 - **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_mask` 只有
   参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积是当前最大的性能差距：
-  设备侧口径下（A800 / cuDNN 9.1 / TF32 关闭）分块直算比 cuDNN 慢 2.3～14.7×、
-  im2col 慢 3.1～6.5×（见 DESIGN 5.251）。
+  单实现对照下（A800 / cuDNN 9.1 / TF32 关闭）分块直算比 cuDNN 慢 2.3～14.7×、
+  im2col 慢 3.1～6.5×（见 DESIGN 5.251）。`conv_impl="auto"` 已按形状选择
+  （5.252）：K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` ≤ 3.2M 元素时走隐式
+  GEMM，1 GFLOP 以上交给 cuDNN；A800 上 auto 与同形状最优实现差 ≤5%。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
