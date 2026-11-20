@@ -123,6 +123,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   10 个形状无一获益，最差慢 29%。`conv_impl="auto"` 已按形状选择（5.252）：
   K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` ≤ 3.2M 元素时走隐式 GEMM，
   1 GFLOP 以上交给 cuDNN；A800 上 auto 与同形状最优实现差 ≤5%。
+  `conv_impl="winograd"`（5.255，F(2x2,3x3)，只做 f32/stride1/dilation1/groups1）
+  把 3x3 宽通道拉到 0.133～0.136 ms（im2col 的 0.51～0.85×、cuDNN 的 1.7～1.9×），
+  对 cuDNN 相对误差约 2e-7；CUDA 的 auto 对 3x3 且 K > 32 选它，HIP 未开。
+  它的瓶颈已不是内核：四次提交 ≈0.045 ms、框架逐节点派发 ≈0.055 ms，GPU 只占
+  0.03～0.07 ms。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
