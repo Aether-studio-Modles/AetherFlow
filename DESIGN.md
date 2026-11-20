@@ -15401,6 +15401,70 @@ modules)`，读不到也调不动时钟——没有 amdgpu 内核模块，GPU �
 的 p90（5.69 ms）与中位数（1.28 ms）差 4 倍，说明单次测量在这张卡上不稳定，
 任何"优化前/后"的对比都必须用同一轮多轮中位数。
 
+### 5.250 性能测量的环境前提：先证明机器可信，再谈优化
+
+5.249 的结论是"WSL 上的绝对值不可引用"。这一节把它变成可操作的验收：
+换机器不是目的，**能证明这台机器没有被人为限速**才是。
+
+**最低要求（HIP / ROCm）**
+
+1. 原生 Linux（不是 WSL），且 `lsmod | grep amdgpu` 有输出。WSL 里没有这个
+   内核模块，时钟与功耗状态都不受控——这正是 5.249 里所有带宽低两个数量级
+   的原因。
+2. `rocm-smi --showclocks` 能读到 `sclk`；采集前执行
+   `sudo rocm-smi --setperflevel high`，避免 DPM 把频率压到最低档。
+3. 卡直连 PCIe x16，不走 USB / Thunderbolt eGPU，也不与显示输出抢占。
+
+NVIDIA 侧对应的是 `nvidia-smi -q -d CLOCK` 可读、`nvidia-smi -lgc` 可用。
+
+**自检：三条命令，任何一条不过就先修环境**
+
+```bash
+lsmod | grep amdgpu                  # 必须有输出
+rocm-smi --showclocks | grep -i sclk # 必须能读到当前频率
+python -m benchmarks.run --backend hip --rounds 5
+```
+
+第三条看两个数：`matmul_1024` 若低于 **2 TFLOPS**（即耗时高于约 1.1 ms），
+或逐元素类用例折算出低于 **100 GB/s** 的有效带宽，说明机器仍受限——此时
+优化任何内核都是在错误的基线上做无用功。
+
+**采集与留档**
+
+```bash
+python -m benchmarks.run --backend hip --graph-mode off  --rounds 5 --save benchmarks/hip_off.json
+python -m benchmarks.run --backend hip --graph-mode auto --rounds 5 --save benchmarks/hip_auto.json
+python -m benchmarks.run --backend ref                  --rounds 5 --save benchmarks/ref.json
+```
+
+三份 JSON 与 `rocm-smi --showclocks`、`python -c "import aetherflow;
+print(aetherflow.__version__)"` 的输出一起提交。`--check` 需要基线文件，因此
+第一次采集同时也是往后回归门禁的起点。
+
+**CUDA 云机（本机只有 AMD 卡时的替代路径）**
+
+```bash
+git clone https://github.com/Aether-studio-Modles/AetherFlow.git
+cd AetherFlow && python -m venv .venv && . .venv/bin/activate
+pip install -e '.[cuda]'                       # cupy-cuda12x
+nvidia-smi --query-gpu=name,driver_version,clocks.sm,clocks.max.sm,power.limit --format=csv
+sudo nvidia-smi -lgc "$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits)"
+python -m benchmarks.run --backend cuda --graph-mode off  --rounds 5 --save benchmarks/cuda_off.json
+python -m benchmarks.run --backend cuda --graph-mode auto --rounds 5 --save benchmarks/cuda_auto.json
+python -m benchmarks.run --backend ref                  --rounds 5 --save benchmarks/ref_cloud.json
+```
+
+云实例通常不给 sudo，`-lgc` 失败就跳过，但必须把 `nvidia-smi` 那张表原样贴进
+记录，否则事后无法判断数字是不是被共享实例拖慢的。CUDA 侧的合格线按卡型另定
+（A100 的 `matmul_1024` 应到 8 TFLOPS 以上，4090 更高）；先记录，再谈优化。
+
+**判据**
+
+- 每个用例的 `p90 / median ≤ 1.5` 才算稳定；超过就重跑，不要用单次结果做
+  优化前后的对比。
+- 只有满足上面自检的机器，才允许把数字写进 README §5 或对外材料；否则只能
+  写"同机相对提速 X 倍"，并注明测量环境。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
