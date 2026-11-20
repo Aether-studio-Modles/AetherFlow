@@ -27,6 +27,16 @@ ctypes 调 cuDNN 的 legacy API（v9 仍保留），只依赖系统里已有的 
 直调库、结果不出卡。若用 ``execute``，每次都会多付一次 4 MB 的 D2H（A800 上
 约 1.4 ms），那是 PCIe 带宽而不是卷积速度（见 DESIGN 5.251）。
 
+**输入也必须驻留**：``execute_device`` 对 numpy 输入仍会在每轮做 H2D，而 cuDNN
+侧是一次 ``cp.asarray`` 后常驻。3x3_c64 的输入有 3.2 MB，A800 上 H2D 约 0.4 ms，
+比卷积本身还大——这一条曾让 5.251 的表里混进 PCIe 带宽（5.253 修正）。所以
+本项目侧先把 ``feed`` 转成设备数组，两边都只测计算。
+
+**报稳态而不是单次**：单次 ``execute`` 的固定开销（host 提交 + sync 往返）在
+A800 上是 0.076～0.086 ms，低 GFLOP 的形状里它比内核还长，单次口径测到的是
+延迟下限而不是卷积速度。表里的数字是连续 launch 平摊后的稳态值，``--single``
+可以切回单次口径做对照（5.253）。
+
 **Ampere 及之后必须设 `NVIDIA_TF32_OVERRIDE=0`**：cuDNN 默认允许卷积走 TF32，
 结果与 f32 差 1e-3 量级，会被下面的数值一致性检查拦下；本项目没有 TF32 路径。
 """
@@ -256,7 +266,13 @@ def build(x_shape, w_shape, pad):
     return g, feed
 
 
-def measure(fn: Callable[[], None], sync, warmup: int, repeat: int) -> Dict[str, float]:
+def measure(fn: Callable[[], None], sync, warmup: int, repeat: int,
+            burst: int = 20) -> Dict[str, float]:
+    """单次延迟（median）与稳态（连续 ``burst`` 次平摊）各报一份。
+
+    稳态取 5 组里的最好值：同一实现固定顺序连测会互相污染，取最好比取中位数
+    更接近"这台机器能做到的上限"（5.252 的测量方法）。
+    """
     for _ in range(warmup):
         fn()
     sync()
@@ -267,22 +283,36 @@ def measure(fn: Callable[[], None], sync, warmup: int, repeat: int) -> Dict[str,
         sync()
         samples.append((time.perf_counter() - t0) * 1e3)
     samples.sort()
+    steady: List[float] = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        for _ in range(burst):
+            fn()
+        t1 = time.perf_counter()
+        sync()
+        t2 = time.perf_counter()
+        steady.append((t2 - t0) * 1e3 / burst)
     return {
         "median_ms": round(statistics.median(samples), 4),
         "min_ms": round(samples[0], 4),
+        "burst_ms": round(min(steady), 4),
     }
 
 
 def run_aetherflow(impl: str, stages, rounds: int):
     backend = CudaBackend(conv_impl=impl)
-    sync = backend.cp.cuda.get_current_stream().synchronize
+    import cupy as cp
+
+    sync = cp.cuda.get_current_stream().synchronize
     out: Dict[str, Dict[str, float]] = {}
     for name, x_shape, w_shape, pad in stages:
         g, feed = build(x_shape, w_shape, pad)
+        # 驻留输入：与 cuDNN 侧一致，只测计算（见模块 docstring）
+        feed_dev = {k: cp.asarray(v) for k, v in feed.items()}
         best: Optional[Dict[str, float]] = None
         for _ in range(rounds):
-            stats = measure(lambda: backend.execute_device(g, feed), sync, 3, 10)
-            if best is None or stats["median_ms"] < best["median_ms"]:
+            stats = measure(lambda: backend.execute_device(g, feed_dev), sync, 3, 10)
+            if best is None or stats["burst_ms"] < best["burst_ms"]:
                 best = stats
         out[name] = best
     return out, backend
@@ -306,7 +336,7 @@ def run_cudnn(stages, rounds: int):
         best: Optional[Dict[str, float]] = None
         for _ in range(rounds):
             stats = measure(call, sync, 3, 10)
-            if best is None or stats["median_ms"] < best["median_ms"]:
+            if best is None or stats["burst_ms"] < best["burst_ms"]:
                 best = stats
         out[name] = best
         outputs[name] = cp.asnumpy(y)
@@ -318,7 +348,12 @@ def run_cudnn(stages, rounds: int):
 def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="conv2d 与 cuDNN 的对照")
     parser.add_argument("--rounds", type=int, default=3, help="每形状跑几轮取最好（默认 3）")
+    parser.add_argument(
+        "--single", action="store_true",
+        help="报单次延迟而不是稳态（单次含 0.08 ms 级固定开销，见 5.253）",
+    )
     args = parser.parse_args(argv)
+    key = "median_ms" if args.single else "burst_ms"
 
     try:
         cudnn_ms, cudnn_out, conv = run_cudnn(SHAPES, args.rounds)
@@ -338,15 +373,16 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             got = backend.execute(g, feed)["y"]
             np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-4)
 
-    print(f"cuDNN {conv.version}（{conv.name}）")
+    print(f"cuDNN {conv.version}（{conv.name}），"
+          f"{'单次延迟' if args.single else '稳态（连续 20 次平摊）'}，ms")
     print(
         f"{'shape':10s} {'tiled':>8s} {'im2col':>8s} {'cuDNN':>8s}"
         f" {'tiled/cudnn':>12s} {'im2col/cudnn':>13s} {'cols MB':>8s}"
     )
     for name, x_shape, w_shape, pad in SHAPES:
-        t = tiled_ms[name]["median_ms"]
-        i = im2col_ms[name]["median_ms"]
-        c = cudnn_ms[name]["median_ms"]
+        t = tiled_ms[name][key]
+        i = im2col_ms[name][key]
+        c = cudnn_ms[name][key]
         cols = im2col_bytes(x_shape, w_shape, pad) / (1024 * 1024)
         print(
             f"{name:10s} {t:8.4f} {i:8.4f} {c:8.4f}"
