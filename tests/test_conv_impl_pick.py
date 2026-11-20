@@ -21,8 +21,34 @@ from aetherflow.lower.plan import (
     conv_implicit_fits,
     conv_implicit_oc_tile,
     conv_implicit_preferred,
+    conv_winograd_supported,
     plan_conv_implicit,
 )
+
+
+class TestConvWinogradFit(unittest.TestCase):
+    """Winograd F(2x2,3x3) 的适用面：只有 3x3 / stride=1 / dilation=1。
+
+    三个变换的系数矩阵是定值推出来的，没有参数化版本；分组卷积也不在
+    "16 个位置各做一次全通道 GEMM"的形状里（由派发处拒绝）。
+    """
+
+    def test_accepts_3x3_stride1(self):
+        self.assertTrue(
+            conv_winograd_supported(kh=3, kw=3, sh=1, sw=1, dh=1, dw=1)
+        )
+
+    def test_rejects_other_shapes(self):
+        bad = (
+            dict(kh=5, kw=5, sh=1, sw=1, dh=1, dw=1),
+            dict(kh=3, kw=5, sh=1, sw=1, dh=1, dw=1),
+            dict(kh=3, kw=3, sh=2, sw=1, dh=1, dw=1),
+            dict(kh=3, kw=3, sh=1, sw=2, dh=1, dw=1),
+            dict(kh=3, kw=3, sh=1, sw=1, dh=2, dw=1),
+            dict(kh=3, kw=3, sh=1, sw=1, dh=1, dw=2),
+        )
+        for kwargs in bad:
+            self.assertFalse(conv_winograd_supported(**kwargs), msg=str(kwargs))
 
 
 class TestConvImplicitFit(unittest.TestCase):

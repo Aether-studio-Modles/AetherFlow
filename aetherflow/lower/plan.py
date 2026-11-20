@@ -73,6 +73,7 @@ __all__ = [
     "plan_conv_implicit",
     "conv_tiled_preferred",
     "conv_implicit_preferred",
+    "conv_winograd_supported",
     "scan_auto_chunk",
     "scan_last_auto_chunk",
     "scan_chunk",
@@ -457,6 +458,19 @@ def conv_oc_tile(khkw: int, o: int) -> Optional[int]:
 def conv_tiled_preferred(k: int, work: int) -> bool:
     """auto 模式下是否该走分块核：K 足够小，且输出总量撑得起一次 staging。"""
     return k <= CONV_TILED_MAX_K and work >= CONV_TILED_MIN_WORK
+
+
+def conv_winograd_supported(
+    *, kh: int, kw: int, sh: int, sw: int, dh: int, dw: int
+) -> bool:
+    """Winograd F(2x2,3x3) 能不能承接这个卷积（纯算术，不碰设备）。
+
+    三个变换的系数矩阵是按 3x3 / stride=1 / dilation=1 推出来的定值，
+    没有参数化的版本；分组卷积的每个组看的是不同输入通道，也套不进
+    "16 个位置各做一次全通道 GEMM"的形状。这些都由调用方显式拒绝，
+    不静默改写用户的 ``conv_impl``。
+    """
+    return kh == 3 and kw == 3 and sh == 1 and sw == 1 and dh == 1 and dw == 1
 
 
 def conv_implicit_preferred(*, n: int, k: int, kh: int, kw: int,

@@ -98,6 +98,10 @@ __all__ = [
     "im2col",
     "conv2d_tiled",
     "conv2d_grouped",
+    "conv2d_implicit",
+    "winograd_weight_transform",
+    "winograd_input_transform",
+    "winograd_output_transform",
     "attention_fwd",
 ]
 
@@ -5405,6 +5409,617 @@ def conv2d_implicit() -> Kernel:
                 type_name="int",
             ),
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Winograd F(2x2, 3x3)
+# ---------------------------------------------------------------------------
+#
+# 三个内核合起来是一次 F(2x2,3x3) 卷积：输入变换 ``V = B^T d B``、16 个
+# ``(O,K)x(K,T)`` 的批量 GEMM（走 cuBLAS，不在这里）、输出变换
+# ``Y = A^T M A``。逐元素乘那一步不写内核，只是 16 个 GEMM 的 batch 维，
+# 所以这里的两个内核都按 ``(16, C, T)`` / ``(16, O, T)`` 的布局写：
+# 变换位置 ``p`` 是最外维，同一次 GEMM 的 batch 各是一块连续的 ``(C, T)``。
+#
+# 索引约定（三处一致，改一处就要改三处）：
+# - ``t`` 是 tile 的全局序号，``n = t / (TH*TW)``、``r = t % (TH*TW)``、
+#   ``th = r / TW``、``tw = r % TW``；
+# - 输入 / 输出的 ``idx`` 分别是 ``c * NT + t`` 与 ``o * NT + t``；
+# - ``p = ii * 4 + jj`` 按行优先编号 4x4 变换位置。
+#
+# 只覆盖 f32、stride=1、dilation=1、groups=1、3x3 核。判据与派发在
+# ``backends/device_backend.py::_conv2d_winograd``。
+
+
+def _wino_inside(ih: Expr, iw: Expr) -> Expr:
+    """窗口内的采样点：``0 <= ih < H && 0 <= iw < W``（打印器不推断优先级）。"""
+    return Bin(
+        "&&",
+        Paren(
+            Bin(
+                "&&",
+                Paren(Bin(">=", ih, Num("0"))),
+                Paren(Bin("<", ih, Var("H"))),
+            )
+        ),
+        Paren(
+            Bin(
+                "&&",
+                Paren(Bin(">=", iw, Num("0"))),
+                Paren(Bin("<", iw, Var("W"))),
+            )
+        ),
+    )
+
+
+def _wino_tile_lets(outer: str) -> tuple:
+    """``i = outer * NT + t`` 拆成 ``(outer, t, n, th, tw)``。
+
+    ``outer`` 在输入变换里是输入通道 ``c``、在输出变换里是输出通道 ``o``。
+    依赖 ``grid_stride`` 声明的循环变量 ``i``、标量 ``NT`` 与
+    ``per_n = TH*TW``。
+    """
+    return (
+        Let(
+            "const int",
+            outer,
+            Cast("int", Paren(Bin("/", Var("i"), Var("NT")))),
+        ),
+        Let(
+            "const int",
+            "t",
+            Cast("int", Paren(Bin("%", Var("i"), Var("NT")))),
+        ),
+        Let("const int", "n", Bin("/", Var("t"), Var("per_n"))),
+        Let("const int", "r", Bin("%", Var("t"), Var("per_n"))),
+        Let("const int", "th", Bin("/", Var("r"), Var("TW"))),
+        Let("const int", "tw", Bin("%", Var("r"), Var("TW"))),
+    )
+
+
+def _wino_cell(name: str, row: Expr, col: Expr) -> Expr:
+    """4x4 局部数组的 ``name[row*4 + col]``。"""
+    return Index(name, Bin("+", Bin("*", row, Num("4")), col))
+
+
+def _wino_pos(row: Expr, col: Expr) -> Expr:
+    """变换位置 ``p = row * 4 + col``（0..15）。"""
+    return Bin("+", Bin("*", row, Num("4")), col)
+
+
+def winograd_input_transform() -> Kernel:
+    """输入变换：``V = B^T d B``，一个线程一个 ``(c, tile)``。
+
+    ``d`` 是 4x4 输入窗口（stride=1、dilation=1、3x3 核），把输出 tile 的
+    起点映射回输入后越界的位置读 0——与 im2col 的"填充即补零"一致。两次
+    4x4 乘法的系数只有 ``±1``，全部展开成加减，没有乘法。
+
+    写回是 ``(16, C, NT)`` 里的 16 个独立位置：相邻线程的 ``t`` 连续，
+    所以每一路写都是合并的；读也是（同一 warp 读同一行相邻 tile）。
+    """
+    ih = Bin("-", Bin("+", Bin("*", Var("th"), Num("2")), Var("ii")), Var("PH"))
+    iw = Bin("-", Bin("+", Bin("*", Var("tw"), Num("2")), Var("jj")), Var("PW"))
+    src = Bin(
+        "+",
+        Var("base"),
+        Bin("+", Bin("*", Cast("long long", Paren(ih)), Var("W")), iw),
+    )
+    to_v = lambda p: Bin(
+        "+", Bin("*", Cast("long long", Paren(p)), Var("plane")), Var("i")
+    )
+    plane = Bin("*", Cast("long long", Var("C")), Var("NT"))
+    body = (
+        Let("const int", "NT", Bin("*", Bin("*", Var("N"), Var("TH")), Var("TW"))),
+        Let("const int", "per_n", Bin("*", Var("TH"), Var("TW"))),
+        Let("const long long", "plane", plane),
+        *_wino_tile_lets("c"),
+        Let(
+            "const long long",
+            "base",
+            Bin(
+                "*",
+                Paren(
+                    Bin(
+                        "+",
+                        Bin("*", Cast("long long", Var("n")), Var("C")),
+                        Var("c"),
+                    )
+                ),
+                Bin("*", Cast("long long", Var("H")), Var("W")),
+            ),
+        ),
+        ArrayDecl("float", "d", 16, None),
+        ArrayDecl("float", "tmp", 16, None),
+        For(
+            "ii",
+            Num("0"),
+            Num("4"),
+            Num("1"),
+            (
+                For(
+                    "jj",
+                    Num("0"),
+                    Num("4"),
+                    Num("1"),
+                    (
+                        Let("const int", "ih", ih),
+                        Let("const int", "iw", iw),
+                        Assign(
+                            _wino_cell("d", Var("ii"), Var("jj")),
+                            Cond(
+                                _wino_inside(Var("ih"), Var("iw")),
+                                Index("x", src),
+                                Num("0.f"),
+                            ),
+                        ),
+                    ),
+                    type_name="int",
+                ),
+            ),
+            type_name="int",
+        ),
+        # 列方向：tmp = B^T d
+        For(
+            "jj",
+            Num("0"),
+            Num("4"),
+            Num("1"),
+            (
+                Assign(
+                    _wino_cell("tmp", Num("0"), Var("jj")),
+                    Bin(
+                        "-",
+                        _wino_cell("d", Num("0"), Var("jj")),
+                        _wino_cell("d", Num("2"), Var("jj")),
+                    ),
+                ),
+                Assign(
+                    _wino_cell("tmp", Num("1"), Var("jj")),
+                    Bin(
+                        "+",
+                        _wino_cell("d", Num("1"), Var("jj")),
+                        _wino_cell("d", Num("2"), Var("jj")),
+                    ),
+                ),
+                Assign(
+                    _wino_cell("tmp", Num("2"), Var("jj")),
+                    Bin(
+                        "-",
+                        _wino_cell("d", Num("2"), Var("jj")),
+                        _wino_cell("d", Num("1"), Var("jj")),
+                    ),
+                ),
+                Assign(
+                    _wino_cell("tmp", Num("3"), Var("jj")),
+                    Bin(
+                        "-",
+                        _wino_cell("d", Num("1"), Var("jj")),
+                        _wino_cell("d", Num("3"), Var("jj")),
+                    ),
+                ),
+            ),
+            type_name="int",
+        ),
+        # 行方向：V = tmp B，直接写回，不需要第三块数组
+        For(
+            "ii",
+            Num("0"),
+            Num("4"),
+            Num("1"),
+            (
+                Store(
+                    "v",
+                    to_v(_wino_pos(Var("ii"), Num("0"))),
+                    Bin(
+                        "-",
+                        _wino_cell("tmp", Var("ii"), Num("0")),
+                        _wino_cell("tmp", Var("ii"), Num("2")),
+                    ),
+                    raw=True,
+                ),
+                Store(
+                    "v",
+                    to_v(_wino_pos(Var("ii"), Num("1"))),
+                    Bin(
+                        "+",
+                        _wino_cell("tmp", Var("ii"), Num("1")),
+                        _wino_cell("tmp", Var("ii"), Num("2")),
+                    ),
+                    raw=True,
+                ),
+                Store(
+                    "v",
+                    to_v(_wino_pos(Var("ii"), Num("2"))),
+                    Bin(
+                        "-",
+                        _wino_cell("tmp", Var("ii"), Num("2")),
+                        _wino_cell("tmp", Var("ii"), Num("1")),
+                    ),
+                    raw=True,
+                ),
+                Store(
+                    "v",
+                    to_v(_wino_pos(Var("ii"), Num("3"))),
+                    Bin(
+                        "-",
+                        _wino_cell("tmp", Var("ii"), Num("1")),
+                        _wino_cell("tmp", Var("ii"), Num("3")),
+                    ),
+                    raw=True,
+                ),
+            ),
+            type_name="int",
+        ),
+    )
+    return Kernel(
+        name="winograd_input",
+        params=(
+            Tensor("x", type_name="float"),
+            Tensor("v", read_only=False, type_name="float"),
+            Scalar("int", "N"),
+            Scalar("int", "C"),
+            Scalar("int", "H"),
+            Scalar("int", "W"),
+            Scalar("int", "TH"),
+            Scalar("int", "TW"),
+            Scalar("int", "PH"),
+            Scalar("int", "PW"),
+            Scalar("long long", "total"),
+        ),
+        body=grid_stride(Var("total"), *body),
+    )
+
+
+def winograd_weight_transform() -> Kernel:
+    """权重变换：``U = G g G^T``，一个线程一个 ``(o, c)``。
+
+    ``G`` 的中间两行带 ``1/2``，所以这一步有乘法；但规模只有 ``O*C`` 个
+    线程、每个 9 读 16 写，与 GEMM 相比可以忽略。
+
+    输出布局 ``(16, O, C)`` 与输入变换的 ``(16, C, NT)`` 对齐，两者一起
+    喂给一次 ``batch=16`` 的 strided GEMM。
+    """
+    g = lambda row, col: Index(
+        "w",
+        Bin(
+            "+",
+            Bin("*", Cast("long long", Var("i")), Num("9")),
+            Bin("+", Bin("*", row, Num("3")), col),
+        ),
+    )
+    to_u = lambda p: Bin(
+        "+", Bin("*", Cast("long long", Paren(p)), Var("oplane")), Var("i")
+    )
+    body = (
+        Let(
+            "const long long",
+            "oplane",
+            Bin("*", Cast("long long", Var("O")), Var("C")),
+        ),
+        ArrayDecl("float", "t", 16, None),
+        # 行方向：tmp = G g，只占前 4 行（G 是 4x3）
+        For(
+            "jj",
+            Num("0"),
+            Num("3"),
+            Num("1"),
+            (
+                Assign(
+                    _wino_cell("t", Num("0"), Var("jj")),
+                    g(Num("0"), Var("jj")),
+                ),
+                Assign(
+                    _wino_cell("t", Num("1"), Var("jj")),
+                    Bin(
+                        "*",
+                        Num("0.5f"),
+                        Paren(
+                            Bin(
+                                "+",
+                                Bin(
+                                    "+",
+                                    g(Num("0"), Var("jj")),
+                                    g(Num("1"), Var("jj")),
+                                ),
+                                g(Num("2"), Var("jj")),
+                            )
+                        ),
+                    ),
+                ),
+                Assign(
+                    _wino_cell("t", Num("2"), Var("jj")),
+                    Bin(
+                        "*",
+                        Num("0.5f"),
+                        Paren(
+                            Bin(
+                                "+",
+                                Bin(
+                                    "-",
+                                    g(Num("0"), Var("jj")),
+                                    g(Num("1"), Var("jj")),
+                                ),
+                                g(Num("2"), Var("jj")),
+                            )
+                        ),
+                    ),
+                ),
+                Assign(
+                    _wino_cell("t", Num("3"), Var("jj")),
+                    g(Num("2"), Var("jj")),
+                ),
+            ),
+            type_name="int",
+        ),
+        # 列方向：U = t G^T
+        For(
+            "ii",
+            Num("0"),
+            Num("4"),
+            Num("1"),
+            (
+                Store(
+                    "u",
+                    to_u(_wino_pos(Var("ii"), Num("0"))),
+                    _wino_cell("t", Var("ii"), Num("0")),
+                    raw=True,
+                ),
+                Store(
+                    "u",
+                    to_u(_wino_pos(Var("ii"), Num("1"))),
+                    Bin(
+                        "*",
+                        Num("0.5f"),
+                        Paren(
+                            Bin(
+                                "+",
+                                Bin(
+                                    "+",
+                                    _wino_cell("t", Var("ii"), Num("0")),
+                                    _wino_cell("t", Var("ii"), Num("1")),
+                                ),
+                                _wino_cell("t", Var("ii"), Num("2")),
+                            )
+                        ),
+                    ),
+                    raw=True,
+                ),
+                Store(
+                    "u",
+                    to_u(_wino_pos(Var("ii"), Num("2"))),
+                    Bin(
+                        "*",
+                        Num("0.5f"),
+                        Paren(
+                            Bin(
+                                "+",
+                                Bin(
+                                    "-",
+                                    _wino_cell("t", Var("ii"), Num("0")),
+                                    _wino_cell("t", Var("ii"), Num("1")),
+                                ),
+                                _wino_cell("t", Var("ii"), Num("2")),
+                            )
+                        ),
+                    ),
+                    raw=True,
+                ),
+                Store(
+                    "u",
+                    to_u(_wino_pos(Var("ii"), Num("3"))),
+                    _wino_cell("t", Var("ii"), Num("2")),
+                    raw=True,
+                ),
+            ),
+            type_name="int",
+        ),
+    )
+    return Kernel(
+        name="winograd_weight",
+        params=(
+            Tensor("w", type_name="float"),
+            Tensor("u", read_only=False, type_name="float"),
+            Scalar("int", "O"),
+            Scalar("int", "C"),
+            Scalar("long long", "total"),
+        ),
+        body=grid_stride(Var("total"), *body),
+    )
+
+
+def winograd_output_transform() -> Kernel:
+    """输出变换：``Y = A^T M A`` + bias，一个线程一个 ``(o, tile)``。
+
+    读 16 个 ``M``（每路相隔 ``O*NT``，同一 warp 内 ``t`` 连续所以每一路
+    都是合并读），写 4 个输出像素。``A^T`` 的系数只有 ``±1``，两次 4x4
+    乘法同样展开成加减。
+
+    越界的输出位置（``HO`` / ``WO`` 为奇数时最后一个 tile 的右 / 下沿）
+    不写——那些位置根本不存在，算出来也只是溢出。
+    """
+    m = lambda row, col: Index(
+        "m",
+        Bin(
+            "+",
+            Bin(
+                "*",
+                Cast("long long", Paren(_wino_pos(row, col))),
+                Var("oplane"),
+            ),
+            Var("i"),
+        ),
+    )
+    to_y = lambda oh, ow: Bin(
+        "+",
+        Var("obase"),
+        Bin(
+            "+",
+            Bin("*", Cast("long long", Paren(oh)), Var("WO")),
+            ow,
+        ),
+    )
+    y00 = lambda row: Bin(
+        "+",
+        Bin(
+            "+",
+            _wino_cell("tmp", row, Num("0")),
+            _wino_cell("tmp", row, Num("1")),
+        ),
+        _wino_cell("tmp", row, Num("2")),
+    )
+    y01 = lambda row: Bin(
+        "-",
+        Bin(
+            "-",
+            _wino_cell("tmp", row, Num("1")),
+            _wino_cell("tmp", row, Num("2")),
+        ),
+        _wino_cell("tmp", row, Num("3")),
+    )
+    body = (
+        Let("const int", "per_n", Bin("*", Var("TH"), Var("TW"))),
+        Let(
+            "const long long",
+            "oplane",
+            Bin("*", Cast("long long", Var("O")), Var("NT")),
+        ),
+        *_wino_tile_lets("o"),
+        Let(
+            "const long long",
+            "obase",
+            Bin(
+                "*",
+                Paren(
+                    Bin(
+                        "+",
+                        Bin("*", Cast("long long", Var("n")), Var("O")),
+                        Var("o"),
+                    )
+                ),
+                Bin("*", Cast("long long", Var("HO")), Var("WO")),
+            ),
+        ),
+        Let(
+            "const float",
+            "bv",
+            Cond(Var("has_bias"), Index("b", Var("o")), Num("0.f")),
+        ),
+        ArrayDecl("float", "tmp", 16, None),
+        # 列方向：tmp = A^T M（只有前两行）
+        For(
+            "jj",
+            Num("0"),
+            Num("4"),
+            Num("1"),
+            (
+                Assign(
+                    _wino_cell("tmp", Num("0"), Var("jj")),
+                    Bin(
+                        "+",
+                        Bin(
+                            "+",
+                            m(Num("0"), Var("jj")),
+                            m(Num("1"), Var("jj")),
+                        ),
+                        m(Num("2"), Var("jj")),
+                    ),
+                ),
+                Assign(
+                    _wino_cell("tmp", Num("1"), Var("jj")),
+                    Bin(
+                        "-",
+                        Bin(
+                            "-",
+                            m(Num("1"), Var("jj")),
+                            m(Num("2"), Var("jj")),
+                        ),
+                        m(Num("3"), Var("jj")),
+                    ),
+                ),
+            ),
+            type_name="int",
+        ),
+        # 行方向：Y = tmp A，越界不写
+        For(
+            "ii",
+            Num("0"),
+            Num("2"),
+            Num("1"),
+            (
+                For(
+                    "jj",
+                    Num("0"),
+                    Num("2"),
+                    Num("1"),
+                    (
+                        Let(
+                            "const int",
+                            "oh",
+                            Bin(
+                                "+",
+                                Bin("*", Var("th"), Num("2")),
+                                Var("ii"),
+                            ),
+                        ),
+                        Let(
+                            "const int",
+                            "ow",
+                            Bin(
+                                "+",
+                                Bin("*", Var("tw"), Num("2")),
+                                Var("jj"),
+                            ),
+                        ),
+                        If(
+                            Bin(
+                                "&&",
+                                Paren(Bin("<", Var("oh"), Var("HO"))),
+                                Paren(Bin("<", Var("ow"), Var("WO"))),
+                            ),
+                            (
+                                Store(
+                                    "y",
+                                    to_y(Var("oh"), Var("ow")),
+                                    Bin(
+                                        "+",
+                                        Paren(
+                                            Cond(
+                                                Bin("==", Var("jj"), Num("0")),
+                                                Paren(y00(Var("ii"))),
+                                                Paren(y01(Var("ii"))),
+                                            )
+                                        ),
+                                        Var("bv"),
+                                    ),
+                                    raw=True,
+                                ),
+                            ),
+                        ),
+                    ),
+                    type_name="int",
+                ),
+            ),
+            type_name="int",
+        ),
+    )
+    return Kernel(
+        name="winograd_output",
+        params=(
+            Tensor("m", type_name="float"),
+            Tensor("b", type_name="float"),
+            Tensor("y", read_only=False, type_name="float"),
+            Scalar("int", "N"),
+            Scalar("int", "O"),
+            Scalar("int", "HO"),
+            Scalar("int", "WO"),
+            Scalar("int", "TH"),
+            Scalar("int", "TW"),
+            Scalar("int", "NT"),
+            Scalar("int", "has_bias"),
+            Scalar("long long", "total"),
+        ),
+        body=grid_stride(Var("total"), *body),
     )
 
 

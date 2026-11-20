@@ -74,6 +74,9 @@ from ...lower.kernels import (
     sparse_linear,
     sparse_linear_values_grad,
     sparse_linear_weight_grad,
+    winograd_input_transform,
+    winograd_output_transform,
+    winograd_weight_transform,
 )
 
 _REDUCE = r"""
@@ -2167,6 +2170,25 @@ def conv2d_implicit_source() -> Kernel:
     不出现，两种 dtype 打印出的源码相同。
     """
     return conv2d_implicit()
+
+
+def winograd_weight_source() -> Kernel:
+    """Winograd F(2x2,3x3) 的权重变换 ``U = G g G^T``（生产路径）。
+
+    三个 Winograd 内核都只做 f32：变换的中间量（``1/2`` 缩放后的和）没有
+    对应的 f16 写法，且 f16 卷积已经走 im2col + hgemm。
+    """
+    return winograd_weight_transform()
+
+
+def winograd_input_source() -> Kernel:
+    """Winograd F(2x2,3x3) 的输入变换 ``V = B^T d B``（生产路径）。"""
+    return winograd_input_transform()
+
+
+def winograd_output_source() -> Kernel:
+    """Winograd F(2x2,3x3) 的输出变换 ``Y = A^T M A`` + bias（生产路径）。"""
+    return winograd_output_transform()
 
 
 def attention_source() -> Kernel:

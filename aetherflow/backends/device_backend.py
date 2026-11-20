@@ -55,6 +55,7 @@ from ..lower.plan import (
     conv_implicit_fits,
     conv_implicit_preferred,
     conv_tiled_preferred,
+    conv_winograd_supported,
     grid_for,
     plan_conv_implicit,
     plan_conv_tiled,
@@ -327,7 +328,7 @@ def _mask_shared_over_heads(mask_shape, s_len: int, t_len: int) -> bool:
 # conv2d 分块核在 W 方向的线程数、shared 预算与分块阈值都在 ``lower/plan.py``：
 # 它们是与设备无关的纯算术，放在后端里既挡住了离线单测，也容易和 HIP 侧分叉。
 
-_CONV_IMPLS = ("auto", "im2col", "tiled", "implicit")
+_CONV_IMPLS = ("auto", "im2col", "tiled", "implicit", "winograd")
 
 # ``sparse_linear`` 的实现选择。基类只给 "custom" 与 "auto"——"cusparse"
 # 属于 NVIDIA 的库，由 ``CudaBackend`` 扩展；HIP 侧构造期就会拒绝它，
@@ -2227,7 +2228,7 @@ class DeviceBackend(Executor):
             # 分块核与隐式 GEMM 核的 shared memory 与累加器都是 float，只覆盖
             # f32 路径。f16 走 im2col + hgemm：GEMM 内部同样是 f32 累加，
             # 语义不变。
-            if self.conv_impl in ("tiled", "implicit"):
+            if self.conv_impl in ("tiled", "implicit", "winograd"):
                 raise BackendCapabilityError(
                     f"conv2d 的 {self.conv_impl} 内核只支持 float32；"
                     "f16 请用 conv_impl='auto' 或 'im2col'"
@@ -2243,7 +2244,7 @@ class DeviceBackend(Executor):
             # M40 上测到 cuBLAS 的 im2col 路径反超（g2 0.47×、g4 0.81×），
             # 而 HIP 上同一形状是直算核更快；跨厂商没有统一结论，想省列矩阵
             # 就显式指定 conv_impl="grouped"。im2col 仍是默认回落路径。
-            if self.conv_impl in ("tiled", "implicit"):
+            if self.conv_impl in ("tiled", "implicit", "winograd"):
                 raise BackendCapabilityError(
                     f"conv2d 的 {self.conv_impl} 内核只支持 groups=1；"
                     "分组卷积请用 conv_impl='auto'、'grouped' 或 'im2col'"
@@ -2254,6 +2255,18 @@ class DeviceBackend(Executor):
                 kernel_kind = "grouped"
             else:
                 kernel_kind = "im2col"
+        elif self.conv_impl == "winograd":
+            # Winograd 的系数矩阵只对 3x3 / stride=1 / dilation=1 成立，
+            # 显式指定时不支持就明确失败，不静默换成别的实现。
+            if not conv_winograd_supported(
+                kh=kh, kw=kw, sh=sh, sw=sw, dh=dh, dw=dw
+            ):
+                raise BackendCapabilityError(
+                    "conv2d 的 winograd 内核只支持 3x3、stride=1、dilation=1，"
+                    f"收到核 {kh}x{kw}、stride {(sh, sw)}、dilation {(dh, dw)}；"
+                    "请用 conv_impl='auto' 或 'im2col'"
+                )
+            kernel_kind = "winograd"
         else:
             kernel_kind = self._pick_conv_kernel(**dims)
         bias_fused = False
@@ -2269,6 +2282,10 @@ class DeviceBackend(Executor):
             elif kernel_kind == "implicit":
                 # 隐式 GEMM 同样在写回时加 bias，理由与分块核一致
                 out = self._conv2d_implicit(x, weight, bias, **dims)
+                bias_fused = True
+            elif kernel_kind == "winograd":
+                # Winograd 的输出变换同样融 bias：最后一个内核写回时就加
+                out = self._conv2d_winograd(x, weight, bias, **dims)
                 bias_fused = True
             else:
                 out = self._conv2d_im2col(x, weight, **dims)
@@ -2406,6 +2423,90 @@ class DeviceBackend(Executor):
                 np.int32(tiling.span),
             ),
             shared_mem=tiling.shared_bytes,
+        )
+        return out
+
+    def _conv2d_winograd(self, x, weight, bias, *, n, c, h, w, o, kh, kw, ho, wo,
+                         sh, sw, ph, pw, dh, dw, k):
+        """Winograd F(2x2,3x3)：用 16 个小 GEMM 换掉 9 倍的乘法。
+
+        三次自研 launch + 一次批量 GEMM：
+
+        1. ``winograd_weight``：``U = G g G^T``，布局 ``(16, O, C)``；
+        2. ``winograd_input``：``V = B^T d B``，布局 ``(16, C, NT)``，
+           其中 ``NT = N * ceil(HO/2) * ceil(WO/2)``；
+        3. 16 个 ``(O, C) x (C, NT)`` 的 strided GEMM，一次 cuBLAS 提交；
+        4. ``winograd_output``：``Y = A^T M A``，写回时融合 bias。
+
+        三条缓冲的量级（相对 im2col 的 ``N*K*HO*WO = 9*N*C*HO*WO``）：
+        ``16*C*NT ≈ 4*N*C*HO*WO``、``16*O*NT ≈ 4*N*O*HO*WO``，比 3x3 的
+        列矩阵小一半多。代价是精度：变换系数里的加减会放大舍入误差，
+        与 cuDNN 的容差要按 1e-4 单独验（见 ``benchmarks/cudnn_compare.py``）。
+
+        ``kh`` / ``kw`` / ``sh`` / ``sw`` / ``dh`` / ``dw`` 只用来断言——
+        调用方已在派发处拒绝非 3x3 stride=1 dilation=1 的形状，这里不重复
+        写判据，但保留参数是为了与其它卷积入口同签名。
+        """
+        cp = self.cp
+        th = cdiv(ho, 2)
+        tw = cdiv(wo, 2)
+        nt = n * th * tw
+        u = cp.empty((16, o, c), dtype=x.dtype)
+        v = cp.empty((16, c, nt), dtype=x.dtype)
+        m = cp.empty((16, o, nt), dtype=x.dtype)
+        out = cp.empty((n, o, ho, wo), dtype=x.dtype)
+        dtype_key = self._kind(x)
+
+        def launch(name: str, total: int, args) -> None:
+            block, grid = self._grid("conv2d", total)
+            kernel = self._kernel(
+                (name, dtype_key),
+                lambda: self.codegen.render(
+                    getattr(self.codegen, f"{name}_source")(), x.dtype
+                ),
+                name,
+            )
+            kernel((grid,), (block,), args)
+
+        # ---- 权重变换：U[p][o][c] = (G g G^T)[p] ----
+        total = o * c
+        launch(
+            "winograd_weight",
+            total,
+            (weight, u, np.int32(o), np.int32(c), np.int64(total)),
+        )
+        # ---- 输入变换：V[p][c][t] = (B^T d B)[p] ----
+        total = c * nt
+        launch(
+            "winograd_input",
+            total,
+            (
+                x, v,
+                np.int32(n), np.int32(c), np.int32(h), np.int32(w),
+                np.int32(th), np.int32(tw), np.int32(ph), np.int32(pw),
+                np.int64(total),
+            ),
+        )
+        # ---- 逐元素乘并沿输入通道求和：16 个 (O, C) x (C, NT) ----
+        blas = self._cublas()
+        blas.set_stream(self.current_stream_ptr())
+        blas.sgemm_batched(
+            u.reshape(16, o, c), v.reshape(16, c, nt), m.reshape(16, o, nt),
+            16, o * c, c * nt, o * nt,
+        )
+        # ---- 输出变换：Y = A^T M A + bias ----
+        total = o * nt
+        bp = x if bias is None else self._contig(bias)
+        launch(
+            "winograd_output",
+            total,
+            (
+                m, bp, out,
+                np.int32(n), np.int32(o), np.int32(ho), np.int32(wo),
+                np.int32(th), np.int32(tw), np.int32(nt),
+                np.int32(0 if bias is None else 1),
+                np.int64(total),
+            ),
         )
         return out
 
