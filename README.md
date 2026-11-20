@@ -7,7 +7,7 @@
 
 第一代版本 `v0.1.0`（API 主版本 `1`）：语义 IR、参考执行器、自动微分、训练与推理闭环、
 CUDA / HIP 两个真机后端、插件契约与一致性套件均已交付。规范只有一份，
-全部历史与实验结论在 [DESIGN.md](DESIGN.md)；上手须知与踩坑在 [REMIND.md](REMIND.md)。
+全部历史与实验结论在 [DESIGN.md](DESIGN.md)；发布说明、环境要求与已知限制在 [REMIND.md](REMIND.md)。
 
 ---
 
