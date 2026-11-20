@@ -28,6 +28,8 @@ _CUDNN_DATA_HALF = 2
 _CUDNN_TENSOR_NCHW = 0
 _CUDNN_CROSS_CORRELATION = 1
 _CUDNN_STATUS_SUCCESS = 0
+# cudnnConvolutionMath_t：只允许 FP32 的 FMA 算法，禁止 TF32 张量核转换。
+_CUDNN_FMA_MATH = 3
 
 _SUPPORTED = {np.dtype("float32"): _CUDNN_DATA_FLOAT, np.dtype("float16"): _CUDNN_DATA_HALF}
 
@@ -119,6 +121,7 @@ class CudnnConv:
         lib.cudnnSetConvolutionNdDescriptor.argtypes = [
             vp, ctypes.c_int, pi, pi, pi, ctypes.c_int, ctypes.c_int,
         ]
+        lib.cudnnSetConvolutionMathType.argtypes = [vp, ctypes.c_int]
         lib.cudnnGetConvolutionForwardAlgorithm_v7.argtypes = [
             vp, vp, vp, vp, vp, ctypes.c_int,
             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(_FwdAlgoPerf),
@@ -211,6 +214,15 @@ class CudnnConv:
             lib.cudnnSetTensor4dDescriptor(bd, _CUDNN_TENSOR_NCHW, data_type, 1, k, 1, 1),
             "set bias desc",
         )
+
+        # f32 必须锁死为 FMA 数学：cuDNN 在 Ampere 之后默认允许卷积走 TF32
+        # （尾数 10 位），实测 c_in=64/128 时与参考语义差到 5e-3——这不是实现
+        # 差异，是精度语义被悄悄降级了。f16 保持默认（它本来就是半精度）。
+        if dtype == np.dtype("float32"):
+            self._check(
+                lib.cudnnSetConvolutionMathType(cd, _CUDNN_FMA_MATH),
+                "set conv math type",
+            )
 
         perf = _FwdAlgoPerf()
         count = ctypes.c_int(0)

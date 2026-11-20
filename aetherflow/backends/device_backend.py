@@ -931,12 +931,12 @@ class DeviceBackend(Executor):
         测量变成 PCIe 带宽测量（见 DESIGN 5.251）。基准与设备侧流水线应当
         用这条路径；需要 numpy 结果的调用方仍用 ``execute``。
 
-        刻意不走 CUDA Graph 计划：捕获计划的返回值是按主机数组组织的，混用
-        会让"是否回传"隐含在计划里。需要两者兼得时先开 ``graph_mode="auto"``
-        并继续用 ``execute``。
+        **与 ``execute`` 一样吃 ``graph_mode="auto"``**：节点数达标且捕获成功时
+        走 ``plan.run_device``，不再逐节点过 Python。少了这一段，多节点图在
+        A800 上会慢 3～5 倍（5.251 的实测），测出来的就不是流水线的吞吐。
 
-        返回的数组归调用方所有（不 dispose）；``release=True`` 已把中间值
-        归还分配器，输出本身要等调用方放手后才会被复用。
+        返回的数组不一定归调用方：命中捕获计划时是计划持有的输出缓冲，下一次
+        replay 会覆盖它。要跨轮保存请自己 ``copy()``。
         """
         with self._memory_scope():
             if self._resident:
@@ -944,6 +944,11 @@ class DeviceBackend(Executor):
                 merged.update(inputs)
             else:
                 merged = inputs
+            if self.graph_mode == "auto" and self._graph_failure(graph) is None:
+                if len(graph.nodes) >= self._min_graph_nodes:
+                    plan = self._graph_plan(graph, inputs, merged)
+                    if plan is not None:
+                        return plan.run_device(inputs)
             env = self.run_device(graph, merged, release=True)
             return {
                 name: env[v.id]

@@ -1084,6 +1084,14 @@ class TestCudaConvCudnn(unittest.TestCase):
     def test_float16(self):
         self._check((2, 8, 16, 16), (16, 8, 3, 3), {"padding": (1, 1)}, dtype=f16, tol=1e-2)
 
+    def test_wide_channels_keep_f32_precision(self):
+        """宽通道 f32 卷积曾被 cuDNN 悄悄降到 TF32（差 5e-3，5.251）。
+
+        这条用例的容差比默认的 1e-3 更紧：锁死 FMA 数学之后，两条路径只差
+        累加顺序（~1e-5）。
+        """
+        self._check((2, 64, 16, 16), (64, 64, 3, 3), {"padding": (1, 1)}, tol=1e-4)
+
     def test_grouped_never_uses_cudnn(self):
         """groups>1 不进 cuDNN；强制 cudnn 时应回落到 im2col 且结果一致。"""
         self._check((2, 4, 8, 8), (6, 2, 3, 3), {"groups": 2, "padding": (1, 1)})
@@ -3720,6 +3728,26 @@ class TestAutoGraph(CudaTestCase):
             np.testing.assert_array_equal(
                 backend.execute(g, feed)["y"], self.cuda.execute(g, feed)["y"]
             )
+        self.assertEqual(len(backend._graph_plans), 1)
+
+    def test_execute_device_reuses_captured_plan(self):
+        """设备侧口径也要吃捕获：否则量到的是逐节点 Python 开销（5.251）。
+
+        捕获计划返回的是计划持有的输出缓冲，下一次 replay 会覆盖它——所以
+        这里每次立刻拷回主机再比对，不能跨轮攒着看。
+        """
+        import cupy as cp
+
+        g = Graph("auto_dev")
+        a = g.input("a", f32[4, 8])
+        b = g.input("b", f32[8, 6])
+        g.output(g.relu(g.matmul(a, b)), "y")
+
+        backend = CudaBackend(graph_mode="auto")
+        feed = {"a": self.rand(4, 8), "b": self.rand(8, 6)}
+        for _ in range(3):
+            got = cp.asnumpy(backend.execute_device(g, feed)["y"])
+            np.testing.assert_array_equal(got, backend.execute(g, feed)["y"])
         self.assertEqual(len(backend._graph_plans), 1)
 
     def test_shape_switch_captures_per_signature(self):

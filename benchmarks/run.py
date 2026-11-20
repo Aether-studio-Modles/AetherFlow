@@ -398,9 +398,11 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--conv-impl",
-        choices=("auto", "im2col", "tiled"),
+        # 这里是 CUDA / HIP 实现选择的并集；某个后端不支持的项由后端在构造期
+        # 拒绝（``ValueError`` 里会列出它自己的候选），基准脚本不替它筛。
+        choices=("auto", "im2col", "tiled", "implicit", "cudnn", "grouped"),
         default="auto",
-        help="conv2d 的实现；auto 走启发式，im2col/tiled 用于对照实验",
+        help="conv2d 的实现；auto 走启发式，其余用于对照实验（cuDNN 需机器上有库）",
     )
     parser.add_argument(
         "--graph-mode",
