@@ -57,10 +57,19 @@ jobs:
       # 打包失败要在标签前暴露：装不上比跑得慢更难发现。
       - name: 构建 sdist 与 wheel
         run: python -m build
+      # 必须带上依赖（numpy）：`--no-deps` 装出来的 wheel 在干净环境里连
+      # `import aetherflow` 都过不去，那不是打包坏了，是冒烟条件写错了。
+      # 同时要离开仓库根执行：cwd 会被 Python 放进 sys.path[0]，在仓库根
+      # 跑 `import aetherflow` 命中的是源码目录，wheel 根本没被验证。
       - name: 装进干净目录并冒烟
         run: |
-          python -m pip install --no-deps --target /tmp/af_site dist/*.whl
-          PYTHONPATH=/tmp/af_site python -c "import aetherflow; from aetherflow.runtime import write_trace; print('import ok')"
+          python -m pip install --target /tmp/af_site dist/*.whl
+          cd /tmp && PYTHONPATH=/tmp/af_site python -c "
+          import aetherflow
+          from aetherflow.runtime import write_trace
+          assert aetherflow.__file__.startswith('/tmp/af_site'), aetherflow.__file__
+          print('import ok', aetherflow.__file__)
+          "
       - uses: actions/upload-artifact@v4
         with:
           name: dist
