@@ -923,6 +923,33 @@ class DeviceBackend(Executor):
         with self._memory_scope():
             return self._execute(graph, inputs)
 
+    def execute_device(self, graph, inputs: Mapping[str, Any]) -> Dict[str, Any]:
+        """执行整张图，但**不把输出拷回主机**。
+
+        与 ``execute`` 的唯一差别是省掉结尾的 ``to_host``：一次 4 MB 的 D2H
+        在这台 A800 上要 1.4 ms，而它的内核只要 0.05 ms——逐图回传会把性能
+        测量变成 PCIe 带宽测量（见 DESIGN 5.251）。基准与设备侧流水线应当
+        用这条路径；需要 numpy 结果的调用方仍用 ``execute``。
+
+        刻意不走 CUDA Graph 计划：捕获计划的返回值是按主机数组组织的，混用
+        会让"是否回传"隐含在计划里。需要两者兼得时先开 ``graph_mode="auto"``
+        并继续用 ``execute``。
+
+        返回的数组归调用方所有（不 dispose）；``release=True`` 已把中间值
+        归还分配器，输出本身要等调用方放手后才会被复用。
+        """
+        with self._memory_scope():
+            if self._resident:
+                merged = dict(self._resident)
+                merged.update(inputs)
+            else:
+                merged = inputs
+            env = self.run_device(graph, merged, release=True)
+            return {
+                name: env[v.id]
+                for v, name in zip(graph.outputs, graph.output_names)
+            }
+
     def _execute(self, graph, inputs: Mapping[str, Any]) -> Dict[str, np.ndarray]:
         if self._resident:
             merged = dict(self._resident)

@@ -128,16 +128,24 @@ def warmup_backend(backend, cases: Sequence[Case], seconds: float, seed: int) ->
         _sync(backend)
 
 
-def measure(backend, graph, feed, warmup: int, repeat: int) -> Dict[str, float]:
-    """重复执行并取中位数；同步放在计时区间内，测的是"算完"的时间。"""
+def measure(
+    backend, graph, feed, warmup: int, repeat: int, device_outputs: bool = False
+) -> Dict[str, float]:
+    """重复执行并取中位数；同步放在计时区间内，测的是"算完"的时间。
+
+    ``device_outputs=True`` 时走 ``execute_device``：输出留在设备上，不回传
+    主机。两种口径不能混为一谈——一次 4 MB 的 D2H 在 A800 上要 1.4 ms，比
+    绝大多数内核本身还贵（见 DESIGN 5.251），把回传算进去测的是 PCIe 带宽。
+    """
+    run = backend.execute_device if device_outputs else backend.execute
     for _ in range(warmup):
-        backend.execute(graph, feed)
+        run(graph, feed)
     _sync(backend)
 
     samples: List[float] = []
     for _ in range(repeat):
         t0 = time.perf_counter()
-        backend.execute(graph, feed)
+        run(graph, feed)
         _sync(backend)
         samples.append((time.perf_counter() - t0) * 1e3)
 
@@ -217,6 +225,7 @@ def run_benchmark(
     progress=None,
     rounds: int = 3,
     warmup_seconds: float = 0.0,
+    device_outputs: bool = False,
 ) -> Dict:
     """跑全部用例，每个用例取 ``rounds`` 轮里最好的一轮。
 
@@ -235,7 +244,9 @@ def run_benchmark(
         graph, feed = prepare_case(backend, case, seed)
         best: Optional[Dict[str, float]] = None
         for _ in range(rounds):
-            stats = measure(backend, graph, feed, case.warmup, case.repeat)
+            stats = measure(
+                backend, graph, feed, case.warmup, case.repeat, device_outputs
+            )
             if best is None or stats["median_ms"] < best["median_ms"]:
                 best = stats
         results[case.name] = {**best, "note": case.note, "rounds": rounds}
@@ -245,6 +256,7 @@ def run_benchmark(
         "backend": backend.name,
         "device": _device_label(backend),
         "machine": _machine_label(),
+        "device_outputs": bool(device_outputs),
         "cases": results,
         **({"conv_impl": backend.conv_impl} if hasattr(backend, "conv_impl") else {}),
         **(
@@ -271,6 +283,15 @@ def check_regression(
             {
                 "kind": "backend_mismatch",
                 "detail": f"基线是 {baseline.get('backend')}，当前是 {current.get('backend')}",
+            }
+        )
+    if bool(baseline.get("device_outputs")) != bool(current.get("device_outputs")):
+        # 两种口径差一倍以上（回传 vs 不回传），混比会把"换了测量方式"判成回归。
+        problems.append(
+            {
+                "kind": "throughput_mode_mismatch",
+                "detail": f"基线 device_outputs={baseline.get('device_outputs')}，"
+                f"当前 {current.get('device_outputs')}；请用同一口径重新采集",
             }
         )
 
@@ -303,6 +324,7 @@ def recheck_slow(
     max_slowdown: float = 0.25,
     rounds: int = 1,
     warmup_seconds: float = 0.0,
+    device_outputs: bool = False,
 ):
     """对超阈值的用例重测一遍，取两次中更快的结果。
 
@@ -322,6 +344,7 @@ def recheck_slow(
         cases=[c for c in cases if c.name in slow],
         rounds=rounds,
         warmup_seconds=warmup_seconds,
+        device_outputs=device_outputs,
     )
     for name in slow:
         if retry["cases"][name]["median_ms"] < report["cases"][name]["median_ms"]:
@@ -332,6 +355,10 @@ def recheck_slow(
 def _print_table(report: Dict) -> None:
     print(f"backend : {report['backend']}")
     print(f"device  : {report['device']}")
+    if report.get("device_outputs"):
+        print("outputs : 设备侧（不计 D2H）")
+    else:
+        print("outputs : 主机侧（含 D2H）")
     if "conv_impl" in report:
         print(f"conv    : {report['conv_impl']}")
     if "graph_mode" in report:
@@ -381,6 +408,11 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         default="off",
         help="execute 的图执行方式；auto 首次按形状捕获整图（节点数 ≥ 2 才捕获），之后只 replay",
     )
+    parser.add_argument(
+        "--device-outputs",
+        action="store_true",
+        help="输出留在设备上、不计 D2H 回传；测的是设备侧吞吐而非端到端延迟",
+    )
     args = parser.parse_args(argv)
 
     if args.backend == "ref":
@@ -395,6 +427,12 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         )
         backend = open_backend(args.backend, **kwargs)
 
+    if args.device_outputs and not hasattr(backend, "execute_device"):
+        raise SystemExit(
+            "--device-outputs 只对设备后端有效：参考后端没有设备内存，"
+            "它的输出本来就在主机上"
+        )
+
     def progress(case, stats):
         print(f"  {case.name:22s} {stats['median_ms']:10.4f} ms", flush=True)
 
@@ -402,7 +440,11 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     if args.warmup > 0:
         print(f"先热身 {args.warmup:.1f}s（解除空闲降频）……", flush=True)
     report = run_benchmark(
-        backend, progress=progress, rounds=args.rounds, warmup_seconds=args.warmup
+        backend,
+        progress=progress,
+        rounds=args.rounds,
+        warmup_seconds=args.warmup,
+        device_outputs=args.device_outputs,
     )
 
     problems = []
@@ -419,6 +461,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             max_slowdown=args.max_slowdown,
             rounds=args.rounds,
             warmup_seconds=args.warmup,
+            device_outputs=args.device_outputs,
         )
         if retried:
             print(f"有 {retried} 个用例首轮超阈值，已重测一次（取更快者）")

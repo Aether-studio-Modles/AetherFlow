@@ -18,6 +18,7 @@ from aetherflow import ReferenceBackend
 from benchmarks import cudnn_compare
 from benchmarks.cases import CASES, build_case
 from benchmarks.run import (
+    _main,
     _sync,
     backend_names,
     check_regression,
@@ -137,6 +138,19 @@ class TestMeasureAndCheck(unittest.TestCase):
         cur = self._tiny_report(10.0, backend="ref")
         kinds = [p["kind"] for p in check_regression(base, cur)]
         self.assertIn("backend_mismatch", kinds)
+
+    def test_throughput_mode_mismatch_is_flagged(self):
+        """回传与不回传的两种口径差一倍以上，混比必须直接判不可比。"""
+        base = {**self._tiny_report(10.0), "device_outputs": False}
+        cur = {**self._tiny_report(10.0), "device_outputs": True}
+        kinds = [p["kind"] for p in check_regression(base, cur)]
+        self.assertIn("throughput_mode_mismatch", kinds)
+
+    def test_device_outputs_rejected_for_reference_backend(self):
+        """参考后端没有设备内存，--device-outputs 必须在开跑前就拒绝。"""
+        with redirect_stdout(StringIO()):
+            with self.assertRaises(SystemExit):
+                _main(["--backend", "ref", "--device-outputs", "--rounds", "1"])
 
     def test_machine_note_silent_on_same_machine(self):
         base = self._tiny_report(10.0)
