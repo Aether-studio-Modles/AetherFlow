@@ -7,6 +7,7 @@ name = "aetherflow"
 version = "0.1.0"
 description = "统一深度学习基础设施：统一前端 IR + 可插拔后端插件"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
