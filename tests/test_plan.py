@@ -467,6 +467,19 @@ class TestConvImplicit(unittest.TestCase):
         )
         self.assertEqual(tiling.tile_w, 16)
         self.assertEqual(tiling.span, 18)
+        self.assertEqual(tiling.tw, 1)
+
+    def test_tw_widens_window_but_not_block(self):
+        """5.254：``tw`` 只放大窗口与 grid，block 的 x 维仍是 ``tile_w``。"""
+        single = plan_conv_implicit(kh=3, kw=3, c=8, o=64, wo=64, sw=1, dw=1)
+        double = plan_conv_implicit(
+            kh=3, kw=3, c=8, o=64, wo=64, sw=1, dw=1, tw=2
+        )
+        self.assertEqual(double.tw, 2)
+        self.assertEqual(double.tile_w, single.tile_w)
+        self.assertEqual(double.block, single.block)
+        self.assertEqual(double.span, 2 * single.tile_w + 2)
+        self.assertLessEqual(double.shared_bytes, CONV_SHARED_LIMIT)
 
     def test_oversized_kernel_rejected(self):
         # 128x128 核的权重加窗口远超 48KB，明确拒绝而不是静默改用 im2col

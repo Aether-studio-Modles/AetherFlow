@@ -21,8 +21,52 @@ from aetherflow.lower.plan import (
     conv_implicit_fits,
     conv_implicit_oc_tile,
     conv_implicit_preferred,
+    conv_implicit_tw,
     plan_conv_implicit,
 )
+
+
+class TestConvImplicitTw(unittest.TestCase):
+    """5.254：每个线程算几个空间位置的判据（纯算术）。"""
+
+    def test_double_position_for_windowed_mid_k(self):
+        self.assertEqual(conv_implicit_tw(kh=3, kw=3, k=144, wo=64), 2)
+        self.assertEqual(conv_implicit_tw(kh=5, kw=5, k=400, wo=64), 2)
+
+    def test_1x1_stays_single(self):
+        """1x1 的权重本来就只服务一个位置，复用它只会多切一段写回。"""
+        self.assertEqual(conv_implicit_tw(kh=1, kw=1, k=256, wo=64), 1)
+
+    def test_small_k_stays_single(self):
+        """K <= 分块阈值时隐式不是主人，没必要承担双份寄存器。"""
+        self.assertEqual(
+            conv_implicit_tw(kh=3, kw=3, k=CONV_TILED_MAX_K, wo=64), 1
+        )
+
+    def test_narrow_output_stays_single(self):
+        """wo 不足两个 tile 时第二个位置整段越界，加倍没有收益。"""
+        self.assertEqual(conv_implicit_tw(kh=3, kw=3, k=144, wo=32), 1)
+        self.assertEqual(conv_implicit_tw(kh=3, kw=3, k=144, wo=33), 2)
+
+    def test_tile_override_changes_the_width_gate(self):
+        self.assertEqual(
+            conv_implicit_tw(kh=3, kw=3, k=144, wo=20, tile_w=16), 2
+        )
+        self.assertEqual(
+            conv_implicit_tw(kh=3, kw=3, k=144, wo=16, tile_w=16), 1
+        )
+
+    def test_fits_accepts_the_widened_window(self):
+        """tw=2 的窗口也算进 shared 预算，fits 与 plan 用同一个 span。"""
+        self.assertTrue(
+            conv_implicit_fits(kh=3, kw=3, c=16, o=32, wo=64, sw=1, dw=1, tw=2)
+        )
+        plan = plan_conv_implicit(
+            kh=3, kw=3, c=16, o=32, wo=64, sw=1, dw=1, tw=2
+        )
+        self.assertEqual(plan.span, 2 * plan.tile_w + 2)
+        self.assertEqual(conv_implicit_oc_tile(3, 3, 32, plan.span), plan.toc)
+        self.assertLessEqual(plan.shared_bytes, CONV_SHARED_LIMIT)
 
 
 class TestConvImplicitFit(unittest.TestCase):

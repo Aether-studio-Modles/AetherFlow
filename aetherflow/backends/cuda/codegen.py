@@ -2160,13 +2160,17 @@ def conv2d_grouped_source() -> Kernel:
     return conv2d_grouped()
 
 
-def conv2d_implicit_source() -> Kernel:
+def conv2d_implicit_source(tw: int = 1) -> Kernel:
     """隐式 GEMM 卷积的 L2 描述：输入窗口也进 shared。
 
     与 :func:`conv2d_tiled_source` 一样不做 dtype 参数化，模板里的 ``%T%``
     不出现，两种 dtype 打印出的源码相同。
+
+    ``tw`` 是每个线程的空间位置数（5.254），在 L2 里按 Python 层展开——
+    它不是运行期参数，因为 ``acc`` 的个数与写回段数都要在编译期定下来。
+    不同 ``tw`` 是两份不同的源码，调用方的内核缓存键必须把它带上。
     """
-    return conv2d_implicit()
+    return conv2d_implicit(tw)
 
 
 def attention_source() -> Kernel:
