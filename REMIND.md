@@ -119,9 +119,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积的差距按稳态口径读
   （DESIGN 5.253）：低 GFLOP 形状与 cuDNN 同量级（1x1_c32 是 0.72×），真实差距
   只在宽通道 3x3/5x5 的内核结构——im2col 稳态为 cuDNN 的 1.4～3.7×，tiled 与
-  implicit 落后 11～18×。`conv_impl="auto"` 已按形状选择（5.252）：K 在 (32, 400]
-  且 im2col 物化缓冲 `n*ho*wo*K` ≤ 3.2M 元素时走隐式 GEMM，1 GFLOP 以上交给
-  cuDNN；A800 上 auto 与同形状最优实现差 ≤5%。
+  implicit 落后 11～18×。隐式核的空间寄存器分块试过并回退（5.254）：A800 上
+  10 个形状无一获益，最差慢 29%。`conv_impl="auto"` 已按形状选择（5.252）：
+  K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` ≤ 3.2M 元素时走隐式 GEMM，
+  1 GFLOP 以上交给 cuDNN；A800 上 auto 与同形状最优实现差 ≤5%。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
