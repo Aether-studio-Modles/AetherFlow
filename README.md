@@ -111,16 +111,18 @@ A800-SXM4-40GB（CUDA 12.9 / cupy 14.2 / `graph_mode="off"`，单位 ms）：
 
 | 用例 | 端到端 | 设备侧 | 裸 cupy 常驻 |
 | --- | --- | --- | --- |
-| matmul_1024 | 2.05 | 1.12 | 0.19 |
-| maxpool2x2 | 3.16 | 2.14 | — |
-| transformer_block | 1.80 | 1.67 | — |
-| cnn_lenet | 0.85 | 0.79 | — |
+| matmul_1024 | 2.13 | 1.16 | 0.19 |
+| maxpool2x2 | 3.50 | 2.49 | — |
+| transformer_block | 1.76 | 1.66 | — |
+| cnn_lenet | 0.85 | 0.80 | — |
 | relu（4M 元素） | 1.98 | — | 0.05 |
 
-单次 `execute` 有约 1.5 ms 的固定成本，其中 1.4 ms 是 4 MB 输出的 D2H；设备侧
-口径剩下的是每轮 8 MB 输入的 H2D（约 0.9 ms，实测 PCIe 约 9 GB/s）。纯算内核
-与裸 cupy 同量级。此前"自研卷积比 cuDNN 慢 4～12×、比 MIOpen 慢 4.52～37×"的
-数字混入了这条固定开销，**需要按新口径重测后才能对外引用**。
+单次 `execute` 有约 0.1～1 ms 的固定成本，最大一项是 4 MB 输入的 H2D（实测
+8 MB / 0.9 ms ≈ 9 GB/s PCIe）；设备侧口径下 `matmul_1024` 从 2.13 降到 1.16 ms。
+纯算内核与裸 cupy 同量级（GEMM 1.16 ms 中 0.19 ms 是 cuBLAS，其余是输入上传）。
+
+卷积是当前最大的差距：设备侧口径下（A800 / cuDNN 9.1 / TF32 关闭）分块直算
+比 cuDNN 慢 2.3～14.7×、im2col 慢 3.1～6.5×，差距随通道数拉大（见 DESIGN 5.251）。
 
 - 图重放：`transformer_block` 在 HIP 上 5.90 → 0.83 ms（节点多时收益显著）；
   默认 `graph_mode="off"`，语义差异需使用者知情。
