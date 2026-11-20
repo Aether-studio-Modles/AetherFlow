@@ -44,6 +44,7 @@ from ..lower.plan import (
     CONV_ROC_MAX,
     CONV_SHARED_LIMIT,
     CONV_TILE_OPTIONS,
+    CONV_TILE_W,
     CONV_TILED_MAX_K,
     SHARED_LIMIT,
     VEC4_ALIGN,
@@ -2388,25 +2389,34 @@ class DeviceBackend(Executor):
         是否读它，写回时就地累加。
         """
         cp = self.cp
+        base_tile = self._conv_tile
         tw = (
             conv_implicit_tw(
-                kh=kh, kw=kw, k=k, wo=wo, tile_w=self._conv_tile
+                kh=kh, kw=kw, k=k, wo=wo, tile_w=base_tile
             )
             if self.CONV_IMPLICIT_TW
             else 1
         )
+        # 位置加倍时把 block 的 x 维减半：一个 block 覆盖的列数基本不变，
+        # 块数也基本不变，只是每线程多算一个位置。若 x 维不动，块数直接减半，
+        # A800 上实测 SM 喂不满（3x3_c64 慢 25%）。
+        tile_w = base_tile
+        if tw > 1:
+            width = CONV_TILE_W if base_tile is None else base_tile
+            tile_w = max(1, width // 2)
         tiling = plan_conv_implicit(
             kh=kh, kw=kw, c=c, o=o, wo=wo, sw=sw, dw=dw,
-            tile_w=self._conv_tile, roc=self._conv_roc, cb=self._conv_cb,
+            tile_w=tile_w, roc=self._conv_roc, cb=self._conv_cb,
             tw=tw,
         )
         if tw > 1:
             single = plan_conv_implicit(
                 kh=kh, kw=kw, c=c, o=o, wo=wo, sw=sw, dw=dw,
-                tile_w=self._conv_tile, roc=self._conv_roc, cb=self._conv_cb,
+                tile_w=base_tile, roc=self._conv_roc, cb=self._conv_cb,
             )
             if single.toc > tiling.toc:
                 tw = 1
+                tile_w = base_tile
                 tiling = single
 
         out = cp.empty((n, o, ho, wo), dtype=x.dtype)
