@@ -1029,7 +1029,7 @@ class TestCudaGatherCrossEntropy(CudaTestCase):
                     "logits": self.rand(8, 11) * 2.0,
                     "target": self.rng.integers(0, 11, 8, dtype=np.int32),
                 }
-                self.assert_backends_equal(g, feed, rtol=tol, atol=tol)
+                self.assert_backends_equal(g, feed, rtol=tol, atol=tol, name="loss")
 
     def test_cross_entropy_backward(self):
         g = Graph("ce_bwd")
