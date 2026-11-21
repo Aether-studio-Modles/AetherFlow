@@ -15,10 +15,10 @@ verifier + 中层优化 pass + torch.export 前端适配 + CUDA 后端 + 后端�
 + SNN 的稀疏事件表示与事件内存池（`runtime/events.py`，数据侧，不进 IR）
 + 自动调优（参数空间 + 网格搜索 + 配置库）+ 运行时数据上报 + 只读智能体查询面
 + zip 硬件包（`backends/hardware.py`，manifest 校验 + 安全解压 + 装完即用 +
-  内容摘要 / 依赖声明 / Ed25519 来源签名）+ 动态执行第一版（`dynamic.DynamicRunner`，
-  按输入形状建图并复用，一次 run 内仍是静态图）+ 部署包（`deploy.py`，图 JSON +
-  权重 + 清单校验和，加载即校验）+ 激活重算（`train/recompute.py`，分段前向只留
-  边界，反向逐段重放）。
+  内容摘要 / 依赖声明 / Ed25519 来源签名）+ 动态执行（`dynamic.DynamicRunner`，
+  按输入形状建图并复用；声明动态轴后一次构图多次重放，一次 run 内仍是静态图）
+  + 部署包（`deploy.py`，图 JSON + 权重 + 清单校验和，加载即校验）
+  + 激活重算（`train/recompute.py`，分段前向只留边界，反向逐段重放）。
 尚未实现：完整的 define-by-run 执行（逐算子即时求值）、强化学习式的配置更新、
 硬件包的公钥分发与撤销链。
 """
