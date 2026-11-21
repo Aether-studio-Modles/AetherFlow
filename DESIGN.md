@@ -18529,3 +18529,31 @@ AF耗时约1.76倍；auto AF **0.4746** / torch **0.5679** ms，AF耗时低约16
 `install_hardware("dist/iluvatar-0.1.0.zip", replace=True)`，不能直接覆盖
 已安装的 `.py`（sha256 校验会失败）。本轮没有天数硬件，未宣称天数实测通过。
 
+### 5.293　硬件包被跳过时保留原因，装配报错附带诊断
+
+`iter_installed()` 的契约是"坏包跳过、不打断别人"：manifest 不合法、文件摘要
+不符、依赖不满足，都当作"这个包在这台机器上用不了"。问题在于跳过时把
+`HardwarePackageError` 直接吞了，装配层只看到名字不在 `_FACTORIES` 里，于是
+
+    LookupError: 未注册的后端 'iluvatar'；已注册: cuda、hip、reference
+
+"包在目录里但校验没过"与"根本没装"给出同一句话。换机器时直接把源码覆盖进
+已安装目录（或 sftp 只替换几个 `.py`）正好命中这个场景：manifest 的 sha256
+对不上，包被静默跳过，排查要自己对目录做哈希。
+
+现在把扫描拆成 `_scan()`，产出 `(目录名, record 或 None, 跳过原因)`；
+`iter_installed()` 只取 record，新增 `scan_errors()` 返回当前被跳过的
+`{目录名: 原因}`。装配层在抛"未注册的后端"时调用它，若同名目录存在就附上
+校验失败原因与"重新打包后用 `install_hardware(..., replace=True)` 重装"的
+提示。
+
+边界：跳过行为不变，坏包仍不影响其它后端；`scan_errors()` 每次调用重扫一遍
+硬件目录，只在**已经是错误路径**上使用，不进入热路径；原因文本直接来自现有
+`HardwarePackageError`，不新增异常类型。目录名与包名不一致时（安装目录来自
+manifest 的 `name`，通常一致）不猜，只按目录名匹配。
+
+**验证**：新增 2 项测试——`scan_errors()` 能报出"摘要不符"；覆盖已安装
+`.py` 后 `get_backend(name)` 的 `LookupError` 里同时含"摘要不符"与
+`install_hardware`。`tests.test_hardware_package` 与 `tests.test_backend_discovery`
+共 72 项通过，Ruff 通过。未触碰天数硬件，包侧与 `build.py` 无改动。
+

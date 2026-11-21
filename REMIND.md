@@ -298,6 +298,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   得到降维视图，天数 `DeviceArray` 只支持切片、会抛 `TypeError`。设备后端要
   去掉长度 1 的前导维时按形状推导后 `reshape`；`attention` 的 `(1,1,S,T)`
   mask 已改为这条路，调用方不再需要自己 squeeze。
+- **坏包跳过不能连原因一起吞**（5.293）：`iter_installed` 静默跳过校验失败的
+  硬件包，会让"包在、但被改过"与"根本没装"都报成"未注册的后端"。跳过行为可以
+  保留，但原因要能被装配层取到；`scan_errors()` 只在错误路径上调用，不要放进
+  热路径。
 - **HIP 上同进程第二个设备态会话会坏**（5.282）：24 层 / `d_model=1024` 时，先后
   建两个 `LMRunner`（即使换后端实例）会给出 NaN logits 或"捕获期 arena 不够
   4 MB"；纯 `generate`（不涉及束搜索）同样复现，一个进程一个配置就正常。基准
