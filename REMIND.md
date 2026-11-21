@@ -130,9 +130,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   CUDA 的 auto 对 3x3 且 K > 32 选它，HIP 未开。5.260 再把静态 conv 的解析、
   线程铺法与 launch 参数挪到计划期，单层 c16 的端到端从 0.054 降到 0.027 ms
   （`benchmarks/overhead_compare.py`）。c32/c64 仍走四段版，5.264 把它的
-  launch 也展开到计划期，c64 单层端到端 0.113 → 0.094 ms；设备侧的三段内核 +
-  batched GEMM 仍是主体，与 cuDNN 的比值待机器空闲后按同进程交替复测
-  （此前记录的 1.80×/4.27× 未复测）。**绝对值随机器变，跨机只比比值**。
+  launch 也展开到计划期、`U` 随计划驻留，c64 单层端到端 0.113 → 0.094 ms；
+  设备侧的三段内核 + batched GEMM 仍是主体，与 cuDNN 的比值待机器空闲后按
+  同进程交替复测（此前记录的 1.80×/4.27× 未复测）。**绝对值随机器变，
+  跨机只比比值**。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
