@@ -158,17 +158,18 @@ GEMM + 输出变换
 L1/L2 吸收。
 复现：`python -m benchmarks.winograd_compare --rounds 3`。
 
-- 层 / 网络级（5.259～5.263）：`conv → mul → add → relu` 叠 8 层，
+- 层 / 网络级（5.259～5.266）：`conv → mul → add → relu` 叠 8 层，
   `mul+add+relu` 被合成一个内核（64 节点 → 48 组）。5.260 把静态 conv 的
   计划期开销去掉、5.261 把融合链的推导也挪到计划期，8 层 `scalar` 从
   0.919 ms 降到 **0.298 ms**（每层 37 µs：19 µs 卷积 + 18 µs 提交），
-  4 层从 0.460 降到 0.157 ms。`graph_mode="auto"` 在这些图上仍显示 0.99×，
-  但原因已经查明：捕获期还在做 H2D（`RuntimeError: ... H2D transfers are
-  disallowed`），实际没有捕获成功，5.259 的结论按此修正。5.262 把逐通道
+  4 层从 0.460 降到 0.157 ms。5.266 修掉了捕获失败：`capture` 在捕获流开始
+  之前重建计划、把常量 H2D 留在默认流，`graph_mode="auto"` 现在真正捕获成功
+  （与 `off` 逐位一致），8 层 `scalar` 0.338 → **0.201 ms**（1.68×）。5.262 把逐通道
   BN 的 `(1,C,1,1)` / `(C,1,1)` 广播也接进融合链（向量路径按 lane 单独取
   索引），8 层 `channel4d` 从 0.905 降到 **0.303 ms**；5.263 再把常量上的
   `reshape`（BN 参数由 `(C,)` 变 `(1,C,1,1)`）在计划期折成视图，`channel`
-  从 1.022 降到 **0.302 ms**。三种形态现在齐平（差 ≤ 2%）。复现：
+  从 1.022 降到 **0.302 ms**。三种形态现在齐平（差 ≤ 2%）；`channel` 形态的
+  捕获收益待共享机空闲后与 cuDNN 基准列一起复测。复现：
   `python -m benchmarks.conv_graph_compare --blocks 8 --rounds 3`。
 - 图重放：小算子的多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
   A800 设备侧 1.66 → 0.40 ms，LeNet 常驻 0.59 → 0.14 ms），单节点图无收益；

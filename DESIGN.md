@@ -16526,6 +16526,40 @@ BN 在推理时的**常见**形态，所以这条判据的缺口不是边角：�
 **结果**：`tests/test_cuda_backend.py` 连跑三次都是 339 passed / 5 skipped；
 全量回到 2572 passed / 53 failed（差集仍是 torch 2.5.0 版本拒绝）。
 
+### 5.266　捕获前的计划重建不能落在捕获流上
+
+5.261 记下过一个更根本的问题：`graph_mode="auto"` 在 conv-bn-relu 这类图上
+**从未捕获成功**，`graph_capture_failure` 一直是
+`RuntimeError: the current stream is capturing, so H2D transfers are disallowed`。
+5.259 那张"捕获 1.00×"的表其实是回落逐节点后的结果。
+
+**根因**：`capture` 的预热轮结束后会 `_drop_plan(graph)`，让常量在捕获轮重新
+上传到本次捕获的 arena（预热轮的地址会被回收，不能复用）。但重建发生在捕获
+开始**之后**——捕获轮第一次 `run_device` 才走到 `_plan` → `_prepare_plan` →
+`_op_constant`，那一遍 `cp.array` 是 `cudaMemcpyAsync` 的 H2D，而捕获流上
+任何 H2D 都被驱动拒绝，整张图随即被记成失败。
+
+**修复**（`backends/cuda/backend.py`）：`_drop_plan` 之后、`begin_capture` 之前
+显式调一次 `self._plan(graph)`，让计划重建与常量上传在默认流上完成；随后
+`cp.cuda.Event().record()` + `stream.wait_event()` 把捕获流挂到它后面。图里
+读到的因此是**本轮 arena** 的那份常量，捕获流内不再出现任何 H2D。HIP 侧不动：
+它的流捕获实现把捕获期 H2D 的主机源记进 `session.host_refs` 并随计划持有，
+语义本来就成立。
+
+**结果**（A800-40GB，8 层 conv-bn-relu，C=16，56×56，batch 4）
+
+- `capture_failure` 从那条 RuntimeError 变为 `None`，`_graph_plans` 里留下 1 个
+  计划；输出与 `graph_mode="off"` 逐位相同（最大绝对差 0.0）。
+- 同进程交替测量（每轮各自同步）：`scalar` 形态 off 0.338 ms → auto 0.201 ms，
+  1.68×。`channel4d` / `channel` 当轮不可比：共享机上另一个进程长期占着 91%
+  的 SM（13.8 GB），两种模式都被拖到 2.6 ms 上下，属负载而非代码差异，待机器
+  空闲后复测（与 5.264 的 cuDNN 基准列同一批待办）。
+- 纯图 replay 的主机提交约 0.016 ms，设备侧单次约 0.16～0.39 ms；图的收益
+  仍取决于图内 kernel 本身，捕获只消掉逐节点的 Python 与 launch 开销。
+
+**回归**：`tests/test_cuda_backend.py` 339 passed / 5 skipped；本项只改动
+CUDA `capture` 的一段流程，不涉及参考后端与 HIP。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
