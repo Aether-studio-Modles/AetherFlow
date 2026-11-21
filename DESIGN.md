@@ -16638,6 +16638,89 @@ c32 融合版 0.0938、四段版 0.0654。`conv_winograd_fused_preferred` 的上
 **结论**：P1 不需要改代码。需要改的是记录口径——把 `winograd_compare` 的
 两列明确标成"显式融合版"，并把 README 里 c32/c64 的比值换成 auto 口径。
 
+### 5.269　bf16 落到设备：`uint16` 位模式 + cuBLAS 的 CUDA_R_16BF
+
+在此之前 bf16 只是一层**数值承诺**：IR 有 `DType.BF16`，参考后端把每个边界
+舍入到 bf16 格点（载体仍是 f32），设备端则完全没有 16 位存储。DESIGN 记过
+一条"不做 bf16"的理由：PTX 的 bf16 转换指令（`cvt.rn.bf16.f32`）要 sm_80，
+而项目承诺不依赖 CUDA toolkit、也不想把内核源码绑死在一种架构上。
+
+这条理由只对"用 `cvt`"成立。bf16 的定义就是 f32 的高 16 位：加宽是左移
+16 位，收窄是高半字的 RNE 舍入，两件事都能用整数指令写出来——
+
+```cuda
+__device__ __forceinline__ float af_ld_b(unsigned short h) {
+    return __uint_as_float(((unsigned int)h) << 16);
+}
+```
+
+舍入规则与主机侧 `runtime.bf16.round_bf16` 逐条对齐：尾数 LSB 为 1 时进位；
+inf / nan 只截断；截断后尾数清零的 NaN 补 quiet 位（否则 NaN 会变成 inf）。
+于是 bf16 在设备上就是 **`uint16` 位模式的数组**，从 Maxwell 起都能编，
+也不需要 `cuda_bf16.h`。
+
+**改动分四层**：
+
+1. **codegen**：`_STORAGE["bf16"] = ("unsigned short", "af_ld_b", "af_st_b",
+   "af_add_b")`，`_BF16_HELPERS` 给出五个设备函数（含 CAS 版原子加，写读
+   半字的 32 位 CAS 与 f16 那份同构）。`_dtype_key` / `_ir_dtype` 认
+   `uint16` / `bfloat16`。方言三处数据（类型名、load、store、atomic、
+   helpers）各加一行；`CAST_DIALECT` 注入 f32 / f16 / bf16 三套 helper，
+   因为 cast 是唯一"两侧存储不同"的内核。
+2. **执行骨架**：新增 `Executor.device_dtype(dtype)` 钩子。计划里的期望
+   dtype 从此不再等于 numpy 载体——bf16 的载体是 f32，但设备容器是
+   `uint16`。设备后端覆盖 `quantize`：边界上 f32 → bf16 直接调 `cast`
+   （store helper 就是 RNE），**不落一次 D2H**；`to_host` 把 `uint16`
+   解包回 f32 载体。这两处让"每个 bf16 边界都要量化"的既有语义在设备侧
+   仍然成立，只是量化的落点从主机挪到了内核。
+3. **逐元素链**：`build_chain` 的 `round_steps` 从 `dtype is F16` 扩到
+   `dtype in (F16, BF16)`。含义是链里每一步先 `af_st_b` 再 `af_ld_b`：
+   不融合的图里每个算子都是一次真实的 16 位往返，融合若一路在 float 里算，
+   结果会与参考实现不同。链的分组判据 `_chainable` 也放开 bf16，运行期
+   再由 `_try_chain` / `_planned_chain` 核对 `BF16_OPS`。
+4. **matmul**：cuBLAS 的 `cublasGemmEx` / `cublasGemmStridedBatchedEx`
+   多一对 `bgemm` / `bgemm_batched`，`CUDA_R_16BF = 14` + `COMPUTE_32F`。
+   `uint16` 数组的位布局与 `CUDA_R_16BF` 完全一致，指针直接传，不需要
+   任何重排。
+
+**支持面**（`backends/cuda/backend.py` 的 `BF16_OPS`，32 个）：逐元素
+（17）、搬运与 constant / cast（8）、matmul（1）、softmax / layernorm /
+rmsnorm（3）、reduce_sum / max / mean（3）。卷积 / 池化 / scan / sparse
+**没开**：它们的内核里有权重布局与分块假设，bf16 版本要逐个验证数值，
+不能靠模板替换就宣布支持。表外的 bf16 算子由 `invoke` 明确拒绝（不做隐式
+降级），消息里点明"bf16 支持面不含这个算子"。
+
+**数值**（A800，与参考后端逐位比对）：
+
+| 用例 | 结果 |
+| --- | --- |
+| 逐元素链 `relu(x*w + b)`（bf16 全程） | 逐位一致 |
+| `cast` f32 → bf16 → f32 往返 | 逐位一致 |
+| constant / reduce_sum / softmax / layernorm | 逐位一致 |
+| matmul 32×64×16、批量 2×32×64×16 | 逐位一致 |
+| matmul 256×1024×256 | 最大相对误差 7.6e-3（一个 bf16 ulp） |
+
+大矩阵上的差异来自 f32 累加的结合顺序（cuBLAS 的分块与 numpy 的 BLAS
+不同），量化到 bf16 后偶尔跨一个格点。这与参考后端"f32 累加、边界量化"
+的约定不冲突：差异在**约定允许的累加顺序**里，不在语义上。小 K 上两者
+恰好同序，因此可以逐位断言。
+
+**性能**（2048³，设备常驻）：
+
+| 精度 | 时间 | 吞吐 |
+| --- | --- | --- |
+| f32 (Sgemm) | 1.255 ms | 13.7 TFLOPS |
+| bf16 (CUDA_R_16BF) | 0.190 ms | 90.5 TFLOPS |
+
+6.6×，确认走的是 HMMA.bf16 而非"转 f32 再算"。
+
+**回归**：远端 `tests/test_cuda_backend.py` 349 passed / 5 skipped（新增
+8 条 `TestCudaBf16`）；本地全量 2236 passed / 51 failed，失败项全是
+"torch 2.4.1 不在兼容矩阵"，与本轮无关。
+
+**遗留**：conv / pool / scan / sparse / attention 的 bf16 支持面，需要
+逐算子做数值验证后再放开。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
