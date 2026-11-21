@@ -1380,19 +1380,31 @@ class DeviceBackend(Executor):
         常量（见 :meth:`_holds_constant_weight`）。
         """
         constant_ids = set()
+        constant_values: Dict[int, Any] = {}
         for group in plan:
             # 常量节点的值只写在属性里、与运行期输入无关，因此在计划期上传
             # 一次就够：每次执行都 H2D 一份，正是 5.161 里"折叠产物大而原
             # 计算便宜时反而倒退"（mask 用例逐节点 GPU 时间 +22.4%）的根因。
             # 计划随图的版本号缓存，设备数组因此与图同寿命；切卡 / 关闭
             # arena 时由 ``_clear_plan_values`` 清掉。
-            if len(group.nodes) == 1 and group.nodes[0].op.name == "constant":
-                node = group.nodes[0]
+            if len(group.nodes) != 1:
+                continue
+            node = group.nodes[0]
+            if node.op.name == "constant":
                 if node.output.type.dtype in (DType.F32, DType.F16):
-                    group.constants[node.output.id] = self._op_constant(
-                        node, (), node.attrs
-                    )
+                    value = self._op_constant(node, (), node.attrs)
+                    group.constants[node.output.id] = value
                     constant_ids.add(node.output.id)
+                    constant_values[node.output.id] = value
+                continue
+            # 常量的一次 reshape 只是一次视图：目标形状与元素个数在 IR 上已经
+            # 定死，运行期再派发一次没有任何数据工作可做（见
+            # :meth:`_fold_constant_reshape`）。
+            folded = self._fold_constant_reshape(node, constant_values)
+            if folded is not None:
+                group.constants[node.output.id] = folded
+                constant_ids.add(node.output.id)
+                constant_values[node.output.id] = folded
         for group in plan:
             fns = []
             for node in group.nodes:
@@ -1412,6 +1424,30 @@ class DeviceBackend(Executor):
                 group.kernels = tuple(fns)
                 if len(group.nodes) > 1:
                     group.chain = self._planned_chain(group)
+
+    def _fold_constant_reshape(self, node: Node, values: Dict[int, Any]):
+        """常量上的 ``reshape`` 在计划期折成视图；不是这种情形返回 ``None``。
+
+        ``reshape`` 不读也不写数据，只换元数据。输入是计划期已上传的常量时，
+        "运行期再 reshape 一次"与"计划期 reshape 好、运行期直接取用"逐位相同，
+        但前者每层要付一次派发 / 形状比对 / 写回环境。8 层 conv-bn-relu 的
+        ``channel`` 形态（BN 参数以 ``(C,)`` 给出、再 reshape 成 ``(1,C,1,1)``）
+        因此比 ``channel4d`` 多约 0.1 ms，折掉这两处就追平。
+
+        只折"目标形状全是字面整数"的 reshape：含符号维时目标随绑定变化，
+        必须留给运行期按本次绑定解析。返回值仍是视图（与 ``_op_reshape``
+        同一条数据路径）；不登记 arena 别名，因为常量在计划存活期内不会被
+        回收，源数组由 ``constant_values`` 与 ``group.constants`` 双双持有。
+        """
+        if node.op.name != "reshape" or len(node.inputs) != 1:
+            return None
+        src = values.get(node.inputs[0].id)
+        if src is None:
+            return None
+        target = node.attrs.get("shape") if isinstance(node.attrs, dict) else None
+        if not target or not all(isinstance(d, int) for d in target):
+            return None
+        return self.cp.reshape(src, tuple(int(d) for d in target))
 
     @staticmethod
     def _holds_constant_weight(node: Node, constant_ids) -> bool:
