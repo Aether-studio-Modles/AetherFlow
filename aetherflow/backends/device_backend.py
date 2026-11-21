@@ -45,6 +45,7 @@ from ..lower.plan import (
     CONV_SHARED_LIMIT,
     CONV_TILE_OPTIONS,
     CONV_TILED_MAX_K,
+    CONV_WINOGRAD_TILE,
     SHARED_LIMIT,
     VEC4_ALIGN,
     attention_block,
@@ -55,6 +56,7 @@ from ..lower.plan import (
     conv_implicit_fits,
     conv_implicit_preferred,
     conv_tiled_preferred,
+    conv_winograd_fused_preferred,
     conv_winograd_preferred,
     conv_winograd_supported,
     grid_for,
@@ -2292,6 +2294,10 @@ class DeviceBackend(Executor):
                 # Winograd 的输出变换同样融 bias：最后一个内核写回时就加
                 out = self._conv2d_winograd(x, weight, bias, **dims)
                 bias_fused = True
+            elif kernel_kind == "winograd_fused":
+                # 融合版的写回同样融 bias
+                out = self._conv2d_winograd_fused(x, weight, bias, **dims)
+                bias_fused = True
             else:
                 out = self._conv2d_im2col(x, weight, **dims)
         else:
@@ -2370,6 +2376,14 @@ class DeviceBackend(Executor):
         """
         if self.conv_impl == "implicit":
             return "implicit"
+        if (
+            self.conv_impl == "auto"
+            and self.CONV_AUTO_WINOGRAD
+            and conv_winograd_fused_preferred(
+                c=c, kh=kh, kw=kw, sw=sw, dw=dw, o=o, work=n * o * ho * wo
+            )
+        ):
+            return "winograd_fused"
         if (
             self.conv_impl == "auto"
             and self.CONV_AUTO_WINOGRAD
@@ -2531,6 +2545,63 @@ class DeviceBackend(Executor):
         )
         return out
 
+    def _conv2d_winograd_fused(self, x, weight, bias, *, n, c, h, w, o, kh, kw,
+                               ho, wo, sh, sw, ph, pw, dh, dw, k):
+        """融合版 F(2x2,3x3)：两次 launch（权重变换 + 融合内核）。
+
+        与 :meth:`_conv2d_winograd` 的差别只在中间量落在哪：``V`` 留在共享
+        内存、``M`` 留在寄存器，因此不再有 ``(16, C, NT)`` / ``(16, O, NT)``
+        两块全局缓冲，也没有 cuBLAS 的那次提交。数值与四段版逐位一致
+        （同一组系数、同样的求和顺序，实测相对 cuDNN ≤ 2e-7）。
+
+        ``U`` 仍每次执行重算一次：权重是图输入，运行期无法证明它没变，
+        按指针缓存会静默用旧权重。这一次 launch 在 c3～c24 上约 0.008～
+        0.015 ms，换来的是"不会算错"。
+        """
+        cp = self.cp
+        th = cdiv(ho, 2)
+        tw = cdiv(wo, 2)
+        nt = n * th * tw
+        tt = CONV_WINOGRAD_TILE
+        dtype_key = self._kind(x)
+
+        u = cp.empty((16, o, c), dtype=x.dtype)
+        total = o * c
+        block, grid = self._grid("conv2d", total)
+        weight_kernel = self._kernel(
+            ("winograd_weight", dtype_key),
+            lambda: self.codegen.render(
+                self.codegen.winograd_weight_source(), x.dtype
+            ),
+            "winograd_weight",
+        )
+        weight_kernel(
+            (grid,), (block,),
+            (weight, u, np.int32(o), np.int32(c), np.int64(total)),
+        )
+
+        out = cp.empty((n, o, ho, wo), dtype=x.dtype)
+        kernel = self._kernel(
+            ("winograd_fused", dtype_key),
+            lambda: self.codegen.render(
+                self.codegen.winograd_fused_source(), x.dtype
+            ),
+            "winograd_fused",
+        )
+        bp = x if bias is None else self._contig(bias)
+        kernel(
+            (cdiv(nt, tt),), (tt * o,),
+            (
+                x, u, bp, out,
+                np.int32(c), np.int32(h), np.int32(w), np.int32(o),
+                np.int32(th), np.int32(tw), np.int32(ho), np.int32(wo),
+                np.int32(ph), np.int32(pw), np.int32(nt), np.int32(tt),
+                np.int32(0 if bias is None else 1),
+            ),
+            shared_mem=16 * c * tt * 4,
+        )
+        return out
+
     def _conv2d_grouped(self, x, weight, bias, *, n, c, h, w, o, kh, kw, ho, wo,
                         sh, sw, ph, pw, dh, dw, k, groups):
         """分组 / depthwise 直算：一个线程一个输出元素（5.165）。
@@ -2617,8 +2688,6 @@ class DeviceBackend(Executor):
             shared_mem=tiling.shared_bytes,
         )
         return out
-
-
 
     def _conv2d_im2col(self, x, weight, *, n, c, h, w, o, kh, kw, ho, wo,
                        sh, sw, ph, pw, dh, dw, k):

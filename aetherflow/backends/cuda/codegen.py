@@ -77,6 +77,7 @@ from ...lower.kernels import (
     winograd_input_transform,
     winograd_output_transform,
     winograd_weight_transform,
+    winograd_fused,
 )
 
 _REDUCE = r"""
@@ -2189,6 +2190,16 @@ def winograd_input_source() -> Kernel:
 def winograd_output_source() -> Kernel:
     """Winograd F(2x2,3x3) 的输出变换 ``Y = A^T M A`` + bias（生产路径）。"""
     return winograd_output_transform()
+
+
+def winograd_fused_source() -> Kernel:
+    """融合版 Winograd：输入变换 + 乘加 + 输出变换，一次 launch。
+
+    与上面三个内核只差"在哪算"：``V`` 不进全局缓冲而是留在共享内存，
+    ``M`` 不进全局缓冲而是留在寄存器。数值与四段版逐位一致（同一组
+    ``B`` / ``A`` / ``G`` 系数、同样的求和顺序）。
+    """
+    return winograd_fused()
 
 
 def attention_source() -> Kernel:

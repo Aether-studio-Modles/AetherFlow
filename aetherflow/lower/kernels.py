@@ -50,6 +50,7 @@ from .kernel import (
 from .indexing import Layout
 from .plan import CSR_SCAN_SLOTS, REDUCE_SCRATCH
 
+
 __all__ = [
     "grid_stride",
     "ew_binary",
@@ -102,6 +103,7 @@ __all__ = [
     "winograd_weight_transform",
     "winograd_input_transform",
     "winograd_output_transform",
+    "winograd_fused",
     "attention_fwd",
 ]
 
@@ -6020,6 +6022,484 @@ def winograd_output_transform() -> Kernel:
             Scalar("long long", "total"),
         ),
         body=grid_stride(Var("total"), *body),
+    )
+
+
+def winograd_fused() -> Kernel:
+    """融合版 F(2x2,3x3)：一次 launch 走完输入变换、乘加与输出变换。
+
+    4 段版（``winograd_input`` + 16 个 cuBLAS GEMM + ``winograd_output``）
+    在 A800 上被固定开销支配：c3/c8/c16/c24 四档的稳态几乎都是 0.103 ms，
+    与通道数无关——四段各付一次 kernel 延迟（每段 0.015～0.019 ms）与一次
+    主机提交。融合版把这三段压进同一个内核，且 ``V`` 只留在共享内存里
+    （``(16, C, TT)``，TT 是每块的 tile 数），不再物化 ``(16, O, NT)`` 的
+    ``M``。实测 3x3_c8 的 device 时间从 0.1015 ms 降到 0.0199 ms。
+
+    线程分工：
+
+    - 第一阶段整个 block 协作算 ``V``：一个线程一个 ``(c, tile)``，写进
+      ``sv[(p*C + c)*TT + lt]``。``TT`` 个 tile 相邻，所以每个 ``p`` 的写
+      是连续的；
+    - 第二阶段一个线程一个 ``(o, tile)``，持 16 个累加器沿 ``C`` 累加
+      ``U[p][o][c] * V[p][c][lt]``，然后做 ``A^T M A`` 并写回 4 个像素。
+
+    ``U`` 由 ``winograd_weight`` 事先算好（布局 ``(16, O, C)``），本内核只读。
+    这个内核不覆盖大 ``C``：``U`` 沿 ``C`` 的读次数是 ``16*C`` 每线程，
+    c64 起就超过共享内存与 L2 的承受范围（device 0.246 ms），那几档仍走
+    四段版。判据见 ``plan.conv_winograd_fused_preferred``。
+
+    边界与四段版逐条一致：越界采样读 0、``HO`` / ``WO`` 为奇数时最后一个
+    tile 的右 / 下沿不写。``TT`` 是运行期标量，网格与线程数由调用方按
+    ``TT * O`` 铺。
+    """
+    cell = _wino_cell
+    acc = lambda row, col: Index("acc", _wino_pos(row, col))
+    sv = lambda p, c, lt: Bin(
+        "+",
+        Bin(
+            "*",
+            Paren(Bin("+", Bin("*", Var(p), Var("C")), Var(c))),
+            Var("TT"),
+        ),
+        Var(lt),
+    )
+    ih = Bin(
+        "-",
+        Bin("+", Bin("*", Var("th"), Num("2")), Var("ii")),
+        Var("PH"),
+    )
+    iw = Bin(
+        "-",
+        Bin("+", Bin("*", Var("tw"), Num("2")), Var("jj")),
+        Var("PW"),
+    )
+    src = Bin(
+        "+",
+        Var("base"),
+        Bin("+", Bin("*", Cast("long long", Paren(ih)), Var("W")), iw),
+    )
+    body = (
+        Shared("float", "sv", extern=True),
+        Let("const int", "per_n", Bin("*", Var("TH"), Var("TW"))),
+        Let("const int", "t0", Bin("*", Axis("bid"), Var("TT"))),
+        # ---- 1. 输入变换：V = B^T d B，一个线程一个 (c, tile) ----
+        For(
+            "idx",
+            Axis("tid"),
+            Bin("*", Var("C"), Var("TT")),
+            Axis("bdim"),
+            (
+                Let("const int", "c", Bin("/", Var("idx"), Var("TT"))),
+                Let("const int", "lt", Bin("%", Var("idx"), Var("TT"))),
+                Let("const int", "t", Bin("+", Var("t0"), Var("lt"))),
+                Let("const bool", "active", Bin("<", Var("t"), Var("NT"))),
+                Let("const int", "n", Bin("/", Var("t"), Var("per_n"))),
+                Let("const int", "r", Bin("%", Var("t"), Var("per_n"))),
+                Let("const int", "th", Bin("/", Var("r"), Var("TW"))),
+                Let("const int", "tw", Bin("%", Var("r"), Var("TW"))),
+                Let(
+                    "const long long",
+                    "base",
+                    Bin(
+                        "*",
+                        Cast(
+                            "long long",
+                            Paren(
+                                Bin(
+                                    "+",
+                                    Bin("*", Var("n"), Var("C")),
+                                    Var("c"),
+                                )
+                            ),
+                        ),
+                        Bin("*", Var("H"), Var("W")),
+                    ),
+                ),
+                ArrayDecl("float", "d", 16, None),
+                ArrayDecl("float", "tmp", 16, None),
+                ArrayDecl("float", "vv", 16, None),
+                For(
+                    "ii",
+                    Num("0"),
+                    Num("4"),
+                    Num("1"),
+                    (
+                        For(
+                            "jj",
+                            Num("0"),
+                            Num("4"),
+                            Num("1"),
+                            (
+                                Let("const int", "ih", ih),
+                                Let("const int", "iw", iw),
+                                Assign(
+                                    cell("d", Var("ii"), Var("jj")),
+                                    Cond(
+                                        Bin(
+                                            "&&",
+                                            Var("active"),
+                                            _wino_inside(Var("ih"), Var("iw")),
+                                        ),
+                                        Index("x", src),
+                                        Num("0.f"),
+                                    ),
+                                ),
+                            ),
+                            type_name="int",
+                        ),
+                    ),
+                    type_name="int",
+                ),
+                # tmp = B^T d（列方向）
+                For(
+                    "jj",
+                    Num("0"),
+                    Num("4"),
+                    Num("1"),
+                    (
+                        Assign(
+                            cell("tmp", Num("0"), Var("jj")),
+                            Bin(
+                                "-",
+                                cell("d", Num("0"), Var("jj")),
+                                cell("d", Num("2"), Var("jj")),
+                            ),
+                        ),
+                        Assign(
+                            cell("tmp", Num("1"), Var("jj")),
+                            Bin(
+                                "+",
+                                cell("d", Num("1"), Var("jj")),
+                                cell("d", Num("2"), Var("jj")),
+                            ),
+                        ),
+                        Assign(
+                            cell("tmp", Num("2"), Var("jj")),
+                            Bin(
+                                "-",
+                                cell("d", Num("2"), Var("jj")),
+                                cell("d", Num("1"), Var("jj")),
+                            ),
+                        ),
+                        Assign(
+                            cell("tmp", Num("3"), Var("jj")),
+                            Bin(
+                                "-",
+                                cell("d", Num("1"), Var("jj")),
+                                cell("d", Num("3"), Var("jj")),
+                            ),
+                        ),
+                    ),
+                    type_name="int",
+                ),
+                # vv = tmp B（行方向）
+                For(
+                    "ii",
+                    Num("0"),
+                    Num("4"),
+                    Num("1"),
+                    (
+                        Assign(
+                            cell("vv", Var("ii"), Num("0")),
+                            Bin(
+                                "-",
+                                cell("tmp", Var("ii"), Num("0")),
+                                cell("tmp", Var("ii"), Num("2")),
+                            ),
+                        ),
+                        Assign(
+                            cell("vv", Var("ii"), Num("1")),
+                            Bin(
+                                "+",
+                                cell("tmp", Var("ii"), Num("1")),
+                                cell("tmp", Var("ii"), Num("2")),
+                            ),
+                        ),
+                        Assign(
+                            cell("vv", Var("ii"), Num("2")),
+                            Bin(
+                                "-",
+                                cell("tmp", Var("ii"), Num("2")),
+                                cell("tmp", Var("ii"), Num("1")),
+                            ),
+                        ),
+                        Assign(
+                            cell("vv", Var("ii"), Num("3")),
+                            Bin(
+                                "-",
+                                cell("tmp", Var("ii"), Num("1")),
+                                cell("tmp", Var("ii"), Num("3")),
+                            ),
+                        ),
+                    ),
+                    type_name="int",
+                ),
+                For(
+                    "p",
+                    Num("0"),
+                    Num("16"),
+                    Num("1"),
+                    (
+                        Store(
+                            "sv",
+                            sv("p", "c", "lt"),
+                            Index("vv", Var("p")),
+                            raw=True,
+                        ),
+                    ),
+                    type_name="int",
+                ),
+            ),
+            type_name="int",
+        ),
+        Sync(),
+        # ---- 2. 逐点乘 + 沿 C 求和 ----
+        Let("const int", "lt", Bin("%", Axis("tid"), Var("TT"))),
+        Let("const int", "oo", Bin("/", Axis("tid"), Var("TT"))),
+        Let("const int", "t", Bin("+", Var("t0"), Var("lt"))),
+        If(Bin(">=", Var("oo"), Var("O")), (Return(),)),
+        If(Bin(">=", Var("t"), Var("NT")), (Return(),)),
+        ArrayDecl("float", "acc", 16, None),
+        For(
+            "p",
+            Num("0"),
+            Num("16"),
+            Num("1"),
+            (Assign(Index("acc", Var("p")), Num("0.f")),),
+            type_name="int",
+        ),
+        For(
+            "c",
+            Num("0"),
+            Var("C"),
+            Num("1"),
+            (
+                Let(
+                    "const float*",
+                    "up",
+                    Bin(
+                        "+",
+                        Var("w"),
+                        Bin(
+                            "+",
+                            Bin("*", Var("oo"), Var("C")),
+                            Var("c"),
+                        ),
+                    ),
+                ),
+                For(
+                    "p",
+                    Num("0"),
+                    Num("16"),
+                    Num("1"),
+                    (
+                        AugAssign(
+                            Index("acc", Var("p")),
+                            "+",
+                            Bin(
+                                "*",
+                                Index(
+                                    "up",
+                                    Bin(
+                                        "*",
+                                        Var("p"),
+                                        Bin("*", Var("O"), Var("C")),
+                                    ),
+                                ),
+                                Index("sv", sv("p", "c", "lt")),
+                            ),
+                        ),
+                    ),
+                    type_name="int",
+                ),
+            ),
+            type_name="int",
+        ),
+        # ---- 3. 输出变换：Y = A^T M A + bias ----
+        ArrayDecl("float", "m2", 8, None),
+        For(
+            "jj",
+            Num("0"),
+            Num("4"),
+            Num("1"),
+            (
+                Assign(
+                    Index("m2", Var("jj")),
+                    Bin(
+                        "+",
+                        Bin(
+                            "+",
+                            acc(Num("0"), Var("jj")),
+                            acc(Num("1"), Var("jj")),
+                        ),
+                        acc(Num("2"), Var("jj")),
+                    ),
+                ),
+                Assign(
+                    Index("m2", Bin("+", Num("4"), Var("jj"))),
+                    Bin(
+                        "-",
+                        Bin(
+                            "-",
+                            acc(Num("1"), Var("jj")),
+                            acc(Num("2"), Var("jj")),
+                        ),
+                        acc(Num("3"), Var("jj")),
+                    ),
+                ),
+            ),
+            type_name="int",
+        ),
+        Let(
+            "const float",
+            "y00",
+            Bin(
+                "+",
+                Bin("+", Index("m2", Num("0")), Index("m2", Num("1"))),
+                Index("m2", Num("2")),
+            ),
+        ),
+        Let(
+            "const float",
+            "y01",
+            Bin(
+                "-",
+                Bin("-", Index("m2", Num("1")), Index("m2", Num("2"))),
+                Index("m2", Num("3")),
+            ),
+        ),
+        Let(
+            "const float",
+            "y10",
+            Bin(
+                "+",
+                Bin("+", Index("m2", Num("4")), Index("m2", Num("5"))),
+                Index("m2", Num("6")),
+            ),
+        ),
+        Let(
+            "const float",
+            "y11",
+            Bin(
+                "-",
+                Bin("-", Index("m2", Num("5")), Index("m2", Num("6"))),
+                Index("m2", Num("7")),
+            ),
+        ),
+        Let("const int", "n", Bin("/", Var("t"), Var("per_n"))),
+        Let("const int", "rr", Bin("%", Var("t"), Var("per_n"))),
+        Let("const int", "th", Bin("/", Var("rr"), Var("TW"))),
+        Let("const int", "tw", Bin("%", Var("rr"), Var("TW"))),
+        Let(
+            "const float",
+            "bv",
+            Cond(Var("has_bias"), Index("b", Var("oo")), Num("0.f")),
+        ),
+        Let(
+            "const long long",
+            "obase",
+            Bin(
+                "*",
+                Paren(
+                    Bin(
+                        "+",
+                        Bin("*", Cast("long long", Var("n")), Var("O")),
+                        Var("oo"),
+                    )
+                ),
+                Bin("*", Cast("long long", Var("HO")), Var("WO")),
+            ),
+        ),
+        Let("const int", "oy", Bin("*", Var("th"), Num("2"))),
+        Let("const int", "ox", Bin("*", Var("tw"), Num("2"))),
+        Let("const int", "row1", Bin("+", Var("oy"), Num("1"))),
+        Let("const int", "col1", Bin("+", Var("ox"), Num("1"))),
+        If(
+            Bin("<", Var("row1"), Var("HO")),
+            (
+                If(
+                    Bin("<", Var("col1"), Var("WO")),
+                    (
+                        Store(
+                            "out",
+                            Bin(
+                                "+",
+                                Var("obase"),
+                                Bin(
+                                    "+",
+                                    Bin("*", Var("row1"), Var("WO")),
+                                    Var("col1"),
+                                ),
+                            ),
+                            Bin("+", Var("y11"), Var("bv")),
+                        ),
+                    ),
+                ),
+                Store(
+                    "out",
+                    Bin(
+                        "+",
+                        Var("obase"),
+                        Bin(
+                            "+",
+                            Bin("*", Var("row1"), Var("WO")),
+                            Var("ox"),
+                        ),
+                    ),
+                    Bin("+", Var("y10"), Var("bv")),
+                ),
+            ),
+        ),
+        If(
+            Bin("<", Var("col1"), Var("WO")),
+            (
+                Store(
+                    "out",
+                    Bin(
+                        "+",
+                        Var("obase"),
+                        Bin(
+                            "+",
+                            Bin("*", Var("oy"), Var("WO")),
+                            Var("col1"),
+                        ),
+                    ),
+                    Bin("+", Var("y01"), Var("bv")),
+                ),
+            ),
+        ),
+        Store(
+            "out",
+            Bin(
+                "+",
+                Var("obase"),
+                Bin("+", Bin("*", Var("oy"), Var("WO")), Var("ox")),
+            ),
+            Bin("+", Var("y00"), Var("bv")),
+        ),
+    )
+    return Kernel(
+        name="winograd_fused",
+        params=(
+            Tensor("x", type_name="float"),
+            Tensor("w", type_name="float"),
+            Tensor("b", type_name="float"),
+            Tensor("out", read_only=False, type_name="float"),
+            Scalar("int", "C"),
+            Scalar("int", "H"),
+            Scalar("int", "W"),
+            Scalar("int", "O"),
+            Scalar("int", "TH"),
+            Scalar("int", "TW"),
+            Scalar("int", "HO"),
+            Scalar("int", "WO"),
+            Scalar("int", "PH"),
+            Scalar("int", "PW"),
+            Scalar("int", "NT"),
+            Scalar("int", "TT"),
+            Scalar("int", "has_bias"),
+        ),
+        body=body,
     )
 
 

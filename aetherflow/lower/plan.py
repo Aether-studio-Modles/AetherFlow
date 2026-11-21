@@ -37,6 +37,9 @@ __all__ = [
     "CONV_SHARED_LIMIT",
     "CONV_TILED_MAX_K",
     "CONV_TILED_MIN_WORK",
+    "CONV_WINOGRAD_TILE",
+    "CONV_WINOGRAD_FUSED_MIN_C",
+    "CONV_WINOGRAD_FUSED_MAX_C",
     "CONV_IMPLICIT_MID_K_MAX",
     "CONV_IMPLICIT_MID_WORK",
     "CONV_CUDNN_MIN_GFLOPS",
@@ -75,6 +78,7 @@ __all__ = [
     "conv_implicit_preferred",
     "conv_winograd_supported",
     "conv_winograd_preferred",
+    "conv_winograd_fused_preferred",
     "scan_auto_chunk",
     "scan_last_auto_chunk",
     "scan_chunk",
@@ -139,6 +143,20 @@ CONV_TILED_MAX_K = 32
 
 # 输出总量太小的时候，一个 block 的权重 staging 抵不过计算本身。
 CONV_TILED_MIN_WORK = 4096
+
+# 融合版 Winograd 的块内 tile 数（5.256）。8 是 A800 上 c3～c24 四档的
+# 共同最好值：TT=2/4 时每块线程数不足，一块只有 1～2 个 warp，拉不满 SM
+# （c8 的 device 时间 0.0364/0.0240 vs TT=8 的 0.0199）。共享内存按
+# ``16*C*TT*4`` 算，C=24 时也只有 12 KB。
+CONV_WINOGRAD_TILE = 8
+
+# 融合版覆盖的输入通道区间（5.256）。下限 8：c3 上融合版端到端 0.0631 ms，
+# 反而慢于分块直算的 0.0579——第一阶段只有 ``C*TT = 24`` 个线程干活，其余
+# 一百多个空转，省下的 device 时间抵不过多出的一次权重变换 launch。
+# 上限 24：c32 起 ``U`` 的重复全局读成为瓶颈（每线程 16*C 次，c32 的 device
+# 0.103 ms 已与四段版持平，c64 退化到 0.246），所以停在 24。
+CONV_WINOGRAD_FUSED_MIN_C = 8
+CONV_WINOGRAD_FUSED_MAX_C = 24
 
 # 隐式 GEMM 的甜点区（A800 实测，5.252）。分界不是像素数，而是 im2col 要
 # 物化的元素数 n*ho*wo*K：网格扫描里 <= 2.95M 的 15 个点在隐式上快 7～13%，
@@ -492,6 +510,38 @@ def conv_winograd_preferred(*, k: int, kh: int, kw: int, sw: int, dw: int,
         and sw == 1
         and dw == 1
         and k > CONV_TILED_MAX_K
+        and work >= CONV_TILED_MIN_WORK
+    )
+
+
+def conv_winograd_fused_preferred(*, c: int, kh: int, kw: int, sw: int,
+                                  dw: int, o: int, work: int) -> bool:
+    """auto 模式下是否该走**融合版** Winograd（A800-40GB 实测，5.256）。
+
+    四段版（输入变换 + 16 个 cuBLAS GEMM + 输出变换）在 A800 上被固定开销
+    支配：c3～c24 的稳态几乎都是 0.103 ms，与通道数无关。融合版把三段压进
+    一次 launch、``V`` 只留共享内存，端到端（``execute_device``，输入驻留、
+    burst 稳态）落在这几档：
+
+    - c8 0.0644、c16 0.0651、c24 0.0661 ms，四段版都是 0.1022～0.1034，
+      与 cuDNN 9 的 0.0639 / 0.0635 / 0.0641 基本持平（1.01～1.03 倍）；
+    - c3 例外：融合版 0.0631 反而慢于分块直算的 0.0579。第一阶段只有
+      ``C*TT = 24`` 个线程干活、其余空转，省下的 device 时间抵不过多出的
+      一次权重变换 launch，所以下限设在 8；
+    - c32 起融合版的乘加退化：``U`` 沿 ``C`` 的读次数是 ``16*C`` 每线程，
+      c32 的 device 0.103 ms 已与四段版持平，c64 退化到 0.246 ms，那几档
+      仍交给四段版。
+
+    因此门槛只看 ``C``，不看 ``K``。其余几何条件与 ``conv_winograd_supported``
+    相同；``TT*O`` 不能超过单块线程上限。
+    """
+    return (
+        kh == 3
+        and kw == 3
+        and sw == 1
+        and dw == 1
+        and CONV_WINOGRAD_FUSED_MIN_C <= c <= CONV_WINOGRAD_FUSED_MAX_C
+        and o * CONV_WINOGRAD_TILE <= BLOCK_MAX
         and work >= CONV_TILED_MIN_WORK
     )
 

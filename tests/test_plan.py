@@ -29,6 +29,7 @@ from aetherflow.lower.plan import (
     check_block,
     conv_oc_tile,
     conv_tiled_preferred,
+    conv_winograd_fused_preferred,
     grid_for,
     plan_conv_implicit,
     plan_conv_tiled,
@@ -485,6 +486,41 @@ class TestConvDecision(unittest.TestCase):
 
     def test_tiny_work_prefers_gemm(self):
         self.assertFalse(conv_tiled_preferred(32, 4095))
+
+    def test_winograd_fused_channel_window(self):
+        """融合版只在 ``8 <= C <= 24`` 打开（5.256）。
+
+        下限来自 c3：融合 0.0631 ms 慢于分块直算的 0.0579；上限来自 c32：
+        融合的 device 时间已退化到 0.103 ms、与四段版持平，c64 更差。
+        """
+
+        def pick(c):
+            return conv_winograd_fused_preferred(
+                c=c, kh=3, kw=3, sw=1, dw=1, o=32, work=1 << 20
+            )
+
+        for c in (3, 7, 25, 32, 64):
+            self.assertFalse(pick(c), msg=f"c={c}")
+        for c in (8, 16, 24):
+            self.assertTrue(pick(c), msg=f"c={c}")
+
+    def test_winograd_fused_geometry(self):
+        """几何条件与 ``conv_winograd_supported`` 一致，另加线程上限。"""
+
+        def pick(**kw):
+            base = dict(c=16, kh=3, kw=3, sw=1, dw=1, o=32, work=1 << 20)
+            base.update(kw)
+            return conv_winograd_fused_preferred(**base)
+
+        self.assertFalse(pick(sw=2))
+        self.assertFalse(pick(dw=2))
+        self.assertFalse(pick(kh=5, kw=5))
+        self.assertFalse(pick(work=4095))
+        self.assertTrue(pick(work=4096))
+        # TT 个 tile × O 个输出通道必须装进一个 block
+        limit = BLOCK_MAX // 8
+        self.assertTrue(pick(o=limit))
+        self.assertFalse(pick(o=limit + 1))
 
 
 class TestScanChunk(unittest.TestCase):

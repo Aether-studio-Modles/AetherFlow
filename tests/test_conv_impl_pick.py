@@ -145,21 +145,33 @@ class TestAutoConvImplPick(unittest.TestCase):
         self.assertFalse(HipBackend.CONV_AUTO_WINOGRAD)
 
     def test_cuda_auto_picks_winograd_for_3x3(self):
-        """3x3 且 K > 32 交给 Winograd（5.255）；K <= 32 仍留给分块直算。"""
+        """3x3 且 K > 32 交给 Winograd；C 小的那几档走融合版（5.256）。
+
+        融合版只在 ``8 <= C <= 24`` 上比四段版快：c8/c16 的端到端从
+        0.103 降到 0.064，c32 起 ``U`` 的重复全局读让乘加退化，仍走四段。
+        """
         backend = self._backend(CudaBackend)
-        cases = (
+        fused = (
             dict(n=4, o=32, k=8 * 9, kh=3, kw=3, ho=64, wo=64, c=8),
             dict(n=4, o=32, k=16 * 9, kh=3, kw=3, ho=64, wo=64, c=16),
+        )
+        for kwargs in fused:
+            self.assertEqual(
+                backend._pick_conv_kernel(sw=1, dw=1, **kwargs),
+                "winograd_fused",
+                msg=str(kwargs),
+            )
+        four = (
             dict(n=4, o=64, k=64 * 9, kh=3, kw=3, ho=56, wo=56, c=64),
             dict(n=2, o=128, k=128 * 9, kh=3, kw=3, ho=28, wo=28, c=128),
         )
-        for kwargs in cases:
+        for kwargs in four:
             self.assertEqual(
                 backend._pick_conv_kernel(sw=1, dw=1, **kwargs),
                 "winograd",
                 msg=str(kwargs),
             )
-        # 3x3_c3：K=27，分块直算 0.077 ms 仍然最快
+        # 3x3_c3：融合版 0.0631 慢于分块直算的 0.0579，仍留给 tiled
         self.assertEqual(
             backend._pick_conv_kernel(
                 n=2, o=16, k=27, kh=3, kw=3, ho=64, wo=64, c=3, sw=1, dw=1
