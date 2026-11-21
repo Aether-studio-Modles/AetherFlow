@@ -7,17 +7,54 @@
 from __future__ import annotations
 
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
-from ..ir.graph import Node
+from ..ir.graph import Graph as Graph, Node
 from ..ir.types import DType
+from ..lower.elementwise import (
+    CHAIN_OPS as CHAIN_OPS,
+    ElemInput as ElemInput,
+    ElemStep as ElemStep,
+    apply_op as apply_op,
+    build_chain as build_chain,
+    channel_broadcast as channel_broadcast,
+)
+from ..lower.kernel import Index as Index, Num as Num
+from ..lower.kernels import BINARY_OP as BINARY_OP
 from ..lower.plan import (
     BLOCK_DEFAULT,
     BLOCK_OPTIONS,
+    CONV_CB_MAX as CONV_CB_MAX,
+    CONV_ROC_MAX as CONV_ROC_MAX,
+    CONV_SHARED_LIMIT as CONV_SHARED_LIMIT,
+    CONV_TILED_MAX_K as CONV_TILED_MAX_K,
+    CONV_TILE_OPTIONS as CONV_TILE_OPTIONS,
+    CONV_WINOGRAD_FUSED_MIN_C as CONV_WINOGRAD_FUSED_MIN_C,
+    CONV_WINOGRAD_FUSED_RESIDENT_MIN_C as CONV_WINOGRAD_FUSED_RESIDENT_MIN_C,
+    CONV_WINOGRAD_TILE as CONV_WINOGRAD_TILE,
+    REDUCE_TILE_X as REDUCE_TILE_X,
+    SHARED_LIMIT as SHARED_LIMIT,
+    VEC4_ALIGN as VEC4_ALIGN,
+    attention_block as attention_block,
     auto_block,
+    cdiv as cdiv,
     check_block,
+    conv_implicit_fits as conv_implicit_fits,
+    conv_implicit_preferred as conv_implicit_preferred,
+    conv_oc_tile as conv_oc_tile,
+    conv_tiled_preferred as conv_tiled_preferred,
+    conv_winograd_fused_preferred as conv_winograd_fused_preferred,
+    conv_winograd_preferred as conv_winograd_preferred,
+    conv_winograd_supported as conv_winograd_supported,
     grid_for,
+    plan_conv_implicit as plan_conv_implicit,
+    plan_conv_tiled as plan_conv_tiled,
+    plan_csr_scan as plan_csr_scan,
+    plan_csr_scan_enabled as plan_csr_scan_enabled,
+    plan_elementwise as plan_elementwise,
     plan_reduce,
+    plan_reduce_tiled as plan_reduce_tiled,
+    scan_chunk as scan_chunk,
 )
-from ..runtime.bf16 import unpack_bf16
+from ..runtime.bf16 import pack_bf16 as pack_bf16, unpack_bf16
 from ..tuning.space import TuningSpace
 from .base import BackendCapabilityError
 from .contracts import MemoryStats
@@ -35,6 +72,7 @@ from .device_shared import (
     _CONV_ROC_OPTIONS as _CONV_ROC_OPTIONS,
     _CONV_TILE_OP as _CONV_TILE_OP,
     _DEQUANTIZE_I8_SRC as _DEQUANTIZE_I8_SRC,
+    _ELEMENTWISE_TUNABLE_OPS as _ELEMENTWISE_TUNABLE_OPS,
     _GRAPH_MODES as _GRAPH_MODES,
     _INDEX_ARGS as _INDEX_ARGS,
     _INDEX_DTYPES as _INDEX_DTYPES,
@@ -42,6 +80,7 @@ from .device_shared import (
     _LAYOUT_OPS as _LAYOUT_OPS,
     _MEMORY_MODES as _MEMORY_MODES,
     _QUANTIZE_I8_SRC as _QUANTIZE_I8_SRC,
+    _REDUCE_TUNABLE_OPS as _REDUCE_TUNABLE_OPS,
     _SPARSE_IMPLS as _SPARSE_IMPLS,
     _TUNABLE_OPS as _TUNABLE_OPS,
     _chainable as _chainable,

@@ -10,7 +10,11 @@ matmul 不在这里：它走 cuBLAS / hipBLAS，没有内核模板，也就没�
 线性代数的可移植性由库契约保证，不是 L2 的职责。
 """
 
-from .common import BINARY_OP as BINARY_OP, grid_stride
+from .common import (
+    BINARY_OP as BINARY_OP,
+    _flat_loop as _flat_loop,
+    grid_stride,
+)
 from .elementwise import (
     ew_binary,
     ew_unary,
@@ -31,6 +35,9 @@ from .reduce import (
     softmax_axis as softmax_axis,
     argmax_last,
     softmax_last,
+    _AXIS_REDUCE_INIT as _AXIS_REDUCE_INIT,
+    _AXIS_REDUCE_TILE_FN as _AXIS_REDUCE_TILE_FN,
+    _reduce_last as _reduce_last,
 )
 from .norm import (
     layernorm_last,
@@ -38,8 +45,13 @@ from .norm import (
     rmsnorm_last,
     batch_norm,
     batch_norm_stats,
+    _batch_norm_prefix as _batch_norm_prefix,
+    _batch_norm_reductions as _batch_norm_reductions,
+    _batch_scan as _batch_scan,
+    _channel_slice as _channel_slice,
+    _outer_scan as _outer_scan,
 )
-from .misc import concat_copy, dropout_mask
+from .misc import concat_copy, dropout_mask, _SPLITMIX64 as _SPLITMIX64
 from .sparse import (
     spike_offsets,
     spike_csr_serial,
@@ -52,6 +64,9 @@ from .sparse import (
     _ROW_COLS as _ROW_COLS,
     _S_ROWS as _S_ROWS,
     _T_WIDTH as _T_WIDTH,
+    _clamp_index as _clamp_index,
+    _event_row_check as _event_row_check,
+    _event_segment as _event_segment,
 )
 from .scan import (
     scan_linear,
@@ -66,6 +81,9 @@ from .scan import (
     scan_linear_chunk_last,
     _T_ELEMS as _T_ELEMS,
     _C_ELEMS as _C_ELEMS,
+    _chunk_bounds as _chunk_bounds,
+    _chunk_coords as _chunk_coords,
+    _chunk_prefix_scan as _chunk_prefix_scan,
 )
 from .pool import (
     maxpool2d,
@@ -75,6 +93,13 @@ from .pool import (
     avgpool2d_backward,
     adaptive_avg_pool2d,
     adaptive_avg_pool2d_backward,
+    _adaptive_bounds as _adaptive_bounds,
+    _adaptive_window as _adaptive_window,
+    _avgpool_pad_bounds as _avgpool_pad_bounds,
+    _in_image as _in_image,
+    _pool_params as _pool_params,
+    _window_axis as _window_axis,
+    _window_scan as _window_scan,
 )
 from .conv import (
     conv2d_input_grad,
@@ -87,8 +112,65 @@ from .conv import (
     winograd_weight_transform,
     winograd_output_transform,
     winograd_fused,
+    _conv_tap as _conv_tap,
+    _plane_prefix as _plane_prefix,
+    _tiled_accumulate as _tiled_accumulate,
+    _tiled_weight as _tiled_weight,
+    _wino_cell as _wino_cell,
+    _wino_inside as _wino_inside,
+    _wino_pos as _wino_pos,
+    _wino_tile_lets as _wino_tile_lets,
 )
-from .attention import attention_fwd
+from .attention import attention_fwd, _ATTENTION_RAND as _ATTENTION_RAND
+from .image import (
+    _IMAGE_LAYOUT as _IMAGE_LAYOUT,
+    _TAP_LAYOUT as _TAP_LAYOUT,
+    _image_slice as _image_slice,
+    _split_output_index as _split_output_index,
+    _tap as _tap,
+)
+
+# 兼容转口：这些名字在拆分前直接住在 ``kernels`` 模块里（自身定义或从邻近
+# 模块导入），外部可能按旧路径取用，故保持同名可见。
+from ..indexing import Layout as Layout
+from ..kernel import (
+    ArrayDecl as ArrayDecl,
+    Assign as Assign,
+    AtomicAdd as AtomicAdd,
+    AtomicMin as AtomicMin,
+    AugAssign as AugAssign,
+    Axis as Axis,
+    Bin as Bin,
+    Call as Call,
+    Cast as Cast,
+    Cond as Cond,
+    Continue as Continue,
+    Expr as Expr,
+    For as For,
+    If as If,
+    Index as Index,
+    Kernel as Kernel,
+    Let as Let,
+    LetMulti as LetMulti,
+    Load as Load,
+    Narrow as Narrow,
+    Neg as Neg,
+    Not as Not,
+    Num as Num,
+    Paren as Paren,
+    Ptr as Ptr,
+    Return as Return,
+    Scalar as Scalar,
+    Shared as Shared,
+    Stmt as Stmt,
+    Store as Store,
+    Sync as Sync,
+    Tensor as Tensor,
+    Var as Var,
+    Widen as Widen,
+)
+from ..plan import CSR_SCAN_SLOTS as CSR_SCAN_SLOTS, REDUCE_SCRATCH as REDUCE_SCRATCH
+from typing import Optional as Optional, Tuple as Tuple
 
 __all__ = [
     "grid_stride",
