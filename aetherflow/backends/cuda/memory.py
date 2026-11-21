@@ -169,9 +169,23 @@ class Arena:
             return
         self._live_bytes -= got
         bisect.insort(self._free, (addr, got))
+        self._coalesce()
+
+    def _coalesce(self) -> None:
+        """把**同一个 chunk 内**地址相邻的空闲块合成一块。
+
+        不能跨 chunk 合并：两个 chunk 是两次独立的 ``cudaMalloc``，地址
+        相邻只是虚拟地址的巧合。合并后 best-fit 会切出跨越分配边界的
+        ``MemoryPointer``，D2D 拷贝按分配校验范围就会失败（HIP 侧实测为
+        code=1，见 ``hip/memory.py`` 的同名方法）。
+        """
         merged: List[Tuple[int, int]] = []
         for a, n in self._free:
-            if merged and merged[-1][0] + merged[-1][1] == a:
+            if (
+                merged
+                and merged[-1][0] + merged[-1][1] == a
+                and self._chunk_of(merged[-1][0]) == self._chunk_of(a)
+            ):
                 merged[-1] = (merged[-1][0], merged[-1][1] + n)
             else:
                 merged.append((a, n))

@@ -3841,6 +3841,37 @@ class TestCudaGraph(CudaTestCase):
         del a, b, big
         arena.close()
 
+    def test_arena_does_not_merge_across_chunks(self):
+        """地址相邻的两个 chunk 不能合并，否则会切出跨分配的指针。
+
+        两个 chunk 是两次独立的 ``cudaMalloc``；合并后 best-fit 发出的
+        ``MemoryPointer`` 会越过第一个分配的末尾，D2D 拷贝按分配校验范围
+        就会失败。这里只走账本（``free`` 不碰驱动），因此不依赖真实 malloc
+        是否恰好给出相邻地址。
+        """
+        from types import SimpleNamespace
+
+        from aetherflow.backends.cuda.memory import Arena
+
+        arena = Arena(self.cuda.cp, chunk_bytes=1 << 20)
+        arena._chunks = [
+            SimpleNamespace(ptr=0x10000, size=1 << 20),
+            SimpleNamespace(ptr=0x110000, size=1 << 20),
+        ]
+        for addr in (0x10000, 0x110000):
+            arena._live[addr] = 1 << 20
+            arena._live_bytes += 1 << 20
+            arena.free(SimpleNamespace(ptr=addr))
+        self.assertEqual(len(arena._free), 2, "跨 chunk 的相邻空闲块不能合并")
+        for addr, size in arena._free:
+            self.assertTrue(
+                any(
+                    chunk.ptr <= addr and addr + size <= chunk.ptr + chunk.size
+                    for chunk in arena._chunks
+                ),
+                "空闲块必须完整落在某个 chunk 内",
+            )
+
     def test_capture_reports_memory_budget(self):
         """捕获后必须能报出峰值与总占用：峰值是下界，总占用只多不少。"""
         spec = BlockSpec(d_model=32, num_heads=4, d_ff=64)

@@ -192,15 +192,31 @@ class Arena:
         self._coalesce()
 
     def _coalesce(self) -> None:
-        """把地址相邻的空闲块合成一块：捕获期反复切开又还给同一块是常态，
-        不合并会让 best-fit 只能选到碎片，从而在捕获期要求新块。"""
+        """把**同一个 chunk 内**地址相邻的空闲块合成一块。
+
+        不能跨 chunk 合并：两个 chunk 是两次独立的 ``hipMalloc``，驱动按
+        分配校验拷贝范围，地址看起来相邻也不行。合并后 best-fit 会切出
+        跨越分配边界的 slice，replay 时的 D2D 直接返回 code=1（实测：24 层
+        模型第二段生成的第一步状态回写）。地址相邻还不够，必须同属一块。
+        """
         merged: List[Tuple[int, int]] = []
         for a, n in self._free:
-            if merged and merged[-1][0] + merged[-1][1] == a:
+            if (
+                merged
+                and merged[-1][0] + merged[-1][1] == a
+                and self._chunk_of(merged[-1][0]) == self._chunk_of(a)
+            ):
                 merged[-1] = (merged[-1][0], merged[-1][1] + n)
             else:
                 merged.append((a, n))
         self._free = merged
+
+    def _chunk_of(self, addr: int) -> int:
+        """``addr`` 属于哪一个 chunk；不属于任何一块返回 -1。"""
+        for index, (start, capacity) in enumerate(self._chunks):
+            if start <= addr < start + capacity:
+                return index
+        return -1
 
     # ------------------------------------------------------------------
 

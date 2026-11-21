@@ -296,6 +296,49 @@ class TestHipCaptureSurface(unittest.TestCase):
         arena.malloc(512 * 1024)
         self.assertEqual(arena.total_bytes, total, "回收后不应触发新的驱动分配")
 
+    def test_arena_does_not_coalesce_across_chunks(self):
+        """地址相邻的两个 chunk 也不能合并成一条空闲块。
+
+        两个 chunk 是两次独立的 ``hipMalloc``，地址相邻只是运气。合并后
+        best-fit 会切出跨越分配边界的 slice，replay 的 D2D 按分配校验范围
+        直接失败（实测 24 层模型第二段生成第一步，code=1）。离线账本钉住：
+        还块后空闲表仍是两条，且每条完整落在自己的 chunk 内。
+        """
+        from aetherflow.backends.hip.memory import Arena
+
+        class _FakeArena(Arena):
+            """地址簿替身：不碰驱动，按 chunk 粒度为每次扩容发一个新地址。"""
+
+            def __init__(self):
+                super().__init__()
+                self._next = 0x10000
+
+            def _new_chunk(self, size):
+                capacity = max(size, 1 << 20)
+                addr = self._next
+                self._next += capacity
+                self._chunks.append((addr, capacity))
+                self._bump.append(0)
+                return addr
+
+        arena = _FakeArena()
+        first = arena.malloc(1 << 20)
+        second = arena.malloc(1 << 20)
+        self.assertEqual(
+            first.ptr + first.nbytes, second.ptr, "两块地址应当相邻，才能复现合并"
+        )
+        arena.free(first)
+        arena.free(second)
+        self.assertEqual(len(arena._free), 2, "跨 chunk 的相邻空闲块不能合并")
+        for addr, size in arena._free:
+            self.assertTrue(
+                any(
+                    start <= addr and addr + size <= start + capacity
+                    for start, capacity in arena._chunks
+                ),
+                "空闲块必须完整落在某个 chunk 内",
+            )
+
     def test_arena_alias_holds_source_until_last_view_dies(self):
         """视图还按源地址读时，那块内存不能还给空闲表。
 
