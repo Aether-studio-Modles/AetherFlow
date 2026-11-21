@@ -39,9 +39,11 @@ from ..lower.elementwise import (
     CHAIN_OPS,
     ElemInput,
     ElemStep,
+    apply_op,
     build_chain,
     channel_broadcast,
 )
+from ..lower.kernel import Index, Num
 from ..lower.kernels import BINARY_OP
 from ..lower.plan import (
     BLOCK_DEFAULT,
@@ -1502,7 +1504,13 @@ class DeviceBackend(Executor):
             if fns is not None:
                 group.kernels = tuple(fns)
                 if len(group.nodes) > 1:
-                    group.chain = self._planned_chain(group)
+                    if group.nodes[0].op.name == "conv2d":
+                        # conv + epilogue：链首不是逐元素算子，不能走
+                        # ``_planned_chain``；绑定一个整组闭包，把链内联进
+                        # conv 内核的写回点（见 ``_planned_conv_epilogue``）。
+                        group.fused = self._planned_conv_epilogue(group)
+                    else:
+                        group.chain = self._planned_chain(group)
 
     def _fold_constant_reshape(self, node: Node, values: Dict[int, Any]):
         """常量上的 ``reshape`` 在计划期折成视图；不是这种情形返回 ``None``。
@@ -1615,7 +1623,8 @@ class DeviceBackend(Executor):
         except Exception:  # noqa: BLE001 - 预解析失败只影响这条优化
             return None
 
-    def _planned_winograd_fused(self, node: Node):
+    def _planned_winograd_fused(self, node: Node, epilogue=None, extra=(),
+                                epi_key=None):
         """静态 3x3 conv 的融合 Winograd launch，在计划期展开成闭包。
 
         运行期每次重新走 ``_op_conv2d`` 的代价不在内核：形状解包、``_pair``、
@@ -1666,25 +1675,37 @@ class DeviceBackend(Executor):
                 # 图输入可能以不同形状 / 非连续视图进来：这两种情况要求
                 # 重新解析与可能的一次 ascontiguousarray，交回原路径。
                 if x.shape != x_shape or x.dtype != cp.float32 or not x.flags.c_contiguous:
+                    if epilogue is not None:
+                        return None
                     return self._op_conv2d(node, args, attrs, resident=box)
                 u = box[0] if box else None
                 if u is None:
                     # 首次：让原实现算 U 并填进盒子，之后的执行才走快路径。
                     return self._conv2d_winograd_fused(
                         x, args[1], args[2] if has_bias else None,
-                        resident=box, **dims
+                        resident=box, epilogue=epilogue, extra=extra,
+                        extra_args=tuple(args[len(node.inputs):]),
+                        **dims
                     )
                 bias = args[2] if has_bias else None
                 out = cp.empty(out_shape, dtype=x.dtype)
                 bp = x if bias is None else self._contig(bias)
+                fused_key = ("winograd_fused", "f32")
+                if epi_key is not None:
+                    fused_key += ((epi_key,),)
                 self._kernel(
-                    ("winograd_fused", "f32"),
+                    fused_key,
                     lambda: self.codegen.render(
-                        self.codegen.winograd_fused_source(), cp.float32
+                        self.codegen.winograd_fused_source(
+                            epilogue=epilogue, extra=extra
+                        ),
+                        cp.float32,
                     ),
                     "winograd_fused",
                 )(
-                    grid, block, (x, u, bp, out) + static, shared_mem=shared
+                    grid, block,
+                    (x, u, bp, out) + static + tuple(args[len(node.inputs):]),
+                    shared_mem=shared,
                 )
                 return out
 
@@ -1692,8 +1713,13 @@ class DeviceBackend(Executor):
         except Exception:  # noqa: BLE001 - 预解析失败只影响这条优化
             return None
 
-    def _planned_winograd(self, node: Node):
+    def _planned_winograd(self, node: Node, epilogue=None, extra=(), epi_key=None):
         """静态 3x3 conv 的四段 Winograd，在计划期展开成闭包。
+
+        ``epilogue`` 非空时，闭包把后继逐元素链内联进输出变换内核：``Y``
+        不再物化一次再被链读回来。``args`` 的前 ``len(node.inputs)`` 项是
+        conv 自己的输入，之后是按 ``extra`` 顺序排的额外张量（由调用方的
+        融合闭包拼上来）。
 
         ``overhead_compare`` 在 c64 上的分解：burst 0.113 / kernel 0.085 /
         三段内核 + GEMM 合计 0.044 ms。缺口里有三块中间缓冲的 ``cp.empty``、
@@ -1743,9 +1769,17 @@ class DeviceBackend(Executor):
             def call(node, args, attrs):
                 x = args[0]
                 if x.shape != x_shape or x.dtype != cp.float32 or not x.flags.c_contiguous:
+                    if epilogue is not None:
+                        # 形状 / 连续性不符时无法复用这份展开。带 epilogue 的
+                        # 情形不能回落到 ``_op_conv2d``（那会丢掉链），交回
+                        # 逐节点执行才是正确的。
+                        return None
                     return self._op_conv2d(node, args, attrs)
                 kernels = holder[0]
                 if kernels is None:
+                    out_key = ("winograd_output", "f32")
+                    if epi_key is not None:
+                        out_key += ((epi_key,),)
                     kernels = holder[0] = (
                         self._kernel(
                             ("winograd_weight", "f32"),
@@ -1762,9 +1796,12 @@ class DeviceBackend(Executor):
                             "winograd_input",
                         ),
                         self._kernel(
-                            ("winograd_output", "f32"),
+                            out_key,
                             lambda: self.codegen.render(
-                                self.codegen.winograd_output_source(), dtype
+                                self.codegen.winograd_output_source(
+                                    epilogue=epilogue, extra=extra
+                                ),
+                                dtype,
                             ),
                             "winograd_output",
                         ),
@@ -1788,7 +1825,10 @@ class DeviceBackend(Executor):
                     *gemm
                 )
                 bp = x if not has_bias else self._contig(args[2])
-                k_output((o_grid,), (o_block,), (m, bp, out) + o_static)
+                k_output(
+                    (o_grid,), (o_block,),
+                    (m, bp, out) + o_static + tuple(args[len(node.inputs):])
+                )
                 return out
 
             return call
@@ -1832,7 +1872,83 @@ class DeviceBackend(Executor):
 
     def group_nodes(self, graph):
         """相邻的同形逐元素算子交给一个内核（计划见 ``_group_elementwise``）。"""
-        return _group_elementwise(graph)
+        return self._merge_conv_epilogue(graph, _group_elementwise(graph))
+
+    def _merge_conv_epilogue(self, graph: Graph, groups: List[tuple]) -> List[tuple]:
+        """把单个 conv 节点与紧随其后的逐元素链并成一组。
+
+        这是 epilogue 融合的**静态前提**，所有条件都必须在这里成立，因为
+        "合并之后又融合不了"会让这条链退回逐节点执行（比不合并更慢）：
+
+        - conv 的输出只被链首使用，且不是图输出（否则中间值必须可见）；
+        - 链里每个节点都在逐元素表里、形状与 dtype 与 conv 输出一致；
+        - 链的额外输入只能是标量（大小 1）或逐通道 ``(1,C,1,1)``：conv
+          内核按输出通道 ``o`` 索引它们，同形的第二张大张量不存在（conv
+          只产出一个输出），也无法在写回点内联。
+
+        目前只对 f32 生效：f16 / bf16 的图里 conv 输出会先舍入到存储类型，
+        融合后一路在 float 里算会改变数值。
+        """
+        if not groups:
+            return groups
+        users: Dict[int, List[Node]] = {}
+        for node in graph.nodes:
+            for a in node.inputs:
+                users.setdefault(a.id, []).append(node)
+        out_ids = {v.id for v in graph.outputs}
+
+        merged: List[tuple] = []
+        i = 0
+        while i < len(groups):
+            group = groups[i]
+            if (
+                i + 1 < len(groups)
+                and len(group) == 1
+                and group[0].op.name == "conv2d"
+                and group[0].output.type.dtype is DType.F32
+            ):
+                conv = group[0]
+                nxt = groups[i + 1]
+                mid = conv.output
+                if (
+                    mid.id not in out_ids
+                    and users.get(mid.id) == [nxt[0]]
+                    and all(_chainable(n) for n in nxt)
+                    and all(
+                        n.output.type.dtype is DType.F32
+                        and n.output.type.shape == mid.type.shape
+                        for n in nxt
+                    )
+                    and self._epilogue_inputs_ok(conv, nxt)
+                ):
+                    merged.append(group + nxt)
+                    i += 2
+                    continue
+            merged.append(group)
+            i += 1
+        return merged
+
+    @staticmethod
+    def _epilogue_inputs_ok(conv: Node, chain: tuple) -> bool:
+        """链的额外输入只能是标量或逐通道广播（见 ``_merge_conv_epilogue``）。"""
+        internal = {node.output.id for node in chain}
+        internal.add(conv.output.id)
+        out_shape = conv.output.type.shape
+        for node in chain:
+            for value in node.inputs:
+                if value.id in internal:
+                    continue
+                t = value.type
+                if not t.is_static:
+                    return False
+                size = 1
+                for d in t.shape:
+                    size *= int(d)
+                if size == 1:
+                    continue
+                if channel_broadcast(t.shape, out_shape) is None:
+                    return False
+        return True
 
 
 
@@ -1847,6 +1963,16 @@ class DeviceBackend(Executor):
         否则仍是原来的逐节点 ``invoke``。
         """
         if len(group) > 1:
+            if group[0].op.name == "conv2d":
+                # conv + epilogue 的融合组：链首不是逐元素算子，不能交给
+                # ``_try_chain``。``fused`` 为 ``None``（计划期判定不成立）或
+                # 运行期前提不满足时，逐节点执行仍是正确的回退路径。
+                fused = plan.fused if plan is not None else None
+                if fused is not None:
+                    out = fused(args)
+                    if out is not None:
+                        return out
+                return super().invoke_group(group, args, attrs, plan=plan)
             chain = plan.chain if plan is not None else None
             if chain is not None:
                 out = chain(group, args)
@@ -1974,6 +2100,82 @@ class DeviceBackend(Executor):
         )
         kernel((launch.grid,), (launch.block,), (*arrays, out, np.int64(n)))
         return out
+
+    def _planned_conv_epilogue(self, group):
+        """把 conv 后继的逐元素链内联进 conv 内核的写回点。
+
+        条件由 ``_merge_conv_epilogue`` 在分组时保证；这里只负责把链翻译成
+        表达式并绑定到 Winograd 的输出变换（四段版或融合版）。链的**组外**
+        输入按形状分成两类：
+
+        - 大小 1 的标量：``e0[0]``，四条通道共用；
+        - ``(1,C,1,1)`` / ``(C,1,1)`` 的逐通道参数：``e0[oo]``，用 conv 内核
+          里已有的输出通道变量索引，不需要再按展平下标反算通道。
+
+        实现选择与 ``_op_conv2d`` 走同一份判据（``_winograd_static`` 里的
+        ``_pick_conv_kernel``）：任何一条不满足就返回 ``None``，整组退回逐
+        节点执行。回退是**正确性优先**的：conv 先落一次全局内存，链再读回来，
+        与没有这个优化时逐位相同。
+        """
+        conv = group.nodes[0]
+        internal = {node.output.id for node in group.nodes[:-1]}
+        extra: List[Tuple[str, str]] = []
+        slots: List[Tuple[int, int]] = []
+        named: Dict[int, Tuple[str, str]] = {}
+        # 只收**链**的组外输入：conv 自己的输入（x / w / bias）不是
+        # epilogue 的操作数，收进来只会给内核多加几个用不到的指针。
+        for j, node in enumerate(group.nodes[1:], start=1):
+            for k, value in enumerate(node.inputs):
+                if value.id in internal or value.id in named:
+                    continue
+                t = value.type
+                size = 1
+                for d in t.shape:
+                    size *= int(d)
+                kind = "scalar" if size == 1 else "channel"
+                name = f"e{len(extra)}"
+                extra.append((name, kind))
+                slots.append((j, k))
+                named[value.id] = (name, kind)
+
+        conv_out = conv.output.id
+
+        def build(base, channel):
+            local = {conv_out: base}
+            for node in group.nodes[1:]:
+                args = []
+                for value in node.inputs:
+                    if value.id in local:
+                        args.append(local[value.id])
+                        continue
+                    name, kind = named[value.id]
+                    args.append(
+                        Index(name, Num("0"))
+                        if kind == "scalar"
+                        else Index(name, channel)
+                    )
+                local[node.output.id] = apply_op(
+                    node.op.name, args, _step_params(node)
+                )
+            return local[group.nodes[-1].output.id]
+
+        epi_key = (
+            tuple((node.op.name, _step_params(node)) for node in group.nodes[1:]),
+            tuple(extra),
+        )
+        prepared = self._planned_winograd(conv, build, tuple(extra), epi_key)
+        if prepared is None:
+            prepared = self._planned_winograd_fused(
+                conv, build, tuple(extra), epi_key
+            )
+        if prepared is None:
+            return None
+
+        def fused(group_args):
+            extras = [group_args[j][k] for j, k in slots]
+            return prepared(conv, tuple(group_args[0]) + tuple(extras), None)
+
+        return fused
 
     def _planned_chain(self, group):
         """静态逐元素组在计划期展开，运行期只剩分配与一次内核调用。
@@ -3112,7 +3314,8 @@ class DeviceBackend(Executor):
         return out
 
     def _conv2d_winograd(self, x, weight, bias, *, n, c, h, w, o, kh, kw, ho, wo,
-                         sh, sw, ph, pw, dh, dw, k):
+                         sh, sw, ph, pw, dh, dw, k, epilogue=None, extra=(),
+                         extra_args=()):
         """Winograd F(2x2,3x3)：用 16 个小 GEMM 换掉 9 倍的乘法。
 
         三次自研 launch + 一次批量 GEMM：
@@ -3142,12 +3345,20 @@ class DeviceBackend(Executor):
         out = cp.empty((n, o, ho, wo), dtype=x.dtype)
         dtype_key = self._kind(x)
 
-        def launch(name: str, total: int, args) -> None:
+        def launch(name: str, total: int, args, epi=None, epi_extra=()) -> None:
             block, grid = self._grid("conv2d", total)
+            # epilogue 改变了输出变换的源码与参数表，内核缓存键必须带上它，
+            # 否则同一张图里"带 BN 的 conv"与"不带 BN 的 conv"会共用内核。
+            key = (name, dtype_key)
+            if epi is not None:
+                key += ((tuple(epi_extra),),)
             kernel = self._kernel(
-                (name, dtype_key),
+                key,
                 lambda: self.codegen.render(
-                    getattr(self.codegen, f"{name}_source")(), x.dtype
+                    getattr(self.codegen, f"{name}_source")(
+                        epilogue=epi, extra=epi_extra
+                    ) if epi is not None else getattr(self.codegen, f"{name}_source")(),
+                    x.dtype,
                 ),
                 name,
             )
@@ -3191,12 +3402,15 @@ class DeviceBackend(Executor):
                 np.int32(th), np.int32(tw), np.int32(nt),
                 np.int32(0 if bias is None else 1),
                 np.int64(total),
-            ),
+            ) + tuple(extra_args),
+            epi=epilogue,
+            epi_extra=extra,
         )
         return out
 
     def _conv2d_winograd_fused(self, x, weight, bias, *, n, c, h, w, o, kh, kw,
-                               ho, wo, sh, sw, ph, pw, dh, dw, k, resident=None):
+                               ho, wo, sh, sw, ph, pw, dh, dw, k, resident=None,
+                               epilogue=None, extra=(), extra_args=()):
         """融合版 F(2x2,3x3)：两次 launch（权重变换 + 融合内核）。
 
         与 :meth:`_conv2d_winograd` 的差别只在中间量落在哪：``V`` 留在共享
@@ -3251,10 +3465,14 @@ class DeviceBackend(Executor):
                     resident.append(u)
 
         out = cp.empty((n, o, ho, wo), dtype=x.dtype)
+        key = ("winograd_fused", dtype_key)
+        if epilogue is not None:
+            key += ((tuple(extra),),)
         kernel = self._kernel(
-            ("winograd_fused", dtype_key),
+            key,
             lambda: self.codegen.render(
-                self.codegen.winograd_fused_source(), x.dtype
+                self.codegen.winograd_fused_source(epilogue=epilogue, extra=extra),
+                x.dtype,
             ),
             "winograd_fused",
         )
@@ -3267,7 +3485,7 @@ class DeviceBackend(Executor):
                 np.int32(th), np.int32(tw), np.int32(ho), np.int32(wo),
                 np.int32(ph), np.int32(pw), np.int32(nt), np.int32(tt),
                 np.int32(0 if bias is None else 1),
-            ),
+            ) + tuple(extra_args),
             shared_mem=16 * c * tt * 4,
         )
         return out

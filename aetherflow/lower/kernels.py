@@ -5830,7 +5830,7 @@ def winograd_weight_transform() -> Kernel:
     )
 
 
-def winograd_output_transform() -> Kernel:
+def winograd_output_transform(epilogue=None, extra=()) -> Kernel:
     """输出变换：``Y = A^T M A`` + bias，一个线程一个 ``(o, tile)``。
 
     读 16 个 ``M``（每路相隔 ``O*NT``，同一 warp 内 ``t`` 连续所以每一路
@@ -5879,6 +5879,14 @@ def winograd_output_transform() -> Kernel:
         ),
         _wino_cell("tmp", row, Num("3")),
     )
+
+    def epi(value, channel):
+        """写回前的 epilogue：把后继逐元素链（BN / 激活）内联在这里。
+
+        默认 ``None`` 时原样返回，生成的源码与没有这个参数时逐字相同。
+        """
+        return value if epilogue is None else epilogue(value, channel)
+
     body = (
         Let("const int", "per_n", Bin("*", Var("TH"), Var("TW"))),
         Let(
@@ -5983,16 +5991,19 @@ def winograd_output_transform() -> Kernel:
                                 Store(
                                     "y",
                                     to_y(Var("oh"), Var("ow")),
-                                    Bin(
-                                        "+",
-                                        Paren(
-                                            Cond(
-                                                Bin("==", Var("jj"), Num("0")),
-                                                Paren(y00(Var("ii"))),
-                                                Paren(y01(Var("ii"))),
-                                            )
+                                    epi(
+                                        Bin(
+                                            "+",
+                                            Paren(
+                                                Cond(
+                                                    Bin("==", Var("jj"), Num("0")),
+                                                    Paren(y00(Var("ii"))),
+                                                    Paren(y01(Var("ii"))),
+                                                )
+                                            ),
+                                            Var("bv"),
                                         ),
-                                        Var("bv"),
+                                        Var("o"),
                                     ),
                                     raw=True,
                                 ),
@@ -6020,12 +6031,13 @@ def winograd_output_transform() -> Kernel:
             Scalar("int", "NT"),
             Scalar("int", "has_bias"),
             Scalar("long long", "total"),
+            *(Tensor(name, type_name="float") for name, _ in extra),
         ),
         body=grid_stride(Var("total"), *body),
     )
 
 
-def winograd_fused() -> Kernel:
+def winograd_fused(epilogue=None, extra=()) -> Kernel:
     """融合版 F(2x2,3x3)：一次 launch 走完输入变换、乘加与输出变换。
 
     4 段版（``winograd_input`` + 16 个 cuBLAS GEMM + ``winograd_output``）
@@ -6078,6 +6090,15 @@ def winograd_fused() -> Kernel:
         Var("base"),
         Bin("+", Bin("*", Cast("long long", Paren(ih)), Var("W")), iw),
     )
+
+    def epi(value, channel):
+        """写回前的 epilogue：把后继逐元素链（BN / 激活）内联在这里。
+
+        默认 ``None`` 时原样返回，生成的源码与没有这个参数时逐字相同。
+        ``channel`` 是当前输出通道变量（``oo``），逐通道参数的索引由它给出。
+        """
+        return value if epilogue is None else epilogue(value, channel)
+
     body = (
         Shared("float", "sv", extern=True),
         Let("const int", "per_n", Bin("*", Var("TH"), Var("TW"))),
@@ -6431,7 +6452,7 @@ def winograd_fused() -> Kernel:
                                     Var("col1"),
                                 ),
                             ),
-                            Bin("+", Var("y11"), Var("bv")),
+                            epi(Bin("+", Var("y11"), Var("bv")), Var("oo")),
                         ),
                     ),
                 ),
@@ -6446,7 +6467,7 @@ def winograd_fused() -> Kernel:
                             Var("ox"),
                         ),
                     ),
-                    Bin("+", Var("y10"), Var("bv")),
+                    epi(Bin("+", Var("y10"), Var("bv")), Var("oo")),
                 ),
             ),
         ),
@@ -6464,7 +6485,7 @@ def winograd_fused() -> Kernel:
                             Var("col1"),
                         ),
                     ),
-                    Bin("+", Var("y01"), Var("bv")),
+                    epi(Bin("+", Var("y01"), Var("bv")), Var("oo")),
                 ),
             ),
         ),
@@ -6475,7 +6496,7 @@ def winograd_fused() -> Kernel:
                 Var("obase"),
                 Bin("+", Bin("*", Var("oy"), Var("WO")), Var("ox")),
             ),
-            Bin("+", Var("y00"), Var("bv")),
+            epi(Bin("+", Var("y00"), Var("bv")), Var("oo")),
         ),
     )
     return Kernel(
@@ -6498,6 +6519,7 @@ def winograd_fused() -> Kernel:
             Scalar("int", "NT"),
             Scalar("int", "TT"),
             Scalar("int", "has_bias"),
+            *(Tensor(name, type_name="float") for name, _ in extra),
         ),
         body=body,
     )

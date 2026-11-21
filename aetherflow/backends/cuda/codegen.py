@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from ...ir.types import DType
 from ...lower import emit
 from ...lower.kernel import Kernel
@@ -328,7 +330,12 @@ _HELPERS = {
 
 
 def _dtype_key(dtype) -> str:
-    name = str(getattr(dtype, "name", dtype))
+    # ``np.dtype`` 实例有 ``.name``，标量**类型**（``cp.float32``）没有：
+    # 它的 ``str`` 是 ``<class 'numpy.float32'>``。两种写法都要认，否则
+    # 同一份调用换个写法就编不出内核。
+    name = getattr(dtype, "name", None)
+    if not isinstance(name, str):
+        name = np.dtype(dtype).name
     if name in ("float32", "f32"):
         return "f32"
     if name in ("float16", "f16"):
@@ -2258,19 +2265,23 @@ def winograd_input_source() -> Kernel:
     return winograd_input_transform()
 
 
-def winograd_output_source() -> Kernel:
-    """Winograd F(2x2,3x3) 的输出变换 ``Y = A^T M A`` + bias（生产路径）。"""
-    return winograd_output_transform()
+def winograd_output_source(epilogue=None, extra=()) -> Kernel:
+    """Winograd F(2x2,3x3) 的输出变换 ``Y = A^T M A`` + bias（生产路径）。
+
+    ``epilogue`` 非空时把后继逐元素链（BN / 激活）内联进写回点：``Y`` 不再
+    落一次全局内存再被链读回来。默认 ``None`` 生成的源码逐字不变。
+    """
+    return winograd_output_transform(epilogue=epilogue, extra=extra)
 
 
-def winograd_fused_source() -> Kernel:
+def winograd_fused_source(epilogue=None, extra=()) -> Kernel:
     """融合版 Winograd：输入变换 + 乘加 + 输出变换，一次 launch。
 
     与上面三个内核只差"在哪算"：``V`` 不进全局缓冲而是留在共享内存，
     ``M`` 不进全局缓冲而是留在寄存器。数值与四段版逐位一致（同一组
     ``B`` / ``A`` / ``G`` 系数、同样的求和顺序）。
     """
-    return winograd_fused()
+    return winograd_fused(epilogue=epilogue, extra=extra)
 
 
 def attention_source() -> Kernel:

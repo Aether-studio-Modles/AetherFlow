@@ -41,7 +41,7 @@ class _GroupPlan:
 
     __slots__ = (
         "nodes", "args", "attrs", "expected", "dtype", "out_dtype",
-        "kernels", "constants", "_memo", "fast", "chain",
+        "kernels", "constants", "_memo", "fast", "chain", "fused",
     )
 
     def __init__(self, nodes: Tuple[Node, ...], static: bool,
@@ -53,6 +53,11 @@ class _GroupPlan:
         # 整组融合成一个内核的启动记录，由设备后端在计划期展开。运行期拿到
         # 不可用的数组（形状 / 对齐不符）时返回 ``None``，调用方回落逐节点。
         self.chain = None
+        # "算子 + 其后继逐元素链"的整体融合（目前是 conv + epilogue）：
+        # 一个 ``callable(args) -> out | None``。与 ``chain`` 的区别是它不是
+        # 逐元素链——链首节点的内核把后继表达式内联进写回点，因此覆盖的
+        # 是"conv 输出不再物化"这一类融合。
+        self.fused = None
         # 常量节点的设备副本：值在属性里、与运行期输入无关，因此可以随这张
         # 图的计划一起缓存。设备后端在 ``_prepare_plan`` 里填，骨架在
         # ``run_device`` 里优先取用——省掉每次执行的 H2D 与重新分配。

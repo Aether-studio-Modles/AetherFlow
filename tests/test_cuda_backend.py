@@ -512,6 +512,79 @@ class TestElementwiseFusionPlan(unittest.TestCase):
         self.assertEqual(self._groups(g), [("silu",), ("relu",)])
 
 
+class TestConvEpiloguePlan(unittest.TestCase):
+    """conv 与后继逐元素链合并的静态判据（5.270，不需要设备）。
+
+    合并的前提是"conv 输出不再物化"：这些节点会被一个内核算完，中间值
+    没有写回点。任何一条前提不成立都必须拆开，否则要么改变可观测行为
+    （中间值是图输出 / 有第二个消费者），要么算出不同数值（f16 输出要先
+    舍入、逐通道参数之外的大张量无法按通道索引）。
+    """
+
+    @staticmethod
+    def _backend():
+        # 只调 ``group_nodes`` 的静态判据，不建设备上下文。
+        return CudaBackend.__new__(CudaBackend)
+
+    def _groups(self, graph):
+        return [
+            tuple(node.op.name for node in group)
+            for group in self._backend().group_nodes(graph)
+        ]
+
+    def _net(self, dtype=f32, chain=True, reuse=False):
+        """conv → mul(1,C,1,1) → add(1,C,1,1) → relu。"""
+        g = Graph()
+        c = 4
+        x = g.input("x", dtype[2, c, 5, 5])
+        w = g.constant(dtype=dtype, shape=(c, c, 3, 3),
+                       data=np.full(c * c * 9, 0.1, np.float32).tolist())
+        b = g.constant(dtype=dtype, shape=(c,),
+                       data=np.full(c, 0.5, np.float32).tolist())
+        # BN 的参数要在 conv **之前**建节点：``_merge_conv_epilogue`` 只看
+        # "conv 的下一组"，插在中间的常量会把链挡在外面。
+        s = t = None
+        if chain:
+            s = g.constant(dtype=dtype, shape=(1, c, 1, 1),
+                           data=np.full(c, 1.5, np.float32).tolist())
+            t = g.constant(dtype=dtype, shape=(1, c, 1, 1),
+                           data=np.full(c, 0.25, np.float32).tolist())
+        y = g.conv2d(x, w, b, padding=1)
+        if reuse:
+            # conv 输出有第二个消费者：中间值必须物化。
+            g.output(y, "mid")
+        if not chain:
+            g.output(y, "y")
+            return g
+        g.output(g.relu(g.add(g.mul(y, s), t)), "y")
+        return g
+
+    def test_channel_bn_and_relu_join_the_conv(self):
+        self.assertIn(("conv2d", "mul", "add", "relu"), self._groups(self._net()))
+
+    def test_conv_left_alone_without_a_chain(self):
+        self.assertIn(("conv2d",), self._groups(self._net(chain=False)))
+
+    def test_f16_conv_is_not_merged(self):
+        """f16 / bf16 的 conv 输出要先舍入到存储类型，融合会改写数值。"""
+        self.assertIn(("conv2d",), self._groups(self._net(dtype=f16)))
+
+    def test_materialized_conv_output_is_not_merged(self):
+        self.assertIn(("conv2d",), self._groups(self._net(reuse=True)))
+
+    def test_second_full_size_operand_is_not_merged(self):
+        """链里出现同形的大张量时没有可索引的通道变量，必须拆开。"""
+        g = Graph()
+        x = g.input("x", f32[2, 4, 5, 5])
+        w = g.constant(dtype=f32, shape=(4, 4, 3, 3),
+                       data=np.full(144, 0.1, np.float32).tolist())
+        b = g.constant(dtype=f32, shape=(4,), data=np.full(4, 0.5,
+                                                          np.float32).tolist())
+        other = g.input("other", f32[2, 4, 5, 5])
+        g.output(g.relu(g.mul(g.conv2d(x, w, b, padding=1), other)), "y")
+        self.assertIn(("conv2d",), self._groups(g))
+
+
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")
 class CudaTestCase(unittest.TestCase):
     @classmethod
@@ -1074,6 +1147,42 @@ class TestCudaConv(CudaTestCase):
         g, feed = self._conv((1, 4, 8, 8), (6, 2, 3, 3), {"groups": 2})
         with self.assertRaises(BackendCapabilityError):
             CudaBackend(conv_impl="tiled").execute(g, feed)
+
+    def test_conv_epilogue_fusion_is_bitwise_identical(self):
+        """conv → BN（逐通道）→ relu 与"conv 落盘 + 逐元素链"逐位一致。
+
+        融合只跳过中间值的物化，不改变任何一个乘加的次序与结合方式，因此
+        两条路径必须逐位相同；一旦出现差异就说明表达式拼接或通道索引错了。
+        """
+        g = Graph()
+        # 规模要落在 auto 选 Winograd 的窗口里：epilogue 融合挂在输出变换的
+        # 写回点上，im2col / tiled 没有这个位置（那就退化成逐节点执行）。
+        c = 16
+        x = g.input("x", f32[2, c, 16, 16])
+        w = g.constant(dtype=f32, shape=(c, c, 3, 3),
+                       data=(self.rand(c, c, 3, 3) * 0.2).ravel().tolist())
+        b = g.constant(dtype=f32, shape=(c,), data=self.rand(c).tolist())
+        s = g.constant(dtype=f32, shape=(1, c, 1, 1),
+                       data=self.rand(c).tolist())
+        t = g.constant(dtype=f32, shape=(1, c, 1, 1),
+                       data=self.rand(c).tolist())
+        y = g.conv2d(x, w, b, padding=1)
+        g.output(g.relu(g.add(g.mul(y, s), t)), "y")
+        feed = {"x": self.rand(2, c, 16, 16)}
+
+        fused = CudaBackend()
+        plain = CudaBackend()
+        plain._merge_conv_epilogue = lambda graph, groups: groups
+
+        plan = fused._plan(g)
+        self.assertIn(4, [len(p.nodes) for p in plan])
+        got = fused.execute(g, feed)["y"]
+        # 融合闭包在计划第一次执行时才绑定（``_prepare_plan``），所以要在
+        # 运行之后再取计划。
+        self.assertTrue(any(p.fused is not None for p in fused._plan(g)))
+        self.assertTrue(np.array_equal(got, plain.execute(g, feed)["y"]))
+        expected = self.ref.execute(g, feed)["y"]
+        np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-4)
 
 
 class TestCudnnFallback(unittest.TestCase):
