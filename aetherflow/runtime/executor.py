@@ -371,6 +371,14 @@ class Executor:
             env[value.id] = arr
 
         for group in plan:
+            # 常量组：值在计划期就已上传并随计划驻留，每次执行只需要把它写回
+            # 环境。它没有输入、没有 attrs 要看，也不会被回收（``keep`` 里已
+            # 包含），走完整路径等于每轮白做一次 args 构造与形状 / dtype 校验。
+            if len(group.nodes) == 1:
+                cid = group.nodes[0].output.id
+                if cid in group.constants:
+                    env[cid] = group.constants[cid]
+                    continue
             # 直连快路径：静态单节点组在第一次执行时把"每步都要做的判断"
             # 收成一条记录，之后只取输入、调内核、写回。
             if group.fast is None:
