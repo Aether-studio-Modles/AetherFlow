@@ -7,7 +7,7 @@
 import json
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -339,6 +339,55 @@ class TestCuDNNCompare(unittest.TestCase):
                 code = cudnn_compare._main([])
         self.assertEqual(code, 0)
         self.assertIn("跳过", buf.getvalue())
+
+
+class TestFrameworkCompare(unittest.TestCase):
+    """对照基准不能忽略请求的模式，也不能依赖两框架共享参数。"""
+
+    def test_training_compile_is_explicitly_rejected(self):
+        from benchmarks.framework_compare import main
+
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as cm:
+            main(["--training", "--compile"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_interleaved_order_rotates(self):
+        from benchmarks.framework_compare import _measure_interleaved
+
+        calls = []
+        with patch("benchmarks.framework_compare._sample",
+                   side_effect=lambda fn, sync, burst: (fn(), 1.0)[1]):
+            a, b = _measure_interleaved(
+                lambda: calls.append("甲"), lambda: None,
+                lambda: calls.append("乙"), lambda: None, 0, 1, 3)
+        self.assertEqual(calls, ["甲", "乙", "乙", "甲", "甲", "乙"])
+        self.assertEqual(a["samples_ms"], [1.0, 1.0, 1.0])
+        self.assertEqual(b["median_ms"], 1.0)
+
+    def test_training_checks_both_backward_paths_on_cpu(self):
+        try:
+            import torch
+            import torch.nn.functional as F
+        except ImportError:
+            self.skipTest("没有安装 torch")
+        from argparse import Namespace
+        from benchmarks import framework_compare as compare
+
+        graph, feed, params = compare._synthetic_train(batch=3, d=8)
+        original = {key: value.copy() for key, value in feed.items()}
+        for raw in (True, False):
+            for no_update in (True, False):
+                with self.subTest(raw=raw, no_update=no_update), patch.object(
+                    compare, "_synthetic_train", return_value=(graph, feed, params)
+                ), redirect_stdout(StringIO()):
+                    args = Namespace(no_update=no_update, raw_backward=raw,
+                                     warmup=0, burst=1, rounds=1)
+                    code = compare._run_training(
+                        "cpu", ReferenceBackend(), None, lambda: None,
+                        lambda: None, torch, F, args)
+                    self.assertEqual(code, 0)
+                    for key in feed:
+                        np.testing.assert_array_equal(feed[key], original[key])
 
 
 if __name__ == "__main__":

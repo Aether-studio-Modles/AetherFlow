@@ -5,9 +5,11 @@
 
 两种口径：
 
-* **纯算**：输入（含权重）常驻显存，只计内核；两边都是。
-* **端到端**：每轮把全部输入上传、把输出取回主机；AetherFlow 走 ``execute``，
-  torch 侧每轮 ``.to(device)`` / ``.cpu()``。
+* **设备驻留调用**：输入（含权重）已在设备，输出不回主机；计入 Python
+  派发、接口内部复制与同步，以及设备计算，并非只计内核。
+* **训练一步**：设备驻留输入下的前向、反向与可选 SGD 更新。
+
+本脚本当前不测每轮 H2D / D2H 的主机端到端路径。
 
 torch 侧**不经过 AetherFlow 前端**：torch 2.5.1 不在兼容矩阵内，走
 ``torch.export`` 会被入口按设计拒绝；对照只需要同一算式，不需要同一张图。
@@ -38,9 +40,10 @@ from benchmarks.cases import CASES
 DEFAULT_CASES = ("matmul_1024", "conv2d_3x3_pad1", "maxpool2x2")
 
 
-def _stats(samples: List[float]) -> Dict[str, float]:
+def _stats(samples: List[float]) -> Dict[str, object]:
     return {"best_ms": round(min(samples), 4),
-            "median_ms": round(statistics.median(samples), 4)}
+            "median_ms": round(statistics.median(samples), 4),
+            "samples_ms": [round(value, 4) for value in samples]}
 
 
 def _sample(fn: Callable[[], object], sync: Callable[[], None], burst: int) -> float:
@@ -66,8 +69,8 @@ def _measure_interleaved(fn_a: Callable[[], object], sync_a: Callable[[], None],
     """两边交替测，每轮各测一次。
 
     共享机上的负载会漂移：先连续测完 A 再连续测 B，A 与 B 可能落在不同的
-    时钟 / 占用状态上。上一版就出现过同一形状两轮差 40%（2.25 vs 3.88 ms）的
-    情况。交替之后漂移同时作用在两边，比值才有意义（同 5.268 的做法）。
+    时钟 / 占用状态上。逐轮轮换先后次序只能减轻顺序偏差；不同执行结构
+    仍可能受到不同程度的干扰，共享卡上的比值不保证可靠。
     """
     for _ in range(warmup):
         fn_a()
@@ -76,9 +79,13 @@ def _measure_interleaved(fn_a: Callable[[], object], sync_a: Callable[[], None],
     sync_b()
     samples_a: List[float] = []
     samples_b: List[float] = []
-    for _ in range(rounds):
-        samples_a.append(_sample(fn_a, sync_a, burst))
-        samples_b.append(_sample(fn_b, sync_b, burst))
+    for index in range(rounds):
+        if index % 2 == 0:
+            samples_a.append(_sample(fn_a, sync_a, burst))
+            samples_b.append(_sample(fn_b, sync_b, burst))
+        else:
+            samples_b.append(_sample(fn_b, sync_b, burst))
+            samples_a.append(_sample(fn_a, sync_a, burst))
     return _stats(samples_a), _stats(samples_b)
 
 
@@ -130,10 +137,8 @@ def _backend(device: str, graph_mode: str = "off"):
 def _other_gpu_processes() -> List[str]:
     """卡上除本进程外的计算进程（拿不到就不报）。
 
-    共享卡上做基准，图重放会被别的进程按毫秒级粒度抢占：同一个训练步
-    会出现成块的双峰（0.55 ms 与 3.05 ms），而图本身稳定在 0.27 ms
-    （见 DESIGN 5.287）。交替对照的**比值**在同等污染下仍可用，绝对耗时
-    则与"独占"无关，所以这里只警告、不阻止。
+    查询覆盖所有可见 GPU，并未按目标卡过滤。存在其他进程时，绝对耗时和
+    比值都可能受干扰（见 DESIGN 5.287），这里只警告、不阻止。
     """
     import subprocess
 
@@ -188,12 +193,20 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
     batch, dim = 128, 1024
     graph, feed, params = _synthetic_train(batch, dim)
     bwd = backward(graph, wrt=params)
+    raw_nodes = len(bwd.nodes)
+    if not args.raw_backward:
+        from aetherflow.passes import backward_pipeline
+
+        bwd = backward_pipeline().run(bwd)
+    print(f"反向执行图：{raw_nodes} → {len(bwd.nodes)} 节点"
+          f"（{'原始图' if args.raw_backward else '框架标准反向优化管线'}）")
     lr = 1e-6
 
     def to_dev(v):
         return cp.asarray(v) if cp is not None else v
 
-    feed_dev = {k: to_dev(v) for k, v in feed.items()}
+    # CPU 上两框架也必须独立持有参数，不能通过 numpy 共享存储互相更新。
+    feed_dev = {k: to_dev(v.copy()) for k, v in feed.items()}
     params_dev = [feed_dev[p.name] for p in params]
     seed_dev = to_dev(np.float32(1.0))
     grad_names = bwd.output_names
@@ -209,7 +222,7 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
             grad *= lr   # 原地缩放：避免每步 8 次临时分配，分配器状态会污染计时
             p -= grad
 
-    tensors = {k: torch.as_tensor(v, device=device) for k, v in feed.items()}
+    tensors = {k: torch.tensor(v, device=device) for k, v in feed.items()}
     tensors["labels"] = tensors["labels"].long()
     ps = [tensors["w1"], tensors["b1"], tensors["w2"], tensors["b2"]]
     for p in ps:
@@ -229,26 +242,53 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
                 p.sub_(p.grad)
                 p.grad = None
 
-    # 对拍：同一份初始权重下的 dw1（前 4x4），不一致就不出数字
-    af_grad = backend.execute(bwd, {**feed, "dloss": np.float32(1.0)})[grad_names[0]]
+    # 对拍完整损失、全部参数梯度与实际执行路径上的一步更新。
+    af_loss = backend.execute(graph, feed)["loss"]
+    af_grads = backend.execute(bwd, {**feed, "dloss": np.float32(1.0)})
+    af_device_grads = af_exec(bwd, {**feed_dev, "dloss": seed_dev})
+    sync_af()
     logits = F.relu(tensors["x"] @ ps[0] + tensors["b1"]) @ ps[2] + tensors["b2"]
-    F.cross_entropy(logits, tensors["labels"]).backward()
-    torch_grad = ps[0].grad.detach().cpu().numpy()
-    np.testing.assert_allclose(af_grad[:4, :4], torch_grad[:4, :4],
-                               rtol=1e-3, atol=1e-5, err_msg="dw1 与 torch 不一致")
+    torch_loss = F.cross_entropy(logits, tensors["labels"])
+    torch_loss.backward()
+    np.testing.assert_allclose(af_loss, torch_loss.detach().cpu().numpy(),
+                               rtol=1e-4, atol=1e-5, err_msg="损失与 torch 不一致")
+    for param, name in zip(ps, grad_names):
+        expected = param.grad.detach().cpu().numpy()
+        np.testing.assert_allclose(af_grads[name], expected, rtol=1e-3, atol=1e-5,
+                                   err_msg=f"完整梯度 {name} 与 torch 不一致")
+        actual = (cp.asnumpy(af_device_grads[name]) if cp is not None
+                  else af_device_grads[name])
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-5,
+                                   err_msg=f"设备路径完整梯度 {name} 与 torch 不一致")
+        param.grad = None
+    af_step()
+    torch_step()
+    sync_af()
+    sync_torch()
+    for af_param, param in zip(params_dev, ps):
+        actual = cp.asnumpy(af_param) if cp is not None else af_param
+        np.testing.assert_allclose(actual, param.detach().cpu().numpy(),
+                                   rtol=1e-4, atol=1e-6,
+                                   err_msg="一步更新后的参数与 torch 不一致")
+    for param, value in zip(params_dev, params):
+        param[...] = to_dev(feed[value.name])
     with torch.no_grad():
         for p, key in zip(ps, ("w1", "b1", "w2", "b2")):
             p.copy_(torch.as_tensor(feed[key], device=device))
             p.grad = None
 
     af_stats, torch_stats = _measure_interleaved(
-        af_step, sync_af, torch_step, sync_torch, 2, args.burst, args.rounds)
+        af_step, sync_af, torch_step, sync_torch, args.warmup, args.burst, args.rounds)
 
     print(f"\n训练一步（batch={batch}, d={dim}, f32, lr={lr}；反向图复用）")
-    ratio = torch_stats["best_ms"] / af_stats["best_ms"]
+    ratio = torch_stats["median_ms"] / af_stats["median_ms"]
+    print("设备驻留调用，中位数 ms；包含接口内部复制、主机派发与同步")
     print(f"{'case':<14}{'af':>10}{'torch':>10}{'torch/af':>10}")
-    print(f"{'mlp_train':<14}{af_stats['best_ms']:>10.3f}"
-          f"{torch_stats['best_ms']:>10.3f}{ratio:>9.2f}x")
+    print(f"{'mlp_train':<14}{af_stats['median_ms']:>10.3f}"
+          f"{torch_stats['median_ms']:>10.3f}{ratio:>9.2f}x")
+    print(f"逐轮 AF：{af_stats['samples_ms']}；torch：{torch_stats['samples_ms']}")
+    print(f"最好值 AF {af_stats['best_ms']:.4f} / "
+          f"torch {torch_stats['best_ms']:.4f} ms（仅作补充）")
 
     if device.startswith("cuda"):
         print(f"图捕获 {getattr(backend, 'graph_captures', 0)} 次 / "
@@ -262,23 +302,8 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
                   f"launch {stats['launch'] / n * 1e3:.3f} / "
                   f"sync {stats['sync'] / n * 1e3:.3f} / "
                   f"guards {stats['guards'] / n * 1e3:.3f}")
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        for _ in range(args.burst):
-            torch_step()
-        torch.cuda.synchronize()
-        torch_peak = torch.cuda.max_memory_allocated() / 2**20
-
-        pool = cp.get_default_memory_pool()
-        base = pool.used_bytes()
-        af_peak = base
-        for _ in range(args.burst):
-            af_step()
-            af_peak = max(af_peak, pool.used_bytes())
-
-        print(f"峰值显存：torch allocated {torch_peak:.1f} MiB / "
-              f"cupy 池增量 {(af_peak - base) / 2**20:.1f} MiB"
-              "（口径不同，只能看量级）")
+        print("显存未并列：torch allocated 与 CuPy 池步后增量不是同一口径，"
+              "步后采样也不能代表峰值。")
     return 0
 
 
@@ -286,7 +311,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="torch eager / compile 与 AetherFlow 的同机对照")
     parser.add_argument("--cases", default=",".join(DEFAULT_CASES), help="逗号分隔的用例名")
     parser.add_argument("--device", default="auto", help="cuda / cpu / auto（默认）")
-    parser.add_argument("--rounds", type=int, default=3, help="每例跑几轮取最好（默认 3）")
+    parser.add_argument("--rounds", type=int, default=3, help="每例测量轮数（默认 3）")
     parser.add_argument("--burst", type=int, default=10, help="每轮连续调用次数（默认 10）")
     parser.add_argument("--warmup", type=int, default=3, help="预热次数（默认 3）")
     parser.add_argument("--compile", action="store_true", help="额外测 torch.compile")
@@ -296,11 +321,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="改测训练一步（前向 + 交叉熵 + 反向 + SGD）")
     parser.add_argument("--graph-mode", default="off",
                         help="AetherFlow 的图重放模式（off / auto / capture）")
+    parser.add_argument("--raw-backward", action="store_true",
+                        help="训练时执行原始反向图，用于与标准优化管线作消融对照")
     parser.add_argument("--no-update", action="store_true",
                         help="只算梯度、不更新参数（分离参数更新成本）")
     parser.add_argument("--profile", action="store_true",
                         help="打开图重放的分段计时（upload / launch / sync / guards）")
     args = parser.parse_args(argv)
+    if args.training and args.compile:
+        parser.error("训练模式尚未实现 torch.compile 对照，不能把 eager 结果标作 compile")
+    if args.rounds < 1 or args.burst < 1 or args.warmup < 0:
+        parser.error("rounds、burst 必须为正数，warmup 不能为负数")
 
     try:
         import torch
@@ -321,10 +352,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         others = _other_gpu_processes()
         if others:
-            print("警告：这块卡上还有别的计算进程，绝对耗时会被抢占污染：")
+            print("警告：可见 GPU 上存在其他计算进程（未按目标卡过滤）：")
             for row in others:
                 print(f"  {row}")
-            print("  交替对照的比值仍可用；要绝对数字请先独占这张卡。")
+            print("  若与目标卡共享，耗时及比值都可能受干扰，交替测量不能保证消除。")
 
         # 设备级同步：replay 跑在捕获流（非阻塞流）上，只同步「当前流」
         # 会漏掉它，测出来的是提交时间而不是完成时间；torch 侧用的也是
