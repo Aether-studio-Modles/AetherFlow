@@ -64,11 +64,28 @@ def _torch_call(name: str, tensors: Mapping[str, object], F):
     raise SystemExit(f"未登记的对照用例：{name}（在 _torch_call 里补一条等价算式）")
 
 
+def _synthetic_matmul(n: int):
+    """合成 ``n x n x n`` 的 GEMM：基准图集里最大只到 1024²，
+    那个尺寸下单次派发就能淹没内核差异，看框架对比要用更大的。"""
+    from aetherflow.ir.graph import Graph
+    from aetherflow.ir.types import f32
+
+    g = Graph(f"matmul_{n}")
+    a = g.input("a", f32[n, n])
+    b = g.input("b", f32[n, n])
+    g.output(g.matmul(a, b), "y")
+    rng = np.random.default_rng(20261121)
+    return g, {"a": rng.standard_normal((n, n)).astype(np.float32),
+               "b": (rng.standard_normal((n, n)) * 0.1).astype(np.float32)}
+
+
 def _build(name: str):
     table = {case.name: case for case in CASES}
-    if name not in table:
-        raise SystemExit(f"未知用例：{name}；可选 {', '.join(table)}")
-    return table[name].build(np.random.default_rng(20261121))
+    if name in table:
+        return table[name].build(np.random.default_rng(20261121))
+    if name.startswith("matmul_") and name[len("matmul_"):].isdigit():
+        return _synthetic_matmul(int(name[len("matmul_"):]))
+    raise SystemExit(f"未知用例：{name}；可选 {', '.join(table)} 或 matmul_<N>")
 
 
 def _backend(device: str):
