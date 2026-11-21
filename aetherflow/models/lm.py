@@ -978,6 +978,15 @@ def _host_array(backend, value) -> np.ndarray:
     return np.asarray(convert(value))
 
 
+def _swap_input(name: str) -> str:
+    """重排图里状态张量的输入名。
+
+    输出的别名就是状态名（下一段 feed 直接用），同一个图里输入不能重名，
+    所以输入加后缀——两边只差这一点，读起来仍是一张表。
+    """
+    return f"{name}__in"
+
+
 def _log_softmax(z: np.ndarray) -> np.ndarray:
     """按最后一维做 log-softmax；``-inf`` 列保持严格 0 概率。"""
     shifted = z - np.max(z, axis=-1, keepdims=True)
@@ -1017,7 +1026,9 @@ def generate_beam(
     束搜索是**单条序列**的算法：``spec.batch`` 必须为 1；内部换成
     ``spec.with_batch(num_beams)`` 的图，把 k 条假设放进 batch 维。每一行
     用各自的父状态重新排布（主机侧 gather，显式的代价），因此图本身仍是
-    静态形状、可复用执行计划。
+    静态形状、可复用执行计划。``LMRunner(device_state=True)`` 下这次 gather
+    改由设备上的 ``embedding`` 完成（见 ``_beam_decode`` 的 ``swap_state``），
+    状态不再回主机。
 
     ``repetition_penalty`` 的历史是**每条假设各自**的 prompt + 已生成 token。
     受约束解码不在束搜索里提供：调用方需要约束时用 ``generate``。
@@ -1096,12 +1107,21 @@ def _beam_decode(
     chunk: int,
     resident: bool,
     graph_for,
+    swap_state=None,
+    device_step=None,
 ) -> List[int]:
     """束搜索的实现：``spec.batch`` 就是 ``beam_width``。
 
     状态、分数、token 序列都按行索引；每步用父行下标把状态 gather 到
     新顺序。死槽位（分数 ``-inf``）喂 ``pad_id`` 并沿用父行 0 的状态，
     它们的结果被丢弃——图是固定 batch，不能少喂一行。
+
+    ``swap_state(state, parents)`` 与 ``device_step(ids, state)`` **成对**
+    给出时改走设备态：状态重排由一张捕获过的 gather 图完成
+    （``embedding(state, parents)``，每个状态张量一次），decode 由
+    ``device_step`` 推进，两者之间状态一直是设备数组。主机只经手
+    ``B*V`` 个 logits 与 ``k`` 个父行号；prefill 交出的状态仍是主机数组，
+    因此每个请求只多一次 H2D。
     """
     rows = [list(prompt) for _ in range(beam_width)]
     state, logits = _prefill(
@@ -1122,11 +1142,13 @@ def _beam_decode(
     dec_graph = None
     dec_inputs = None
     for step in range(limit):
+        # 整块取回一次：逐行 to_host 会把一次 D2H 拆成 ``beam_width`` 次。
+        block = _host_row(backend, row_logits)
         logp = np.full((beam_width, vocab), -np.inf, dtype=np.float64)
         for index in range(beam_width):
             if tokens[index] is None or not np.isfinite(scores[index]):
                 continue
-            row = _host_row(backend, row_logits[index])
+            row = block[index]
             if not np.isfinite(row).any():
                 raise ValueError(
                     f"束搜索第 {index} 条假设没有可选 token（logits 全被屏蔽）"
@@ -1170,21 +1192,30 @@ def _beam_decode(
         if step == limit - 1:
             break
 
-        if dec_graph is None:
+        if dec_graph is None and device_step is None:
             dec_graph, dec_inputs, _ = graph_for(1, "last")
-        state = {name: _host_array(backend, value)[parents]
-                 for name, value in state.items()}
         ids = np.full((beam_width, 1), spec.pad_id, dtype=np.int32)
         for index in range(filled):
             ids[index, 0] = tokens[index][-1]
-        feed = {} if resident else dict(params)
-        feed[dec_inputs["ids"].name] = ids
-        feed[dec_inputs["reset"].name] = np.zeros((beam_width, 1), dtype=np.float32)
-        for name in spec.state_shapes:
-            feed[dec_inputs[name].name] = state[name]
-        out = backend.execute(dec_graph, feed)
-        state = spec.carry_state(out)
-        row_logits = out["logits"][:, 0, :]
+        if device_step is None:
+            state = {name: _host_array(backend, value)[parents]
+                     for name, value in state.items()}
+            feed = {} if resident else dict(params)
+            feed[dec_inputs["ids"].name] = ids
+            feed[dec_inputs["reset"].name] = np.zeros(
+                (beam_width, 1), dtype=np.float32
+            )
+            for name in spec.state_shapes:
+                feed[dec_inputs[name].name] = state[name]
+            out = backend.execute(dec_graph, feed)
+            state = spec.carry_state(out)
+            row_logits = out["logits"][:, 0, :]
+        else:
+            state = swap_state(state, parents)
+            next_logits, state = device_step(ids, state)
+            # decode 给出的是 ``(B, 1, V)``：这里就把这一步的 logits 取回，
+            # 下一轮顶部的 ``_host_row`` 于是对两种路径都只是取行。
+            row_logits = _host_row(backend, next_logits)[:, 0, :]
 
     candidates = list(done)
     for index in range(beam_width):
@@ -1504,8 +1535,10 @@ class LMRunner:
     （``steps=1``）只捕获一次，每步 replay 时状态作为设备输入直接 D2D，
     只有 logits 回主机（``B*V`` 个 float）。这要求 ``resident=True``——
     否则捕获图必须把全部权重当可变输入，每步重传的字节数比原来更多。
-    束搜索仍走宿主路径（它按父假设 gather 状态，与单条 decode 不是同一
-    张图）；prefill 也仍是普通执行，第一步 decode 会把状态上传一次。
+    束搜索走同一套：状态按父假设重排换成一张
+    ``embedding(state, parents)`` 的捕获图（每个状态张量一次内核），
+    重排与 decode 之间状态不落地。prefill 仍是普通执行，第一步 decode
+    会把状态上传一次；末步的状态不再回传。
     """
 
     def __init__(
@@ -1554,6 +1587,10 @@ class LMRunner:
         self._decode_graph = None
         self._decode_inputs = None
         self._decode_batch: Optional[int] = None
+        # 束搜索的状态重排图：与 decode 图同生命周期，同样不进 ``_graphs``。
+        self._swap_plan = None
+        self._swap_graph = None
+        self._swap_width: Optional[int] = None
         # 缓存前缀：最近一次 ``prime`` 已消费的 token 与带出的状态。
         self._prefix: List[int] = []
         self._state = None
@@ -1606,7 +1643,9 @@ class LMRunner:
             inputs["ids"].name: np.zeros((batch, 1), dtype=np.int32),
             inputs["reset"].name: np.zeros((batch, 1), dtype=np.float32),
         }
-        for name, shape in self.spec.state_shapes.items():
+        # 形状必须按**这张图**的批宽取：束搜索的批宽与本会话的 ``spec.batch``
+        # 不同，拿 ``self.spec.state_shapes`` 会在捕获时形状不匹配。
+        for name, shape in self.spec.with_batch(batch).state_shapes.items():
             sample[inputs[name].name] = np.zeros(shape, dtype=np.float32)
         self._decode_plan = self.backend.capture(graph, sample)
         self._decode_graph = graph
@@ -1615,16 +1654,55 @@ class LMRunner:
         return self._decode_plan, self._decode_inputs
 
     def _device_step(self, ids: np.ndarray, state):
-        """一步 decode：状态作为设备输入 D2D，只回传 logits。"""
+        """一步 decode：状态作为设备输入 D2D，只回传 logits。
+
+        ``state`` 的键就是状态名（与 ``carry_state`` 一致），因此这里不查
+        ``self.spec``：束搜索的批宽与 ``self.spec.batch`` 不同，形状只能由
+        调用方交进来的数组自己说明。
+        """
         plan, inputs = self._decode_plan_for(int(ids.shape[0]))
         feed = {
             inputs["ids"].name: ids,
             inputs["reset"].name: np.zeros(ids.shape, dtype=np.float32),
         }
-        for name in self.spec.state_shapes:
-            feed[inputs[name].name] = state[name]
+        for name, value in state.items():
+            feed[inputs[name].name] = value
         out = plan.run_device(feed)
         return out["logits"], self.spec.carry_state(out)
+
+    def _swap_plan_for(self, beam_width: int):
+        """束搜索的状态重排图：``(parents, state...) -> state...``。
+
+        每个状态张量一次 ``embedding(table, parents)``——表就是那一步的
+        ``(k, ...)`` 状态，下标是父行号，于是 gather 落在设备上（内核按行
+        拷整块），主机侧只剩 ``k`` 个 int32 的父行号要上传。
+
+        这张图没有权重输入，因此不像 decode 那样要求"先驻留"：捕获与
+        权重无关。每个束宽一张，跨请求复用。
+        """
+        if self._swap_plan is not None and self._swap_width == beam_width:
+            return self._swap_plan
+        spec = self.spec.with_batch(beam_width)
+        graph = Graph("lm_beam_swap")
+        parents = graph.input("parents", i32[(beam_width,)])
+        sample = {"parents": np.zeros((beam_width,), dtype=np.int32)}
+        for name, shape in spec.state_shapes.items():
+            # 输入与输出的名字必须错开：图里同一个名字只能出现一次。
+            table = graph.input(_swap_input(name), f32[shape])
+            graph.output(graph.embedding(table, parents), name)
+            sample[_swap_input(name)] = np.zeros(shape, dtype=np.float32)
+        self._swap_plan = self.backend.capture(graph, sample)
+        self._swap_graph = graph
+        self._swap_width = beam_width
+        return self._swap_plan
+
+    def _swap_state(self, state, parents):
+        """按父行号重排状态，返回的仍是设备数组（replay 输出，下一步喂回）。"""
+        plan = self._swap_plan_for(int(parents.size))
+        feed = {"parents": parents.astype(np.int32, copy=False)}
+        for name, value in state.items():
+            feed[_swap_input(name)] = value
+        return plan.run_device(feed)
 
     @property
     def graph_count(self) -> int:
@@ -1846,6 +1924,11 @@ class LMRunner:
         单条生成的图互不覆盖；``resident=True`` 时权重也只有一份。
         有缓存前缀时显式拒绝（先 ``reset()``）：束搜索的 k 条假设会把状态
         推进到分叉后的不同末尾，前缀无法再代表它们。
+
+        ``device_state=True`` 时会话多捕获一张按父行号重排状态的图
+        （``k`` 个 int32 上传、状态 D2D），decode 计划按批宽复用。两张计划
+        都只有一个槽位：同一会话里与单条生成交替使用会重新捕获，适合以
+        一种入口为主的服务。
         """
         if self._closed:
             raise ValueError("LMRunner 已关闭，请新建一个会话")
@@ -1894,6 +1977,8 @@ class LMRunner:
             graph_for=lambda length, head: self._graph_for_batch(
                 beam_spec, length, head
             ),
+            swap_state=self._swap_state if self.device_state else None,
+            device_step=self._device_step if self.device_state else None,
         )
 
     # -- 生命周期 -----------------------------------------------------
@@ -1910,6 +1995,9 @@ class LMRunner:
         self._decode_graph = None
         self._decode_inputs = None
         self._decode_batch = None
+        self._swap_plan = None
+        self._swap_graph = None
+        self._swap_width = None
         self._clear_prefix()
         self._closed = True
 
