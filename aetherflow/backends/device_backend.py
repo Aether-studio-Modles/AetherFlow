@@ -1626,6 +1626,10 @@ class DeviceBackend(Executor):
         实现选择仍由 ``_pick_conv_kernel`` 给出（与融合版共用
         ``_winograd_static``）。形状 / dtype / 连续性不符时回落 ``_op_conv2d``，
         报错时机与文案不变。
+
+        权重驻留：这条展开只在"权重是 IR 常量"的分支里被采用（见
+        ``_prepare_plan``），所以权重变换 ``U`` 首次执行算一次就随计划常驻，
+        每轮只做输入变换 + GEMM + 输出变换。与融合版的 ``resident`` 同一语义。
         """
         parsed = self._winograd_static(node, ("winograd",))
         if parsed is None:
@@ -1655,7 +1659,7 @@ class DeviceBackend(Executor):
             )
             cp = self.cp
             dtype = np.dtype(cp.float32)
-            holder: List[Any] = [None]
+            holder: List[Any] = [None, None]  # [内核三元组, 驻留的 U]
             blas = self._cublas()
             gemm = (16, o * c, c * nt, o * nt)
 
@@ -1689,11 +1693,17 @@ class DeviceBackend(Executor):
                         ),
                     )
                 k_weight, k_input, k_output = kernels
-                u = cp.empty(u_shape, dtype=x.dtype)
+                # ``U = G g G^T`` 只依赖权重，而这条展开只在权重是常量的分支里
+                # 被采用（调用点即判据）：首次执行算一次、随计划驻留，之后每轮
+                # 直接读。``v`` / ``m`` 每轮都被写满且是内核输出，不驻留——
+                # 复用它们会让同一张图的并发执行互相覆盖。
+                u = holder[1]
+                if u is None:
+                    u = holder[1] = cp.empty(u_shape, dtype=x.dtype)
+                    k_weight((w_grid,), (w_block,), (args[1], u) + w_static)
                 v = cp.empty(v_shape, dtype=x.dtype)
                 m = cp.empty(m_shape, dtype=x.dtype)
                 out = cp.empty(out_shape, dtype=x.dtype)
-                k_weight((w_grid,), (w_block,), (args[1], u) + w_static)
                 k_input((i_grid,), (i_block,), (x, v) + i_static)
                 blas.set_stream(self.current_stream_ptr())
                 blas.sgemm_batched(
