@@ -301,6 +301,13 @@ torch 的 autograd 派发在 C++ 里，单节点约 10 µs。这条要作为训�
 到具体 kernel 之后再决定默认值。慢态定位需要图内 kernel 级证据（逐节点
 事件或 ncu），留作下一项。
 
+预置 cuBLAS workspace 这条路已经试过并**排除**：`AETHERFLOW_CUBLAS_WORKSPACE_MB=32`
+（`cublasSetWorkspace_v2`，让捕获期不再自己分配）各跑 5 次，开是 2 快 3 慢、
+不开是 1 快 4 慢，双峰没有消失。所以不是 workspace 分配导致的算法降级，
+可疑点收窄到捕获期 cuBLAS 自己的算法选择，Python 侧看不到，需要
+ncu / nsys 级别的 kernel 证据。开关保留（默认 0，不改变原有行为），
+留作以后对照。
+
 训练显存这一轮**没有取到可信数字**：cupy 池在预热后已驻留，`used_bytes`
 增量为 0，不能当峰值；torch 侧 allocated 37.8 MiB 只作量级参考。显存对照
 需要换一套统计方式（池的 `total_bytes` 或逐分配打点）再补。
