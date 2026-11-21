@@ -602,7 +602,7 @@ class TestGather(unittest.TestCase):
             with self.subTest(idx=bad):
                 with self.assertRaises(ValueError):
                     _run(g, {"x": np.zeros((2, 4)),
-                             "idx": np.asarray([bad], dtype=np.int32)})
+                             "idx": np.asarray([bad, [1, 2]], dtype=np.int32)})
 
     def test_shape_mismatch_is_rejected_at_graph_time(self):
         """除 dim 外每一维必须相等；不等时不能在构图期默默广播。"""

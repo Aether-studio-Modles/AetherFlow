@@ -1001,7 +1001,8 @@ class TestCudaGatherCrossEntropy(CudaTestCase):
                 with self.assertRaises(BackendCapabilityError):
                     self.cuda.execute(g, {
                         "x": self.rand(2, 4),
-                        "idx": np.asarray([bad], dtype=np.int32),
+                        # 形状必须与图声明一致：越界检查在绑定之后才走到
+                        "idx": np.asarray([bad, [1, 2]], dtype=np.int32),
                     })
 
     def test_gather_backward_accumulates_repeated_ids(self):
