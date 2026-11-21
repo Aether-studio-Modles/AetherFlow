@@ -16721,6 +16721,76 @@ rmsnorm（3）、reduce_sum / max / mean（3）。卷积 / 池化 / scan / spars
 **遗留**：conv / pool / scan / sparse / attention 的 bf16 支持面，需要
 逐算子做数值验证后再放开。
 
+### 5.270　conv + BN + 激活融进输出变换的写回点
+
+5.262 之后 `channel4d` 的 BN 链已经是一个内核，但它仍然是"conv 落盘、
+链读回来"：`conv` 的 `Y` 每当只为这条链服务时，那次写 + 那次读都是白付的。
+这一轮把链内联进 conv 内核的**写回点**，`Y` 不再物化。
+
+**改动**
+
+1. **模板**（`lower/kernels.py`）：`winograd_output_transform(epilogue=None,
+   extra=())` 与 `winograd_fused(epilogue=None, extra=())` 在写回前插
+   `epi(value, channel)`。`channel` 是**当前输出通道变量**（四段版是 `o`，
+   融合版是 `oo`），逐通道参数因此可以直接 `Index(name, channel)`，不需要
+   按展平下标反算通道。`extra` 是 `((name, "scalar" | "channel"), ...)` 的
+   声明，实际数组走独立的 `extra_args`——把"参数类型声明"与"运行期指针"
+   分开，是因为前者进源码缓存键、后者每次执行才拿到。默认 `None` / 空时
+   生成的源码与改动前逐字相同。
+2. **分组**（`device_backend._merge_conv_epilogue`）：单个 `conv2d` 节点与
+   紧随其后的逐元素链并成一组。前提全部是静态的：conv 输出不是图输出、
+   只被链首使用、链全部 `_chainable`、dtype 与形状一致、链的组外输入只能
+   是标量或逐通道广播（否则 conv 内核里没有可索引的通道变量）。
+3. **计划**（`_planned_conv_epilogue`）：用 `apply_op` 把链翻译成表达式，
+   逐通道参数取 `Index(name, channel)`、标量取 `Index(name, 0)`；先试
+   四段版 `_planned_winograd`，再试融合版 `_planned_winograd_fused`，两者
+   都不可用就返回 `None`，整组退回逐节点执行（正确性优先）。
+4. **执行**（`_GroupPlan.fused` + `invoke_group`）：conv 组优先调 `fused`，
+   返回 `None` 才交给父类逐节点。`fused` 与 `chain` 分开是因为链首不是
+   逐元素算子，`_try_chain` 的判据套不上。
+
+**范围**：只对 f32 + Winograd。f16 / bf16 的 conv 输出要先舍入到存储类型，
+融合后一路在 float 里算会改变数值；im2col / tiled 内核没有集中的写回点，
+没有可内联的位置。
+
+**数值**（3 层 C=16 16×16×16，batch 2）
+
+| 对照 | max\|d\| | 值域 |
+| --- | --- | --- |
+| 纯 conv，auto vs 参考 | 2.4e-3 | ±6500 |
+| 纯 conv，im2col vs 参考 | 1.9e-3 | ±6500 |
+| conv + BN + relu，auto vs 参考 | 9.2e-4 | [0, 2418] |
+| fused vs 关掉合并 | **0（逐位）** | — |
+
+融合路径与"conv 落盘 + 链"逐位相同，说明表达式拼接与通道索引没有引入
+额外误差；与参考后端的 1e-3 量级差异在纯 conv 上就已存在，来自 Winograd
+变换与 f32 累加顺序（im2col 对参考也有同样的量级），不是融合造成的。
+
+**性能**（A800-40GB，8 层 conv-bn-relu，4×C×56×56，CUDA events，ms）
+
+| 用例 | 关融合 | 开融合 | 组数 |
+| --- | --- | --- | --- |
+| c16（`conv_graph_compare` 口径） | 0.306 | **0.185** | 48 → 40 |
+| c32 | 0.607 | **0.473** | 48 → 40 |
+
+c16 是 1.65×、c32 是 1.28×。差距来自两档的 conv 本身占比：c16 走融合版
+Winograd，本身只有约 20 µs/层，链的 3 次启动与一次物化就显得可观；c32
+走四段版，conv 自身 50 µs/层以上，省下的仍是固定的那几微秒。
+
+**顺手修的真问题**：`codegen._dtype_key` 只认 `np.dtype` 与字符串，不认
+标量**类型**（`cp.float32` 没有 `.name`，`str()` 是 `<class 'numpy.float32'>`）。
+融合版计划展开里传的正是 `cp.float32`，此前一直没暴露，是因为它的缓存键
+`("winograd_fused", "f32")` 与非计划路径共享、后者已用 `np.dtype` 编译过；
+带 epilogue 的内核换了键，第一次真正编译就抛 `ValueError`。改成"先取
+`.name`，不是字符串再用 `np.dtype()` 归一化"。
+
+**回归**：远端 `tests/test_cuda_backend.py` 355 passed / 5 skipped，新增
+`TestConvEpiloguePlan`（5 条静态判据）与 `TestCudaConv.test_conv_epilogue_
+fusion_is_bitwise_identical`（逐位 + 参考对照）。
+
+**遗留**：im2col / tiled 没有写回点；f16 / bf16 需要内核里先舍入再进链；
+多张量 epilogue（如 `layernorm(add(a, b))`）不能只按通道索引。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成

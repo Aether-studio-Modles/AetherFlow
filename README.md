@@ -175,7 +175,11 @@ auto 的实际比值看 `benchmarks.conv_compare`）。
   捕获收益待共享机空闲后与 cuDNN 基准列一起复测。5.267 又把 `clamp` 的上下界
   与 `step` / `spike` 的阈值（都是属性里的编译期常量）内联进链，SSM 的
   `clamp → mul → add` 与 SNN 的 `step → mul` 不再各写一次内存（NaN 仍透传）。
-  复现：`python -m benchmarks.conv_graph_compare --blocks 8 --rounds 3`。
+  5.270 再把整条链内联进 conv 输出变换的**写回点**：`conv → mul → add → relu`
+  变成一次内核、`Y` 不再落盘（48 → 40 组），8 层 c16 从 0.306 降到
+  **0.185 ms**（1.65×）、c32 从 0.607 降到 **0.473 ms**（1.28×）；融合路径与
+  "关掉合并"逐位一致。范围是 f32 + Winograd（f16/bf16 需先舍入、im2col/tiled
+  没有集中写回点）。复现：`python -m benchmarks.conv_graph_compare --blocks 8 --rounds 3`。
 - 图重放：小算子的多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
   A800 设备侧 1.66 → 0.40 ms，LeNet 常驻 0.59 → 0.14 ms），单节点图无收益；
   默认 `graph_mode="off"`，语义差异需使用者知情。
