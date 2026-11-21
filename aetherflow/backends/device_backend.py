@@ -601,6 +601,9 @@ class DeviceBackend(Executor):
         self._capturing = False
         # 捕获期登记的越界标志：[(设备标量, 算子名, 允许范围), ...]
         self._capture_guards: Optional[List[Tuple[Any, str, str]]] = None
+        # 捕获期正在记录的图输出 id。这些 Value 的零拷贝视图要物化成
+        # 独立缓冲（见 ``_shared_view``），否则源被回收后地址会被复用。
+        self._capture_outputs: frozenset = frozenset()
         # 算子注册表：注册即声明，capabilities() 与 invoke 都只认这一份
         self.kernels = KernelRegistry(self.name)
         self._register_kernels()
@@ -940,7 +943,7 @@ class DeviceBackend(Executor):
         if arena is not None:
             arena.alias(owner.data.ptr)
 
-    def _shared_view(self, out, src):
+    def _shared_view(self, out, src, node=None):
         """``out`` 是共享 ``src`` 存储的另一个对象时，给源地址记一次引用。
 
         "零拷贝算子"不止 ``reshape``：``slice`` 与退化成恒等的
@@ -953,7 +956,17 @@ class DeviceBackend(Executor):
         本身，但执行器看到的是两条 Value——源那条在算子执行后立刻归零，
         地址会被下一个分配拿走，而"输出"那条还要读。记账之后两次 dispose
         各扣一次，归零才还块。
+
+        捕获期多一条：**图输出必须独占一块**。捕获图把地址写死，输出若与
+        源共用一段，源按"最后一个读者"回收后地址会分给后面的算子，图里
+        就出现两个输出写同一块（A800 实测：``logits`` 与 ``l0_h`` 同址，
+        设备态解码首步之后 token 全偏）。物化一次只发生在捕获期，replay
+        时的地址仍然固定。
         """
+        if node is not None and node.output.id in self._capture_outputs:
+            dst = self.cp.empty(out.shape, dtype=out.dtype)
+            dst[...] = out
+            return dst
         if self._shares_storage(out, src):
             self._alias_view(src)
         return out
@@ -2667,7 +2680,7 @@ class DeviceBackend(Executor):
         target = tuple(int(d) for d in attrs["shape"])
         out = self.cp.ascontiguousarray(self.cp.broadcast_to(args[0], target))
         # 目标形状与输入相同时广播退化成恒等，拿到的是同一个对象或视图
-        return self._shared_view(out, args[0])
+        return self._shared_view(out, args[0], node)
 
 
 
@@ -5291,7 +5304,7 @@ class DeviceBackend(Executor):
         out = self.cp.reshape(src, target)
         # reshape 是零拷贝视图，和 src 共用同一段地址。src 的回收点早于 out 的
         # 最后一次读取，不记账就会被 arena 拿去复用（详见 ``Arena.alias``）。
-        return self._shared_view(out, src)
+        return self._shared_view(out, src, node)
 
 
 
@@ -5299,7 +5312,7 @@ class DeviceBackend(Executor):
         perm = tuple(int(p) for p in attrs["perm"])
         out = self.cp.ascontiguousarray(self.cp.transpose(args[0], perm))
         # 恒等置换不拷贝，返回的是输入的视图
-        return self._shared_view(out, args[0])
+        return self._shared_view(out, args[0], node)
 
 
 
@@ -5326,7 +5339,7 @@ class DeviceBackend(Executor):
         # （如 ``x[0:2]``）本来就是连续的，``ascontiguousarray`` 会原样返回
         # 这个视图——它仍然指向 x 的地址，必须记账。
         out = self.cp.ascontiguousarray(x[tuple(index)])
-        return self._shared_view(out, x)
+        return self._shared_view(out, x, node)
 
     # ------------------------------------------------------------------
     # 索引类：拼接 / 查表

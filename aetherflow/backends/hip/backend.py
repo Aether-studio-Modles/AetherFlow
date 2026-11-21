@@ -375,10 +375,15 @@ class HipBackend(DeviceBackend):
                     guards: List[Tuple[Any, str, str]] = []
                     self._capture_guards = guards
                     self._capturing = True
+                    # 图输出必须独占一块（见 ``_shared_view``）：捕获图把
+                    # 地址写死，输出若与源共用一段，源被回收后地址会分给
+                    # 后面的算子，两个输出就写同一块了。
+                    self._capture_outputs = frozenset(v.id for v in graph.outputs)
                     try:
                         env = self.run_device(graph, buffers, release=True)
                     finally:
                         self._capturing = False
+                        self._capture_outputs = frozenset()
                         self._capture_guards = None
             graph_exec = runtime.graph_exec(session.graph)
             # 捕获期 H2D 的主机源（常量、`full` 的临时 numpy）：图里只记

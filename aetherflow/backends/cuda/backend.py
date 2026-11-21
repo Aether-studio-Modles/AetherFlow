@@ -753,16 +753,14 @@ class CudaBackend(DeviceBackend):
                 guards: List[Tuple[Any, str, str]] = []
                 self._capture_guards = guards
                 self._capturing = True
+                # 图输出必须独占一块（见 ``_shared_view``）：捕获图把地址写死，
+                # 输出若与源共用一段，源被回收后地址会分给后面的算子。
+                self._capture_outputs = frozenset(v.id for v in graph.outputs)
                 try:
-                    # 捕获轮**不回收**中间值。回收走的是"最后一个读者之后
-                    # 释放"，而图输出常常是零拷贝视图（reshape / 整段切片），
-                    # 与它的源共用地址；源被记成待回收、最后一个视图死掉后
-                    # 还块，可那个视图正是图输出，捕获图里于是出现两个输出
-                    # 写同一块（实测 A800：logits 与 l0_h 同址，首步之后
-                    # token 走偏）。让每个值独占一块，地址就只被写一次。
-                    env = self.run_device(graph, buffers, release=False)
+                    env = self.run_device(graph, buffers, release=True)
                 finally:
                     self._capturing = False
+                    self._capture_outputs = frozenset()
                     self._capture_guards = None
                 cg = stream.end_capture()
         finally:
