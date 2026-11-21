@@ -178,6 +178,8 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
 
     def af_step():
         out = af_exec(bwd, {**feed_dev, "dloss": seed_dev})
+        if args.no_update:
+            return
         for p, name in zip(params_dev, grad_names):
             p -= lr * out[name]
 
@@ -191,6 +193,10 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
         logits = F.relu(tensors["x"] @ ps[0] + tensors["b1"]) @ ps[2] + tensors["b2"]
         loss = F.cross_entropy(logits, tensors["labels"])
         loss.backward()
+        if args.no_update:
+            for p in ps:
+                p.grad = None
+            return
         with torch.no_grad():
             for p in ps:
                 p -= lr * p.grad
@@ -252,6 +258,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="改测训练一步（前向 + 交叉熵 + 反向 + SGD）")
     parser.add_argument("--graph-mode", default="off",
                         help="AetherFlow 的图重放模式（off / auto / capture）")
+    parser.add_argument("--no-update", action="store_true",
+                        help="只算梯度、不更新参数（分离参数更新成本）")
     args = parser.parse_args(argv)
 
     try:
