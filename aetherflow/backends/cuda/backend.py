@@ -637,6 +637,7 @@ class CudaBackend(DeviceBackend):
 
         buffers: Dict[str, Any] = {}
         mutable: List[str] = []
+        pending: List[Tuple[Any, Any]] = []
         for name in declared:
             if name in sample_inputs:
                 src = self.to_array(sample_inputs[name])
@@ -647,9 +648,13 @@ class CudaBackend(DeviceBackend):
                 raise KeyError(f"capture 缺少图输入: {name}")
             buf = shared.get(name)
             if buf is None:
-                # 静态缓冲：捕获记录的是固定地址，之后每次 run 往这里拷新值
+                # 静态缓冲：捕获记录的是固定地址，之后每次 run 往这里拷新值。
+                # 拷贝本身留到预热用的那条流上做——``to_array`` 出来的是主机
+                # 数组，在默认流上异步 H2D，非阻塞流上的预热会先读到未就绪的
+                # 内存（表现为 embedding 拿随机 ids）。共享缓冲由调用方负责
+                # 填好，这里不重复拷。
                 buf = cp.empty(src.shape, dtype=src.dtype)
-                buf[...] = src
+                pending.append((buf, src))
             elif tuple(buf.shape) != tuple(src.shape) or buf.dtype != src.dtype:
                 raise ValueError(
                     f"共享缓冲 %{name} 的形状/dtype 是 {tuple(buf.shape)}/{buf.dtype}，"
@@ -660,6 +665,16 @@ class CudaBackend(DeviceBackend):
         allocator = self.allocator() if reuse_memory else cp.cuda.MemoryPool()
         previous_allocator = cp.cuda.get_allocator()
         stream = stream if stream is not None else self.new_stream()
+        # 静态缓冲的填充必须在换分配器之前完成：``to_array`` 出来的是主机
+        # 数组，H2D 在默认流上异步进行，而预热跑在非阻塞流上——不建立这条
+        # 依赖，预热会先读到未就绪的内存（表现为 embedding 拿随机 ids）。
+        # 放在换分配器之前也让这次 H2D 的临时分配不落进捕获 arena，
+        # ``capture_reports_memory_budget`` 的预算因此只反映图本身。
+        for buf, src in pending:
+            buf[...] = src
+        ready = cp.cuda.Event()
+        ready.record()
+        stream.wait_event(ready)
         cp.cuda.set_allocator(allocator.malloc)
         self._active_arena = allocator if isinstance(allocator, Arena) else None
         self._last_arena = self._active_arena
