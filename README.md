@@ -145,10 +145,18 @@ K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` 不超过 3.2M 元素时走�
 常量时下限放到 C=3（0.049 vs tiled 0.059），否则 C ≤ 7 仍分块直算；C ≥ 32
 仍走四段（c32 打平、c64 起 `U` 的重复全局读让融合退化）。大通道的剩余差距
 不是内核算得慢：四次提交约 0.045 ms、框架逐节点派发约 0.055 ms，GPU 只占
-0.03～0.07 ms——下一步是把 `U` 分块进共享内存并做寄存器复用。复现：
-`python -m benchmarks.winograd_compare --rounds 3`。
+0.03～0.07 ms；把 `U` 分块进共享内存试过（5.258），c24 反而慢 1.9 倍、
+c32/c64 持平——`U` 的重复读本来就被 L1/L2 吸收，不是瓶颈，c32 这一档已经
+落在"提交 + 派发"的量级上。复现：`python -m benchmarks.winograd_compare --rounds 3`。
 
-- 图重放：多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
+- 层 / 网络级（5.259）：`conv → mul → add → relu` 叠 1/4/8 层，`mul+add+relu`
+  确实被合成一个内核（4 层 32 节点 → 24 组），但 `graph_mode="auto"` 在这张
+  图上只有 1.00～1.01×——每个 block 有 0.11 ms 的卷积，派发不占主导。捕获的
+  收益来自"小算子 + 主机瓶颈"，不是"节点多"。逐通道 BN（`(1,C,1,1)` 广播）
+  不进融合链，每层因此多 27%～39%（0.112 → 0.141 / 0.155 ms），是当前融合
+  判据最明显的一处缺口。复现：
+  `python -m benchmarks.conv_graph_compare --blocks 4 --rounds 3`。
+- 图重放：小算子的多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
   A800 设备侧 1.66 → 0.40 ms，LeNet 常驻 0.59 → 0.14 ms），单节点图无收益；
   默认 `graph_mode="off"`，语义差异需使用者知情。
 - cuDNN 快路径的 f32 数学类型锁死为 FMA（关掉 TF32）：此前宽通道卷积会被
