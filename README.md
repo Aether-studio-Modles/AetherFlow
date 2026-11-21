@@ -145,18 +145,21 @@ K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` 不超过 3.2M 元素时走�
 四段版逐位相等，对 cuDNN 归一化误差 ≤ 5.3e-7。auto 的接管面按 `C` 与权重
 来源分档（`plan.conv_winograd_fused_preferred`）：8 ≤ C ≤ 24 走融合；权重是
 常量时下限放到 C=3（0.028 vs tiled 0.059），否则 C ≤ 7 仍分块直算；C ≥ 32
-仍走四段。大通道的剩余差距是设备侧结构：c32/c64 为 0.116/0.343 ms
-（cuDNN 的 1.80×/4.27×），三段内核加 batched GEMM 是主体。5.264 把四段版的
+改走四段版。5.268 在空闲机上按同进程交替重测，`auto` 在 c32/c64 上分别是
+cuDNN 9 的 **1.02×/1.36×**（0.0655/0.0887 对 0.0639/0.0654 ms），且是全实现
+里最快的；旧表里的 1.80×/4.27× 是显式 `conv_impl="winograd_fused"` 的对照
+列（融合版只接管到 C=24），不代表 auto。5.264 把四段版的
 launch 也在计划期展开（三段 `grid`/`block`、静态参数、内核句柄一次算好），
 c64 单层端到端 0.113 → 0.094 ms（空闲时；共享机上有负载时 `burst` 会到
 0.21，稳定可复现的是 `host` / `gpu` / `kernel` 0.062 / 0.088 / 0.042）、
 `kernel` 口径 0.085 → 0.042 ms；`U` 也随计划驻留，运行期只做输入变换 +
 GEMM + 输出变换
-（`benchmarks/overhead_compare.py`）；主机成本已不再与内核同量级，剩下的
-要靠设备侧结构，比值待机器空闲后按同进程交替重测。把 `U` 分块进共享内存
+（`benchmarks/overhead_compare.py`）；主机成本已不再与内核同量级，c64 剩下
+的 1.36× 在 GEMM 本身（减少乘法量或 TF32 才能再压，见 DESIGN 5.268）。把 `U` 分块进共享内存
 试过（5.258），c24 反而慢 1.9 倍、c32/c64 持平——`U` 的重复读本来就被
 L1/L2 吸收。
-复现：`python -m benchmarks.winograd_compare --rounds 3`。
+复现：`python -m benchmarks.winograd_compare --rounds 3`（前两列是显式融合版，
+auto 的实际比值看 `benchmarks.conv_compare`）。
 
 - 层 / 网络级（5.259～5.266）：`conv → mul → add → relu` 叠 8 层，
   `mul+add+relu` 被合成一个内核（64 节点 → 48 组）。5.260 把静态 conv 的

@@ -24,6 +24,12 @@ python -m benchmarks.winograd_compare --rounds 5 --single
 **只比设备侧**：本项目侧走 ``execute_device``，输入先转成设备数组；cuDNN
 侧同样不出卡。``NVIDIA_TF32_OVERRIDE=0`` 必须设，否则 cuDNN 会走 TF32，
 数值对拍会被 1e-3 的差值拦下（本项目没有 TF32 路径）。
+
+**注意这两列都是显式融合版**（``conv_impl="winograd_fused"``），而 auto 的
+接管面上限是 C=24（``plan.conv_winograd_fused_preferred``）：c32/c64 的
+"常量/cuDNN"是这条对照路径的比值，不是 ``auto`` 的表现。auto 在 C ≥ 32 走
+四段版，实测为 cuDNN 的 1.02×/1.36×（DESIGN 5.268），要看那张表请用
+``benchmarks.conv_compare``。
 """
 
 from __future__ import annotations
