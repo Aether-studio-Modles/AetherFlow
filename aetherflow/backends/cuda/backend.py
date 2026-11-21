@@ -66,6 +66,7 @@ class CudaBackend(DeviceBackend):
     """NVIDIA 上的后端。构造失败时抛出带原因的错误，不静默退回 CPU。"""
 
     name = "cuda"
+    GEMM_TRANSPOSE = True
     _LABEL = "CUDA 后端"
     _OPS = CUDA_OPS
     _BF16_OPS = BF16_OPS

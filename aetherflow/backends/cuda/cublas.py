@@ -22,6 +22,7 @@ import ctypes
 import ctypes.util
 
 _CUBLAS_OP_N = 0
+_CUBLAS_OP_T = 1
 
 # cudaDataType_t / cublasComputeType_t / cublasGemmAlgo_t 的常量。
 # 这些值在 CUDA 11 与 12 的 ABI 里是稳定的；不 include 头文件，直接按文档写。
@@ -175,6 +176,32 @@ class Cublas:
             ),
             "cublasSetWorkspace_v2",
         )
+
+    def gemm_transposed(self, a, b, out, trans_a=False, trans_b=False) -> None:
+        """连续二维源矩阵的逻辑转置直接交给 GEMM，不分配转置副本。"""
+        m, n = (int(d) for d in out.shape)
+        k = int(a.shape[-2] if trans_a else a.shape[-1])
+        op_a = _CUBLAS_OP_T if trans_a else _CUBLAS_OP_N
+        op_b = _CUBLAS_OP_T if trans_b else _CUBLAS_OP_N
+        lda, ldb = int(a.shape[-1]), int(b.shape[-1])
+        alpha, beta = ctypes.c_float(1.0), ctypes.c_float(0.0)
+        # 行主序交换左右操作数；leading dimension 始终取物理源矩阵行宽。
+        dtype = str(a.dtype)
+        if dtype == "float32":
+            status = self._lib.cublasSgemm_v2(
+                self._handle, op_b, op_a, n, m, k,
+                ctypes.byref(alpha), _ptr(b), ldb, _ptr(a), lda,
+                ctypes.byref(beta), _ptr(out), n,
+            )
+        else:
+            storage = _CUDA_R_16F if dtype == "float16" else _CUDA_R_16BF
+            status = self._lib.cublasGemmEx(
+                self._handle, op_b, op_a, n, m, k,
+                ctypes.byref(alpha), _ptr(b), storage, ldb,
+                _ptr(a), storage, lda, ctypes.byref(beta),
+                _ptr(out), storage, n, _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT,
+            )
+        self._check(status, "转置 GEMM")
 
     def sgemm(self, a, b, out) -> None:
         """行主序 ``out[M, N] = a[M, K] @ b[K, N]``。"""

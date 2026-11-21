@@ -100,6 +100,8 @@ class _PlanMixin:
                         # ``_planned_chain``；绑定一个整组闭包，把链内联进
                         # conv 内核的写回点（见 ``_planned_conv_epilogue``）。
                         group.fused = self._planned_conv_epilogue(group)
+                    elif group.nodes[0].op.name == "transpose":
+                        group.fused = self._planned_transpose_matmul(group)
                     else:
                         group.chain = self._planned_chain(group)
 
@@ -497,7 +499,70 @@ class _PlanMixin:
 
     def group_nodes(self, graph):
         """相邻的同形逐元素算子交给一个内核（计划见 ``_group_elementwise``）。"""
-        return self._merge_conv_epilogue(graph, _group_elementwise(graph))
+        groups = self._merge_conv_epilogue(graph, _group_elementwise(graph))
+        return self._merge_transpose_matmul(graph, groups)
+
+    def _merge_transpose_matmul(self, graph, groups):
+        """只合并相邻、单消费者的二维转置；其他布局与 HIP 保持原路径。"""
+        if not getattr(self, "GEMM_TRANSPOSE", False):
+            return groups
+        users = {}
+        for node in graph.nodes:
+            for value in node.inputs:
+                users.setdefault(value.id, []).append(node)
+        outputs = {value.id for value in graph.outputs}
+        merged = []
+        for group in groups:
+            if len(group) == 1 and group[0].op.name == "matmul":
+                matmul = group[0]
+                selected = []
+                wanted = {value.id for value in matmul.inputs}
+                while merged and len(selected) < 2:
+                    prev = merged[-1]
+                    node = prev[0]
+                    if not (
+                        len(prev) == 1 and node.op.name == "transpose"
+                        and tuple(node.attrs["perm"]) == (1, 0)
+                        and node.output.id in wanted
+                        and node.output.id not in outputs
+                        and users.get(node.output.id) == [matmul]
+                        and all(v.type.is_static and len(v.type.shape) == 2
+                                and all(int(d) > 0 for d in v.type.shape)
+                                and v.type.dtype in (DType.F32, DType.F16, DType.BF16)
+                                for v in matmul.inputs)
+                    ):
+                        break
+                    selected.insert(0, merged.pop()[0])
+                if selected:
+                    group = tuple(selected) + group
+            merged.append(group)
+        return merged
+
+    def _planned_transpose_matmul(self, group):
+        """用源矩阵和 GEMM 转置位替代组内转置副本。"""
+        nodes = group.nodes
+        positions = {node.output.id: i for i, node in enumerate(nodes[:-1])}
+        matmul = nodes[-1]
+        sources = tuple(positions.get(value.id) for value in matmul.inputs)
+        shape = tuple(int(d) for d in matmul.output.type.shape)
+
+        def call(args):
+            arrays = [args[-1][i] if pos is None else args[pos][0]
+                      for i, pos in enumerate(sources)]
+            if any(a.ndim != 2 or not a.flags.c_contiguous for a in arrays):
+                return None
+            a, b = arrays
+            if a.dtype != b.dtype or a.dtype not in (
+                self.cp.float32, self.cp.float16, self.cp.uint16
+            ):
+                return None
+            out = self.cp.empty(shape, dtype=a.dtype)
+            blas = self._cublas()
+            blas.set_stream(self.current_stream_ptr())
+            blas.gemm_transposed(a, b, out, sources[0] is not None, sources[1] is not None)
+            return out
+
+        return call
 
     def _merge_conv_epilogue(self, graph: Graph, groups: List[tuple]) -> List[tuple]:
         """把单个 conv 节点与紧随其后的逐元素链并成一组。
@@ -585,8 +650,8 @@ class _PlanMixin:
         否则仍是原来的逐节点 ``invoke``。
         """
         if len(group) > 1:
-            if group[0].op.name == "conv2d":
-                # conv + epilogue 的融合组：链首不是逐元素算子，不能交给
+            if group[0].op.name in ("conv2d", "transpose"):
+                # conv 后融合与转置矩阵乘都不是逐元素链，不能交给
                 # ``_try_chain``。``fused`` 为 ``None``（计划期判定不成立）或
                 # 运行期前提不满足时，逐节点执行仍是正确的回退路径。
                 fused = plan.fused if plan is not None else None

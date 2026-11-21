@@ -928,7 +928,111 @@ class TestCudaSymbolicSpatial(CudaTestCase):
             np.testing.assert_allclose(got[name], expected[name], rtol=1e-4, atol=1e-4)
 
 
+class TestTransposeMatmulPlan(unittest.TestCase):
+    @staticmethod
+    def graph(left=True, right=True, dtype=f32):
+        graph = Graph()
+        a = graph.input("a", dtype[7, 3] if left else dtype[3, 7])
+        b = graph.input("b", dtype[5, 7] if right else dtype[7, 5])
+        x = graph.transpose(a, perm=(1, 0)) if left else a
+        y = graph.transpose(b, perm=(1, 0)) if right else b
+        graph.output(graph.matmul(x, y), "y")
+        return graph
+
+    def test_adjacent_transposes_merge_on_either_side(self):
+        backend = CudaBackend.__new__(CudaBackend)
+        for left, right in ((True, False), (False, True), (True, True)):
+            graph = self.graph(left, right)
+            groups = backend.group_nodes(graph)
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(groups[0]), 1 + left + right)
+
+    def test_output_and_extra_consumer_prevent_merge(self):
+        backend = CudaBackend.__new__(CudaBackend)
+        for extra_consumer in (False, True):
+            graph = self.graph(True, False)
+            transposed = graph.nodes[0].output
+            if extra_consumer:
+                graph.output(graph.relu(transposed), "extra")
+            else:
+                graph.output(transposed, "extra")
+            self.assertEqual(len(backend.group_nodes(graph)[0]), 1)
+
+    def test_batched_and_empty_matrices_keep_original_groups(self):
+        backend = CudaBackend.__new__(CudaBackend)
+        for shape, perm, other in (((2, 7, 3), (0, 2, 1), (2, 7, 5)),
+                                   ((7, 0), (1, 0), (7, 5))):
+            graph = Graph()
+            a = graph.input("a", f32[shape])
+            b = graph.input("b", f32[other])
+            graph.output(graph.matmul(graph.transpose(a, perm=perm), b), "y")
+            self.assertTrue(all(len(group) == 1 for group in backend.group_nodes(graph)))
+
+    def test_disabled_backend_keeps_original_groups(self):
+        backend = CudaBackend.__new__(CudaBackend)
+        backend.GEMM_TRANSPOSE = False
+        self.assertEqual(len(backend.group_nodes(self.graph())), 3)
+
+    def test_closure_uses_sources_and_rejects_noncontiguous_layout(self):
+        from aetherflow.runtime.executor import _GroupPlan
+
+        backend = CudaBackend.__new__(CudaBackend)
+        backend.cp = np
+        blas = mock.Mock()
+        backend._cublas = lambda: blas
+        backend.current_stream_ptr = lambda: 0
+        graph = self.graph()
+        group = _GroupPlan(backend.group_nodes(graph)[0], True)
+        call = backend._planned_transpose_matmul(group)
+        a, b = np.ones((7, 3), np.float32), np.ones((5, 7), np.float32)
+        out = call([[a], [b], [None, None]])
+        self.assertEqual(out.shape, (3, 5))
+        args = blas.gemm_transposed.call_args.args
+        self.assertIs(args[0], a)
+        self.assertIs(args[1], b)
+        self.assertEqual(args[3:], (True, True))
+        self.assertIsNone(call([[a[::-1]], [b], [None, None]]))
+
+
 class TestCudaMatmul(CudaTestCase):
+    def test_transpose_fusion_dtypes_capture_and_release(self):
+        for dtype in (f32, f16, bf16):
+            for left, right in ((True, False), (False, True), (True, True)):
+                graph = TestTransposeMatmulPlan.graph(left, right, dtype)
+                feed = {v.name: self.rand(*v.type.shape) for v in graph.inputs}
+                expected = self.ref.execute(graph, feed)["y"]
+                for mode in ("off", "auto"):
+                    for memory in ("container", "tiered"):
+                        with self.subTest(dtype=dtype, left=left, right=right,
+                                          mode=mode, memory=memory):
+                            backend = CudaBackend(graph_mode=mode, memory_mode=memory)
+                            for _ in range(3):
+                                got = backend.execute(graph, feed)["y"]
+                                np.testing.assert_allclose(
+                                    got, expected, rtol=1e-4 if dtype is f32 else .03,
+                                    atol=1e-4 if dtype is f32 else .04,
+                                )
+                            if mode == "auto":
+                                self.assertGreater(backend.graph_captures, 0)
+                            dev = {name: backend.to_array(value) for name, value in feed.items()}
+                            for release in (False, True):
+                                env = backend.run_device(graph, dev, release=release)
+                                np.testing.assert_allclose(
+                                    backend.to_host(env[graph.outputs[0].id]), expected,
+                                    rtol=.03, atol=.04,
+                                )
+
+    def test_transpose_graph_output_invalidates_fused_plan(self):
+        graph = TestTransposeMatmulPlan.graph(True, False)
+        feed = {v.name: self.rand(*v.type.shape) for v in graph.inputs}
+        self.cuda.execute(graph, feed)
+        graph.output(graph.nodes[0].output, "transposed")
+        got = self.cuda.execute(graph, feed)
+        expected = self.ref.execute(graph, feed)
+        for name in expected:
+            np.testing.assert_allclose(got[name], expected[name], rtol=1e-4, atol=1e-4)
+        self.assertEqual(len(self.cuda.group_nodes(graph)), 2)
+
     def test_2d(self):
         g = Graph()
         a = g.input("a", f32[4, 8])
