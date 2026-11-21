@@ -1320,10 +1320,6 @@ def _pack(value):
 # ----------------------------------------------------------------------
 
 
-def _module():
-    return _MODULE
-
-
 def empty(shape, dtype=float32) -> DeviceArray:
     dt = _dtype(dtype)
     if isinstance(shape, int):

@@ -25,7 +25,6 @@ from aetherflow import (
     dumps,
     f16,
     f32,
-    i32,
     loads,
     verify,
 )

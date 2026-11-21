@@ -23,7 +23,6 @@ from aetherflow.backends.contracts import (
 )
 from aetherflow.runtime import ReferenceExecutor
 from aetherflow.runtime.telemetry import (
-    InstrumentedBackend,
     NodeTiming,
     RunRecord,
     TelemetryRecorder,

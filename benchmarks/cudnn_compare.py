@@ -288,7 +288,6 @@ def measure(fn: Callable[[], None], sync, warmup: int, repeat: int,
         t0 = time.perf_counter()
         for _ in range(burst):
             fn()
-        t1 = time.perf_counter()
         sync()
         t2 = time.perf_counter()
         steady.append((t2 - t0) * 1e3 / burst)

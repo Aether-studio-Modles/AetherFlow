@@ -4,17 +4,58 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aetherflow"
-version = "0.1.0"
+# 版本只有一处事实来源：aetherflow/__init__.py 的 __version__。
+# 两处各写一遍迟早漂移，而 wheel 的版本号恰恰是安装侧唯一可见的那一个。
+dynamic = ["version"]
 description = "统一深度学习基础设施：统一前端 IR + 可插拔后端插件"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/Aether-studio-Modles/AetherFlow"
+Repository = "https://github.com/Aether-studio-Modles/AetherFlow"
+Mirror = "https://gitee.com/xy--yd/AetherFlow"
 
 [project.optional-dependencies]
 # CUDA 后端是可选插件：内核与全部测试在无 cupy 的环境下依然可运行（CUDA 组跳过）
 cuda = ["cupy-cuda12x>=13"]
-# 前端适配器是可选依赖：卸载 torch 后内核、后端、全部非前端测试仍然可用
-frontend = ["torch>=2.1"]
+# 前端适配器是可选依赖：卸载 torch 后内核、后端、全部非前端测试仍然可用。
+# 版本范围与 frontend/compat.py 的 TORCH_MATRIX 保持同一条口径：矩阵外的版本
+# 在导入时就会抛 UnsupportedTorchVersion，安装约束不该比运行时检查更宽。
+frontend = ["torch>=2.9,<2.14"]
+# 开发工具：只服务于 CI 的 lint / 覆盖率 / 打包，运行时不依赖。
+dev = ["ruff>=0.6", "coverage[toml]>=7", "build>=1"]
+
+[tool.setuptools.dynamic]
+version = { attr = "aetherflow.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["aetherflow*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# 只开门槛型规则：语法错误 + 未定义/未使用名。风格类规则（行宽、lambda 赋值等）
+# 会制造大量与正确性无关的改动，不适合放进 CI 门禁。
+select = ["E9", "F"]
+
+[tool.coverage.run]
+source = ["aetherflow"]
+branch = true
+
+[tool.coverage.report]
+omit = ["*/tests/*", "*/benchmarks/*"]

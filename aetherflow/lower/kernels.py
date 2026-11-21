@@ -12,6 +12,8 @@ matmul 不在这里：它走 cuBLAS / hipBLAS，没有内核模板，也就没�
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 from .kernel import (
     ArrayDecl,
     Assign,
@@ -41,6 +43,7 @@ from .kernel import (
     Return,
     Scalar,
     Shared,
+    Stmt,
     Store,
     Sync,
     Tensor,

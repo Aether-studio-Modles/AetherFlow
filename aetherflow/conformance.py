@@ -40,7 +40,7 @@ from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence,
 
 import numpy as np
 
-from .backends.base import BackendCapabilityError, unsupported_ops
+from .backends.base import BackendCapabilityError
 from .backends.capabilities import (
     BackendCapabilities,
     capability_gaps,

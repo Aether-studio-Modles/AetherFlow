@@ -21,8 +21,6 @@ import unittest
 
 import numpy as np
 
-from aetherflow import f32
-from aetherflow.backends import ReferenceBackend
 from aetherflow.train import (
     GradScaler,
     ParameterStore,

@@ -297,7 +297,6 @@ def _numpy_cnn(x, p, spec):
     for i in range(len(spec.widths) - 1):
         h = block(h, f"stage{i}", p[f"stage{i}_w"], p[f"stage{i}_b"])
         h = _maxpool2(h)
-    side = spec.pooled_image
     h = h.mean(axis=(2, 3), keepdims=True)  # kernel=side、stride=1 的全局平均
     flat = h.reshape(h.shape[0], -1)
     return flat @ p["head_w"] + p["head_b"]

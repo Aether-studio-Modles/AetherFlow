@@ -14,7 +14,6 @@
 
 import unittest
 
-import numpy as np
 
 from aetherflow import ReferenceBackend
 from aetherflow.models import (

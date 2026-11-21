@@ -17,7 +17,7 @@ import unittest
 
 import numpy as np
 
-from aetherflow import Graph, ReferenceBackend, bf16, f16, f32
+from aetherflow import Graph, ReferenceBackend, bf16, f32
 from aetherflow.passes import Autocast
 from aetherflow.runtime.bf16 import (
     STORAGE_BYTES,

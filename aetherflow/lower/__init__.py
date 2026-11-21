@@ -72,7 +72,6 @@ from .kernels import (
     conv2d_grouped,
     conv2d_tiled,
     conv2d_weight_grad,
-    cumsum,
     dropout_mask,
     ew_binary,
     ew_broadcast,
@@ -102,7 +101,6 @@ from .kernels import (
     scan_linear_last,
     silu_gate,
     softmax_last,
-    tril,
 )
 
 __all__ = [

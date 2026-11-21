@@ -748,7 +748,7 @@ def _ref_sparse_linear_values_grad(
     这里**没有重复下标问题**：每个事件只写一次，不需要 ``add.at``。
     """
     dout, weights, indices, offsets = args
-    steps, cols = int(dout.shape[0]), int(dout.shape[1])
+    steps = int(dout.shape[0])
     rows = int(weights.shape[0])
     nnz = int(indices.shape[0])
     _check_event_offsets(np.asarray(offsets), nnz, "sparse_linear_values_grad")

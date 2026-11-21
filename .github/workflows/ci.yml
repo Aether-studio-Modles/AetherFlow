@@ -14,6 +14,23 @@ on:
     - cron: "0 18 * * *"
 
 jobs:
+  lint:
+    name: 静态检查（门槛规则）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 规则集在 pyproject.toml 的 [tool.ruff.lint] 里：只开 E9 + F（语法错误、
+      # 未定义/未使用名）。风格类规则不进门禁，避免把正确性流水线变成格式争论。
+      - name: 安装 ruff
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ruff>=0.6"
+      - name: ruff check
+        run: python -m ruff check .
+
   cpu:
     name: 正确性（Python ${{ matrix.python }}）
     runs-on: ubuntu-latest
@@ -30,9 +47,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # torch 是可选依赖；不装时前端测试整组跳过，CUDA 组同理。
-          python -m pip install numpy
-      - name: 单元测试
-        run: python -m unittest discover -s tests -t . -v
+          python -m pip install numpy coverage
+      - name: 单元测试（带覆盖率）
+        run: python -m coverage run -m unittest discover -s tests -t .
+      - name: 覆盖率报告
+        run: python -m coverage report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python }}
+          path: .coverage
+          if-no-files-found: ignore
       - name: 参考后端一致性报告
         run: |
           python - <<'PY'
@@ -41,6 +65,28 @@ jobs:
           print(report.text())
           assert report.ok, "参考后端未通过一致性检查"
           PY
+
+  frontend:
+    name: 前端（torch ${{ matrix.torch }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 矩阵的两端各钉一次：区间内其余版本只有声明，没有逐版本回归（见 compat.py）。
+        torch: ["2.9.*", "2.13.*"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 torch（CPU wheel）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy "torch==${{ matrix.torch }}" \
+            --index-url https://download.pytorch.org/whl/cpu
+      # torchvision 是可选依赖：没装时真实模型用例自动跳过，其余对拍照跑。
+      - name: 前端适配器测试
+        run: python -m unittest tests.test_frontend -v
 
   build:
     name: 打包（wheel + 安装冒烟）
@@ -157,3 +203,42 @@ jobs:
             telemetry_cuda.json
             telemetry_history.json
           if-no-files-found: ignore
+
+  publish:
+    name: 发布到 PyPI（v* tag）
+    # 只在打 tag 时发布：普通 push 与 PR 都不该持有发布权限。
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, cpu, frontend, build, fuzz]
+    runs-on: ubuntu-latest
+    permissions:
+      # PyPI trusted publishing：用 OIDC 换短期令牌，不存长期密码。
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装构建依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy build
+      # tag 与包版本错配时，PyPI 上会出现"tag 写 v0.2.0、发出去的是 0.1.0"。
+      # 在构建前拦住，比发布后 yank 便宜。
+      - name: 校验 tag 与 __version__ 一致
+        run: |
+          python - <<'PY'
+          import os
+          import aetherflow
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = tag[1:] if tag.startswith("v") else tag
+          assert expected == aetherflow.__version__, (
+              f"tag {tag} 与包版本 {aetherflow.__version__} 不一致"
+          )
+          print("version ok:", aetherflow.__version__)
+          PY
+      - name: 构建 sdist 与 wheel
+        run: python -m build
+      - name: 上传到 PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

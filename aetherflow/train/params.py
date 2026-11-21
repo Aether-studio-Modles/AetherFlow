@@ -23,7 +23,7 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from ..ir.graph import Graph
-from ..ir.types import DType, TensorType
+from ..ir.types import DType
 
 __all__ = ["init_array", "default_init", "ParameterStore"]
 

@@ -32,7 +32,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional
 
 __all__ = [
     "UID_SIZE",

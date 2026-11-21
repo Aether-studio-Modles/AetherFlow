@@ -26,7 +26,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 __all__ = ["TuningRecord", "ConfigStore", "STORE_VERSION"]
 

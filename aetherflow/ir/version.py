@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 IR_VERSION: Tuple[int, int] = (1, 0)
 

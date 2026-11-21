@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import math
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -180,7 +179,6 @@ class CufftPlan:
         lib, self.name = _load()
         self.lib = lib
         i32 = ctypes.c_int
-        i64 = ctypes.c_longlong
 
         required = (
             "cufftPlanMany",

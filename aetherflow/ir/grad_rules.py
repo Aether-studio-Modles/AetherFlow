@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .ops import OPS, NoGradientError
 
@@ -356,7 +356,7 @@ def _spike(ctx):
     后者在 ``d = 0``（恰好等于阈值）处反向是 ``g / (2*sqrt(0))``，会算出 NaN，
     而 x == thr 恰恰是 SNN 最常停留的位置。前者在 0 处取 0，不会污染梯度。
     """
-    b, g = ctx.b, ctx.g
+    b = ctx.b
     x = ctx.input(0)
     thr = float(ctx.attrs.get("threshold", 1.0))
     alpha = float(ctx.attrs.get("alpha", 1.0))

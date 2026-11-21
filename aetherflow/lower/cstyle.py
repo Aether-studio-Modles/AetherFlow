@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from ..ir.types import DType
 from .kernel import (

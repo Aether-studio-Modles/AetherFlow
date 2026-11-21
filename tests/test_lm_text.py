@@ -9,7 +9,7 @@ import unittest
 
 import numpy as np
 
-from aetherflow.models import ByteTokenizer, ChatTemplate, LMSpec
+from aetherflow.models import ByteTokenizer, ChatTemplate
 from aetherflow.train import lm_batch
 
 

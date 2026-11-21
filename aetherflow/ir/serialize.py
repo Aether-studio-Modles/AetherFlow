@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 
 from .graph import Graph
 from .types import DType, SymExpr, TensorType
-from .version import IR_VERSION, IRVersionError, check_version, migrate
+from .version import IRVersionError, check_version, migrate
 
 __all__ = [
     "IRVersionError",

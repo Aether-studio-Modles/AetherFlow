@@ -15,7 +15,6 @@ softmax 概率那条边回传，这与 PyTorch 的 top-k 门控一致。
 
 from __future__ import annotations
 
-import math
 import unittest
 
 import numpy as np

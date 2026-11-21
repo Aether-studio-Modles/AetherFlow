@@ -19,7 +19,6 @@ from aetherflow import ReferenceBackend
 from aetherflow.models import (
     ByteTokenizer,
     ChatTemplate,
-    LMSpec,
     QueueFullError,
     ServingEngine,
 )

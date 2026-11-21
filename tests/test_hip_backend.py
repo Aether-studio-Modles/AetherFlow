@@ -897,8 +897,8 @@ class TestHipCaptureDeferredFree(unittest.TestCase):
         host = runtime.pinned((64,), np.float32)
         with runtime.new_stream() as stream:
             with runtime.capture(stream) as session:
-                dead = None
-                host = None
+                # 捕获期内释放：释放必须被延迟到图执行之后，而不是立即归还。
+                del dead, host
             self.assertNotEqual(session.graph, 0)
         self.assertEqual(rt._deferred_free, [])
         self.assertEqual(rt._deferred_pinned, [])

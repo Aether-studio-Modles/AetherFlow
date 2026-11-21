@@ -388,7 +388,7 @@ class TestReferenceExecution(unittest.TestCase):
 
         g = Graph()
         x = g.input("x", f32["B", 2])
-        y = g.input("y", f32["B", 3])
+        g.input("y", f32["B", 3])  # 未被使用的第二个输入：只为让 B 维冲突
         g.output(x)
         with self.assertRaises(ShapeMismatchError):
             ReferenceBackend().execute(

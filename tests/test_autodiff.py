@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import math
 import unittest
 
 import numpy as np
