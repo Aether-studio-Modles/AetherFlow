@@ -95,6 +95,31 @@ def _host_time(fn: Callable[[], None], sync, warmup: int = 3,
     return best
 
 
+def _gpu_time(fn: Callable[[], None], cp, sync, warmup: int = 3,
+              repeat: int = BURST, rounds: int = 5) -> float:
+    """连续 ``repeat`` 次执行的设备时间（CUDA events），ms/次。
+
+    与 ``host`` 的差就是"主机提交被设备执行掩盖"的部分：``gpu`` 明显小于
+    ``host`` 说明主机是瓶颈，两者接近则说明设备已经吃满，继续压 Python
+    不会再缩短端到端。
+    """
+    for _ in range(warmup):
+        fn()
+    sync()
+    best: Optional[float] = None
+    for _ in range(rounds):
+        start = cp.cuda.Event()
+        end = cp.cuda.Event()
+        start.record()
+        for _ in range(repeat):
+            fn()
+        end.record()
+        end.synchronize()
+        dt = cp.cuda.get_elapsed_time(start, end) / repeat
+        best = dt if best is None or dt < best else best
+    return best
+
+
 def _pack_cost(repeat: int = BURST) -> float:
     """卷积 launch 的 20 个 ``np.int32`` 参数构造成本（ms/次）。"""
     c = h = w = o = 16
@@ -156,6 +181,7 @@ def _case(backend: CudaBackend, graph: Graph, feed: dict, label: str,
 
     burst = measure(lambda: backend.execute_device(graph, feed_dev), sync, 3, 10)
     host = _host_time(lambda: backend.execute_device(graph, feed_dev), sync)
+    gpu = _gpu_time(lambda: backend.execute_device(graph, feed_dev), cp, sync)
 
     kernel_ms, op, groups = _kernel_probe(backend, graph, feed_dev, sync)
     out_shape = graph.outputs[0].type.shape
@@ -185,6 +211,7 @@ def _case(backend: CudaBackend, graph: Graph, feed: dict, label: str,
         "groups": groups,
         "burst": burst["burst_ms"],
         "host": host,
+        "gpu": gpu,
         "kernel": kernel_ms,
         "skeleton": host - kernel_ms,
         "empty": empty_ms,
@@ -225,19 +252,20 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(
         f"\n{'case':12s} {'nodes':>5s} {'grp':>4s} {'burst':>8s} {'host':>8s}"
-        f" {'kernel':>8s} {'skel':>7s} {'empty':>7s} {'pack':>7s} {'cap':>8s}"
+        f" {'gpu':>8s} {'kernel':>8s} {'skel':>7s} {'empty':>7s} {'pack':>7s} {'cap':>8s}"
     )
     for r in rows:
         cap = f"{r['capture']:8.4f}" if np.isfinite(r["capture"]) else f"{'-':>8s}"
         print(
             f"{r['label']:12s} {r['nodes']:5d} {r['groups']:4d}"
-            f" {r['burst']:8.4f} {r['host']:8.4f} {r['kernel']:8.4f}"
-            f" {r['skeleton']:7.4f} {r['empty']:7.4f} {r['pack']:7.4f} {cap}"
+            f" {r['burst']:8.4f} {r['host']:8.4f} {r['gpu']:8.4f}"
+            f" {r['kernel']:8.4f} {r['skeleton']:7.4f} {r['empty']:7.4f}"
+            f" {r['pack']:7.4f} {cap}"
         )
     print(
         "\n单位 ms：burst = 20 次提交 + 同步的稳态；host = 20 次提交不带同步；\n"
-        "kernel = 直接调已绑定内核函数；skel = host - kernel；\n"
-        "empty = 同形状 cp.empty；pack = 20 个 np.int32 的构造；"
+        "gpu = 20 次执行的 CUDA events 设备时间；kernel = 直接调已绑定内核函数；\n"
+        "skel = host - kernel；empty = 同形状 cp.empty；pack = 20 个 np.int32 的构造；"
         "cap = 捕获后 replay。"
     )
     return 0

@@ -1400,6 +1400,8 @@ class DeviceBackend(Executor):
                 fns.append(fn)
             if fns is not None:
                 group.kernels = tuple(fns)
+                if len(group.nodes) > 1:
+                    group.chain = self._planned_chain(group)
 
     @staticmethod
     def _holds_constant_weight(node: Node, constant_ids) -> bool:
@@ -1597,6 +1599,11 @@ class DeviceBackend(Executor):
         否则仍是原来的逐节点 ``invoke``。
         """
         if len(group) > 1:
+            chain = plan.chain if plan is not None else None
+            if chain is not None:
+                out = chain(group, args)
+                if out is not None:
+                    return out
             fused = self._try_chain(group, args)
             if fused is not None:
                 return fused
@@ -1696,6 +1703,133 @@ class DeviceBackend(Executor):
         )
         kernel((launch.grid,), (launch.block,), (*arrays, out, np.int64(n)))
         return out
+
+    def _planned_chain(self, group):
+        """静态逐元素组在计划期展开，运行期只剩分配与一次内核调用。
+
+        ``_try_chain`` 每次执行都要重新推导参数顺序、广播形状、线程铺法，
+        再组装源码键——8 层 conv-bn-relu 上实测约 60 µs/层，比它自己的内核
+        长一个数量级（DESIGN 5.261）。这些量与绑定值无关，可以一次算好。
+
+        运行期只核对每个外部数组的形状、dtype、连续性与 16 字节对齐；任一
+        不符就返回 ``None``，调用方回落 ``_try_chain``（它会按实际情况重选
+        vec）。因此这里的乐观假设不会算错，最多白算一次。
+
+        内核本身仍是惰性获取：计划期只构造键与源码生成器，第一次真正执行
+        时才编译，之后把句柄留在闭包里，不再查表。
+        """
+        nodes = group.nodes
+        out_type = nodes[-1].output.type
+        if not out_type.is_static:
+            return None
+        out_shape = tuple(int(v) for v in out_type.shape)
+        if not out_shape:
+            return None
+        ir_dtype = out_type.dtype
+        if ir_dtype not in (DType.F32, DType.F16):
+            return None
+        internal = {node.output.id for node in nodes[:-1]}
+        order: List[int] = []
+        param_of: Dict[int, str] = {}
+        local_of: Dict[int, str] = {}
+        steps: List[ElemStep] = []
+        specs: List[ElemInput] = []
+        want: List[Tuple[int, ...]] = []
+        for idx, node in enumerate(nodes):
+            names = []
+            for value in node.inputs:
+                if value.id in internal:
+                    names.append(local_of[value.id])
+                    continue
+                name = param_of.get(value.id)
+                if name is None:
+                    name = f"p{len(param_of)}"
+                    param_of[value.id] = name
+                    value_type = value.type
+                    if not value_type.is_static:
+                        return None
+                    shape = tuple(int(v) for v in value_type.shape)
+                    if shape == out_shape:
+                        specs.append(ElemInput(name, scalar=False))
+                    elif int(np.prod(shape)) == 1:
+                        specs.append(ElemInput(name, scalar=True))
+                    else:
+                        return None
+                    order.append(value.id)
+                    want.append(shape)
+                names.append(name)
+            local = f"t{idx}"
+            local_of[node.output.id] = local
+            steps.append(ElemStep(out=local, op=node.op.name, args=tuple(names)))
+        if not order:
+            return None
+        n = 1
+        for d in out_shape:
+            n *= d
+        if n == 0:
+            return None
+
+        cp = self.cp
+        cp_dtype = cp.float32 if ir_dtype is DType.F32 else cp.float16
+        # ``codegen.render`` 要的是 ``numpy.dtype`` 实例；``cp.float32`` 是类型
+        # 对象，直接传进去会被当成"未知 dtype"拒绝。
+        render_dtype = np.dtype(cp_dtype)
+        kind = "f32" if ir_dtype is DType.F32 else "f16"
+        # 对齐只有运行期才知道：先按对齐选铺法，闭包入口再核对指针。
+        launch = plan_elementwise(
+            n,
+            block=self.block,
+            max_blocks=self.max_blocks,
+            dtype=ir_dtype.value,
+            aligned=True,
+            target_blocks=self.sm_count,
+        )
+        key = (
+            "chain",
+            tuple((s.out, s.op, s.args) for s in steps),
+            tuple((s.name, s.scalar) for s in specs),
+            launch.vec,
+            kind,
+        )
+        grid = (launch.grid,)
+        block = (launch.block,)
+        n_arg = np.int64(n)
+        holder: List[Any] = [None]
+
+        def call(group, args):
+            arrays = []
+            seen = set()
+            for node, node_args in zip(group, args):
+                for value, arr in zip(node.inputs, node_args):
+                    if value.id in internal or value.id in seen:
+                        continue
+                    seen.add(value.id)
+                    arrays.append(arr)
+            if len(arrays) != len(want):
+                return None
+            for arr, shape in zip(arrays, want):
+                if tuple(arr.shape) != shape or arr.dtype != cp_dtype:
+                    return None
+                if not arr.flags.c_contiguous or int(arr.data.ptr) % VEC4_ALIGN:
+                    return None
+            kernel = holder[0]
+            if kernel is None:
+                kernel = holder[0] = self._kernel(
+                    key,
+                    lambda: self.codegen.render(
+                        build_chain(
+                            steps, specs, vec=launch.vec,
+                            dtype=ir_dtype, kernel_name="ew_chain",
+                        ),
+                        render_dtype,
+                    ),
+                    "ew_chain",
+                )
+            out = cp.empty(out_shape, dtype=cp_dtype)
+            kernel(grid, block, (*arrays, out, n_arg))
+            return out
+
+        return call
 
     # ------------------------------------------------------------------
     # 逐元素
