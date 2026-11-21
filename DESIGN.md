@@ -17426,7 +17426,10 @@ y = runner.run({"x": np.ones((7, 4), np.float32)})["y"]   # 复用同一张图�
    标识符符号，构造期即拒绝；`dynamic_axes=None` 保持 5.68 的按形状缓存不变。
 
 **验证**：本地 `py -3.14` + torch 2.13.0，`Ran 2786 tests / OK (skipped=427)`；
-`ruff check aetherflow/dynamic.py tests/test_dynamic.py` 通过。
+`ruff check aetherflow/dynamic.py tests/test_dynamic.py` 通过。远端 Ubuntu 22.04 /
+Python 3.10.12 拉取同一 commit：`tests.test_dynamic` 23 条通过；全量 2786 条里
+非前端用例全通过，`test_frontend` 的 121 条因该机 torch 2.5.1 不在兼容矩阵内报
+`UnsupportedTorchVersion`——这是环境问题，不是本轮回归。
 
 **边界**：trace-once 只覆盖"未声明维不变、声明维取任意值"的复用；声明维之外的
 形状变化仍按模板分别建图，这正是 `capacity` 的作用。`build` 必须在声明轴上是
