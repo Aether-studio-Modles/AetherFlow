@@ -49,8 +49,7 @@ class _HostCopy:
         return float(self.value())
 
 
-# ``_GroupPlan.fast`` 的"已确认不能直连"标记。用空元组而不是 ``None``：
-# ``None`` 表示"还没试过"，第一次执行时才决定，整份计划因此不需要额外的标志位。
+# ``_GroupPlan.fast`` 的"不能直连"标记，由计划构建期统一确定。
 _NO_FAST: Tuple = ()
 
 
@@ -66,6 +65,7 @@ class _GroupPlan:
     __slots__ = (
         "nodes", "args", "attrs", "expected", "dtype", "out_dtype",
         "kernels", "constants", "_memo", "fast", "chain", "fused", "release",
+        "cached",
     )
 
     def __init__(self, nodes: Tuple[Node, ...], static: bool,
@@ -106,9 +106,9 @@ class _GroupPlan:
         # 不物化、也不进环境，所以没有"中间值需要量化"的边界。
         self.out_dtype = nodes[-1].output.type.dtype
         self._memo = None
-        # 静态单节点组的直连记录，由 ``Executor._fast_step`` 在第一次执行时
-        # 填。``None`` = 这组仍走 ``invoke_group`` 的通用路径。
-        self.fast = None
+        # 后端准备完成后统一确定直连记录与缓存常量快捷入口。
+        self.fast = _NO_FAST
+        self.cached = None
         # 最后消费者执行后可摘掉的值，顺序与逐边计数归零的顺序一致。
         self.release: Tuple[int, ...] = ()
 
@@ -332,7 +332,7 @@ class Executor:
         通用路径每节点要过 ``resolve`` → ``invoke_group``（可能两三层）→
         ``cast`` → ``quantize``，其中绝大多数判断在静态图上恒为真：形状不随
         绑定变、dtype 等于声明值、组里只有一个节点、也没有组内前序输出要补位。
-        这些都在第一次执行时定下来，之后每步只剩"取输入 → 调内核 → 写回环境"。
+        这些都在计划期定下来，之后每步只剩"取输入 → 调内核 → 写回环境"。
 
         返回 ``None`` 表示这组不适合直连（含符号维、融合组、常量、后端没绑定
         内核），调用方原路径不变。**不改变任何语义**：dtype 仍需确认（参考
@@ -427,17 +427,11 @@ class Executor:
             # 常量组：值在计划期就已上传并随计划驻留，每次执行只需要把它写回
             # 环境。它没有输入、没有 attrs 要看，回收计划也已排除它，走完整
             # 路径等于每轮白做一次 args 构造与形状 / dtype 校验。
-            if len(group.nodes) == 1:
-                cid = group.nodes[0].output.id
-                if cid in group.constants:
-                    env[cid] = group.constants[cid]
-                    continue
-            # 直连快路径：静态单节点组在第一次执行时把"每步都要做的判断"
-            # 收成一条记录，之后只取输入、调内核、写回。
-            if group.fast is None:
-                group.fast = self._fast_step(group)
-                if group.fast is None:
-                    group.fast = _NO_FAST
+            cached = group.cached
+            if cached is not None:
+                env[cached[0]] = cached[1]
+                continue
+            # 静态单节点组的直连记录已在计划期确定。
             fast = group.fast
             if fast:
                 kernel, node, used, node_attrs, shape, oid, dtype, quantize = fast
@@ -523,6 +517,11 @@ class Executor:
         # 后端上传的缓存常量跨执行存活，须等准备钩子填好后再排回收。
         for group in plan:
             keep.update(group.constants)
+            if len(group.nodes) == 1:
+                cid = group.nodes[0].output.id
+                if cid in group.constants:
+                    group.cached = (cid, group.constants[cid])
+            group.fast = self._fast_step(group) or _NO_FAST
         remaining: Dict[int, int] = {}
         for node in graph.nodes:
             for a in node.inputs:

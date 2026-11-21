@@ -86,15 +86,34 @@ class FastPathEquivalenceTest(unittest.TestCase):
         for key in plain:
             np.testing.assert_array_equal(fast[key], plain[key])
 
-    def test_fast_record_is_armed_after_first_run(self):
+    def test_fast_record_is_armed_during_planning(self):
         graph = _linear()
         executor = _Fast()
-        executor.run(graph, _feed())
         plan = executor._plan(graph)
         self.assertTrue(plan)
         for group in plan:
             self.assertTrue(group.fast, "静态单节点组应该收成直连记录")
             self.assertEqual(group.fast[0], executor.invoke)
+
+    def test_dispatch_selection_runs_once_per_plan(self):
+        class Counted(_Fast):
+            def __init__(self):
+                self.selections = 0
+
+            def _fast_step(self, group):
+                self.selections += 1
+                return super()._fast_step(group)
+
+        graph = _linear()
+        executor = Counted()
+        plan = executor._plan(graph)
+        self.assertEqual(executor.selections, len(plan))
+        for _ in range(2):
+            executor.run_device(graph, _feed(), release=True)
+        self.assertEqual(executor.selections, len(plan))
+        executor._clear_plan_values()
+        executor.run_device(graph, _feed(), release=True)
+        self.assertEqual(executor.selections, 2 * len(plan))
 
     def test_casts_back_to_declared_dtype(self):
         graph = _linear()
@@ -227,6 +246,11 @@ class ReleasePlanTest(unittest.TestCase):
         g.output(g.add(x, c), "y")
         executor = self._executor(Cached)
         feed = {"x": np.arange(4, dtype=np.float32)}
+        plan = executor._plan(g)
+        cached = next(group for group in plan if group.constants)
+        self.assertEqual(cached.cached[0], c.id)
+        self.assertIs(cached.cached[1], cached.constants[c.id])
+        self.assertEqual(cached.fast, ())
         first = executor.run_device(g, feed, release=True)
         second = executor.run_device(g, feed, release=True)
         self.assertIs(first[c.id], second[c.id])
