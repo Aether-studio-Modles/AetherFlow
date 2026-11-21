@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, List, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 
 from ..ir.graph import Graph, Node
@@ -299,6 +299,23 @@ def _mask_shared_over_heads(mask_shape, s_len: int, t_len: int) -> bool:
     """
     shape = tuple(int(dim) for dim in mask_shape)
     return shape[-2:] == (int(s_len), int(t_len)) and all(dim == 1 for dim in shape[:-2])
+
+
+def _mask_target_shape(mask_shape, keep: int) -> Optional[Tuple[int, ...]]:
+    """去掉 ``mask`` 多余前导维后的目标形状；前导维不全是 1 时返回 ``None``。
+
+    只做形状推导，不碰数组本身：调用方据此 ``reshape`` 降维。之所以不用
+    ``mask[0]``，是因为天数（Iluvatar）的 ``DeviceArray.__getitem__`` 只接受
+    切片、拒绝降维索引，整数索引会抛 ``TypeError``；在 numpy / cupy 上
+    ``reshape`` 与降维索引等价，语义因此不分叉。
+    """
+    shape = tuple(int(dim) for dim in mask_shape)
+    extra = len(shape) - keep
+    if extra <= 0:
+        return shape
+    if any(dim != 1 for dim in shape[:extra]):
+        return None
+    return shape[extra:]
 
 
 # conv2d 分块核在 W 方向的线程数、shared 预算与分块阈值都在 ``lower/plan.py``：

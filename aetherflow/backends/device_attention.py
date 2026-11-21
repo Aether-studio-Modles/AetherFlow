@@ -5,7 +5,7 @@ from __future__ import annotations
 from ..lower.plan import SHARED_LIMIT, attention_block, cdiv
 from .base import BackendCapabilityError
 import numpy as np
-from .device_shared import _mask_shared_over_heads
+from .device_shared import _mask_shared_over_heads, _mask_target_shape
 
 
 class _AttentionMixin:
@@ -127,14 +127,18 @@ class _AttentionMixin:
             raw_mask = args[3]
             # 与参考实现一致：先去掉长度 1 的多余前导维（如 (1,1,S,T)）。
             # cupy 的 broadcast_to 不允许目标秩比输入小，直接传会报
-            # "more dimensions than allowed"。
-            while raw_mask.ndim > len(batch) + 2:
-                if raw_mask.shape[0] != 1:
-                    raise BackendCapabilityError(
-                        f"attention 的 mask 前导维必须是 1，得到 {tuple(raw_mask.shape)}"
-                        f"（节点 %{node.output.name}）"
-                    )
-                raw_mask = raw_mask[0]
+            # "more dimensions than allowed"。降维只 reshape、不做整数索引：
+            # 天数 DeviceArray 拒绝降维索引（只支持切片），``mask[0]`` 会抛
+            # TypeError，而 reshape 在 numpy / cupy / 天数上语义一致。
+            original = tuple(raw_mask.shape)
+            target = _mask_target_shape(original, len(batch) + 2)
+            if target is None:
+                raise BackendCapabilityError(
+                    f"attention 的 mask 前导维必须是 1，得到 {original}"
+                    f"（节点 %{node.output.name}）"
+                )
+            if len(target) != len(original):
+                raw_mask = cp.ascontiguousarray(raw_mask).reshape(target)
             # 共享形态：(S,T) 或前导维全为 1。此时每个 (b,h) 读同一份，复制成
             # (BH,S,T) 只会多出 BH-1 份 S*T 的显存。
             if _mask_shared_over_heads(raw_mask.shape, s_len, t_len):

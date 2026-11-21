@@ -17,6 +17,7 @@ from aetherflow import Graph, ReferenceBackend, backward, bf16, f16, f32, f64, i
 from aetherflow.backends.base import BackendCapabilityError
 from aetherflow.backends.cuda import CUDA_AVAILABLE, CudaBackend
 from aetherflow.backends.device_backend import _group_elementwise, _mask_shared_over_heads
+from aetherflow.backends.device_shared import _mask_target_shape
 from aetherflow.lower.plan import (
     BLOCK_OPTIONS,
     CONV_SHARED_LIMIT,
@@ -72,6 +73,18 @@ class TestAttentionMaskSharing(unittest.TestCase):
         # 可广播但最后两维不是 (S,T) 的 mask 仍走 broadcast_to
         self.assertFalse(_mask_shared_over_heads((1, 8, 1), 8, 8))
         self.assertFalse(_mask_shared_over_heads((1, 8, 9), 8, 8))
+
+    def test_leading_singletons_are_stripped_by_shape(self):
+        """降维只算目标形状、不改数组：天数 DeviceArray 拒绝整数索引。"""
+        self.assertEqual(_mask_target_shape((1, 1, 8, 8), 3), (1, 8, 8))
+        self.assertEqual(_mask_target_shape((1, 1, 8, 8), 2), (8, 8))
+        self.assertEqual(_mask_target_shape((1, 1, 1, 8, 8), 3), (1, 8, 8))
+        self.assertEqual(_mask_target_shape((1, 8, 8), 3), (1, 8, 8))
+        self.assertEqual(_mask_target_shape((8, 8), 3), (8, 8))
+
+    def test_non_singleton_leading_dim_is_rejected(self):
+        self.assertIsNone(_mask_target_shape((2, 1, 8, 8), 3))
+        self.assertIsNone(_mask_target_shape((2, 8, 8), 2))
 
 
 class TestPlannedDispatch(unittest.TestCase):
@@ -3742,6 +3755,28 @@ class TestCudaAttention(CudaTestCase):
             "k": self.rand(2, 4, 3),
             "v": self.rand(2, 4, 3),
             "mask": causal_mask_bias(4),
+        }
+        self.assert_backends_equal(g, feed, rtol=1e-5, atol=1e-5)
+
+    def test_mask_with_multiple_leading_singletons(self):
+        """``(1,1,1,S,T)`` 直接可用：降维不得依赖整数索引。
+
+        天数 ``DeviceArray`` 只支持切片、拒绝降维索引，``mask[0]`` 会抛
+        ``TypeError``；这里用两层前导 1 覆盖"连续去掉多个前导维"的路径。
+        """
+        from aetherflow.models import causal_mask_bias
+
+        g = Graph("attention")
+        q = g.input("q", f32[2, 4, 3])
+        k = g.input("k", f32[2, 4, 3])
+        v = g.input("v", f32[2, 4, 3])
+        mask = g.input("mask", f32[1, 1, 1, 4, 4])
+        g.output(g.attention(q, k, v, mask, scale=0.5), "y")
+        feed = {
+            "q": self.rand(2, 4, 3),
+            "k": self.rand(2, 4, 3),
+            "v": self.rand(2, 4, 3),
+            "mask": causal_mask_bias(4).reshape(1, 1, 1, 4, 4),
         }
         self.assert_backends_equal(g, feed, rtol=1e-5, atol=1e-5)
 
