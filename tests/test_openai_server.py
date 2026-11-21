@@ -77,15 +77,19 @@ class _HttpCase(unittest.TestCase):
         if engine is not None:
             engine.close()
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, headers=None, *, with_headers=False):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {} if body is None else {"Content-Type": "application/json"}
+        all_headers = {} if body is None else {"Content-Type": "application/json"}
+        all_headers.update(headers or {})
         try:
-            conn.request(method, path, body=body, headers=headers)
+            conn.request(method, path, body=body, headers=all_headers)
             response = conn.getresponse()
             raw = response.read()
-            return response.status, json.loads(raw) if raw else None
+            parsed = json.loads(raw) if raw else None
+            if with_headers:
+                return response.status, parsed, dict(response.getheaders())
+            return response.status, parsed
         finally:
             conn.close()
 
@@ -249,6 +253,44 @@ class TestProtocol(_HttpCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["choices"][0]["text"], "")
 
+    def test_stop_ends_generation_early(self):
+        """stop 不只是截断：命中后调度器就该腾槽，token 数必须小于上限。"""
+        _, plain = self.request(
+            "POST", "/v1/completions", {"prompt": "hi", "max_tokens": 8}
+        )
+        text = plain["choices"][0]["text"]
+        self.assertGreaterEqual(len(text), 2, "掩码后应生成同一字母的重复串")
+        status, payload = self.request(
+            "POST",
+            "/v1/completions",
+            {"prompt": "hi", "max_tokens": 8, "stop": text[:2]},
+        )
+        self.assertEqual(status, 200, payload)
+        choice = payload["choices"][0]
+        self.assertEqual(choice["text"], "")
+        self.assertEqual(choice["finish_reason"], "stop")
+        # 命中两个字符就停，不会再把 8 个 token 全生成完。
+        self.assertLessEqual(payload["usage"]["completion_tokens"], 2)
+        self.assertLess(payload["usage"]["completion_tokens"], 8)
+
+    def test_stream_stop_ends_early_with_stop_reason(self):
+        status, plain = self.request(
+            "POST", "/v1/completions", {"prompt": "hi", "max_tokens": 8}
+        )
+        self.assertEqual(status, 200, plain)
+        text = plain["choices"][0]["text"]
+        self.assertGreaterEqual(len(text), 2)
+        status, frames, done = self.stream(
+            {"prompt": "hi", "max_tokens": 8, "stop": text[:2], "stream": True}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(done)
+        pieces = [frame["choices"][0]["text"] for frame in frames]
+        self.assertEqual("".join(pieces), "")
+        last = frames[-1]
+        self.assertEqual(last["choices"][0]["finish_reason"], "stop")
+        self.assertLess(last["usage"]["completion_tokens"], 8)
+
     def test_zero_tokens_returns_an_empty_completion(self):
         status, payload = self.request(
             "POST", "/v1/completions", {"prompt": "hi", "max_tokens": 0}
@@ -279,6 +321,8 @@ class TestProtocol(_HttpCase):
                 "frequency_penalty",
             ),
             ({"prompt": "hi", "stop": ["a", "b", "c", "d", "e"]}, "stop"),
+            ({"prompt": "hi", "stop": ""}, "stop"),
+            ({"prompt": "hi", "stop": ["a", ""]}, "stop"),
             ({"prompt": [999]}, "token"),
         ]
         for payload, needle in cases:
@@ -315,6 +359,110 @@ class TestProtocol(_HttpCase):
             with self.subTest(method=method, path=path):
                 status, body = self.request(method, path)
                 self.assertEqual(status, 404, body)
+
+
+class TestAuthAndRateLimit(_HttpCase):
+    """认证与限流：401/429 都在解析请求体之前，且失败不占解码槽位。"""
+
+    AUTH = {"Authorization": "Bearer sk-test"}
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.spec = _spec()
+        self.params = self.spec.init_params(seed=7)
+        self.backend = _AsciiBackend(BACKEND)
+        self.engine = ServingEngine(
+            self.backend, self.params, self.spec, capacity=2
+        )
+        self.now = 0.0
+        self.start(
+            OpenAIService(
+                self.engine,
+                tokenizer=self.tok,
+                poll=0.002,
+                api_key="sk-test",
+                rate_limit=2,
+                rate_window=10.0,
+                clock=lambda: self.now,
+            )
+        )
+
+    def test_wrong_or_missing_key_is_401(self):
+        for headers in (
+            {},
+            {"Authorization": "Bearer nope"},
+            {"Authorization": "sk-test"},
+            {"Authorization": "Basic sk-test"},
+        ):
+            with self.subTest(headers=headers):
+                status, body, headers_out = self.request(
+                    "POST",
+                    "/v1/completions",
+                    {"prompt": "hi"},
+                    headers=headers,
+                    with_headers=True,
+                )
+                self.assertEqual(status, 401, body)
+                self.assertEqual(body["error"]["type"], "authentication_error")
+                self.assertIn("Bearer", headers_out.get("WWW-Authenticate", ""))
+
+    def test_health_is_open_but_models_needs_the_key(self):
+        self.assertEqual(self.request("GET", "/healthz")[0], 200)
+        self.assertEqual(self.request("GET", "/v1/models")[0], 401)
+        status, body = self.request("GET", "/v1/models", headers=self.AUTH)
+        self.assertEqual(status, 200, body)
+
+    def test_key_unlocks_completions(self):
+        status, body = self.request(
+            "POST",
+            "/v1/completions",
+            {"prompt": "hi", "max_tokens": 2},
+            headers=self.AUTH,
+        )
+        self.assertEqual(status, 200, body)
+
+    def test_rate_limit_is_a_sliding_window(self):
+        # 认证失败的请求不消耗配额：先打三次 401，再确认还有整整两次额度。
+        for _ in range(3):
+            self.assertEqual(
+                self.request(
+                    "POST", "/v1/completions", {"prompt": "hi"}
+                )[0],
+                401,
+            )
+        for _ in range(2):
+            status, body = self.request(
+                "POST",
+                "/v1/completions",
+                {"prompt": "hi", "max_tokens": 1},
+                headers=self.AUTH,
+            )
+            self.assertEqual(status, 200, body)
+
+        status, body, headers_out = self.request(
+            "POST",
+            "/v1/completions",
+            {"prompt": "hi", "max_tokens": 1},
+            headers=self.AUTH,
+            with_headers=True,
+        )
+        self.assertEqual(status, 429, body)
+        self.assertEqual(body["error"]["type"], "rate_limit_error")
+        # 第一条请求还在窗口里，建议等待时间必须落在 (0, 10] 秒。
+        wait = int(headers_out["Retry-After"])
+        self.assertGreaterEqual(wait, 1)
+        self.assertLessEqual(wait, 10)
+
+        # 窗口滑过去之后恢复。固定窗口会在 t=10 前后给出两倍突发，
+        # 滑动窗口不会：这里把时钟拨到 10.0，最早那条恰好出窗。
+        self.now = 10.0
+        status, body = self.request(
+            "POST",
+            "/v1/completions",
+            {"prompt": "hi", "max_tokens": 1},
+            headers=self.AUTH,
+        )
+        self.assertEqual(status, 200, body)
 
 
 class _RejectingEngine:
@@ -428,6 +576,42 @@ class TestServiceUnit(unittest.TestCase):
             self.service.submit_chat([])
         with self.assertRaises(ValueError):
             self.service.submit_chat([{"role": "tool", "content": "x"}])
+
+    def test_stop_hit_ends_the_job_early(self):
+        """命中 stop 后服务主动取消：job 提前完成，token 数远小于上限。
+
+        stop 文本不能写死：模型的贪心输出取决于参数，先探测再取前两个
+        token 的文本——这样断言的是"命中位置"，不是"某个特定字母"。
+        """
+        probe = ServingEngine(
+            _AsciiBackend(BACKEND), self.params, self.spec, capacity=1
+        )
+        engine = ServingEngine(
+            _AsciiBackend(BACKEND), self.params, self.spec, capacity=1
+        )
+        try:
+            rid = probe.submit(
+                [2, 3], max_new_tokens=8, temperature=0.0,
+                eos_id=self.tok.eos_id,
+            )
+            full = dict(probe.run())[rid]
+            self.assertGreaterEqual(len(full), 3)
+            stop = self.tok.decode(full[:2])
+            with OpenAIService(engine, tokenizer=self.tok, poll=0.002) as service:
+                job = service.submit_tokens([2, 3], max_tokens=8, stops=(stop,))
+                tokens = service.wait(job, timeout=30)
+        finally:
+            probe.close()
+            engine.close()
+        self.assertTrue(job.stop_hit)
+        self.assertEqual(tokens, full[:2])
+        self.assertLess(len(tokens), 8)
+
+    def test_empty_stop_is_rejected_at_the_service_boundary(self):
+        with self.assertRaises(ValueError):
+            self.service.submit_tokens([2], stops=[""])
+        with self.assertRaises(ValueError):
+            self.service.submit_tokens([2], stops=["ok", ""])
 
     def test_safe_decode_holds_a_partial_utf8_character(self):
         raw = self.tok.encode("你")
