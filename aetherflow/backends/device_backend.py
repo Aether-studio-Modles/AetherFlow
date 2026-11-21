@@ -35,7 +35,13 @@ import numpy as np
 
 from ..ir.graph import Graph, Node
 from ..ir.types import DType
-from ..lower.elementwise import CHAIN_OPS, ElemInput, ElemStep, build_chain
+from ..lower.elementwise import (
+    CHAIN_OPS,
+    ElemInput,
+    ElemStep,
+    build_chain,
+    channel_broadcast,
+)
 from ..lower.kernels import BINARY_OP
 from ..lower.plan import (
     BLOCK_DEFAULT,
@@ -234,6 +240,10 @@ def _chainable(node: Node) -> bool:
             for d in t.shape:
                 size *= d
             if size == 1:
+                continue
+            # 逐通道广播 (1,C,1,1) / (C,1,1)：BN 的常态，索引可由静态形状
+            # 完全确定，因此可以融（见 lower.elementwise.channel_broadcast）。
+            if out_type.is_static and channel_broadcast(t.shape, out_type.shape):
                 continue
         return False
     return True
@@ -1653,12 +1663,16 @@ class DeviceBackend(Executor):
 
         specs = []
         for vid, arr in entries:
-            if tuple(arr.shape) == out_shape:
+            shape = tuple(arr.shape)
+            if shape == out_shape:
                 specs.append(ElemInput(param_of[vid], scalar=False))
             elif arr.size == 1:
                 specs.append(ElemInput(param_of[vid], scalar=True))
             else:
-                return None
+                chan = channel_broadcast(shape, out_shape)
+                if chan is None:
+                    return None
+                specs.append(ElemInput(param_of[vid], channel=chan))
 
         n = int(np.prod(out_shape))
         if n == 0:
@@ -1687,7 +1701,9 @@ class DeviceBackend(Executor):
         key = (
             "chain",
             tuple((s.out, s.op, s.args) for s in steps),
-            tuple((s.name, s.scalar) for s in specs),
+            # channel 必须进键：同一个链形状在不同 H*W / C 下生成的索引
+            # 表达式不同，只按名字与 scalar 复用会拿错内核。
+            tuple((s.name, s.scalar, s.channel) for s in specs),
             vec,
             self._kind(arrays[0]),
         )
@@ -1754,7 +1770,10 @@ class DeviceBackend(Executor):
                     elif int(np.prod(shape)) == 1:
                         specs.append(ElemInput(name, scalar=True))
                     else:
-                        return None
+                        chan = channel_broadcast(shape, out_shape)
+                        if chan is None:
+                            return None
+                        specs.append(ElemInput(name, channel=chan))
                     order.append(value.id)
                     want.append(shape)
                 names.append(name)
@@ -1787,7 +1806,9 @@ class DeviceBackend(Executor):
         key = (
             "chain",
             tuple((s.out, s.op, s.args) for s in steps),
-            tuple((s.name, s.scalar) for s in specs),
+            # channel 必须进键：同一个链形状在不同 H*W / C 下生成的索引
+            # 表达式不同，只按名字与 scalar 复用会拿错内核。
+            tuple((s.name, s.scalar, s.channel) for s in specs),
             launch.vec,
             kind,
         )

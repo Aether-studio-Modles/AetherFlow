@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 from ..ir.types import DType
 from .kernel import (
@@ -45,7 +45,10 @@ from .kernel import (
 )
 from .kernels import BINARY_OP, UNARY_EXPR, grid_stride
 
-__all__ = ["ElemInput", "ElemStep", "CHAIN_OPS", "apply_op", "build_chain"]
+__all__ = [
+    "ElemInput", "ElemStep", "CHAIN_OPS", "apply_op", "build_chain",
+    "channel_broadcast",
+]
 
 # 可以进链的算子：恰好是 L2 已经有一元/二元表达式表的那些。step / spike
 # 不在里面——它们多一个标量参数（阈值），融进来会让"参数就是张量"这条
@@ -81,10 +84,38 @@ class ElemInput:
 
     ``scalar`` 表示它是"实际只有 1 个元素、在所有位置复用"的那一侧（例如
     ``x * scale`` 里的 scale）：整个内核只读一次 ``[0]``，四条通道共用。
+
+    ``channel`` 是 ``(C, H*W)`` 两个整数，表示这个输入是逐通道广播
+    （``(1,C,1,1)`` 或 ``(C,1,1)``）：第 ``i`` 个展平输出元素取
+    ``(i / (H*W)) % C`` 号元素。它是 BN 的常态，也是"同形或单元素"之外
+    唯一还值得单独开口子的形状——其余广播一律不融。
     """
 
     name: str
     scalar: bool = False
+    channel: Tuple[int, int] = ()
+
+
+def channel_broadcast(
+    shape: Sequence[int], out_shape: Sequence[int]
+) -> Optional[Tuple[int, int]]:
+    """逐通道广播的参数 ``(C, H*W)``；不是这种形状就返回 ``None``。
+
+    只认 NCHW 上"只有通道维非 1"的形状，且允许省略前导维：
+    ``(1,C,1,1)`` 与 ``(C,1,1)`` 都返回同一个 ``(C, H*W)``。``(B,C,1,1)``
+    这类随 batch 变化的掩码不在此列，仍然不融。
+    """
+    if len(out_shape) != 4 or len(shape) not in (3, 4):
+        return None
+    aligned = (1,) * (4 - len(shape)) + tuple(shape)
+    _, c, h, w = (int(d) for d in out_shape)
+    if c <= 0 or h <= 0 or w <= 0:
+        return None
+    if aligned[1] != c or aligned[0] != 1 or aligned[2] != 1 or aligned[3] != 1:
+        return None
+    if c == 1:
+        return None  # 单通道等价于标量，交给 scalar 路径
+    return (c, h * w)
 
 
 @dataclass(frozen=True)
@@ -186,6 +217,23 @@ def build_chain(
         """按通道展开一个值的表达式（向量路径：整棵树内联）。"""
         if name in leaves:
             inp = leaves[name]
+            if inp.channel:
+                # 四个连续元素可能跨通道边界，不能把逐通道输入一次读成
+                # float4；按 lane 单独取索引，正确性优先，带宽由 L2 兜住。
+                if not lane:
+                    return Load(inp.name, Num("0"))
+                at = Bin("+", index, Num(str(_LANES.index(lane))))
+                channel, plane = inp.channel
+                # ``at`` 是复合表达式：不包一层括号的话，打印出来会是
+                # ``i * 4 + 1 / plane``，lane 的偏移被吞进除法里。
+                return Load(
+                    inp.name,
+                    Bin(
+                        "%",
+                        Bin("/", _atom(at), Num(str(plane))),
+                        Num(str(channel)),
+                    ),
+                )
             local = Var(f"v_{inp.name}")
             if inp.scalar or not lane:
                 return local
@@ -212,6 +260,12 @@ def build_chain(
         local = f"v_{inp.name}"
         if inp.scalar:
             body.append(Let("float", local, Load(inp.name, Num("0"))))
+        elif inp.channel:
+            # 向量路径不在这里加载：四个 lane 的通道号可能不同，见 expr_for。
+            if vec == 1:
+                channel, plane = inp.channel
+                at = Bin("%", Bin("/", Var("i"), Num(str(plane))), Num(str(channel)))
+                body.append(Let("float", local, Load(inp.name, at)))
         elif vec == 1:
             body.append(Let("float", local, Load(inp.name, Var("i"))))
         else:
