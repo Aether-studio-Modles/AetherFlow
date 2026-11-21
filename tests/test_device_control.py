@@ -1,8 +1,9 @@
-"""设备端循环的判据：捕获一次、状态留在显存、语义与宿主路径逐位一致。
+"""设备端控制流的判据：捕获一次、状态留在显存、语义与宿主路径逐位一致。
 
 离线替身 ``_NumpyDevice`` 把 numpy 数组当"设备数组"：它不碰显存，但把
-``capture`` / ``to_array`` / ``to_host`` 的调用次数如实记账——本层的两个
-主张（"循环只捕获两次"与"每轮只有谓词回主机"）都靠这份账来判。
+``capture`` / ``to_array`` / ``to_host`` 的调用次数如实记账——本层的主张
+（"循环只捕获两次"、"每轮只有谓词回主机"、"分支只 replay 选中一支"）都靠
+这份账来判。
 """
 
 import unittest
@@ -18,7 +19,7 @@ from aetherflow import (
     WhileLoop,
     f32,
 )
-from aetherflow.runtime import DeviceLoopError, DeviceWhileLoop
+from aetherflow.runtime import DeviceConditional, DeviceLoopError, DeviceWhileLoop
 
 try:  # 真机部分：没有 ROCm 或设备不可枚举时整组跳过
     from aetherflow.backends.hip import HIP_AVAILABLE, HipBackend
@@ -94,6 +95,7 @@ class _NumpyPlan:
         self.graph = graph
         self._buffers = dict(shared)
         self._last = {}
+        self.replays = 0
 
     def _execute(self, inputs):
         feed = dict(self._buffers)
@@ -104,6 +106,7 @@ class _NumpyPlan:
         return {name: _Dev(produced[name]) for name in self.graph.output_names}
 
     def replay(self, inputs):
+        self.replays += 1
         self._last = self._execute(inputs)
 
     def device_outputs(self):
@@ -121,6 +124,7 @@ class _NumpyDevice:
     def __init__(self):
         self.reference = ReferenceBackend()
         self.captured = []
+        self.plans = []
         self.streams = []
         self.capture_streams = []
         self.to_host_calls = 0
@@ -148,7 +152,9 @@ class _NumpyDevice:
                 raise KeyError(name)
         self.captured.append(graph)
         self.capture_streams.append(stream)
-        return _NumpyPlan(self, graph, shared)
+        plan = _NumpyPlan(self, graph, shared)
+        self.plans.append(plan)
+        return plan
 
 
 class _NoCaptureBackend:
@@ -301,6 +307,156 @@ class TestContract(unittest.TestCase):
             DeviceWhileLoop(GraphRegion(_counter_body()), {}, _NumpyDevice())
 
 
+def _pick_condition(graph_name="pick_cond"):
+    """``1 - x > 0``，即 x < 1。"""
+    g = Graph(graph_name)
+    x = g.input("x", _scalar())
+    g.output(g.step(g.sub(g.constant(1.0), x), threshold=0.0), "flag")
+    return g
+
+
+def _offset_branch(offset, graph_name):
+    """y = x + offset。"""
+    g = Graph(graph_name)
+    x = g.input("x", _scalar())
+    g.output(g.add(x, g.constant(offset)), "y")
+    return g
+
+
+def _conditional(name="pick"):
+    return Conditional(
+        GraphRegion(_pick_condition()),
+        GraphRegion(_offset_branch(10.0, "then")),
+        GraphRegion(_offset_branch(-10.0, "else")),
+        name=name,
+    )
+
+
+def _conditional_device(backend=None):
+    backend = backend if backend is not None else _NumpyDevice()
+    return DeviceConditional(_conditional(), {"x": _feed(0.0)}, backend), backend
+
+
+class TestDeviceConditionalNumerics(unittest.TestCase):
+    def test_matches_host_conditional_bit_for_bit(self):
+        plan, _ = _conditional_device()
+        for value in (0.0, 0.999, 1.0, 3.0):
+            got = plan.run({"x": _feed(value)})
+            expected = _conditional().run({"x": _feed(value)})
+            self.assertEqual(float(got["y"]), float(expected["y"]))
+
+    def test_run_device_keeps_outputs_on_device(self):
+        plan, backend = _conditional_device()
+        backend.to_host_calls = 0
+        backend.to_array_calls = 0
+        state = plan.run_device()
+        self.assertIsInstance(state["y"], _Dev)
+        self.assertEqual(backend.to_host_calls, 1)  # 只读谓词
+        self.assertEqual(backend.to_array_calls, 0)
+
+    def test_run_returns_host_arrays_after_one_read(self):
+        plan, backend = _conditional_device()
+        backend.to_host_calls = 0
+        got = plan.run({"x": _feed(0.0)})
+        self.assertIsInstance(got["y"], np.ndarray)
+        self.assertEqual(backend.to_host_calls, 2)  # 谓词 + 分支输出
+
+    def test_selected_branch_flips_with_predicate(self):
+        plan, backend = _conditional_device()
+        self.assertEqual(float(plan.run({"x": _feed(0.0)})["y"]), 10.0)
+        self.assertEqual(float(plan.run({"x": _feed(2.0)})["y"]), -8.0)
+        self.assertEqual([p.replays for p in backend.plans], [2, 1, 1])
+
+
+class TestDeviceConditionalCapture(unittest.TestCase):
+    def test_three_graphs_captured_once_on_one_stream(self):
+        plan, backend = _conditional_device()
+        self.assertEqual(plan.captures, 3)
+        self.assertEqual(len(backend.captured), 3)
+        self.assertEqual(len(backend.streams), 1)
+        for captured_stream in backend.capture_streams:
+            self.assertIs(captured_stream, backend.streams[0])
+        for _ in range(3):
+            plan.run()
+        self.assertEqual(len(backend.captured), 3)
+        self.assertEqual(len(backend.streams), 1)
+
+    def test_unselected_branch_never_replays(self):
+        plan, backend = _conditional_device()
+        plan.run({"x": _feed(0.0)})  # then
+        self.assertEqual([p.replays for p in backend.plans], [1, 1, 0])
+        plan.run({"x": _feed(5.0)})  # otherwise
+        self.assertEqual([p.replays for p in backend.plans], [2, 1, 1])
+
+    def test_one_sync_and_one_round_trip_per_run(self):
+        plan, backend = _conditional_device()
+        backend.plan_syncs = 0
+        plan.run_device()
+        self.assertEqual(plan.syncs, 1)
+        self.assertEqual(backend.plan_syncs, 1)
+        self.assertEqual(plan.branches, 1)
+
+    def test_new_free_input_is_uploaded_once(self):
+        plan, backend = _conditional_device()
+        backend.to_array_calls = 0
+        plan.run({"x": _feed(1.0)})
+        self.assertEqual(backend.to_array_calls, 1)
+
+
+class TestDeviceConditionalContract(unittest.TestCase):
+    def test_nested_region_in_a_branch_is_refused(self):
+        inner = Conditional(
+            GraphRegion(_pick_condition("inner_cond")),
+            GraphRegion(_offset_branch(1.0, "inner_then")),
+            GraphRegion(_offset_branch(2.0, "inner_else")),
+        )
+        outer = Conditional(
+            GraphRegion(_pick_condition("outer_cond")),
+            inner,
+            GraphRegion(_offset_branch(-10.0, "outer_else")),
+        )
+        with self.assertRaises(DeviceLoopError) as caught:
+            DeviceConditional(outer, {"x": _feed(0.0)}, _NumpyDevice())
+        self.assertIn("嵌套控制区域", str(caught.exception))
+
+    def test_backend_without_capture_is_refused_at_construction(self):
+        with self.assertRaises(TypeError) as caught:
+            DeviceConditional(
+                _conditional(), {"x": _feed(0.0)}, _NoCaptureBackend()
+            )
+        self.assertIn("capture", str(caught.exception))
+
+    def test_missing_input_is_explicit(self):
+        with self.assertRaises(KeyError) as caught:
+            DeviceConditional(_conditional(), {}, _NumpyDevice())
+        self.assertIn("x", str(caught.exception))
+
+    def test_unknown_name_is_explicit(self):
+        with self.assertRaises(KeyError) as caught:
+            DeviceConditional(
+                _conditional(),
+                {"x": _feed(0.0), "y": _feed(0.0)},
+                _NumpyDevice(),
+            )
+        self.assertIn("y", str(caught.exception))
+
+    def test_shape_change_is_refused(self):
+        plan, _ = _conditional_device()
+        with self.assertRaises(ValueError):
+            plan.run({"x": np.zeros(2, np.float32)})
+
+    def test_wrong_dtype_is_refused(self):
+        plan, _ = _conditional_device()
+        with self.assertRaises(ValueError):
+            plan.run({"x": np.asarray(0.0, np.float64)})
+
+    def test_non_conditional_is_refused(self):
+        with self.assertRaises(TypeError):
+            DeviceConditional(
+                GraphRegion(_pick_condition()), {"x": _feed(0.0)}, _NumpyDevice()
+            )
+
+
 @unittest.skipUnless(HIP_AVAILABLE, "本机没有 HIP 设备")
 class TestOnHipDevice(unittest.TestCase):
     """真机一条：HIP 上两次捕获、五轮 replay，结果与参考后端逐位相等。"""
@@ -317,6 +473,16 @@ class TestOnHipDevice(unittest.TestCase):
         self.assertEqual(plan.iterations, 5)
         # 条件 run_device 6 次（含退出那次）；体是异步 replay，不另计同步。
         self.assertEqual(plan.syncs, 6)
+
+    def test_conditional_matches_reference_on_hip(self):
+        backend = HipBackend()
+        plan = DeviceConditional(_conditional(), {"x": _feed(0.0)}, backend)
+        self.assertEqual(plan.captures, 3)
+        for value in (0.0, 2.0):
+            got = plan.run({"x": _feed(value)})
+            expected = _conditional().run({"x": _feed(value)})
+            self.assertEqual(float(got["y"]), float(expected["y"]))
+        self.assertEqual(plan.syncs, 1)
 
 
 if __name__ == "__main__":
