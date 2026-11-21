@@ -24,7 +24,8 @@
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行（主机中转）、
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
-  分页 KV cache 与贪心投机解码（组件级，见"已知限制"）。
+  分页 KV cache 与贪心投机解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集
+  （`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
   roofline 式成本模型（用于排序，不做性能预测）、Chrome Trace 导出。
 - **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）；
@@ -113,6 +114,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **控制流**：没有设备端真分支；`Conditional` / `WhileLoop` 每次判定回主机。
 - **推理**：分页 KV cache 与投机解码是组件级交付，**未接进 `LMRunner`**——主干是
   Mamba，没有随上下文增长的 KV。投机只支持贪心验收与 `batch=1`。
+- **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
+  `response_format` / 非 0 penalty 显式 400；无认证、限流与多副本；`stop` 只在
+  文本层截断、不参与调度（命中后仍生成到 `max_tokens`）；流式由每个请求轮询
+  `ServingEngine.progress()` 快照，并发很大时应改成调度器推送增量。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
   无 `bool` 常量、无 `arange`、`padding_idx` / `sparse` / `scale_grad_by_freq`
   显式拒绝。
