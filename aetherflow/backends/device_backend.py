@@ -1418,6 +1418,8 @@ class DeviceBackend(Executor):
                     # 静态 3x3 的整条 launch 还能在计划期展开：形状、线程铺法、
                     # 标量参数都不随执行变化，运行期只剩分配与一次内核调用。
                     prepared = self._planned_winograd_fused(node)
+                    if prepared is None:
+                        prepared = self._planned_winograd(node)
                     fn = prepared if prepared is not None else self._resident_conv2d(fn)
                 fns.append(fn)
             if fns is not None:
@@ -1479,24 +1481,15 @@ class DeviceBackend(Executor):
 
         return call
 
-    def _planned_winograd_fused(self, node: Node):
-        """静态 3x3 conv 的融合 Winograd launch，在计划期展开成闭包。
+    def _winograd_static(self, node: Node, kinds: Tuple[str, ...]):
+        """静态 3x3 conv 的解析结果 ``(dims, has_bias)``；不适用时返回 ``None``。
 
-        运行期每次重新走 ``_op_conv2d`` 的代价不在内核：形状解包、``_pair``、
-        ``_pick_conv_kernel``、``_kind``、``_kernel`` 查表与十几个 ``np.int32``
-        的打包，在 A800 上合计约 15～20 µs，已经和 c16 的内核本身同量级。
-        这些量在静态图上**只取决于 IR**，与绑定值无关，因此可以提前算好。
-
-        只覆盖 ``auto`` / 显式 ``winograd_fused`` 且判据确实选中融合版的形状：
-        实现选择仍由 ``_pick_conv_kernel`` 这一份判据给出，不在这里复制阈值。
-        任何一条不满足就返回 ``None``，运行期走原来的 ``_op_conv2d``——报错
-        时机与文案因此完全不变。
-
-        权重必须来自常量节点（调用方已保证）：``U`` 由闭包持有的 ``box``
-        驻留，与执行计划同寿命；形状或 dtype 变了就回落原路径重算，不会拿
-        旧 ``U`` 算新权重。
+        ``kinds`` 是调用方愿意在计划期展开的实现名（融合版 / 四段版）。
+        形状校验、cuDNN 让位判据与 ``_pick_conv_kernel`` 的调用都只写这一处，
+        两份展开因此共用同一套阈值。显式 ``conv_impl`` 直接就是实现名，
+        只有 ``auto`` 才去问判据。
         """
-        if self.conv_impl not in ("auto", "winograd", "winograd_fused"):
+        if self.conv_impl not in ("auto",) + tuple(kinds):
             return None
         try:
             x_type = node.inputs[0].type
@@ -1539,8 +1532,36 @@ class DeviceBackend(Executor):
                 self.conv_impl if self.conv_impl != "auto"
                 else self._pick_conv_kernel(weight_resident=True, **dims)
             )
-            if kind != "winograd_fused":
+            if kind not in kinds:
                 return None
+            return dims, has_bias
+        except Exception:  # noqa: BLE001 - 预解析失败只影响这条优化
+            return None
+
+    def _planned_winograd_fused(self, node: Node):
+        """静态 3x3 conv 的融合 Winograd launch，在计划期展开成闭包。
+
+        运行期每次重新走 ``_op_conv2d`` 的代价不在内核：形状解包、``_pair``、
+        ``_pick_conv_kernel``、``_kind``、``_kernel`` 查表与十几个 ``np.int32``
+        的打包，在 A800 上合计约 15～20 µs，已经和 c16 的内核本身同量级。
+        这些量在静态图上**只取决于 IR**，与绑定值无关，因此可以提前算好。
+
+        只覆盖 ``auto`` / 显式 ``winograd_fused`` 且判据确实选中融合版的形状：
+        实现选择仍由 ``_pick_conv_kernel`` 这一份判据给出，不在这里复制阈值。
+        任何一条不满足就返回 ``None``，运行期走原来的 ``_op_conv2d``——报错
+        时机与文案因此完全不变。
+
+        权重必须来自常量节点（调用方已保证）：``U`` 由闭包持有的 ``box``
+        驻留，与执行计划同寿命；形状或 dtype 变了就回落原路径重算，不会拿
+        旧 ``U`` 算新权重。
+        """
+        parsed = self._winograd_static(node, ("winograd_fused",))
+        if parsed is None:
+            return None
+        dims, has_bias = parsed
+        n, c, h, w, o = dims["n"], dims["c"], dims["h"], dims["w"], dims["o"]
+        ho, wo, ph, pw = dims["ho"], dims["wo"], dims["ph"], dims["pw"]
+        try:
             tt = CONV_WINOGRAD_TILE
             shared = 16 * c * tt * 4
             if shared > CONV_SHARED_LIMIT:
@@ -1594,6 +1615,98 @@ class DeviceBackend(Executor):
         except Exception:  # noqa: BLE001 - 预解析失败只影响这条优化
             return None
 
+    def _planned_winograd(self, node: Node):
+        """静态 3x3 conv 的四段 Winograd，在计划期展开成闭包。
+
+        ``overhead_compare`` 在 c64 上的分解：burst 0.113 / kernel 0.085 /
+        三段内核 + GEMM 合计 0.044 ms。缺口里有三块中间缓冲的 ``cp.empty``、
+        二十多个 ``np.int32`` 与三次 ``_grid`` / ``_kernel`` 查表——全都只取决于
+        IR。展开后运行期只剩四次分配与四次提交。
+
+        实现选择仍由 ``_pick_conv_kernel`` 给出（与融合版共用
+        ``_winograd_static``）。形状 / dtype / 连续性不符时回落 ``_op_conv2d``，
+        报错时机与文案不变。
+        """
+        parsed = self._winograd_static(node, ("winograd",))
+        if parsed is None:
+            return None
+        dims, has_bias = parsed
+        n, c, h, w, o = dims["n"], dims["c"], dims["h"], dims["w"], dims["o"]
+        ho, wo, ph, pw = dims["ho"], dims["wo"], dims["ph"], dims["pw"]
+        try:
+            th, tw = cdiv(ho, 2), cdiv(wo, 2)
+            nt = n * th * tw
+            u_shape, v_shape, m_shape = (16, o, c), (16, c, nt), (16, o, nt)
+            out_shape = (n, o, ho, wo)
+            x_shape = (n, c, h, w)
+            w_grid, w_block = self._grid("conv2d", o * c)
+            i_grid, i_block = self._grid("conv2d", c * nt)
+            o_grid, o_block = self._grid("conv2d", o * nt)
+            w_static = (np.int32(o), np.int32(c), np.int64(o * c))
+            i_static = (
+                np.int32(n), np.int32(c), np.int32(h), np.int32(w),
+                np.int32(th), np.int32(tw), np.int32(ph), np.int32(pw),
+                np.int64(c * nt),
+            )
+            o_static = (
+                np.int32(n), np.int32(o), np.int32(ho), np.int32(wo),
+                np.int32(th), np.int32(tw), np.int32(nt),
+                np.int32(1 if has_bias else 0), np.int64(o * nt),
+            )
+            cp = self.cp
+            dtype = np.dtype(cp.float32)
+            holder: List[Any] = [None]
+            blas = self._cublas()
+            gemm = (16, o * c, c * nt, o * nt)
+
+            def call(node, args, attrs):
+                x = args[0]
+                if x.shape != x_shape or x.dtype != cp.float32 or not x.flags.c_contiguous:
+                    return self._op_conv2d(node, args, attrs)
+                kernels = holder[0]
+                if kernels is None:
+                    kernels = holder[0] = (
+                        self._kernel(
+                            ("winograd_weight", "f32"),
+                            lambda: self.codegen.render(
+                                self.codegen.winograd_weight_source(), dtype
+                            ),
+                            "winograd_weight",
+                        ),
+                        self._kernel(
+                            ("winograd_input", "f32"),
+                            lambda: self.codegen.render(
+                                self.codegen.winograd_input_source(), dtype
+                            ),
+                            "winograd_input",
+                        ),
+                        self._kernel(
+                            ("winograd_output", "f32"),
+                            lambda: self.codegen.render(
+                                self.codegen.winograd_output_source(), dtype
+                            ),
+                            "winograd_output",
+                        ),
+                    )
+                k_weight, k_input, k_output = kernels
+                u = cp.empty(u_shape, dtype=x.dtype)
+                v = cp.empty(v_shape, dtype=x.dtype)
+                m = cp.empty(m_shape, dtype=x.dtype)
+                out = cp.empty(out_shape, dtype=x.dtype)
+                k_weight((w_grid,), (w_block,), (args[1], u) + w_static)
+                k_input((i_grid,), (i_block,), (x, v) + i_static)
+                blas.set_stream(self.current_stream_ptr())
+                blas.sgemm_batched(
+                    u.reshape(u_shape), v.reshape(v_shape), m.reshape(m_shape),
+                    *gemm
+                )
+                bp = x if not has_bias else self._contig(args[2])
+                k_output((o_grid,), (o_block,), (m, bp, out) + o_static)
+                return out
+
+            return call
+        except Exception:  # noqa: BLE001 - 预解析失败只影响这条优化
+            return None
 
     def _planned_kernel(self, node: Node):
         """按 IR 声明预判能否跳过 ``invoke`` 的校验；能就返回内核函数。
