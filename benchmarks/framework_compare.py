@@ -127,6 +127,29 @@ def _backend(device: str, graph_mode: str = "off"):
     return ReferenceBackend(), "ref"
 
 
+def _other_gpu_processes() -> List[str]:
+    """卡上除本进程外的计算进程（拿不到就不报）。
+
+    共享卡上做基准，图重放会被别的进程按毫秒级粒度抢占：同一个训练步
+    会出现成块的双峰（0.55 ms 与 3.05 ms），而图本身稳定在 0.27 ms
+    （见 DESIGN 5.269）。交替对照的**比值**在同等污染下仍可用，绝对耗时
+    则与"独占"无关，所以这里只警告、不阻止。
+    """
+    import subprocess
+
+    try:
+        done = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    mine = str(os.getpid())
+    return [row.strip() for row in done.stdout.splitlines()
+            if row.strip() and row.split(",")[0].strip() != mine]
+
+
 def _synthetic_train(batch: int = 128, d: int = 1024):
     """两条 ``d x d`` 的 MLP + 交叉熵：前向、反向、参数更新都能对上 torch。"""
     from aetherflow.ir.graph import Graph
@@ -295,6 +318,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     backend, backend_kind = _backend(device, args.graph_mode)
     if device.startswith("cuda"):
         import cupy as cp
+
+        others = _other_gpu_processes()
+        if others:
+            print("警告：这块卡上还有别的计算进程，绝对耗时会被抢占污染：")
+            for row in others:
+                print(f"  {row}")
+            print("  交替对照的比值仍可用；要绝对数字请先独占这张卡。")
 
         # 设备级同步：replay 跑在捕获流（非阻塞流）上，只同步「当前流」
         # 会漏掉它，测出来的是提交时间而不是完成时间；torch 侧用的也是
