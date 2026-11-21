@@ -102,7 +102,7 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 | 自动微分 | 47 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环接不进这套形态——判定在主机采样之后（5.278），但 decode 的**状态**可以常驻（5.279） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast，未接进数据并行路径）、数据并行（主机中转归约）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
-| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、**设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`：decode 状态常驻显存、每步只取回 logits，DESIGN 5.279 / 5.280；A800 24 层实测 86.4 → 14.2 ms/token）、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
+| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、**设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`：decode 状态常驻显存、每步只取回 logits，DESIGN 5.279～5.281；空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 cap=8 时 66.1 → 491.6 tok/s）、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
 | 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb；roofline 式成本模型（六项分解 + 可行性剪枝）先算再测，按估算排序只测前 N 个 |
 | 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、Chrome Trace 导出（`python -m aetherflow.runtime.trace telemetry.json`）、NHWC 布局传播（`LayoutPropagation`，仅参考后端承接）、CI 四作业（含 wheel 构建与安装冒烟）、部署包、zip 硬件包 |
 
@@ -192,11 +192,18 @@ auto 的实际比值看 `benchmarks.conv_compare`）。
   默认 `graph_mode="off"`，语义差异需使用者知情。
 - cuDNN 快路径的 f32 数学类型锁死为 FMA（关掉 TF32）：此前宽通道卷积会被
   悄悄降到 TF32、与参考语义差 5e-3（DESIGN 5.251）。
-- 设备态解码（5.279 / 5.280）：24 层 Mamba（`d_model=1024`、`vocab=32000`、
-  `steps=1`）逐 token 解码，A800 上宿主 86.4 → 设备态 **14.2 ms/token**（6.10×）；
+- 设备态解码（5.279～5.281）：24 层 Mamba（`d_model=1024`、`vocab=32000`）
+  逐 token 解码，空闲 A800 上宿主 81.2 → 设备态 **8.2 ms/token**（9.89×）；
   RX 7650 GRE 上 8 / 12 / 24 层分别为 7.25× / 7.18× / 7.88×，逐 token 输出一致。
-  省下的是每步 7.1 MiB 状态往返，留下的是 128 KB logits；采样、停止判定与
-  `ids` 写回仍在主机，所以这不是"设备端全流程"的数字。
+  连续批处理按容量扫描（`capacity=1/2/4/8`，32-token prompt、每条 32 token，
+  每步状态 3.56～28.50 MiB）：宿主 77.3 / 95.7 / 102.0 / 117.3 ms/步，设备态
+  5.5 / 8.2 / 9.5 / 12.1 ms/步，吞吐 12.5 / 20.2 / 38.0 / 66.1 →
+  114.3 / 169.0 / 300.3 / **491.6 tok/s**（7.4～9.2×）。宿主每步成本几乎与行数
+  无关（被整块状态往返拖住），设备态的边际行成本 0.93 ms，所以解码加速比随容量
+  收窄、吞吐加速比稳定。设备路径吃 SM 时钟与同卡其它进程：同一段代码在 91%～
+  100% 外部占用下测到 22.8～25.7 ms/token，宿主侧只差 6%，**设备态数字必须在
+  空闲卡上取**。省下的是状态往返，留下的是每步 `capacity × 128 KB` logits；
+  采样、停止判定与 `ids` 写回仍在主机，所以这不是"设备端全流程"的数字。
 - 调优：多轮采集显示"最优 block"在采集间不可复现，配置库只在同机同卡命中；
   成本模型（5.242）只给排序依据，不是性能预测器。
 
@@ -225,8 +232,9 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   5.278），但 decode 的**状态**已能常驻：`LMRunner(device_state=True)` /
   `ServingEngine(device_state=True)` 捕获一次 `steps=1` 的 decode 图，每步只取回
   logits（5.279 / 5.280）。它要求 `resident=True` 与静态形状（换 batch 重建计划）；
-  同机实测 A800 24 层 86.4 → 14.2 ms/token、RX 7650 GRE 8～24 层 7.2～7.9×，
-  束搜索与投机解码仍走宿主；
+  空闲 A800 24 层实测 81.2 → 8.2 ms/token（9.89×）、连续批处理 `capacity=8` 时
+  66.1 → 491.6 tok/s（7.4×）、RX 7650 GRE 8～24 层 7.2～7.9×；设备态数字受同卡
+  其它进程影响（5.281），束搜索与投机解码仍走宿主；
 - **服务化**：分页 KV cache 与投机解码只有组件级交付（主干是 Mamba，没有增长 KV，
   二者未接进 `generate` / `LMRunner`；投机解码只做贪心验收与 batch=1）；已有 OpenAI
   兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /

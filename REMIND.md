@@ -25,8 +25,9 @@
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
   **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
-  decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279 / 5.280；
-  A800 24 层实测 86.4 → 14.2 ms/token）；分页 KV cache 与贪心投机解码（组件级，
+  decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
+  空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
+  分页 KV cache 与贪心投机解码（组件级，
   见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：`/v1/completions`、
   `/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
@@ -119,8 +120,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   采样出的 token、每步还要写回 `ids`，设备端循环的"条件→体"之间没有主机回调位
   （DESIGN 5.278，负结果）；**但 decode 的状态已经常驻**：
   `LMRunner(device_state=True)` / `ServingEngine(device_state=True)` 捕获一次
-  `steps=1` 的 decode 图，状态每步 D2D、只回传 logits 块（5.279 / 5.280；
-  A800 24 层 86.4 → 14.2 ms/token，RX 7650 GRE 8～24 层 7.2～7.9×）。它要求
+  `steps=1` 的 decode 图，状态每步 D2D、只回传 logits 块（5.279～5.281；
+  空闲 A800 24 层 81.2 → 8.2 ms/token，RX 7650 GRE 8～24 层 7.2～7.9×）。它要求
   `resident=True` 与静态形状（换 batch 重建计划），prefill 与首步仍各回传/上传
   一次状态，束搜索与投机解码仍走宿主路径。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
@@ -236,6 +237,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   HIP 上表现为跨 chunk 合并后 D2D `code=1`，CUDA 上表现为捕获图与逐节点
   `execute` 首步分叉。判据：先让输出独占缓冲，再把记账统一到底层持有者；
   验收时捕获图必须与 `execute` 数值一致（后者不走回收，是安全基准）。
+- **设备态性能数字只能在空闲卡上取**（5.281）：同一段代码、同一台 A800，外部占用
+  91%～100%（显存被占 6.3～21.8 GiB）时设备态 22.8～25.7 ms/token，空闲时 8.2；
+  宿主侧只差 6%（87.7～90.2 对 79.9～81.2）。宿主路径被整块状态往返拖住，对 SM
+  争用不敏感；设备路径吃时钟与同卡其它进程。测这类数字前后各记一次 `nvidia-smi`
+  （利用率 / 显存 / SM 时钟），跨时段的单点数字不能直接比。
 
 ---
 
