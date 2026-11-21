@@ -724,19 +724,35 @@ class DeviceBackend(Executor):
         """登记一次视图引用。默认无操作。"""
         return None
 
+    def _storage_root(self, arr):
+        """视图的底层持有者；非视图返回自身。
+
+        cupy 的 ``base`` 可以是一条链（视图的视图）：``_op_reshape`` 对一个
+        已经是 ``slice`` 结果的数组再 reshape，``out.base`` 就指向**最底层
+        数组**而不是中间那个视图。记账与回收必须都落在同一个对象上，所以
+        统一追到底（``dispose`` 里的 ``while base.base`` 是同一个约定）。
+        """
+        base = getattr(arr, "base", None)
+        if base is None:
+            return arr
+        while getattr(base, "base", None) is not None:
+            base = base.base
+        return base
+
     def _shares_storage(self, result, source) -> bool:
         """``result`` 是否与 ``source`` 共用同一段设备内存。
 
-        默认按"视图"判断：``transpose`` 的恒等置换在两家容器上都返回视图，
-        只有真的重排才会新分配。``result is source`` 覆盖 HIP 的
-        ``ascontiguousarray``——它对已连续的输入直接原样返回。
+        判据是**底层持有者同一**，不是 ``base is source``：当 ``source``
+        本身是视图时（SSM 状态被连续 slice / reshape），``result.base``
+        指向最底层数组，与 ``source`` 的恒等比较必然失败，于是源被当成
+        "没人再用"提前还给 arena，地址立刻分给后面的算子——下游读到的
+        是别人写进去的数据（A800 实测：捕获图与逐节点 execute 首步分叉）。
         """
         if result is source:
             return True
-        base = getattr(result, "base", None)
-        if base is None:
+        if getattr(result, "base", None) is None:
             return False
-        return base is source or getattr(base, "base", None) is source
+        return self._storage_root(result) is self._storage_root(source)
 
 
     # ------------------------------------------------------------------
@@ -938,10 +954,14 @@ class DeviceBackend(Executor):
 
         非捕获期是空操作：普通执行靠 cupy 的引用计数，源数组只要还被视图
         的 ``base`` 指着就不会被回收。
+
+        登记的是**底层持有者**的地址，不是 ``owner`` 自己的 ``data.ptr``：
+        后者在 ``owner`` 是视图时是偏移地址，而 ``dispose`` 追到最底层后
+        用根地址扣账，两边对不上就一条也匹配不到。
         """
         arena = self._active_arena
         if arena is not None:
-            arena.alias(owner.data.ptr)
+            arena.alias(self._storage_root(owner).data.ptr)
 
     def _shared_view(self, out, src, node=None):
         """``out`` 是共享 ``src`` 存储的另一个对象时，给源地址记一次引用。
