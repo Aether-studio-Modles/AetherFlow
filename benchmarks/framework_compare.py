@@ -182,7 +182,9 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
         if args.no_update:
             return
         for p, name in zip(params_dev, grad_names):
-            p -= lr * out[name]
+            grad = out[name]
+            grad *= lr   # 原地缩放：避免每步 8 次临时分配，分配器状态会污染计时
+            p -= grad
 
     tensors = {k: torch.as_tensor(v, device=device) for k, v in feed.items()}
     tensors["labels"] = tensors["labels"].long()
@@ -200,7 +202,8 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
             return
         with torch.no_grad():
             for p in ps:
-                p -= lr * p.grad
+                p.grad.mul_(lr)
+                p.sub_(p.grad)
                 p.grad = None
 
     # 对拍：同一份初始权重下的 dw1（前 4x4），不一致就不出数字
