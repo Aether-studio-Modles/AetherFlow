@@ -146,7 +146,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   逐通道 BN 的 `channel4d` 由 5.262 降到 0.303 ms、带常量 reshape 的 `channel`
   由 5.263 降到 0.302 ms，三种形态齐平）。
   显式 `conv_impl="cudnn"` 时整图无法捕获（algo 查询是 host API），`auto`
-  会在捕获期自动改走 tiled。
+  会在捕获期自动改走 tiled。捕获为静态输入预分配的缓冲，其首次填充与预热
+  流之间用事件建立依赖（5.265）——此前是默认流异步 H2D、预热在非阻塞流上
+  抢跑，输入会读到未初始化内存。
 
 ### 兼容性策略
 

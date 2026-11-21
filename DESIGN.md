@@ -16502,6 +16502,30 @@ BN 在推理时的**常见**形态，所以这条判据的缺口不是边角：�
 不可比。设备侧仍是主体（`gpu 0.088` vs `host 0.062`），真正的 cuDNN 差距
 要等机器空闲后按同进程交替重测。
 
+### 5.265　捕获的静态输入拷贝要与预热流建立依赖
+
+`tests/test_cuda_backend.py` 有一个既存的顺序依赖：整文件跑时
+`TestCudaGraph::test_replay_reports_out_of_range_ids` 必失败，单跑必过；切到
+5.262 的代码同样复现，所以与本轮的三个性能改动无关，但它是真缺陷。
+
+**定位**：在 `_op_embedding` 的越界分支前打印实际下标，失败时 ids 里是一串
+随机浮点（`1058314997` 之类），而不是传入的 `[0,1,2,3,4]`。也就是说
+"越界"是内核读到未初始化内存后的误报。
+
+**根因**：`capture` 为静态输入分配缓冲后，用 `buf[...] = src` 从主机数组拷贝
+（默认流上的异步 H2D），紧接着在 `self.new_stream()`——一条非阻塞流——上跑
+预热。两条流之间没有任何依赖，预热可能先于拷贝完成。单跑时默认流刚创建、
+拷贝瞬间完成，所以看不到；整文件跑时前面的用例把默认流排满，竞态就稳定暴露。
+
+**修复**（`backends/cuda/backend.py`）：待填的缓冲先记进 `pending`，在**换
+分配器之前**统一拷贝，然后 `cp.cuda.Event().record()` + `stream.wait_event()`
+把捕获流挂到这条拷贝之后。放在换分配器之前还有一个副作用是好的：这次 H2D
+的临时分配不落进捕获 arena，`capture_reports_memory_budget` /
+`static_budget_matches_captured_peak` 的预算只反映图本身。
+
+**结果**：`tests/test_cuda_backend.py` 连跑三次都是 339 passed / 5 skipped；
+全量回到 2572 passed / 53 failed（差集仍是 torch 2.5.0 版本拒绝）。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
