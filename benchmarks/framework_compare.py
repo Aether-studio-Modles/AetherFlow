@@ -224,6 +224,9 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
           f"{torch_stats['best_ms']:>10.3f}{ratio:>9.2f}x")
 
     if device.startswith("cuda"):
+        print(f"图捕获 {getattr(backend, 'graph_captures', 0)} 次 / "
+              f"命中 {getattr(backend, 'graph_replays', 0)} 次；"
+              f"失败原因：{backend.graph_capture_failure(bwd) or '无'}")
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         for _ in range(args.burst):

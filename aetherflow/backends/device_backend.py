@@ -268,6 +268,10 @@ class DeviceBackend(
         # 簿记成本，还固定了 cuBLAS 的算法（5.79 实测 matmul_batched 慢 8%）。
         self._min_graph_nodes = int(min_graph_nodes)
         self._graph_plans: "OrderedDict[Any, Tuple[Any, Any]]" = OrderedDict()
+        # 捕获 / 命中计数：只用于观测（基准脚本据此判断到底走没走到重放）。
+        # 与 ``_graph_plans`` 同生命周期，失效时不清零——它记录的是累计次数。
+        self.graph_captures = 0
+        self.graph_replays = 0
         # 捕获失败按图隔离：id(graph) -> (弱引用, 图版本, 原因)。一张图失败
         # （例如图里有主机同步）不代表别的图也捕不了；旧实现把整个后端
         # 关掉，一次失败就让之后所有图都退回逐节点，且原因再也查不到。
@@ -751,6 +755,7 @@ class DeviceBackend(
         if entry is not None:
             if entry[0]() is graph:
                 self._graph_plans.move_to_end(key)
+                self.graph_replays += 1
                 return entry[1]
             # id 被另一张图复用了：旧计划对新图毫无意义，直接丢掉
             del self._graph_plans[key]
@@ -772,6 +777,7 @@ class DeviceBackend(
             )
             return None
         self._graph_plans[key] = (ref(graph), plan)
+        self.graph_captures += 1
         # 按形状缓存多个计划，但必须封顶：每个计划的 arena 都是常驻显存。
         while len(self._graph_plans) > self._max_graph_plans:
             self._graph_plans.popitem(last=False)
