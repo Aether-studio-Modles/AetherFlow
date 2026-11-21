@@ -217,6 +217,26 @@ extern "C" __global__ void af_dequantize_i8(
 """
 
 
+def _step_params(node: Node) -> tuple:
+    """逐元素链一步的编译期常量参数。
+
+    - ``clamp``：``(min, max)``，缺省一侧为 ``None``；
+    - ``step`` / ``spike``：``(threshold,)``，默认值分别与 IR 的参考实现一致
+      （0.0 / 1.0，见 ``ir/ops.py``）。
+
+    IR 的 infer 已经保证 clamp 至少一侧存在且 ``min <= max``，所以这里不再
+    重复校验；参数会进源码缓存键，边界/阈值不同的两个节点不会共用内核。
+    """
+    name = node.op.name
+    if name == "clamp":
+        return (node.attrs.get("min"), node.attrs.get("max"))
+    if name == "step":
+        return (node.attrs.get("threshold", 0.0),)
+    if name == "spike":
+        return (node.attrs.get("threshold", 1.0),)
+    return ()
+
+
 def _chainable(node: Node) -> bool:
     """这个节点能不能作为逐元素链的一环（不看它与邻居的关系）。"""
     name = node.op.name
@@ -1803,7 +1823,14 @@ class DeviceBackend(Executor):
                 arg_names.append(name)
             local = f"t{idx}"
             local_of[node.output.id] = local
-            steps.append(ElemStep(out=local, op=node.op.name, args=tuple(arg_names)))
+            steps.append(
+                ElemStep(
+                    out=local,
+                    op=node.op.name,
+                    args=tuple(arg_names),
+                    params=_step_params(node),
+                )
+            )
 
         arrays = [arr for _, arr in entries]
         if not arrays:
@@ -1859,7 +1886,7 @@ class DeviceBackend(Executor):
         # 跟着它在 specs 里的名字一起进键。
         key = (
             "chain",
-            tuple((s.out, s.op, s.args) for s in steps),
+            tuple((s.out, s.op, s.args, s.params) for s in steps),
             # channel 必须进键：同一个链形状在不同 H*W / C 下生成的索引
             # 表达式不同，只按名字与 scalar 复用会拿错内核。
             tuple((s.name, s.scalar, s.channel) for s in specs),
@@ -1938,7 +1965,14 @@ class DeviceBackend(Executor):
                 names.append(name)
             local = f"t{idx}"
             local_of[node.output.id] = local
-            steps.append(ElemStep(out=local, op=node.op.name, args=tuple(names)))
+            steps.append(
+                ElemStep(
+                    out=local,
+                    op=node.op.name,
+                    args=tuple(names),
+                    params=_step_params(node),
+                )
+            )
         if not order:
             return None
         n = 1
@@ -1964,7 +1998,7 @@ class DeviceBackend(Executor):
         )
         key = (
             "chain",
-            tuple((s.out, s.op, s.args) for s in steps),
+            tuple((s.out, s.op, s.args, s.params) for s in steps),
             # channel 必须进键：同一个链形状在不同 H*W / C 下生成的索引
             # 表达式不同，只按名字与 scalar 复用会拿错内核。
             tuple((s.name, s.scalar, s.channel) for s in specs),

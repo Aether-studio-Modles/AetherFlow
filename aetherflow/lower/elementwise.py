@@ -27,6 +27,7 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 from ..ir.types import DType
 from .kernel import (
     Bin,
+    Cond,
     Expr,
     Kernel,
     Let,
@@ -50,10 +51,15 @@ __all__ = [
     "channel_broadcast",
 ]
 
-# 可以进链的算子：恰好是 L2 已经有一元/二元表达式表的那些。step / spike
-# 不在里面——它们多一个标量参数（阈值），融进来会让"参数就是张量"这条
-# 简单规则出现例外。
-CHAIN_OPS = frozenset(BINARY_OP) | frozenset(UNARY_EXPR)
+# 可以进链的算子：L2 已有一元/二元表达式表的那些，外加三个"参数是编译期
+# 常量"的算子——``clamp`` 的上下界、``step`` / ``spike`` 的阈值。它们都不占
+# 操作数（不像 ``silu`` 的门控形态要第二个张量），常量直接内联进表达式，
+# 因此源码缓存键必须带上这些值。
+CHAIN_OPS = frozenset(BINARY_OP) | frozenset(UNARY_EXPR) | {
+    "clamp",
+    "step",
+    "spike",
+}
 
 _LANES = ("x", "y", "z", "w")
 
@@ -124,11 +130,17 @@ class ElemStep:
 
     ``out`` 在标量路径里是一个真实的局部变量；在向量路径里它只是一棵
     表达式的名字，不会单独声明——四条通道各自把整棵树内联一遍。
+
+    ``params`` 是编译期常量参数，目前只有 ``clamp`` 用（``(min, max)``，
+    缺省一侧为 ``None``）。它必须进源码缓存键：同一张图里
+    ``clamp(min=-80)`` 与 ``clamp(0, 1)`` 很常见，只按算子名复用内核会
+    静默换掉边界。
     """
 
     out: str
     op: str
     args: Tuple[str, ...]
+    params: Tuple[Optional[float], ...] = ()
 
 
 def _atom(e: Expr) -> Expr:
@@ -141,12 +153,43 @@ def _atom(e: Expr) -> Expr:
     return e if isinstance(e, (Var, Num, Member)) else Paren(e)
 
 
-def apply_op(op: str, args: Sequence[Expr]) -> Expr:
+def _const(value: float) -> Num:
+    """编译期浮点常量写成 C 字面量（``repr`` 保留全精度，后缀锁 float）。"""
+    return Num(f"{float(value)!r}f")
+
+
+def apply_op(
+    op: str, args: Sequence[Expr], params: Sequence[Optional[float]] = ()
+) -> Expr:
     """把一个逐元素算子作用在给定的操作数上，返回表达式。
 
     与 ``kernels.ew_binary`` / ``ew_unary`` 共用同一张表：新加一个逐元素
     算子时只需要在 ``kernels.py`` 里写一次表达式，融合与向量化自动获得。
+    ``clamp`` 是唯一的例外——它的上下界来自节点属性，作为 ``params`` 内联成
+    ``Cond``（顺序与 ``kernels.ew_clamp`` 一致：先上界后下界），这样 NaN 仍
+    原样透传，而源码缓存键必须包含这两个值。
     """
+    if op == "clamp":
+        if len(args) != 1:
+            raise ValueError(f"clamp 需要 1 个操作数，收到 {len(args)}")
+        lo, hi = params if len(params) == 2 else (None, None)
+        if lo is None and hi is None:
+            raise ValueError("clamp 至少要给出 min 或 max 之一")
+        value = args[0]
+        if hi is not None:
+            value = Cond(Bin(">", _atom(value), _const(hi)), _const(hi), _atom(value))
+        if lo is not None:
+            value = Cond(Bin("<", _atom(value), _const(lo)), _const(lo), _atom(value))
+        return value
+    if op in ("step", "spike"):
+        if len(args) != 1:
+            raise ValueError(f"{op} 需要 1 个操作数，收到 {len(args)}")
+        if len(params) != 1:
+            raise ValueError(f"{op} 需要阈值参数，收到 {params!r}")
+        value = args[0]
+        return Cond(
+            Bin(">", _atom(value), _const(params[0])), Num("1.f"), Num("0.f")
+        )
     if op in BINARY_OP:
         if len(args) != 2:
             raise ValueError(f"{op} 需要 2 个操作数，收到 {len(args)}")
@@ -239,7 +282,9 @@ def build_chain(
                 return local
             return Member(local, lane)
         step = defs[name]
-        return apply_op(step.op, tuple(expr_for(a, lane) for a in step.args))
+        return apply_op(
+            step.op, tuple(expr_for(a, lane) for a in step.args), step.params
+        )
 
     def consume(name: str) -> Expr:
         """标量路径里"读一个已定义的值"：中间步在 f16 下要先读成 float。"""
@@ -273,7 +318,9 @@ def build_chain(
 
     if vec == 1:
         for step in steps:
-            value = apply_op(step.op, tuple(consume(a) for a in step.args))
+            value = apply_op(
+                step.op, tuple(consume(a) for a in step.args), step.params
+            )
             local = f"v_{step.out}"
             if round_steps and step is not steps[-1]:
                 # type_name=None 表示用方言的存储类型（f16 下是 unsigned short）

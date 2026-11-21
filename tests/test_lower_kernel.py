@@ -869,6 +869,49 @@ class TestElementwiseChain(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_chain(self._steps(), self._inputs(), vec=2)
 
+    def test_clamp_bounds_are_inlined(self):
+        """``clamp`` 的上界落在属性里，是编译期常量：内联成条件表达式。
+
+        用条件而不是 ``fminf`` / ``fmaxf``：后者在 NaN 上返回边界值，而
+        ``kernels.ew_clamp`` 的语义是 NaN 原样透传。
+        """
+        steps = (ElemStep("t0", "clamp", ("p0",), (-1.0, 1.0)),)
+        src = _kernel_part(
+            emit(build_chain(steps, (ElemInput("p0"),)), CUDA_DIALECT, DType.F32)
+        )
+        self.assertIn("> 1.0f ? 1.0f :", src)
+        self.assertIn("< -1.0f ? -1.0f :", src)
+        self.assertNotIn("fminf", src)
+        self.assertNotIn("fmaxf", src)
+
+    def test_clamp_one_sided(self):
+        steps = (ElemStep("t0", "clamp", ("p0",), (0.0, None)),)
+        src = _kernel_part(
+            emit(
+                build_chain(steps, (ElemInput("p0"),), vec=4),
+                CUDA_DIALECT,
+                DType.F32,
+            )
+        )
+        for lane in "xyzw":
+            self.assertIn(f"v_p0.{lane} < 0.0f ? 0.0f : v_p0.{lane}", src)
+
+    def test_step_threshold_is_inlined(self):
+        """``step`` / ``spike`` 的阈值同样是属性常量；SNN 的 ``step → mul`` 少一次物化。"""
+        steps = (
+            ElemStep("t0", "step", ("p0",), (0.5,)),
+            ElemStep("t1", "mul", ("t0", "p1")),
+        )
+        src = _kernel_part(
+            emit(
+                build_chain(steps, (ElemInput("p0"), ElemInput("p1"))),
+                CUDA_DIALECT,
+                DType.F32,
+            )
+        )
+        self.assertIn("float v_t0 = v_p0 > 0.5f ? 1.f : 0.f;", src)
+        self.assertIn("float v_t1 = v_t0 * v_p1;", src)
+
     def test_f32_chain_is_identical_across_vendors(self):
         kernel = build_chain(self._steps(), self._inputs(), vec=4)
         self.assertEqual(

@@ -455,6 +455,24 @@ class TestElementwiseFusionPlan(unittest.TestCase):
         g.output(g.relu(g.mul(a, s)), "y")
         self.assertEqual(self._groups(g), [("mul", "relu")])
 
+    def test_clamp_joins_the_chain(self):
+        """``clamp`` 的边界是属性里的常量，不占操作数，可以和邻居同组。
+
+        SSM / 门控里的 ``clamp(x, min=-80) → mul → add`` 因此少一次物化。
+        """
+        g = Graph()
+        a = g.input("a", f32[4, 8])
+        s = g.input("s", f32[1])
+        g.output(g.mul(g.clamp(g.relu(a), min=-1.0, max=1.0), s), "y")
+        self.assertEqual(self._groups(g), [("relu", "clamp", "mul")])
+
+    def test_step_joins_the_chain(self):
+        """阈值是属性常量的阶跃同样不占操作数：SNN 的 step → mul 合成一个内核。"""
+        g = Graph()
+        a = g.input("a", f32[4, 8])
+        g.output(g.mul(g.step(a, threshold=0.5), a), "y")
+        self.assertEqual(self._groups(g), [("step", "mul")])
+
     def test_graph_output_intermediate_is_materialized(self):
         """链中间的边是图输出时必须物化；链尾本身是图输出不影响合并。"""
         g = Graph()
