@@ -48,6 +48,7 @@ CUDA 后端需要 `cupy-cuda12x`；HIP 后端需要 ROCm 与自带的 `hip.runti
 | numpy | ≥ 1.24 |
 | torch（可选） | 前端适配器声明区间 2.9–2.13，本版仅在 2.13.0 上验证；区间内未验证版本不承诺回归覆盖，越界显式抛 `UnsupportedTorchVersion` |
 | CUDA 后端 | CUDA 12.x + 驱动 550+（2×V100 `sm_70` 上验证）；cuFFT 提供 `fft` / `rfft` |
+| CUDA 实测机 | A800-SXM4-40GB、驱动 550.127、cuDNN 9.1（Ubuntu 22.04）。系统没装 CUDA toolkit，cuBLAS / cuDNN 由 miniconda 的 `nvidia/{cublas,cudnn}/lib` 提供，跑卷积必须把这两条加进 `LD_LIBRARY_PATH`；对照 cuDNN 再加 `NVIDIA_TF32_OVERRIDE=0` |
 | HIP 后端 | ROCm 7.2（RX 7650 GRE `gfx1100`，WSL 上验证） |
 
 ### 快速上手
@@ -127,7 +128,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   把 3x3 宽通道拉到 0.133～0.136 ms（im2col 的 0.51～0.85×、cuDNN 的 1.7～1.9×），
   对 cuDNN 相对误差约 2e-7；CUDA 的 auto 对 3x3 且 K > 32 选它，HIP 未开。
   它的瓶颈已不是内核：四次提交 ≈0.045 ms、框架逐节点派发 ≈0.055 ms，GPU 只占
-  0.03～0.07 ms。
+  0.03～0.07 ms。换到 host 更快的 A800-40GB 上，同一份内核 3x3_c16/c64 是
+  0.103/0.112 ms（cuDNN 0.065/0.081，比值降到 1.6×/1.4×），进一步印证这一段
+  的耗时主要由提交与派发决定；**绝对值随机器变，跨机只比比值**。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
