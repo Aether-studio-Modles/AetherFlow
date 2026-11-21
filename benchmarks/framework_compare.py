@@ -116,11 +116,11 @@ def _build(name: str):
     raise SystemExit(f"未知用例：{name}；可选 {', '.join(table)} 或 matmul_<N>")
 
 
-def _backend(device: str):
+def _backend(device: str, graph_mode: str = "off"):
     if device.startswith("cuda"):
         from aetherflow.backends.cuda import CudaBackend
 
-        return CudaBackend(), "cuda"
+        return CudaBackend(graph_mode=graph_mode), "cuda"
     from aetherflow import ReferenceBackend
 
     return ReferenceBackend(), "ref"
@@ -250,6 +250,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="torch.compile 的模式（default / max-autotune）")
     parser.add_argument("--training", action="store_true",
                         help="改测训练一步（前向 + 交叉熵 + 反向 + SGD）")
+    parser.add_argument("--graph-mode", default="off",
+                        help="AetherFlow 的图重放模式（off / auto / capture）")
     args = parser.parse_args(argv)
 
     try:
@@ -263,7 +265,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    backend, backend_kind = _backend(device)
+    backend, backend_kind = _backend(device, args.graph_mode)
     if device.startswith("cuda"):
         import cupy as cp
 
