@@ -25,7 +25,7 @@ from ..backends.reference_backend import ReferenceBackend
 from ..ir.grad import backward
 from ..ir.graph import Graph
 from ..ir.serialize import dumps as _serialize_dumps
-from ..ir.shape_contract import require_static_shapes
+from ..ir.shape_contract import symbolic_inputs
 from ..passes.autocast import Autocast
 from ..runtime.bf16 import pack_bf16, unpack_bf16
 from ..runtime.executor import _HostCopy
@@ -360,11 +360,19 @@ class Trainer:
                 low_precision_inputs=store.names if master_weights else (),
             ).run(graph)
 
-        require_static_shapes(
-            graph,
-            stage="trainer",
-            hint="请用固定 batch 构图，变长数据先补齐或用 DataLoader(drop_last=True)",
-        )
+        if device_state:
+            # 主机态对符号批维是开放的（见 shape_contract 的 trainer 条目）：
+            # 每一步按实际形状绑定，反向的归约计数也在运行期算。设备态不是
+            # 同一个问题——捕获计划把每步的维度与地址写死在图里，换形状就得
+            # 重新捕获，所以这里仍然要求静态。
+            symbolic = symbolic_inputs(graph)
+            if symbolic:
+                listed = "、".join(f"%{name}" for name in symbolic)
+                raise ValueError(
+                    "设备态训练要求静态形状：前向/反向的捕获计划把每步的维度与"
+                    f"地址写死在图里，这些输入含符号维: {listed}。"
+                    "请改用主机态（device_state=False），或按固定 batch 构图"
+                )
 
         inputs = {value.name for value in graph.inputs}
         missing = [name for name in store.names if name not in inputs]
@@ -507,13 +515,22 @@ class Trainer:
         每步按 ``(seed, step, rank)`` 派生）。数据并行要按这张表核对"分成
         W 份后第 0 维是否等于图的静态 batch"——用"所有输入减参数"去猜会把
         dropout 的 key 也算成数据，报出一条对不上号的错误。
+
+        含符号维的输入在这里显式拒绝：数据并行按每卡固定 batch 切分，符号
+        批维没有"该切多少"的答案。主机态单机训练不走这张表，不受影响。
         """
-        return {
-            value.name: tuple(int(d) for d in value.type.shape)
-            for value in self.graph.inputs
-            if value.name not in self._param_names
-            and value.name not in self._rng_names
-        }
+        shapes: Dict[str, Tuple[int, ...]] = {}
+        for value in self.graph.inputs:
+            if value.name in self._param_names or value.name in self._rng_names:
+                continue
+            shape = tuple(value.type.shape)
+            if not all(isinstance(d, int) for d in shape):
+                raise ValueError(
+                    f"数据输入 {value.name!r} 的形状 {shape} 含符号维；"
+                    "数据并行按每卡固定 batch 切分，需要静态形状"
+                )
+            shapes[value.name] = shape
+        return shapes
 
     def step(
         self,

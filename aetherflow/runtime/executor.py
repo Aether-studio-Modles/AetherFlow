@@ -17,7 +17,7 @@ from weakref import WeakKeyDictionary
 import numpy as np
 
 from ..ir.graph import Graph, Node
-from ..ir.types import DType, TensorType, dim_resolve
+from ..ir.types import DType, SymExpr, TensorType, dim_resolve
 from .bf16 import round_bf16
 
 
@@ -133,14 +133,17 @@ class _GroupPlan:
 def resolve_attrs(attrs: dict, binding: Dict[str, int]) -> dict:
     """把属性里出现的符号维替换成运行期绑定值。
 
-    只替换能在 binding 中命中的字符串，所以 ``dtype="f32"`` 这类
-    字面量属性不会被误改——前提是形状符号不叫 ``f32``，而这一点由
-    ``TensorType`` 构造期拒绝（见 ``ir/types.py``）。
+    两种形式都要处理：裸符号是字符串（``"B"``），复合维是
+    ``SymExpr``（``4*B``）。只替换能在 binding 中命中的符号，所以
+    ``dtype="f32"`` 这类字面量属性不会被误改——前提是形状符号不叫
+    ``f32``，而这一点由 ``TensorType`` 构造期拒绝（见 ``ir/types.py``）。
     """
 
     def resolve(v):
         if isinstance(v, str):
             return binding.get(v, v)
+        if isinstance(v, SymExpr):
+            return dim_resolve(v, binding)
         if isinstance(v, (tuple, list)):
             return type(v)(resolve(x) for x in v)
         return v

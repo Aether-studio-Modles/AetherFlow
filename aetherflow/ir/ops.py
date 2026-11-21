@@ -35,7 +35,6 @@ import numpy as np
 from .types import (
     DType,
     Dim,
-    SymExpr,
     TensorType,
     _as_shape,
     dim_static,
@@ -2454,18 +2453,18 @@ def _infer_reshape(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     t = inputs[0]
     target = _as_shape(attrs["shape"])
 
-    # reshape 不允许引入新的未知量：符号维必须在源类型中出现过
+    # reshape 不允许引入新的未知量：符号维必须在源类型中出现过。目标里可以
+    # 出现表达式（``(B,4) -> (4*B,)``），它的取值到执行期按符号绑定求值；
+    # 元素数守恒无法在结构上判定时交给 reshape 本身——形状真的对不上，执行期
+    # 的 numpy/torch 会报错，而不是像"静态检查漏过"那样算出错误结果。
     for d in target:
-        if isinstance(d, SymExpr):
-            raise ValueError("reshape 的目标形状暂不支持符号表达式，请用裸符号或静态整数")
         unknown = dim_symbols(d) - t.symbols
         if unknown:
             raise ValueError(f"reshape 引入了未定义的符号维: {sorted(unknown)}")
 
-    static_target = [d for d in target if isinstance(d, int)]
     if t.is_static and all(isinstance(d, int) for d in target):
         n_src, n_dst = t.numel(), 1
-        for d in static_target:
+        for d in target:
             n_dst *= d
         if n_src != n_dst:
             raise ValueError(f"reshape 元素个数不守恒: {n_src} -> {n_dst}")

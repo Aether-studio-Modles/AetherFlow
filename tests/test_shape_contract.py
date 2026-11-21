@@ -3,8 +3,8 @@
 判据分三层：
 
 1. 契约表本身：每个环节都有明确状态与非空理由，未知环节不默认放行；
-2. ``rejected`` 环节在入口显式拒绝：训练循环与分段重算都在构造期报错，
-   错误里带环节名、具体输入与可操作建议；
+2. ``rejected`` 环节在入口显式拒绝：分段重算在构造期报错，设备态训练拒绝
+   符号输入，错误里带环节名、具体输入与可操作建议；
 3. ``full`` / ``per-op`` / ``data-only`` 的声明不是空话：同一张符号图能被
    执行器按不同 batch 跑、部署包只要求权重静态、reshape 的 ``(B,4) -> (4*B,)``
    在构图期被拒绝。
@@ -15,7 +15,7 @@ import unittest
 
 import numpy as np
 
-from aetherflow import Graph, f32
+from aetherflow import Graph, backward, f32
 from aetherflow.backends import ReferenceBackend
 from aetherflow.deploy import BundleError, load_bundle, save_bundle
 from aetherflow.frontend.torch_export import UnsupportedOperatorError, _shape_of
@@ -81,7 +81,7 @@ class TestContractTable(unittest.TestCase):
     def test_static_guard_only_applies_to_rejected_stages(self):
         """把 full / per-op 环节交给守卫会误拦本来可用的图，必须直接拒绝。"""
         graph = _static_graph()
-        for stage in ("execute", "autodiff"):
+        for stage in ("execute", "autodiff", "trainer"):
             with self.subTest(stage=stage):
                 with self.assertRaises(ValueError) as ctx:
                     require_static_shapes(graph, stage=stage)
@@ -97,20 +97,50 @@ class TestSymbolicInputs(unittest.TestCase):
         self.assertEqual(symbolic_inputs(g), ["dynamic", "expr"])
 
     def test_static_graph_passes_the_guard(self):
-        require_static_shapes(_static_graph(), stage="trainer")
+        require_static_shapes(_static_graph(), stage="recompute")
 
 
 class TestRejectedStages(unittest.TestCase):
-    def test_trainer_rejects_symbolic_input_with_stage_name(self):
+    def test_host_state_trainer_runs_symbolic_batches(self):
+        """``trainer`` 声明为 per-op：主机态的符号 batch 能真的训练一步。
+
+        一次构图、多形状执行；损失对符号维求平均时，反向的计数按每步的实际
+        形状算。参数形状与 batch 无关，优化器看不出差别。
+        """
+        g = _symbolic_graph()
+        store = ParameterStore.from_graph(g, exclude=("x", "t"))
+        trainer = Trainer(g, store, SGD(store.arrays(), lr=0.05))
+        before = store["w"].copy()
+        for batch in (1, 3, 5):
+            loss = trainer.step(
+                {
+                    "x": np.ones((batch, 4), dtype=np.float32),
+                    "t": np.zeros((batch, 1), dtype=np.float32),
+                }
+            )
+            self.assertIsInstance(loss, float)
+            self.assertTrue(np.isfinite(loss))
+        self.assertFalse(np.array_equal(store["w"], before))
+
+    def test_device_state_trainer_rejects_symbolic_input(self):
+        """设备态的捕获计划把维度写死在图里，符号批维必须在构造期拒绝。"""
         g = _symbolic_graph()
         store = ParameterStore.from_graph(g, exclude=("x", "t"))
         with self.assertRaises(ValueError) as ctx:
-            Trainer(g, store, SGD(store.arrays(), lr=0.1))
+            Trainer(g, store, SGD(store.arrays(), lr=0.1), device_state=True)
         message = str(ctx.exception)
-        self.assertIn("训练循环环节", message)
-        self.assertIn("符号维", message)
+        self.assertIn("设备态训练要求静态形状", message)
         self.assertIn("%x", message)
-        self.assertIn("DataLoader(drop_last=True)", message)
+        self.assertIn("device_state=False", message)
+
+    def test_data_parallel_rejects_symbolic_input_with_shape_hint(self):
+        """数据并行按每卡固定 batch 切分：符号批维没有"该切多少"。"""
+        g = _symbolic_graph()
+        store = ParameterStore.from_graph(g, exclude=("x", "t"))
+        trainer = Trainer(g, store, SGD(store.arrays(), lr=0.1))
+        with self.assertRaises(ValueError) as ctx:
+            trainer.data_input_shapes()
+        self.assertIn("含符号维", str(ctx.exception))
 
     def test_checkpoint_plan_rejects_symbolic_graph(self):
         g = _symbolic_graph()
@@ -159,13 +189,64 @@ class TestDeclaredSupport(unittest.TestCase):
                 )
             self.assertIn("静态形状", str(ctx.exception))
 
-    def test_reshape_cannot_express_a_symbol_expression(self):
-        """``(B,4) -> (4*B,)`` 需要表达式目标，reshape 在构图期拒绝。"""
+    def test_reshape_accepts_symbol_expression_target(self):
+        """``(B,4) -> (4*B,)`` 的目标可以是表达式：构图期只查符号是否已定义，
+        具体取值在执行期按绑定求值。"""
         g = Graph("reshape")
         x = g.input("x", f32["B", 4])
+        y = g.reshape(x, shape=(sym_mul(4, "B"),))
+        g.output(y, "y")
+        self.assertEqual(y.type.shape, (sym_mul(4, "B"),))
+
+    def test_symbolic_reshape_runs_on_several_batches(self):
+        """执行器把表达式目标解析成实际整数：同一张图跑不同 batch。"""
+        g = Graph("reshape-run")
+        x = g.input("x", f32["B", 4])
+        g.output(g.reshape(x, shape=(sym_mul(4, "B"),)), "y")
+        backend = ReferenceBackend()
+        for batch in (1, 3, 7):
+            data = np.arange(batch * 4, dtype=np.float32).reshape(batch, 4)
+            out = backend.execute(g, {"x": data})["y"]
+            self.assertEqual(out.shape, (4 * batch,))
+            np.testing.assert_array_equal(out, data.reshape(-1))
+
+    def test_symbolic_reshape_rejects_unknown_symbol(self):
+        g = Graph("reshape-bad")
+        x = g.input("x", f32["B", 4])
         with self.assertRaises(ValueError) as ctx:
-            g.reshape(x, shape=(sym_mul(4, "B"),))
-        self.assertIn("符号表达式", str(ctx.exception))
+            g.reshape(x, shape=(sym_mul(4, "S"),))
+        self.assertIn("未定义的符号维", str(ctx.exception))
+
+    def test_symbolic_reduce_mean_backward(self):
+        """归约轴静态、batch 维符号：反向的计数在运行期按形状算。
+
+        对 ``(B,4)`` 沿最后一维求均值，正确梯度是每元素 1/4。静态实现会把
+        ``1/count`` 写成常量；符号 batch 走的是 broadcast_to + reduce_sum
+        的运行期计数，两条路径都要给出同一个值。
+        """
+        g = Graph("dyn-mean")
+        x = g.input("x", f32["B", 4])
+        g.output(g.reduce_mean(x, axis=(-1,), keepdims=False), "y")
+        bwd = backward(g, wrt=[x])
+        backend = ReferenceBackend()
+        for batch in (1, 3, 7):
+            data = np.arange(batch * 4, dtype=np.float32).reshape(batch, 4)
+            seed = np.ones((batch,), dtype=np.float32)
+            grads = backend.execute(bwd, {"x": data, "dy": seed})
+            np.testing.assert_allclose(
+                grads["dx"], np.full((batch, 4), 0.25, dtype=np.float32), rtol=1e-6, atol=1e-6
+            )
+
+    def test_symbolic_reduce_sum_backward(self):
+        g = Graph("dyn-sum")
+        x = g.input("x", f32["B", 4])
+        g.output(g.reduce_sum(x, axis=(-1,), keepdims=False), "y")
+        bwd = backward(g, wrt=[x])
+        backend = ReferenceBackend()
+        for batch in (1, 3, 7):
+            data = np.ones((batch, 4), dtype=np.float32)
+            grads = backend.execute(bwd, {"x": data, "dy": np.ones((batch,), np.float32)})
+            np.testing.assert_array_equal(grads["dx"], np.ones((batch, 4), dtype=np.float32))
 
     def test_torch_import_rejects_dynamic_dims(self):
         """torch 的动态维不能靠 int() 静默具体化。"""

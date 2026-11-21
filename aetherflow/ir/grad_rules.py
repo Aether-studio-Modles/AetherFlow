@@ -48,9 +48,9 @@ def _prod(xs) -> int:
 def _static(value, what: str) -> Tuple[int, ...]:
     """取静态形状；含符号维时明确报错。
 
-    为什么要求静态：归约回原形状要靠 ``reshape`` 把若干维合并/拆开，
-    而合并符号维需要一套运行期形状表达式，IR 现在没有（与 conv 的符号维
-    拒绝是同一条理由）。报错点在这里，比在执行器里抛形状不匹配好解释得多。
+    为什么要求静态：这些规则要靠 ``reshape`` 把若干维合并/拆开，而合并符号维
+    需要一套运行期形状表达式，IR 现在没有。只靠转置 + ``keepdims`` 就能完成
+    的求和已经放开（见 :func:`sum_to`），其余仍在构图期拒绝。
     """
     if not value.type.is_static:
         raise NoGradientError(
@@ -65,9 +65,11 @@ def _sum_axis_keep(b, g, axis: int):
 
     用 ``transpose`` 把轴换到最后，是因为 CUDA 后端的 ``reduce_sum`` 只实现了
     最后一维；这样这条规则在两个后端上都成立，而不是"参考后端能跑"。
+
+    只需要秩，不需要各维的具体数字：``reduce_sum`` 的 ``keepdims=True`` 本身
+    就接受符号维，转置也只依赖下标。所以符号批维上求和的这一条路是通的。
     """
-    shape = _static(g, "归约")
-    r = len(shape)
+    r = g.type.rank
     if r == 1:
         return b.add_node("reduce_sum", [g], {"axis": 0, "keepdims": True})
     perm = [i for i in range(r) if i != axis] + [axis]
@@ -99,9 +101,17 @@ def sum_axes(b, g, axes: Sequence[int]):
 
 
 def sum_to(b, g, target_shape: Sequence[int]):
-    """把 ``g`` 归约到 ``target_shape``（广播的反向）。"""
-    gs = _static(g, "广播")
-    ts = tuple(int(d) for d in target_shape)
+    """把 ``g`` 归约到 ``target_shape``（广播的反向）。
+
+    形状相同直接返回：这一步不需要任何具体数字，符号批维也走这里。
+
+    需要真正求和时分成两条路。全是具体数字时保留原来的"合并前导维再一次
+    归约"，数值与算子顺序都不变；含符号维时前导乘积无法在构图期算出来，
+    改成"前导维转置到最后 -> ``reduce_sum``（``keepdims=True``）-> reshape
+    去掉最后那个 1"。reshape 的目标只有保留维（本来就已定义），不引入新符号。
+    """
+    gs = tuple(g.type.shape)
+    ts = tuple(target_shape)
     if len(ts) > len(gs):
         raise NoGradientError(f"梯度形状 {gs} 比目标形状 {ts} 秩更小，无法反向广播")
     if gs == ts:
@@ -113,7 +123,10 @@ def sum_to(b, g, target_shape: Sequence[int]):
         if td == 1 and gd != 1:
             g = _sum_axis_keep(b, g, lead + i)
 
-    if lead:
+    if not lead:
+        return g
+
+    if all(isinstance(d, int) for d in gs) and all(isinstance(d, int) for d in ts):
         # 多出来的前导维整体求和：转置到 (目标维..., 前导维...)，二维化后归约。
         r = len(gs)
         perm = list(range(lead, r)) + list(range(lead))
@@ -123,8 +136,13 @@ def sum_to(b, g, target_shape: Sequence[int]):
         if lnum != 1:
             g = b.add_node("reshape", [g], {"shape": [knum, lnum]})
             g = b.add_node("reduce_sum", [g], {"axis": -1, "keepdims": False})
-        g = b.add_node("reshape", [g], {"shape": list(ts)})
-    return g
+        return b.add_node("reshape", [g], {"shape": list(ts)})
+
+    r = len(gs)
+    perm = list(range(lead, r)) + list(range(lead))
+    g = b.add_node("transpose", [g], {"perm": perm})
+    g = b.add_node("reduce_sum", [g], {"axis": -1, "keepdims": True})
+    return b.add_node("reshape", [g], {"shape": list(ts)})
 
 
 def _const(b, value: float, dtype):
@@ -1008,7 +1026,9 @@ def _rmsnorm(ctx):
 @vjp("reduce_sum")
 def _reduce_sum(ctx):
     b, g, x = ctx.b, ctx.g, ctx.input(0)
-    shape = _static(x, "reduce_sum")
+    # 归约的反向只需要"把梯度广播回原形状"，逐维保持原样即可：静态维与符号维
+    # 走同一条路。reshape 的目标可以含裸符号，broadcast_to 也已接受符号目标。
+    shape = tuple(x.type.shape)
     raw_axes = ctx.attrs.get("axis", -1)
     axes = (raw_axes,) if isinstance(raw_axes, int) else tuple(raw_axes)
     norm = {a % len(shape) for a in axes}
@@ -1019,8 +1039,8 @@ def _reduce_sum(ctx):
 
 
 def _reduce_info(ctx):
-    """归约类规则共用的 (输入形状, 归一化轴, keepdims)。"""
-    shape = _static(ctx.input(0), "归约")
+    """归约类规则共用的 (输入形状, 归一化轴, keepdims)。形状允许含符号维。"""
+    shape = tuple(ctx.input(0).type.shape)
     raw_axes = ctx.attrs.get("axis", -1)
     axes = (raw_axes,) if isinstance(raw_axes, int) else tuple(raw_axes)
     norm = tuple(sorted({a % len(shape) for a in axes}))
@@ -1035,12 +1055,25 @@ def _keepdims_shape(shape, norm):
 def _reduce_mean(ctx):
     b, g, x = ctx.b, ctx.g, ctx.input(0)
     shape, norm, keepdims = _reduce_info(ctx)
-    count = 1
-    for a in norm:
-        count *= shape[a]
+    mid = _keepdims_shape(shape, norm)
     if not keepdims:
-        g = b.add_node("reshape", [g], {"shape": _keepdims_shape(shape, norm)})
-    scaled = b.add_node("mul", [g, _const(b, 1.0 / count, x.type.dtype)])
+        g = b.add_node("reshape", [g], {"shape": mid})
+
+    if all(isinstance(shape[a], int) for a in norm):
+        count = 1
+        for a in norm:
+            count *= shape[a]
+        scaled = b.add_node("mul", [g, _const(b, 1.0 / count, x.type.dtype)])
+    else:
+        # 归约轴含符号维：计数只能在执行期算。用"把标量 1 广播成 mid 形状再
+        # 沿归约轴求和"得到与梯度同形的计数张量——它只取决于形状，与输入值
+        # 无关（不能用 exp(x-x) 之类的技巧：x 含 inf 时会污染计数）。
+        one = _const(b, 1.0, x.type.dtype)
+        ones = b.add_node("broadcast_to", [one], {"shape": list(mid)})
+        count = b.add_node(
+            "reduce_sum", [ones], {"axis": list(norm), "keepdims": True}
+        )
+        scaled = b.add_node("div", [g, count])
     return (_expand_to(b, scaled, shape),)
 
 

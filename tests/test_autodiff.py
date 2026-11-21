@@ -636,13 +636,31 @@ class TestBackwardGraph(unittest.TestCase):
         with self.assertRaises(ValueError):
             backward(g, seeds={"y": "x"})
 
-    def test_symbolic_reduction_rejected(self):
+    def test_symbolic_broadcast_reduction_is_supported(self):
+        """符号批维上的广播反向：内部广播维求和只依赖秩，可以在运行期完成。
+
+        ``a[B,1] + b[B,4]`` 对 ``a`` 的梯度要把最后一维求和回长度 1。这条路径
+        用 transpose + ``reduce_sum(keepdims=True)`` 实现，不需要在构图期拿到
+        具体数字；``B`` 的值只在执行时绑定。
+        """
         g = Graph("sym")
         a = g.input("a", f64["B", 1])
         b = g.input("b", f64["B", 4])
         g.output(g.add_node("add", [a, b]), "y")
-        with self.assertRaises(NoGradientError):
-            backward(g, wrt=[a])
+        bwd = backward(g, wrt=[a])
+        backend = ReferenceBackend()
+        for batch in (1, 3):
+            grads = backend.execute(
+                bwd,
+                {
+                    "a": np.zeros((batch, 1)),
+                    "b": np.zeros((batch, 4)),
+                    "dy": np.ones((batch, 4)),
+                },
+            )
+            np.testing.assert_array_equal(
+                grads["da"], np.full((batch, 1), 4.0, dtype=np.float64)
+            )
 
     def test_inactive_output_is_pruned_not_zero_seeded(self):
         """AF-04：未激活输出要从反向图里剪掉，而不是喂零种子。

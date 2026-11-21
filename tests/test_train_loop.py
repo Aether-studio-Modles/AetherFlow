@@ -124,8 +124,12 @@ class TestTrainer(unittest.TestCase):
         with self.assertRaises(ValueError):
             Trainer(g, other, SGD(other.arrays(), lr=0.1))
 
-    def test_symbolic_input_is_rejected_with_a_clear_error(self):
-        """反向图的归约需要静态形状：这条边界要在构造期讲清楚。"""
+    def test_symbolic_batch_trains_across_shapes(self):
+        """主机态支持符号批维：一次构图，batch 1 与 3 各跑一步。
+
+        这条图覆盖训练里最常见的那条反向链：广播加法（对 ``b`` 要沿符号批维
+        求和）、``mul``、以及标量损失对批维的两次归约。
+        """
         g = Graph("sym")
         x = g.input("x", f32["B", 4])
         t = g.input("t", f32["B", 1])
@@ -136,9 +140,15 @@ class TestTrainer(unittest.TestCase):
         loss = g.reduce_sum(g.reduce_sum(sq, axis=0, keepdims=False), axis=0, keepdims=False)
         g.output(loss, "loss")
         store = ParameterStore.from_graph(g, exclude=("x", "t"))
-        with self.assertRaises(ValueError) as ctx:
-            Trainer(g, store, SGD(store.arrays(), lr=0.1))
-        self.assertIn("符号维", str(ctx.exception))
+        trainer = Trainer(g, store, SGD(store.arrays(), lr=0.1))
+        for batch in (1, 3):
+            value = trainer.step(
+                {
+                    "x": np.ones((batch, 4), dtype=np.float32),
+                    "t": np.zeros((batch, 1), dtype=np.float32),
+                }
+            )
+            self.assertTrue(np.isfinite(value))
 
     def test_on_step_receives_global_indices(self):
         x, t = _data(n=8)

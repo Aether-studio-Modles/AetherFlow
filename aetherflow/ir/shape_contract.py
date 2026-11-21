@@ -68,14 +68,18 @@ DYNAMIC_SHAPE_SUPPORT: Mapping[str, StageSupport] = MappingProxyType(
                 "autodiff",
                 "自动微分",
                 PER_OP,
-                "反向按算子逐个判定：attention、elementwise 等可带符号批维；"
-                "reduce_sum 的广播与 reshape 的目标形状需要具体数字，在构图期拒绝",
+                "反向按算子逐个判定：elementwise、attention 与 reshape 可带符号批维，"
+                "reduce_sum / reduce_mean 的归约计数与广播反向的求和都在执行期按"
+                "实际形状算；需要合并若干维的规则（sum_axes 等）仍要求具体形状，"
+                "在构图期拒绝",
             ),
             StageSupport(
                 "trainer",
                 "训练循环",
-                REJECTED,
-                "训练目标必经一次归约，反向的广播需要具体形状；Trainer 在构造期拒绝",
+                PER_OP,
+                "主机态支持符号批维：损失对符号维求均值时，反向的计数在每一步按"
+                "实际形状算，训练循环本身只做形状无关的参数更新；设备态的捕获计划"
+                "与分段重算仍要求静态形状，构造期拒绝",
             ),
             StageSupport(
                 "recompute",
