@@ -1,12 +1,12 @@
 """设备态解码：decode 的状态留在设备上，每步只回传 logits。
 
-配套 DESIGN 5.279～5.282。判据：
+配套 DESIGN 5.279～5.283。判据：
 
 1. **捕获一次**：同一批次形状的 decode 图只 capture 一次，跨请求复用；
-   束搜索另有一张按父行号重排状态的 gather 图，同样只捕获一次。
+   束搜索把"按父行号重排"并进 decode 图，同样只有一张计划。
 2. **状态不往返**：decode 每步的 state 以设备数组喂回（D2D），不产生 D2H；
    只有 logits 块（``B*V`` 个 float）被取回主机。束搜索的状态重排也在
-   设备上做，主机只上传 ``k`` 个父行号。
+   同一张图里做，主机只上传 ``k`` 个父行号。
 3. **数值不变**：与宿主路径（``resident=True`` 的同一会话）和模块级
    ``generate`` / ``generate_beam`` 逐 token 一致。
 4. **契约**：``device_state=True`` 必须配 ``resident=True``，后端必须提供
@@ -227,7 +227,7 @@ class TestDeviceStateDecode(unittest.TestCase):
 
 
 class TestDeviceStateBeam(unittest.TestCase):
-    """束搜索的设备态：重排走 gather 图，decode 走同一套捕获计划。"""
+    """束搜索的设备态：重排并进 decode 图，每步一次重放。"""
 
     def _setup(self):
         spec = _small(batch=1, steps=4, vocab_size=8)
@@ -247,11 +247,11 @@ class TestDeviceStateBeam(unittest.TestCase):
                     rec, params, spec, resident=True, device_state=True
                 ) as runner:
                     got = list(runner.generate_beam(prompt, num_beams=beams, **kwargs))
-                    swap_plan = runner._swap_plan
+                    beam_plan = runner._beam_plan
                 self.assertEqual(got, want)
-                self.assertIsNotNone(swap_plan, "设备态束搜索必须捕获重排图")
-                # 两张图各捕获一次：重排 + decode
-                self.assertEqual(rec.captures, 2)
+                self.assertIsNotNone(beam_plan, "设备态束搜索必须捕获融合计划")
+                # 重排与 decode 在同一张图里，只捕获一次
+                self.assertEqual(rec.captures, 1)
 
     def test_state_swap_stays_on_device(self):
         spec, params, prompt = self._setup()
@@ -265,8 +265,8 @@ class TestDeviceStateBeam(unittest.TestCase):
             d2h = list(rec.d2h)
             replays = rec.replays
 
-        # 每步两次 replay：重排图 + decode 图
-        self.assertEqual(replays, 2 * (limit - 1), "decode 只剩 limit-1 步")
+        # 重排并进 decode 图：每步只剩一次 replay
+        self.assertEqual(replays, limit - 1, "decode 只剩 limit-1 步")
         state_shapes = {
             tuple(shape) for shape in spec.with_batch(beams).state_shapes.values()
         }
@@ -318,7 +318,7 @@ class TestDeviceStateBeam(unittest.TestCase):
         rec = _DeviceRecorder(BACKEND)
         with LMRunner(rec, params, spec, resident=True, device_state=True) as runner:
             runner.generate_beam(prompt, num_beams=2, max_new_tokens=3, chunk_size=2)
-        self.assertIsNone(runner._swap_plan, "close 必须丢掉重排计划")
+        self.assertIsNone(runner._beam_plan, "close 必须丢掉束搜索的融合计划")
         self.assertIsNone(runner._decode_plan, "close 必须丢掉 decode 计划")
 
 

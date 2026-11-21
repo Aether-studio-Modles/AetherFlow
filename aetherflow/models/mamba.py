@@ -822,6 +822,7 @@ def build_mamba_layers(
     prefix: str = "",
     with_states: bool = False,
     reset: Optional[Value] = None,
+    state_source=None,
 ) -> Tuple[Dict[str, Value], Value, Dict[str, Value]]:
     """从**已有 Value** 出发叠 N 层，参数单独建输入。
 
@@ -829,6 +830,12 @@ def build_mamba_layers(
     语言模型要把 embedding 的输出接进来（``x`` 是一张算子的结果而不是图输入），
     但又需要叠层函数返回同一套参数名与状态名。``inputs`` 的键已带 ``prefix``，
     且**不含** ``x``。
+
+    ``state_source(name, shape) -> (value, feed)`` 可接管状态张量的来源：
+    默认建一张同名图输入；传入时由调用方决定（束搜索的设备态 decode 用它
+    把状态换成 ``embedding(上一状态, parents)``，并把喂入用的表张量一起交
+    回来）。返回的 ``inputs`` 里状态键仍是逻辑名（``l0_conv0``），取值是
+    待 feed 的图输入，因此 ``inputs[sname].name`` 就是重放时要写的输入名。
     """
 
     def name(base: str) -> str:
@@ -838,13 +845,22 @@ def build_mamba_layers(
     for pname, shape in spec.param_shapes.items():
         # 键保持原名（``_run_layers`` 按 ``l0_w_in`` 查找），图输入名才带前缀。
         raw[pname] = g.input(name(pname), f32[shape])
+    state_feeds: Dict[str, Value] = {}
     if with_states:
         for sname, shape in spec.state_shapes.items():
-            raw[sname] = g.input(name(sname), f32[shape])
+            if state_source is None:
+                raw[sname] = state_feeds[sname] = g.input(name(sname), f32[shape])
+            else:
+                raw[sname], state_feeds[sname] = state_source(name(sname), shape)
     out, state_out = _run_layers(
         g, spec, {**raw, "x": x}, stateful=with_states, reset=reset
     )
-    return {value.name: value for value in raw.values()}, out, state_out
+    inputs: Dict[str, Value] = {
+        raw[pname].name: raw[pname] for pname in spec.param_shapes
+    }
+    # 状态用逻辑名做键：图输入名可能带后缀（重排路径），两者在这里合流。
+    inputs.update(state_feeds)
+    return inputs, out, state_out
 
 
 def build_mamba_model(
