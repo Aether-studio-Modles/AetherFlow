@@ -17847,3 +17847,70 @@ H2D——批越大往返越贵。把 `_device_step` 的后端能力接进 `Servi
 - 死槽仍随 pad 推进（图是固定 batch），父行 0，它们的 logits 被丢弃。
 - HIP 只有 8 GB：24 层 / `d_model=1024` 时一张捕获计划里的权重常量副本约
   750 MB，设备态一次只够一个会话。
+
+### 5.283　把重排并进 decode 图：一张计划、每步一次 replay
+
+**问题**
+
+5.282 把束搜索的状态重排搬进显存，但每步仍是两次 replay：先跑一张只做
+`embedding(state, parents)` 的 48 节点图，再跑 decode 图。5.282 把这 2.4 ms
+记成"replay 的固定开销"，并留下尺子：把重排并进 decode 图
+（`(parents, state) → (state', logits)`），每步只剩一次 replay。
+
+**做法**
+
+- `build_mamba_layers` 增加 `state_source(name, shape) -> (value, feed)` 钩子：
+  状态不再固定由 `g.input` 产生，调用方可以交回"已有 Value + 要 feed 的图输入"。
+  `build_language_model_stateful` 原样透传。
+- `_stream_graph(..., state_swap=True)` 多建一张 `parents (B,)` 输入，每个状态
+  先 `embedding(g.input(name + "__in"), parents)` 再进层；`inputs` 里状态键仍是
+  逻辑名（`l0_conv0`），`inputs[name].name` 是重放要写的 `l0_conv0__in`。
+- `LMRunner._beam_plan_for(beam_width)` 捕获这张融合图；`_beam_step(parents, ids,
+  state)` 一次 replay 同时完成重排与推进。`_swap_plan_for` / `_swap_state` 删除，
+  束搜索与单条生成各占一个计划槽位。
+- `_beam_decode` 的设备分支从"`swap_state` + `device_step` 两次调用"收成一个
+  `device_step(parents, ids, state)`；主机路径（`device_state=False`）一字未动。
+
+**口径**
+
+- A800-SXM4-40GB 空闲，前后 `nvidia-smi` 均为 `0 % / 10 MiB`。
+- 24 层 Mamba，`d_model=1024`、`d_state=16`、`vocab=32000`、`steps=32`、
+  32-token prompt，每条生成 32 token；`early_stopping=False`，`resident=True`，
+  只切 `device_state`。预热一轮、测两轮取最快；每个格子一个独立进程。
+- **同机同口径对照**：把 `920aa2c`（5.282）检出到另一个工作树，跑同一份脚本。
+  两版的宿主列互相吻合（91.8 / 111.6 / 122.2 vs 92.9 / 117.4 / 128.6），
+  设备列才是本节要比较的差值。
+- 逐 token 输出两侧完全一致（`num_beams=1/2/4`，两版都一样）。
+
+| beams | 5.282 设备 ms/步 | 5.283 设备 ms/步 | 变化 | 5.283 tok/s | 同机宿主 ms/步 | 加速 |
+|---|---|---|---|---|---|---|
+| 1 | 14.818 | 14.010 | −0.81（−5.5%） | 71.38 | 92.905 | 6.63× |
+| 2 | 21.947 | 21.032 | −0.92（−4.2%） | 47.55 | 117.420 | 5.58× |
+| 4 | 33.164 | 31.662 | −1.50（−4.5%） | 31.58 | 128.622 | 4.06× |
+
+（5.282 与 5.283 两列都是同一台机器、同一脚本、同一时间段；`tok/s` 与
+5.282 同口径，按 `1000 / ms_per_step` 计。）
+
+**读法**
+
+1. 合并计划确实更快，但只快 4～5%，不是 5.282 预估的 2.4 ms。原因在成本
+   结构：重排的主体不是"一次 replay 的边界"，而是**48 个 `embedding`
+   节点各自的越界守卫**——每次 replay 后 `CudaGraphPlan._check_guards` 要
+   对每个 guard 做一次 `int(err.item())`。合并前后 guard 总数都是 49
+   （重排 48 + 词表 embedding 1），所以只省下第二次 replay 的流同步与输入
+   暂存（0.8～1.5 ms）。
+2. 顺带纠正 5.282 的拆解：那 2.4 ms 不是纯固定开销，主要是 48 次同步读回。
+   下一步若要再省，得把同一张图的越界标志汇总成一个标量（或 replay 前一次
+   清零、一次读回），预计再省 ~2 ms；不改这个，继续拆计划没有意义。
+3. 同机宿主列是 92.9 / 117.4 / 128.6 ms/步，与 5.282 文档里的
+   12.98 / 22.07 / 36.01 差 7×。同机旧版就是 91.8，说明 5.282 的宿主列不是
+   这台机器 / 这套环境的同口径结果；**本节只做同机两版之间的比较**。
+4. 设备态相对宿主 6.6× / 5.6× / 4.1× 的加速，来自主机路径每步 96 次逐数组
+   往返（48 次 `to_array` + 48 次 H2D）；这个量级与 5.282"未驻留量级"的
+   106.8 ms/步相符，与 12.98 不符。跨条目横比仍按 5.282 的告诫作废。
+
+**边界**
+
+- 融合图按束宽捕获，与单条生成的 decode 计划分开；`close()` 一并释放。
+- `resident=True` 仍是前提；prefill 仍是普通执行，第一步 decode 上传一次状态。
+- `parents` 只有 `k` 个 int32 上传；死槽仍随 pad 推进，父行 0。
