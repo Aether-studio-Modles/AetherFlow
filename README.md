@@ -95,6 +95,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 
 | 面 | 已交付 |
 |---|---|
+| 前端 | `torch.export` 导入：卷积 / 池化 / linear / LayerNorm / softmax / SDPA / 归一化 / 索引与切片之外，P7 补上了逐元素数学、激活展开、clamp 与标量运算、dtype 转换、归约（mean / sum / amax / max.dim / argmax）、tril / triu / cumsum / pad、栈与切分、mm / mv / dot / addmm、常量构造（zeros / ones / full / arange 等）；不能精确表达的算子显式拒绝（见第 6 节） |
 | 算子 | IR 里 67 个算子；CUDA / HIP 各自承接 64 个（63 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
 | 精度 | f32 全覆盖；f16 覆盖 60 个（64 个设备端算子去掉 3 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
 | 自动微分 | 47 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
@@ -217,6 +218,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /
   工具调用显式 400），但没有认证、限流与多副本，`stop` 只在文本层截断、不提前取消；
 - **生态**：只吃 `torch.export` 的 aten 子集，无 define-by-run，无采样 profiler（只有把已有遥测导成 Chrome Trace 的离线路径）；
+  前端覆盖算子 `torch.export` 的常用面（逐元素数学 / 激活 / 归约 / 形状 / 常量构造），
+  但 `where` / `masked_fill` / 比较算子（IR 没有 bool 张量）、`topk`、`sign` / `round` / `floor` / `ceil`、
+  `copy_`、图内 `clamp` 边界、非零或 reflect 的 `pad`、非整数 `pow` 指数都**显式拒绝**，
+  不会退化成近似实现；
 - **硬件**：NVIDIA sm_75 与 AMD gfx1100 各一张卡，无 Intel / Apple / 移动端。
 
 反过来，主流框架没有的差异化能力：**SNN 的替代梯度与事件稀疏**、**SSM 的 scan**、

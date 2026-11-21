@@ -17187,3 +17187,70 @@ HIP 后端不依赖 cupy / torch：容器是 `backends/hip/runtime.py` 的 ctype
 libhiprtc，GEMM 用 libhipblas，目标机只需要 ROCm 运行时。WSL 发行版自带的系统
 `python3` 可能没有 numpy，要用自建环境（本例为 `/opt/rocm-env`）。hipRTC 的编译
 不需要 GPU，所以"模板能否编译"在没有显卡的机器上也能先验证。
+
+### 5.273　前端补全：只扩 aten 子集，不引入 define-by-run
+
+第一代前端的导入是"能跑通 ResNet / SqueezeNet 的最小集"：卷积与池化、linear、
+LayerNorm、softmax、SDPA、reshape/切片/拼接。真实模型还会用到截断、标量运算、
+归约、常量构造与 dtype 转换，缺一条就整图导不进来。P7 把这批补齐，仍然守住
+**只吃 `torch.export` 的 aten 子集、不做 define-by-run** 的边界。
+
+**三条接地规则**
+
+1. **只落到 IR 已有的算子上。** 这轮没有新增 IR 算子，所以也没有新的后端内核
+   与新的对齐面：算子表仍是 67 个，CUDA/HIP 的承接范围不变。能用已有算子
+   精确表达的，就展开成多个节点。
+2. **展开必须是恒等式，不是近似。** `leaky_relu(x) = relu(x) - slope*relu(-x)`、
+   `elu(z) = relu(z) + alpha*(exp(-relu(-z)) - 1)`、`triu = tril(x^T, -k)^T`、
+   `abs(x) = relu(x) + relu(-x)` 在全部输入上都成立。`softplus` 用
+   `max(z,0) + log(1 + exp(-|z|))`：指数项恒 `<= 1`，任意输入都不溢出，而且
+   比 torch 的 threshold 截断（`x > 20` 时直接返回 `x`）更精确——两者相差
+   `exp(-20)`。正因如此，**非默认 `threshold` 一律拒绝**：换值会真的改变输出。
+3. **不能精确展开就拒绝，并说清原因。** `pow` 只接 0 / 0.5 / `-1` / 整数
+   （平方求幂展开）；`x ** 1.5` 走 `exp(1.5*log x)` 在非正输入上不是原式，
+   直接报错。`clamp` 的边界必须是构图期常量（IR 把边界写在属性里）；`pad`
+   只补零（reflect/replicate 与 `value != 0` 拒绝）；`copy_` 拒绝（IR 的值
+   不可变，无法表达"写回后旧读者仍看到旧值"）。
+
+**新增的覆盖**
+
+- 一元数学：`tanh` / `exp` / `log` / `neg` / `sqrt` / `erf` / `abs` / `rsqrt` /
+  `reciprocal` / `square` / `log1p` / `expm1`；
+- 激活：`leaky_relu` / `elu` / `hardsigmoid` / `hardswish` / `relu6` /
+  `softplus` / `log_softmax`；
+- 截断与标量：`clamp` / `clamp_min` / `clamp_max`，`add/sub/mul/div/rsub`
+  的 `Scalar` 重载与 `Tensor` 重载里的 Python 字面量操作数；
+- dtype：`to.dtype` / `_to_copy` / `type_as` / 非原地 `copy`；
+  `_assert_tensor_metadata` 与 `contiguous` 按恒等处理（IR 没有步长与设备语义）；
+- 归约：`mean` / `sum` / `amax` / `max.dim` / `argmax`。`max.dim` 的两个输出
+  槽位都精确给出（values 用 `reduce_max`、indices 用 `argmax`），而不是把
+  indices 填 `None`——那样下游一取下标就变成"未支持的多输出槽位"；
+- 掩码与前缀和：`tril` / `triu` / `cumsum`；
+- 形状与拼接：`expand_as` / `stack` / `split_with_sizes` / `narrow` /
+  `unbind` / `squeeze`（无 dim）/ `flatten` / `t`；
+- 矩阵乘族：`mm` / `mv` / `dot` / `addmm`。`mv` 要先补成 `(K,1)`，因为 IR 的
+  `matmul` 只接受秩 >= 2；
+- 常量构造：`zeros` / `ones` / `full` / `zeros_like` / `ones_like` /
+  `full_like` / `arange` / `scalar_tensor` 落成 `constant` 节点，复用导入期的
+  元素上限（65536）；超过上限请改成参数或显式输入，而不是把大张量塞进图属性。
+
+**明确的拒绝清单**（都走 `UnsupportedOperatorError`，不静默跳过）：
+`where` / `masked_fill` / 比较算子（IR 没有 bool 张量）、`topk`、`sign` /
+`round` / `floor` / `ceil`、`baddbmm` 等批量矩阵乘变体、
+`copy_`、非默认 `softplus.threshold`、非整数 `pow` 指数、图内 `clamp` 边界、
+非零/非 constant `pad`。
+
+**判据**（`tests/test_frontend.py`，83 条）
+
+- 每一族至少一条端到端对拍：`import_exported` 后在参考后端算出的结果与 torch
+  eager 逐点一致；`abs`/`tril`/`triu`/`pad`/常量构造用 `atol=0` 钉住精确性；
+- `softplus` 在 `±50`、`±80` 上不溢出，且与 `F.softplus` 的差在 `1e-6` 内；
+- `max.dim` 的 values 与 indices 各一条，并确认图里真的出现 `argmax`；
+- 反例逐条：`pow(1.5)`、图内 `clamp` 边界、`pad(mode="reflect")`、
+  `pad(value=1.0)`、`softplus(threshold=5)`、`floor`、`sign`、超上限常量；
+- `resnet18` 与 `squeezenet1_0` 的整体对拍仍在（未受影响）。
+
+**遗留**：`where` / 比较 / `topk` 需要 IR 新增 bool 张量或选择算子，属于
+"扩 IR"而不是"扩前端"，留给后续；`log_softmax` 走 `log(softmax(x))`，在
+概率下溢到 0 时会得到 `-inf` 而 torch 的稳定实现对同一输入给有限值——这是
+浮点表示差异，不是语义改变，但极端 logits 上会看到差别。
