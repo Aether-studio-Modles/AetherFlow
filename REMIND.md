@@ -268,12 +268,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **HIP 上同进程第二个设备态会话会坏**（5.282）：24 层 / `d_model=1024` 时，先后
   建两个 `LMRunner`（即使换后端实例）会给出 NaN logits 或"捕获期 arena 不够
   4 MB"；纯 `generate`（不涉及束搜索）同样复现，一个进程一个配置就正常。基准
-  脚本按"每个配置一个子进程"写。**本轮在 `gfx1100`（RX 7650 GRE）上系统复测
-  未复现**：host→device 两种顺序、同后端实例 / 换实例、两个 `device_state=True`
-  会话同存活、host beam → device beam、`steps=32/tokens=32`、`_stream_graph`
-  的 `steps=1/8 × batch=1/2` 全部正常。可能已随 5.282 的 `_decode_plan_for`
-  形状修复消失，也可能依赖当时的机器状态；在没有新证据前不改代码，只把它
-  从"已知缺陷"降级为"历史记录·当前未复现"。
+  脚本按"每个配置一个子进程"写。**本轮在本地 WSL 的 RX 7650 GRE（ROCm 7.2）
+  上系统复测未复现**：host→device 两种顺序、同后端实例 / 换实例、两个
+  `device_state=True` 会话同存活、host beam → device beam、`steps=32/tokens=32`、
+  `_stream_graph` 的 `steps=1/8 × batch=1/2` 全部正常。可能已随 5.282 的
+  `_decode_plan_for` 形状修复消失，也可能依赖当时的机器状态；在没有新证据前
+  不改代码，只把它从"已知缺陷"降级为"历史记录·当前未复现"。
 - **HIP `d_model=512 / 12 层 / vocab=8192 / batch=2` 的 `generate_batch` 出 NaN**
   （5.282 顺带发现）：同配置 batch=1 正常，`d_model=1024` 的 batch=2 正常。
   **本轮同机复测未复现**：`chunk=2/4/8/32` × `plain/device` 全部与参考后端一致；
