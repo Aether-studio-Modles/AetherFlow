@@ -118,6 +118,14 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 - **设备侧**：`execute_device()`，输出不回传（基准加 `--device-outputs`）；
 - **纯算**：输入常驻设备，只计内核。
 
+训练同机对照：`python -m benchmarks.framework_compare --training --graph-mode auto`。
+默认使用标准反向优化管线，`--raw-backward` 保留原始图作消融；计时前核对完整
+损失、全部参数梯度和一步更新。输出是设备驻留调用的逐轮耗时与中位数，包含
+Python 派发、接口内部复制及同步；训练暂不支持 `--compile`。共享卡上的耗时
+和比值都可能受干扰。2026-11-21 A800 空闲窗口两批复测：本例优化图普通路径
+1.073～1.098 ms、自动图 0.509～0.536 ms，同轮 torch eager 约 0.583～0.597 ms。
+这只覆盖两层 MLP，不代表其他模型或 torch.compile（完整口径见 DESIGN 5.288）。
+
 A800-SXM4-40GB（CUDA 12.9 / cupy 14.2 / `graph_mode="off"`，单位 ms）：
 
 | 用例 | 端到端 | 设备侧 | 裸 cupy 常驻 |
