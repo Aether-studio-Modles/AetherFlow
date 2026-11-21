@@ -125,12 +125,13 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` ≤ 3.2M 元素时走隐式 GEMM，
   1 GFLOP 以上交给 cuDNN；A800 上 auto 与同形状最优实现差 ≤5%。
   `conv_impl="winograd"`（5.255，F(2x2,3x3)，只做 f32/stride1/dilation1/groups1）
-  把 3x3 宽通道拉到 0.133～0.136 ms（im2col 的 0.51～0.85×、cuDNN 的 1.7～1.9×），
-  对 cuDNN 相对误差约 2e-7；CUDA 的 auto 对 3x3 且 K > 32 选它，HIP 未开。
-  它的瓶颈已不是内核：四次提交 ≈0.045 ms、框架逐节点派发 ≈0.055 ms，GPU 只占
-  0.03～0.07 ms。换到 host 更快的 A800-40GB 上，同一份内核 3x3_c16/c64 是
-  0.103/0.112 ms（cuDNN 0.065/0.081，比值降到 1.6×/1.4×），进一步印证这一段
-  的耗时主要由提交与派发决定；**绝对值随机器变，跨机只比比值**。
+  的融合版与权重驻留（5.256/5.257）把 A800-40GB 上 3x3_c8/c16/c24 的稳态
+  压到 0.029～0.048 ms，为 cuDNN 9 的 0.45～0.75×，对 cuDNN 相对误差约 2e-7；
+  CUDA 的 auto 对 3x3 且 K > 32 选它，HIP 未开。5.260 再把静态 conv 的解析、
+  线程铺法与 launch 参数挪到计划期，单层 c16 的端到端从 0.054 降到 0.027 ms
+  （`benchmarks/overhead_compare.py`）。c32/c64 仍走四段版，为 0.116/0.343 ms
+  （cuDNN 的 1.80×/4.27×），差距是设备侧三段内核 + batched GEMM 的结构问题；
+  **绝对值随机器变，跨机只比比值**。
 - **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
@@ -182,6 +183,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `cudnn_compare.build` 都用 `default_rng(0)`，但前者若先抽权重再抽输入，
   两条路径算的就不是同一份数据，表现为"100% 元素不匹配、最大绝对差 3.35"，
   很容易被误判成算法错误。
+- **计划期展开的快路径必须留同一条回退路径**：5.260 的
+  `_planned_winograd_fused` 只处理"常量权重 + 静态形状 + 连续输入"，形状、
+  dtype 或连续性任一条不符就回落 `_op_conv2d`。只写快路径不写回退，图输入
+  换个形状就会按旧步长读内存；这些前提在计划构建时看不见（取决于运行期
+  数组），所以检查只能放在闭包入口，且必须是原路径而不是另一份近似逻辑。
 
 ---
 
