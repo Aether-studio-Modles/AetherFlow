@@ -112,7 +112,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
   状态与输出常驻显存，但每次判定仍要读一次谓词；实测**不比宿主路径快**，交付的是
   执行形态而非加速。没有 device-side 真分支，`Conditional` / `WhileLoop` 的判定
-  本身仍回主机（DESIGN 5.245 / 5.277）。
+  本身仍回主机（DESIGN 5.245 / 5.277）。**推理解码主路径接不进去**：判定输入是
+  主机采样出的 token、每步还要写回 `ids`，设备端循环的"条件→体"之间没有主机回调位
+  （DESIGN 5.278，负结果）。设备态解码若要做，先做状态常驻（`execute_device`），
+  不要指望条件节点。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
