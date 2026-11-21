@@ -136,6 +136,10 @@ GPU_OPS: FrozenSet[str] = frozenset(
     "concat",
     "embedding",
     "embedding_backward",
+    "gather",
+    "gather_backward",
+    "cross_entropy",
+    "cross_entropy_backward",
     "pad",
     "maxpool2d_backward",
     "conv2d_input_grad",
@@ -165,6 +169,10 @@ GPU_OPS: FrozenSet[str] = frozenset(
 _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "embedding": frozenset({1}),
     "embedding_backward": frozenset({1}),
+    "gather": frozenset({1}),
+    "gather_backward": frozenset({1}),
+    "cross_entropy": frozenset({1}),
+    "cross_entropy_backward": frozenset({1}),
     "dropout_mask": frozenset({1}),
     "sparse_linear": frozenset({1, 3}),
     "sparse_linear_weight_grad": frozenset({1, 3}),
@@ -818,6 +826,10 @@ class DeviceBackend(Executor):
         r.register("concat", self._op_concat)
         r.register("embedding", self._op_embedding)
         r.register("embedding_backward", self._op_embedding_backward)
+        r.register("gather", self._op_gather)
+        r.register("gather_backward", self._op_gather_backward)
+        r.register("cross_entropy", self._op_cross_entropy)
+        r.register("cross_entropy_backward", self._op_cross_entropy_backward)
         r.register("pad", self._op_pad)
         r.register("maxpool2d_backward", self._op_maxpool2d_backward)
         r.register("conv2d_input_grad", self._op_conv2d_input_grad)
@@ -5508,6 +5520,241 @@ class DeviceBackend(Executor):
         )
         self._check_ids(err, "embedding_backward", f"[0, {vocab})")
         return dtable
+
+
+
+    def _gather_dim(self, attrs: dict, rank: int, op: str) -> int:
+        """负轴归一化 + 越界显式报错（与 ``ir/ops.py`` 的 ``_norm_axis`` 一致）。"""
+        raw = attrs.get("dim", -1)
+        dim = int(raw)
+        if dim < 0:
+            dim += rank
+        if not 0 <= dim < rank:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的 dim 越界：得到 {raw}，秩为 {rank}"
+            )
+        return dim
+
+    def _gather_shapes(self, x_shape, idx_shape, dim: int, op: str) -> None:
+        """秩相同、除 dim 外每一维相等——与 IR 的 ``_check_gather_shapes`` 同义。"""
+        if len(x_shape) != len(idx_shape):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的 idx 秩必须与 x 相同"
+                f"（{len(x_shape)}），收到 {len(idx_shape)}"
+            )
+        for d, (a, b) in enumerate(zip(x_shape, idx_shape)):
+            if d != dim and int(a) != int(b):
+                raise BackendCapabilityError(
+                    f"{self._LABEL}的 {op} 要求除 dim={dim} 外每一维相等："
+                    f"第 {d} 维是 {a} 与 {b}"
+                )
+
+    def _op_gather(self, node, args, attrs):
+        """沿任意一维按下标取值；idx / out 视为 ``(outer, idx_dim, inner)``。
+
+        收紧后的形状约束（除 dim 外与 x 相等）让偏移只依赖三个运行期长度，
+        不必把整张 shape 表传进内核。
+        """
+        cp = self.cp
+        x, idx = args
+        if x.ndim < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 gather 需要 x 至少 1 维，收到形状 {tuple(x.shape)}"
+            )
+        dim = self._gather_dim(attrs, x.ndim, "gather")
+        self._gather_shapes(x.shape, idx.shape, dim, "gather")
+        out = cp.empty(tuple(int(d) for d in idx.shape), dtype=x.dtype)
+        total = int(idx.size)
+        if total == 0:
+            return out
+        inner = int(np.prod(x.shape[dim + 1 :])) if dim + 1 < x.ndim else 1
+        idx_dim = int(idx.shape[dim])
+        x_dim = int(x.shape[dim])
+        if x_dim < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 gather 的 dim={dim} 长度为 0（形状 {tuple(x.shape)}）"
+            )
+
+        ids = cp.ascontiguousarray(idx).reshape(-1)
+        dtype_key = self._kind(x)
+        kernel = self._kernel(
+            ("gather", str(idx.dtype), dtype_key),
+            lambda: self.codegen.render(
+                self.codegen.gather_source(idx.dtype), x.dtype
+            ),
+            "gather",
+        )
+        err = cp.zeros(1, dtype=cp.int32)
+        block, grid = self._grid("gather", total)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                self._contig(x),
+                ids,
+                out,
+                np.int64(total),
+                np.int64(inner),
+                np.int64(idx_dim),
+                np.int64(x_dim),
+                err,
+            ),
+        )
+        self._check_ids(err, "gather", f"[0, {x_dim})")
+        return out
+
+    def _op_gather_backward(self, node, args, attrs):
+        """把 dy 散射累加回 x 的被选位置；重复下标必须累加。"""
+        cp = self.cp
+        dy, idx = args
+        shape = tuple(int(d) for d in attrs["x_shape"])
+        dim = self._gather_dim(attrs, len(shape), "gather_backward")
+        if tuple(int(d) for d in dy.shape) != tuple(int(d) for d in idx.shape):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 gather_backward 的 dy 形状必须等于 idx 形状 "
+                f"{tuple(idx.shape)}，收到 {tuple(dy.shape)}"
+            )
+        self._gather_shapes(shape, dy.shape, dim, "gather_backward")
+        dx = cp.zeros(shape, dtype=dy.dtype)
+        total = int(dy.size)
+        if total == 0:
+            return dx
+        inner = int(np.prod(shape[dim + 1 :])) if dim + 1 < len(shape) else 1
+        idx_dim = int(dy.shape[dim])
+        x_dim = shape[dim]
+        if x_dim < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 gather_backward 的 x_shape[{dim}] 为 0（{shape}）"
+            )
+
+        ids = cp.ascontiguousarray(idx).reshape(-1)
+        dtype_key = self._kind(dy)
+        kernel = self._kernel(
+            ("gather_backward", str(idx.dtype), dtype_key),
+            lambda: self.codegen.render(
+                self.codegen.gather_backward_source(idx.dtype), dy.dtype
+            ),
+            "gather_backward",
+        )
+        err = cp.zeros(1, dtype=cp.int32)
+        block, grid = self._grid("gather_backward", total)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                self._contig(dy),
+                ids,
+                dx,
+                np.int64(total),
+                np.int64(inner),
+                np.int64(idx_dim),
+                np.int64(x_dim),
+                err,
+            ),
+        )
+        self._check_ids(err, "gather_backward", f"[0, {x_dim})")
+        return dx
+
+    def _ce_geometry(self, logits, target, op: str):
+        """交叉熵的 ``(rows, vocab)``，并把形状不一致挡在内核之前。"""
+        if logits.ndim < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 需要 logits 至少 1 维，"
+                f"收到形状 {tuple(logits.shape)}"
+            )
+        vocab = int(logits.shape[-1])
+        if vocab < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的词表维必须 >= 1，"
+                f"收到形状 {tuple(logits.shape)}"
+            )
+        rows = int(logits.size) // vocab
+        if int(target.size) != rows:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的 target 元素数应为 {rows}，"
+                f"收到 {int(target.size)}（形状 {tuple(target.shape)}）"
+            )
+        return rows, vocab
+
+    def _op_cross_entropy(self, node, args, attrs):
+        """融合交叉熵：一个 block 一行，两遍扫描求 logsumexp。
+
+        只读 logits 两遍（max 与 exp 和），**不物化** ``(rows, vocab)`` 的
+        概率矩阵。``out`` 是每行损失，形状为 ``logits.shape[:-1]``；训练里
+        再接一个 ``reduce_mean`` 就是标量损失。
+        """
+        cp = self.cp
+        logits, target = args
+        rows, vocab = self._ce_geometry(logits, target, "cross_entropy")
+        out = cp.empty(tuple(int(d) for d in logits.shape[:-1]), dtype=logits.dtype)
+        if rows == 0:
+            return out
+
+        dtype_key = self._kind(logits)
+        kernel = self._kernel(
+            ("cross_entropy", str(target.dtype), dtype_key),
+            lambda: self.codegen.render(
+                self.codegen.cross_entropy_source(target.dtype), logits.dtype
+            ),
+            "cross_entropy",
+        )
+        block = self._reduce_block("cross_entropy", vocab)
+        err = cp.zeros(1, dtype=cp.int32)
+        kernel(
+            (rows,),
+            (block,),
+            (
+                self._contig(logits),
+                cp.ascontiguousarray(target).reshape(-1),
+                out,
+                np.int64(rows),
+                np.int64(vocab),
+                err,
+            ),
+        )
+        self._check_ids(err, "cross_entropy", f"[0, {vocab})")
+        return out
+
+    def _op_cross_entropy_backward(self, node, args, attrs):
+        """``(softmax - onehot) * dloss``：重算行统计，不缓存前向概率。"""
+        cp = self.cp
+        logits, target, dloss = args
+        rows, vocab = self._ce_geometry(logits, target, "cross_entropy_backward")
+        head = tuple(int(d) for d in logits.shape[:-1])
+        if tuple(int(d) for d in dloss.shape) != head:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 cross_entropy_backward 的 dloss 形状应为 {head}，"
+                f"收到 {tuple(dloss.shape)}"
+            )
+        dlogits = cp.empty(tuple(int(d) for d in logits.shape), dtype=logits.dtype)
+        if rows == 0:
+            return dlogits
+
+        dtype_key = self._kind(logits)
+        kernel = self._kernel(
+            ("cross_entropy_backward", str(target.dtype), dtype_key),
+            lambda: self.codegen.render(
+                self.codegen.cross_entropy_backward_source(target.dtype), logits.dtype
+            ),
+            "cross_entropy_backward",
+        )
+        block = self._reduce_block("cross_entropy", vocab)
+        err = cp.zeros(1, dtype=cp.int32)
+        kernel(
+            (rows,),
+            (block,),
+            (
+                self._contig(logits),
+                cp.ascontiguousarray(target).reshape(-1),
+                self._contig(dloss).reshape(-1),
+                dlogits,
+                np.int64(rows),
+                np.int64(vocab),
+                err,
+            ),
+        )
+        self._check_ids(err, "cross_entropy_backward", f"[0, {vocab})")
+        return dlogits
 
     # ------------------------------------------------------------------
     # 卷积 / 池化的反向

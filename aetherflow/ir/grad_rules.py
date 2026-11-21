@@ -1201,6 +1201,44 @@ def _embedding(ctx):
     )
 
 
+@vjp("gather")
+def _gather(ctx):
+    """``gather`` 只对 x 求导：下标是整型，梯度沿被选中的位置散射回去。
+
+    ``x_shape`` 必须静态：反向节点的属性要把每一维写死（与 embedding 的
+    ``table_shape`` 同一条理由），含符号维时直接报"没有定义梯度"，而不是
+    在运行期拿绑定后的形状去拼一个与图不符的属性。
+    """
+    shape = _static(ctx.input(0), "gather")
+    dim = int(ctx.attrs.get("dim", -1))
+    if dim < 0:
+        dim += len(shape)
+    return (
+        ctx.b.add_node(
+            "gather_backward",
+            [ctx.g, ctx.input(1)],
+            {"x_shape": list(shape), "dim": dim},
+        ),
+        None,
+    )
+
+
+@vjp("cross_entropy")
+def _cross_entropy(ctx):
+    """交叉熵对 logits 的梯度是 ``(softmax - onehot) * dloss``。
+
+    专门的反向算子而不是"softmax + 散射 + 逐元素"拼出来的图：拼法要么
+    物化一份与 logits 同大的 softmax，要么走一次 gather_backward 的散射。
+    融合实现两次扫过 logits，中间量只有每行的 max / sum。
+    """
+    return (
+        ctx.b.add_node(
+            "cross_entropy_backward", [ctx.input(0), ctx.input(1), ctx.g]
+        ),
+        None,
+    )
+
+
 @vjp("sparse_linear")
 def _sparse_linear(ctx):
     """事件驱动稀疏线性：``weights`` 与 ``values`` 都有梯度。

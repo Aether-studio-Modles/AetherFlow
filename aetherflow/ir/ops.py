@@ -2763,6 +2763,272 @@ register(
 
 
 # --------------------------------------------------------------------------
+# 任意轴下标取值与交叉熵
+# --------------------------------------------------------------------------
+# ``embedding`` 只沿表的第一维取整行，形状语义固定为
+# ``table.shape[1:]`` 追加在 ids 后面。``gather`` 是它的一般形态：沿任意
+# 一维按下标取值，输出形状等于 idx 的形状（与 ``torch.gather`` 一致）。
+# 交叉熵必须用它取 label 那一格的 logit；拿 embedding 去凑会在
+# ``table=[N, V]``、``ids=[N]`` 时得到 ``[N, N]`` 而不是逐样本收集。
+
+
+def _norm_axis(axis: Any, rank: int, op: str) -> int:
+    """把负轴归一化，并显式拒绝越界。
+
+    不用 ``%``：``dim=-rank-1`` 会被绕回一个合法轴，静默选错方向。
+    """
+    a = int(axis)
+    if a < 0:
+        a += rank
+    if not 0 <= a < rank:
+        raise ValueError(f"{op} 的 dim 越界：得到 {axis}，秩为 {rank}")
+    return a
+
+
+def _check_gather_shapes(
+    x_shape: Sequence[Dim], idx_shape: Sequence[Dim], dim: int, op: str
+) -> None:
+    """gather 系列的形状约束：秩相同，除 dim 外每一维相等。
+
+    这是 ``torch.gather`` 在"idx 各维不超过 x"之上的收紧形态。索引表比
+    目标小的时候，输出里没有对应坐标，语义仍然成立；但参考实现与设备内核
+    都要额外处理"输出与 x 的 outer 不一致"，收益为零。收紧后 ``x`` 与
+    ``idx`` 只差 dim 那一维，内核按 ``(outer, dim, inner)`` 三轴寻址即可。
+    """
+    if len(x_shape) != len(idx_shape):
+        raise ValueError(
+            f"{op} 的 idx 秩必须与 x 相同（{len(x_shape)}），得到 {len(idx_shape)}"
+        )
+    for d, (a, b) in enumerate(zip(x_shape, idx_shape)):
+        if d == dim:
+            continue
+        if a != b:
+            raise ValueError(
+                f"{op} 要求除 dim={dim} 外每一维相等：第 {d} 维是 {a} 与 {b}"
+            )
+
+
+def _infer_gather(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(f"gather 需要 (x, idx) 两个输入，得到 {len(inputs)}")
+    x, idx = inputs
+    if x.rank < 1:
+        raise ValueError(f"gather 的 x 至少是 1 维，得到 {x}")
+    if idx.dtype not in (DType.I32, DType.I8):
+        raise TypeError(f"gather 的 idx 必须是整数下标，得到 {idx.dtype.value}")
+    dim = _norm_axis(attrs.get("dim", -1), x.rank, "gather")
+    _check_gather_shapes(x.shape, idx.shape, dim, "gather")
+    return TensorType(x.dtype, tuple(idx.shape))
+
+
+def _check_gather_ids(idx: np.ndarray, extent: int, op: str) -> np.ndarray:
+    """下标必须落在 ``[0, extent)``。
+
+    与 ``_check_embedding_ids`` 同一条理由：numpy 对负下标会静默回绕，
+    设备端若只做 clamp 就会给出"看起来算完了"的错误结果。这里统一在
+    参考语义里检查，设备端用 err 标量走同一条报错通路。
+    """
+    idx = np.asarray(idx)
+    if idx.size:
+        low, high = int(idx.min()), int(idx.max())
+        if low < 0 or high >= extent:
+            raise ValueError(f"{op} 的下标必须落在 [0, {extent})，得到 [{low}, {high}]")
+    return idx
+
+
+def _ref_gather(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, idx = args
+    dim = _norm_axis(attrs.get("dim", -1), x.ndim, "gather")
+    _check_gather_shapes(x.shape, idx.shape, dim, "gather")
+    _check_gather_ids(idx, int(x.shape[dim]), "gather")
+    return np.take_along_axis(x, idx.astype(np.int64), axis=dim)
+
+
+register(
+    Op(
+        name="gather",
+        infer=_infer_gather,
+        reference=_ref_gather,
+        attrs_schema=("dim",),
+        doc="沿 dim 按下标取值：out[i...] = x[..., idx[i...], ...]；"
+        "输出形状等于 idx，除 dim 外每一维必须与 x 相等（torch.gather 的收紧形态）",
+    )
+)
+
+
+def _infer_gather_backward(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(f"gather_backward 需要 (dy, idx) 两个输入，得到 {len(inputs)}")
+    dy, idx = inputs
+    shape = _as_shape(attrs["x_shape"])
+    if len(shape) < 1:
+        raise ValueError(f"gather_backward 的 x_shape 至少 1 维，得到 {shape}")
+    if idx.dtype not in (DType.I32, DType.I8):
+        raise TypeError(f"gather_backward 的 idx 必须是整数下标，得到 {idx.dtype.value}")
+    dim = _norm_axis(attrs.get("dim", -1), len(shape), "gather_backward")
+    if tuple(dy.shape) != tuple(idx.shape):
+        raise ValueError(
+            f"gather_backward 的 dy 形状必须等于 idx 形状 {idx.shape}，得到 {dy.shape}"
+        )
+    _check_gather_shapes(shape, dy.shape, dim, "gather_backward")
+    return TensorType(dy.dtype, shape)
+
+
+def _ref_gather_backward(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """``gather`` 对 x 的梯度：把 dy 散射累加回被选中的位置。
+
+    重复下标必须累加：上游的同一个坐标可以被多次选中（例如词表里同一行
+    在多处出现），赋值会丢掉除最后一次以外的全部贡献。
+    """
+    dy, idx = args
+    shape = tuple(int(d) for d in attrs["x_shape"])
+    dim = _norm_axis(attrs.get("dim", -1), len(shape), "gather_backward")
+    if tuple(dy.shape) != tuple(idx.shape):
+        raise ValueError(
+            f"gather_backward 的 dy 形状必须等于 idx 形状 {idx.shape}，得到 {dy.shape}"
+        )
+    _check_gather_shapes(shape, dy.shape, dim, "gather_backward")
+    _check_gather_ids(idx, shape[dim], "gather_backward")
+
+    outer = int(np.prod(shape[:dim])) if dim else 1
+    inner = int(np.prod(shape[dim + 1 :])) if dim + 1 < len(shape) else 1
+    idx_dim = int(dy.shape[dim])
+    flat_dy = dy.reshape(outer, idx_dim, inner)
+    flat_idx = idx.astype(np.int64).reshape(outer, idx_dim, inner)
+    dx = np.zeros(shape, dtype=dy.dtype)
+    flat_dx = dx.reshape(outer, shape[dim], inner)
+    o = np.arange(outer)[:, None, None]
+    i = np.arange(inner)[None, None, :]
+    np.add.at(flat_dx, (o, flat_idx, i), flat_dy)
+    return dx
+
+
+register(
+    Op(
+        name="gather_backward",
+        infer=_infer_gather_backward,
+        reference=_ref_gather_backward,
+        attrs_schema=("x_shape", "dim"),
+        doc="gather 对 x 的梯度：dy 与 idx -> dx(x_shape)；重复下标用散射累加",
+    )
+)
+
+
+def _infer_cross_entropy(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(f"cross_entropy 需要 (logits, target) 两个输入，得到 {len(inputs)}")
+    logits, target = inputs
+    if logits.rank < 1:
+        raise ValueError(f"cross_entropy 的 logits 至少是 1 维，得到 {logits}")
+    if not logits.dtype.is_float:
+        raise TypeError(f"cross_entropy 的 logits 必须是浮点，得到 {logits.dtype.value}")
+    if target.dtype not in (DType.I32, DType.I8):
+        raise TypeError(f"cross_entropy 的 target 必须是整数下标，得到 {target.dtype.value}")
+    if tuple(target.shape) != tuple(logits.shape[:-1]):
+        raise ValueError(
+            f"cross_entropy 的 target 形状应为 {logits.shape[:-1]}（去掉词表维），"
+            f"得到 {target.shape}"
+        )
+    vocab = logits.shape[-1]
+    if isinstance(vocab, int) and vocab < 1:
+        raise ValueError(f"cross_entropy 的词表维必须 >= 1，得到 {vocab}")
+    return TensorType(logits.dtype, tuple(logits.shape[:-1]))
+
+
+def _ref_cross_entropy(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """逐行 ``logsumexp(logits) - logits[target]``。
+
+    刻意不物化 softmax：参考实现直接算对数域的和，既与 fused 内核同义，
+    也不会在 ``(B, T, V)`` 上多出一份与 logits 同大的临时量。
+    """
+    logits, target = args
+    vocab = int(logits.shape[-1])
+    idx = _check_gather_ids(target, vocab, "cross_entropy")
+    acc = np.float64 if logits.dtype == np.float64 else np.float32
+    x = logits.astype(acc, copy=False)
+    m = np.max(x, axis=-1, keepdims=True)
+    lse = m[..., 0] + np.log(np.sum(np.exp(x - m), axis=-1))
+    picked = np.take_along_axis(x, idx[..., None].astype(np.int64), axis=-1)[..., 0]
+    return (lse - picked).astype(logits.dtype, copy=False)
+
+
+register(
+    Op(
+        name="cross_entropy",
+        infer=_infer_cross_entropy,
+        reference=_ref_cross_entropy,
+        doc="逐样本交叉熵：logits(..., V) 与 target(...) -> (...)；"
+        "语义是 logsumexp - 目标 logit，不物化 softmax",
+    )
+)
+
+
+def _infer_cross_entropy_backward(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 3:
+        raise ValueError(
+            f"cross_entropy_backward 需要 (logits, target, dloss) 三个输入，得到 {len(inputs)}"
+        )
+    logits, target, dloss = inputs
+    if logits.rank < 1:
+        raise ValueError(f"cross_entropy_backward 的 logits 至少是 1 维，得到 {logits}")
+    if target.dtype not in (DType.I32, DType.I8):
+        raise TypeError(
+            f"cross_entropy_backward 的 target 必须是整数下标，得到 {target.dtype.value}"
+        )
+    head = tuple(logits.shape[:-1])
+    if tuple(target.shape) != head:
+        raise ValueError(
+            f"cross_entropy_backward 的 target 形状应为 {head}，得到 {target.shape}"
+        )
+    if tuple(dloss.shape) != head:
+        raise ValueError(
+            f"cross_entropy_backward 的 dloss 形状应为 {head}，得到 {dloss.shape}"
+        )
+    if dloss.dtype != logits.dtype:
+        raise TypeError(
+            f"cross_entropy_backward 的 dloss 与 logits dtype 必须一致，得到 "
+            f"{dloss.dtype.value} 与 {logits.dtype.value}"
+        )
+    return logits
+
+
+def _ref_cross_entropy_backward(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """``(softmax(logits) - onehot(target)) * dloss``，按样本缩放。"""
+    logits, target, dloss = args
+    vocab = int(logits.shape[-1])
+    idx = _check_gather_ids(target, vocab, "cross_entropy_backward")
+    head = tuple(logits.shape[:-1])
+    if tuple(dloss.shape) != head:
+        raise ValueError(
+            f"cross_entropy_backward 的 dloss 形状应为 {head}，得到 {dloss.shape}"
+        )
+    acc = np.float64 if logits.dtype == np.float64 else np.float32
+    x = logits.astype(acc, copy=False)
+    m = np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x - m)
+    p = e / np.sum(e, axis=-1, keepdims=True)
+    onehot = idx[..., None].astype(np.int64)
+    np.put_along_axis(
+        p, onehot, np.take_along_axis(p, onehot, axis=-1) - 1.0, axis=-1
+    )
+    p *= np.asarray(dloss, dtype=acc)[..., None]
+    return p.astype(logits.dtype, copy=False)
+
+
+register(
+    Op(
+        name="cross_entropy_backward",
+        infer=_infer_cross_entropy_backward,
+        reference=_ref_cross_entropy_backward,
+        doc="cross_entropy 对 logits 的梯度：(softmax - onehot) * dloss；"
+        "dloss 的形状是每样本损失形状（与 target 相同）",
+    )
+)
+
+
+# --------------------------------------------------------------------------
 # 序列扫描（SSM / 线性递归）
 # --------------------------------------------------------------------------
 # 递归 h_t = a_t * h_{t-1} + b_t 无法用逐元素算子展开成固定图（T 会变成节点数），

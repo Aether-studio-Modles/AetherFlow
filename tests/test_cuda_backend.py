@@ -325,6 +325,53 @@ class TestIndexMath(unittest.TestCase):
             flat_out[i][j] = flat_table[flat_ids[i]][j]
         np.testing.assert_allclose(flat_out.reshape(4, 5, 2, 3), table[ids])
 
+    def test_gather_three_axis_offsets(self):
+        """gather 内核的 (outer, idx_dim, inner) 拆分，用非末维验证。"""
+        rng = np.random.default_rng(6)
+        x = rng.standard_normal((3, 6, 4)).astype(np.float32)
+        idx = rng.integers(0, 6, (3, 2, 4), dtype=np.int32)
+        dim = 1
+        idx_dim = 2
+        inner = 4
+        x_dim = 6
+        flat_x = x.reshape(-1)
+        flat_idx = idx.reshape(-1)
+        flat_out = np.empty(flat_idx.size, dtype=np.float32)
+        for p in range(flat_idx.size):
+            i = p % inner
+            t = p // inner
+            o = t // idx_dim
+            v = int(flat_idx[p])
+            flat_out[p] = flat_x[(o * x_dim + v) * inner + i]
+        np.testing.assert_array_equal(
+            flat_out.reshape(3, 2, 4), np.take_along_axis(x, idx.astype(np.int64), axis=dim)
+        )
+
+    def test_gather_backward_scatter_add(self):
+        """重复下标必须累加：内核里是原子加，不是赋值。"""
+        rng = np.random.default_rng(7)
+        dy = rng.standard_normal((3, 2, 4)).astype(np.float32)
+        idx = np.full((3, 2, 4), 1, dtype=np.int32)
+        idx_dim = 2
+        inner = 4
+        x_dim = 6
+        dx = np.zeros((3, 6, 4), dtype=np.float32)
+        flat_dy = dy.reshape(-1)
+        for p in range(flat_dy.size):
+            i = p % inner
+            t = p // inner
+            o = t // idx_dim
+            v = int(idx.reshape(-1)[p])
+            dx.reshape(-1)[(o * x_dim + v) * inner + i] += flat_dy[p]
+        want = np.zeros((3, 6, 4), dtype=np.float32)
+        np.add.at(
+            want,
+            (np.arange(3)[:, None, None], idx.astype(np.int64),
+             np.arange(4)[None, None, :]),
+            dy,
+        )
+        np.testing.assert_allclose(dx, want, rtol=0, atol=0)
+
     def test_avgpool_backward_scatter(self):
         rng = np.random.default_rng(5)
         n, c, h, w = 1, 2, 6, 6
@@ -912,6 +959,101 @@ class TestCudaMatmul(CudaTestCase):
         g.output(g.matmul(a, b), "y")
         with self.assertRaises(BackendCapabilityError):
             self.cuda.execute(g, {"a": self.rand(2, 1, 4, 8), "b": self.rand(2, 3, 8, 6)})
+
+
+class TestCudaGatherCrossEntropy(CudaTestCase):
+    """gather 与 fused cross_entropy 的设备实现对拍参考语义。
+
+    越界下标在宿主侧是 ``ValueError``，设备端统一收成
+    ``BackendCapabilityError``：内核只做 clamp 保证不非法访存，判断与报文
+    留在宿主侧，普通执行与 Graph replay 共用一个出口。
+    """
+
+    def test_gather_last_and_middle_axis(self):
+        for dim, idx_shape, extent in ((-1, (3, 6, 2), 4), (1, (3, 2, 4), 6)):
+            with self.subTest(dim=dim):
+                g = Graph("gather")
+                x = g.input("x", f32[3, 6, 4])
+                idx = g.input("idx", i32[idx_shape])
+                g.output(g.add_node("gather", [x, idx], {"dim": dim}), "y")
+                feed = {
+                    "x": self.rand(3, 6, 4),
+                    "idx": self.rng.integers(0, extent, idx_shape, dtype=np.int32),
+                }
+                self.assert_backends_equal(g, feed)
+
+    def test_gather_int8_ids(self):
+        g = Graph("gather_i8")
+        x = g.input("x", f32[4, 5])
+        idx = g.input("idx", i8[4, 3])
+        g.output(g.add_node("gather", [x, idx], {"dim": -1}), "y")
+        feed = {"x": self.rand(4, 5),
+                "idx": self.rng.integers(0, 5, (4, 3), dtype=np.int8)}
+        self.assert_backends_equal(g, feed)
+
+    def test_gather_rejects_out_of_range_ids(self):
+        g = Graph("gather_oob")
+        x = g.input("x", f32[2, 4])
+        idx = g.input("idx", i32[2, 2])
+        g.output(g.add_node("gather", [x, idx], {"dim": -1}), "y")
+        for bad in ([0, 4], [-1, 2]):
+            with self.subTest(idx=bad):
+                with self.assertRaises(BackendCapabilityError):
+                    self.cuda.execute(g, {
+                        "x": self.rand(2, 4),
+                        "idx": np.asarray([bad], dtype=np.int32),
+                    })
+
+    def test_gather_backward_accumulates_repeated_ids(self):
+        g = Graph("gather_bwd")
+        x = g.input("x", f32[3, 6, 4])
+        idx = g.input("idx", i32[3, 2, 4])
+        g.output(g.add_node("gather", [x, idx], {"dim": 1}), "y")
+        bwd = backward(g, wrt=[x])
+        feed = {
+            "x": self.rand(3, 6, 4),
+            "idx": np.full((3, 2, 4), 1, dtype=np.int32),
+            "dy": self.rand(3, 2, 4),
+        }
+        self.assert_backends_equal(bwd, feed, name="dx")
+
+    def test_cross_entropy_f32_and_f16(self):
+        for dtype, tol in ((f32, 1e-5), (f16, 1e-3)):
+            with self.subTest(dtype=str(dtype)):
+                g = Graph("ce")
+                logits = g.input("logits", dtype[8, 11])
+                target = g.input("target", i32[8])
+                g.output(g.add_node("cross_entropy", [logits, target]), "loss")
+                feed = {
+                    "logits": self.rand(8, 11) * 2.0,
+                    "target": self.rng.integers(0, 11, 8, dtype=np.int32),
+                }
+                self.assert_backends_equal(g, feed, rtol=tol, atol=tol)
+
+    def test_cross_entropy_backward(self):
+        g = Graph("ce_bwd")
+        logits = g.input("logits", f32[6, 13])
+        target = g.input("target", i32[6])
+        dloss = g.input("dloss", f32[6])
+        g.output(
+            g.add_node("cross_entropy_backward", [logits, target, dloss]),
+            "dlogits",
+        )
+        feed = {
+            "logits": self.rand(6, 13) * 2.0,
+            "target": self.rng.integers(0, 13, 6, dtype=np.int32),
+            "dloss": self.rand(6),
+        }
+        self.assert_backends_equal(g, feed, name="dlogits")
+
+    def test_cross_entropy_rejects_out_of_range_target(self):
+        g = Graph("ce_oob")
+        logits = g.input("logits", f32[2, 4])
+        target = g.input("target", i32[2])
+        g.output(g.add_node("cross_entropy", [logits, target]), "loss")
+        with self.assertRaises(BackendCapabilityError):
+            self.cuda.execute(g, {"logits": self.rand(2, 4),
+                                  "target": np.array([4, 0], dtype=np.int32)})
 
 
 class TestCudaBf16(CudaTestCase):

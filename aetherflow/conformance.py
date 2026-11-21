@@ -906,6 +906,83 @@ def _embedding_backward():
     return build
 
 
+def _gather(dim: int = -1):
+    """沿 dim 取下标：idx 的该维长度小于 x，其余维必须相同。"""
+
+    def build(rng):
+        g = Graph("gather")
+        shape = [3, 6, 4]
+        d = dim % len(shape)
+        idx_shape = list(shape)
+        idx_shape[d] = 2
+        x = g.input("x", f32[tuple(shape)])
+        idx = g.input("idx", i32[tuple(idx_shape)])
+        g.output(g.add_node("gather", [x, idx], {"dim": dim}), "y")
+        return g, {
+            "x": _f32(rng, tuple(shape)),
+            # 有意重复：同一位置被选多次是常态（反向必须累加）
+            "idx": rng.integers(0, shape[d], tuple(idx_shape), dtype=np.int32),
+        }
+
+    return build
+
+
+def _gather_backward(dim: int = -1):
+    def build(rng):
+        g = Graph("gather_backward")
+        shape = [3, 6, 4]
+        d = dim % len(shape)
+        idx_shape = list(shape)
+        idx_shape[d] = 2
+        dy = g.input("dy", f32[tuple(idx_shape)])
+        idx = g.input("idx", i32[tuple(idx_shape)])
+        g.output(
+            g.add_node(
+                "gather_backward", [dy, idx], {"x_shape": shape, "dim": dim}
+            ),
+            "y",
+        )
+        return g, {
+            "dy": _f32(rng, tuple(idx_shape)),
+            "idx": rng.integers(0, shape[d], tuple(idx_shape), dtype=np.int32),
+        }
+
+    return build
+
+
+def _cross_entropy(shape: tuple = (3, 5, 7)):
+    def build(rng):
+        g = Graph("cross_entropy")
+        logits = g.input("logits", f32[shape])
+        target = g.input("target", i32[shape[:-1]])
+        g.output(g.add_node("cross_entropy", [logits, target]), "y")
+        return g, {
+            # 放大 logits：让 softmax 真正有区分度，而不是接近均匀分布
+            "logits": _f32(rng, shape, scale=3.0),
+            "target": rng.integers(0, shape[-1], shape[:-1], dtype=np.int32),
+        }
+
+    return build
+
+
+def _cross_entropy_backward(shape: tuple = (3, 5, 7)):
+    def build(rng):
+        g = Graph("cross_entropy_backward")
+        logits = g.input("logits", f32[shape])
+        target = g.input("target", i32[shape[:-1]])
+        dloss = g.input("dloss", f32[shape[:-1]])
+        g.output(
+            g.add_node("cross_entropy_backward", [logits, target, dloss]), "y"
+        )
+        return g, {
+            "logits": _f32(rng, shape, scale=2.0),
+            "target": rng.integers(0, shape[-1], shape[:-1], dtype=np.int32),
+            "dloss": _f32(rng, shape[:-1]),
+        }
+
+    return build
+
+
 def _spike_offsets(steps: int = 4, width: int = 5):
     """稠密脉冲 → 每步起点表（CSR 的前一半）。"""
 
@@ -1354,6 +1431,17 @@ def default_cases() -> List[Case]:
         _case("embedding_backward", _embedding_backward(),
               note="重复下标必须累加：用一个 batch 里同一 token 出现两次来覆盖",
               deterministic=False),
+        _case("gather_last", _gather(),
+              note="沿末维取值：输出形状等于 idx，除 dim 外每一维必须与 x 相等"),
+        _case("gather_dim1", _gather(dim=1),
+              note="非末维：inner > 1，必须按 (outer, dim, inner) 三轴寻址"),
+        _case("gather_backward", _gather_backward(),
+              note="重复下标必须累加，设备端走原子加；顺序不固定",
+              deterministic=False),
+        _case("cross_entropy", _cross_entropy(),
+              note="融合 logsumexp：不物化 (rows, vocab) 的 softmax；越界 target 显式拒绝"),
+        _case("cross_entropy_backward", _cross_entropy_backward(),
+              note="(softmax - onehot) * dloss：重算行统计，不缓存前向概率"),
         # 随机
         _case("dropout_mask", _dropout_mask(),
               note="随机算子也要可对拍：seed 写在 attrs 里，参考后端与 CUDA 用同一套 SplitMix64"),

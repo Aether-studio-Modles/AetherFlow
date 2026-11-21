@@ -524,6 +524,184 @@ class TestEmbedding(unittest.TestCase):
             _analytic_grad(g, feed, ["table"])
 
 
+class TestGather(unittest.TestCase):
+    """沿任意轴按下标取值。
+
+    ``embedding`` 沿表的第一维取**整行**，输出形状是 ``ids.shape + table.shape[1:]``；
+    ``table=[N, V]``、``ids=[N]`` 时它给 ``[N, N]``，不是逐样本收集。交叉熵取
+    label logit 需要的是这里的一般形态。
+    """
+
+    def test_forward_last_axis_matches_take_along_axis(self):
+        g = Graph("gather")
+        x = g.input("x", f64[3, 6, 4])
+        idx = g.input("idx", i32[3, 6, 2])
+        g.output(g.add_node("gather", [x, idx], {"dim": -1}), "y")
+        rng = np.random.default_rng(31)
+        feed = {"x": rng.standard_normal((3, 6, 4)),
+                "idx": rng.integers(0, 4, (3, 6, 2), dtype=np.int32)}
+        got = _run(g, feed)["y"]
+        want = np.take_along_axis(feed["x"], feed["idx"].astype(np.int64), axis=-1)
+        np.testing.assert_array_equal(got, want)
+        self.assertEqual(got.shape, (3, 6, 2))
+
+    def test_forward_middle_axis(self):
+        """非末维：inner > 1，偏移必须按 (outer, dim, inner) 三轴算。"""
+        g = Graph("gather_mid")
+        x = g.input("x", f64[3, 6, 4])
+        idx = g.input("idx", i32[3, 2, 4])
+        g.output(g.add_node("gather", [x, idx], {"dim": 1}), "y")
+        rng = np.random.default_rng(32)
+        feed = {"x": rng.standard_normal((3, 6, 4)),
+                "idx": rng.integers(0, 6, (3, 2, 4), dtype=np.int32)}
+        got = _run(g, feed)["y"]
+        want = np.take_along_axis(feed["x"], feed["idx"].astype(np.int64), axis=1)
+        np.testing.assert_array_equal(got, want)
+        self.assertEqual(got.shape, (3, 2, 4))
+
+    def test_int8_indices(self):
+        from aetherflow import i8
+
+        g = Graph("gather_i8")
+        x = g.input("x", f64[4, 5])
+        idx = g.input("idx", i8[4, 3])
+        g.output(g.add_node("gather", [x, idx], {"dim": -1}), "y")
+        rng = np.random.default_rng(33)
+        feed = {"x": rng.standard_normal((4, 5)),
+                "idx": rng.integers(0, 5, (4, 3), dtype=np.int8)}
+        got = _run(g, feed)["y"]
+        want = np.take_along_axis(feed["x"], feed["idx"].astype(np.int64), axis=-1)
+        np.testing.assert_array_equal(got, want)
+
+    def test_backward_accumulates_repeated_indices(self):
+        g = Graph("gather_bwd")
+        x = g.input("x", f64[3, 6, 4])
+        idx = g.input("idx", i32[3, 2, 4])
+        g.output(g.add_node("gather", [x, idx], {"dim": 1}), "y")
+        rng = np.random.default_rng(34)
+        feed = {"x": rng.standard_normal((3, 6, 4)),
+                "idx": np.array([[[1, 1, 1, 1], [1, 1, 1, 1]]] * 3, dtype=np.int32)}
+
+        dtable, = _analytic_grad(g, feed, ["x"])
+        want = np.zeros((3, 6, 4))
+        np.add.at(
+            want,
+            (np.arange(3)[:, None, None], feed["idx"].astype(np.int64),
+             np.arange(4)[None, None, :]),
+            np.ones((3, 2, 4)),
+        )
+        np.testing.assert_allclose(dtable, want, atol=1e-12)
+        np.testing.assert_allclose(dtable, _numeric_grad(g, feed, "x"), atol=1e-8)
+
+    def test_out_of_range_indices_are_rejected(self):
+        g = Graph("gather_oob")
+        x = g.input("x", f64[2, 4])
+        idx = g.input("idx", i32[2, 2])
+        g.output(g.add_node("gather", [x, idx], {"dim": -1}), "y")
+        for bad in ([0, 4], [-1, 2]):
+            with self.subTest(idx=bad):
+                with self.assertRaises(ValueError):
+                    _run(g, {"x": np.zeros((2, 4)),
+                             "idx": np.asarray([bad], dtype=np.int32)})
+
+    def test_shape_mismatch_is_rejected_at_graph_time(self):
+        """除 dim 外每一维必须相等；不等时不能在构图期默默广播。"""
+        g = Graph("gather_bad")
+        x = g.input("x", f64[3, 6, 4])
+        idx = g.input("idx", i32[3, 6, 2])
+        with self.assertRaises(ValueError):
+            g.add_node("gather", [x, idx], {"dim": 1})
+
+    def test_float_indices_are_rejected(self):
+        g = Graph("gather_bad_idx")
+        x = g.input("x", f64[3, 6])
+        idx = g.input("idx", f64[3, 2])
+        with self.assertRaises(TypeError):
+            g.add_node("gather", [x, idx], {"dim": -1})
+
+
+class TestCrossEntropy(unittest.TestCase):
+    """fused 交叉熵：语义是 ``logsumexp(logits) - logits[target]``。"""
+
+    @staticmethod
+    def _softmax(x):
+        m = np.max(x, axis=-1, keepdims=True)
+        e = np.exp(x - m)
+        return e / np.sum(e, axis=-1, keepdims=True)
+
+    def _graph(self, shape, dtype=f64):
+        g = Graph("ce")
+        logits = g.input("logits", dtype[shape])
+        target = g.input("target", i32[shape[:-1]])
+        g.output(g.add_node("cross_entropy", [logits, target]), "loss")
+        return g
+
+    def test_forward_matches_negative_log_softmax(self):
+        shape = (4, 7)
+        g = self._graph(shape)
+        rng = np.random.default_rng(41)
+        feed = {"logits": rng.standard_normal(shape) * 2.0,
+                "target": rng.integers(0, shape[-1], shape[:-1], dtype=np.int32)}
+        got = _run(g, feed)["loss"]
+        want = -np.log(self._softmax(feed["logits"])[
+            np.arange(shape[0]), feed["target"]])
+        np.testing.assert_allclose(got, want, rtol=1e-12)
+        self.assertEqual(got.shape, (4,))
+
+    def test_forward_is_stable_for_large_logits(self):
+        """1e4 的差值不能变成 inf/nan：这正是逐行减 max 的目的。"""
+        g = self._graph((2, 3))
+        feed = {"logits": np.array([[1e4, 0.0, -1e4], [-1e4, 0.0, 1e4]]),
+                "target": np.array([0, 2], dtype=np.int32)}
+        got = _run(g, feed)["loss"]
+        self.assertTrue(np.all(np.isfinite(got)))
+        np.testing.assert_allclose(got, [0.0, 0.0], atol=1e-12)
+
+    def test_backward_matches_softmax_minus_onehot(self):
+        shape = (3, 5)
+        g = Graph("ce_bwd")
+        logits = g.input("logits", f64[shape])
+        target = g.input("target", i32[shape[:-1]])
+        dloss = g.input("dloss", f64[shape[:-1]])
+        g.output(g.add_node("cross_entropy_backward", [logits, target, dloss]), "dlogits")
+        rng = np.random.default_rng(42)
+        feed = {"logits": rng.standard_normal(shape) * 2.0,
+                "target": rng.integers(0, shape[-1], shape[:-1], dtype=np.int32),
+                "dloss": rng.standard_normal(shape[:-1])}
+        got = _run(g, feed)["dlogits"]
+        onehot = np.zeros(shape)
+        onehot[np.arange(shape[0]), feed["target"]] = 1.0
+        want = (self._softmax(feed["logits"]) - onehot) * feed["dloss"][:, None]
+        np.testing.assert_allclose(got, want, atol=1e-12)
+
+    def test_autodiff_matches_numeric_gradient(self):
+        shape = (3, 4)
+        g = self._graph(shape)
+        rng = np.random.default_rng(43)
+        feed = {"logits": rng.standard_normal(shape) * 2.0,
+                "target": rng.integers(0, shape[-1], shape[:-1], dtype=np.int32)}
+        dlogits, = _analytic_grad(g, feed, ["logits"])
+        np.testing.assert_allclose(dlogits, _numeric_grad(g, feed, "logits"), atol=1e-8)
+        # 每行梯度之和为 0：softmax 的雅可比行和为 0，减去 onehot 后整行和也是 0
+        np.testing.assert_allclose(np.sum(dlogits, axis=-1), 0.0, atol=1e-12)
+
+    def test_out_of_range_target_is_rejected(self):
+        g = self._graph((2, 4))
+        for bad in ([4, 0], [-1, 2]):
+            with self.subTest(target=bad):
+                with self.assertRaises(ValueError):
+                    _run(g, {"logits": np.zeros((2, 4)),
+                             "target": np.asarray(bad, dtype=np.int32)})
+
+    def test_dloss_dtype_mismatch_is_rejected(self):
+        g = Graph("ce_bad_dtype")
+        logits = g.input("logits", f64[2, 3])
+        target = g.input("target", i32[2])
+        dloss = g.input("dloss", f32[2])
+        with self.assertRaises(TypeError):
+            g.add_node("cross_entropy_backward", [logits, target, dloss])
+
+
 class TestDivisionSemantics(unittest.TestCase):
     """除零的两种语义必须分开：浮点按 IEEE，整数显式拒绝。"""
 

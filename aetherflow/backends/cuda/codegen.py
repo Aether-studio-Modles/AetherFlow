@@ -1678,6 +1678,142 @@ extern "C" __global__ void embedding_backward(const %T%* __restrict__ dy,
 )
 
 
+# gather: out[p] = x[(o * x_dim + v) * inner + i]. idx / out are viewed as
+# (outer, idx_dim, inner) and x as (outer, x_dim, inner) -- the IR requires
+# the same rank and equal non-dim extents, so this three-axis form is exact.
+# Out-of-range ids are flagged in *err instead of being wrapped; the clamp to
+# 0 only prevents an illegal access on the way to the host-side error.
+# NOTE: NVRTC requires ASCII source -- keep every comment in this file ASCII.
+_GATHER_TMPL = (
+    PRELUDE
+    + r"""
+extern "C" __global__ void gather(const %T%* __restrict__ x,
+                                  const %IDS_T%* __restrict__ idx,
+                                  %T%* __restrict__ out,
+                                  long long total, long long inner,
+                                  long long idx_dim, long long x_dim,
+                                  int* __restrict__ err) {
+    const long long step = (long long)gridDim.x * blockDim.x;
+    for (long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         p < total; p += step) {
+        const long long i = p % inner;
+        const long long t = p / inner;
+        const long long o = t / idx_dim;
+        long long v = (long long)idx[p];
+        if (v < 0 || v >= x_dim) { *err = 1; v = 0; }
+        out[p] = x[(o * x_dim + v) * inner + i];
+    }
+}
+"""
+)
+
+# gather backward: scatter-add dy[p] to the selected slot of x. Repeated ids
+# are expected (the same row can be selected many times), so the add is
+# atomic; a plain store would keep only the last contribution.
+_GATHER_BACKWARD_TMPL = (
+    PRELUDE
+    + r"""
+extern "C" __global__ void gather_backward(const %T%* __restrict__ dy,
+                                           const %IDS_T%* __restrict__ idx,
+                                           %T%* __restrict__ dx,
+                                           long long total, long long inner,
+                                           long long idx_dim, long long x_dim,
+                                           int* __restrict__ err) {
+    const long long step = (long long)gridDim.x * blockDim.x;
+    for (long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         p < total; p += step) {
+        const long long i = p % inner;
+        const long long t = p / inner;
+        const long long o = t / idx_dim;
+        long long v = (long long)idx[p];
+        if (v < 0 || v >= x_dim) { *err = 1; continue; }
+        %ATOMIC%(&dx[(o * x_dim + v) * inner + i], %LD%(dy[p]));
+    }
+}
+"""
+)
+
+# cross_entropy: one block per row, two block-wide reductions (max, then
+# exp-sum). The softmax probabilities are never materialised: only the row
+# statistics and the single target logit are touched, which is the whole
+# point of fusing when V is 32k and there are B*T rows.
+# Shared scratch is REDUCE_SCRATCH (1024 floats), matching the block cap.
+_CROSS_ENTROPY_TMPL = (
+    PRELUDE
+    + r"""
+extern "C" __global__ void cross_entropy(const %T%* __restrict__ logits,
+                                         const %IDS_T%* __restrict__ target,
+                                         %T%* __restrict__ out,
+                                         long long rows, long long vocab,
+                                         int* __restrict__ err) {
+    __shared__ float smem[1024];
+    const long long row = (long long)blockIdx.x;
+    if (row >= rows) { return; }
+    const %T%* xr = logits + row * vocab;
+    float m = -3.4e38f;
+    for (long long j = threadIdx.x; j < vocab; j += blockDim.x) {
+        const float v = %LD%(xr[j]);
+        m = v > m ? v : m;
+    }
+    m = block_reduce_max(m, smem);
+    float s = 0.f;
+    for (long long j = threadIdx.x; j < vocab; j += blockDim.x) {
+        s += expf(%LD%(xr[j]) - m);
+    }
+    s = block_reduce_sum(s, smem);
+    if (threadIdx.x == 0) {
+        long long t = (long long)target[row];
+        if (t < 0 || t >= vocab) { *err = 1; t = 0; }
+        out[row] = %ST%(m + logf(s) - %LD%(xr[t]));
+    }
+}
+"""
+)
+
+# cross_entropy backward: (softmax - onehot) * dloss, computed row by row.
+# It re-derives the row statistics instead of caching probabilities from the
+# forward pass: caching would need a [rows, vocab] buffer, exactly the
+# materialisation the fused forward avoids.
+_CROSS_ENTROPY_BACKWARD_TMPL = (
+    PRELUDE
+    + r"""
+extern "C" __global__ void cross_entropy_backward(
+    const %T%* __restrict__ logits,
+    const %IDS_T%* __restrict__ target,
+    const %T%* __restrict__ dloss,
+    %T%* __restrict__ dlogits,
+    long long rows, long long vocab,
+    int* __restrict__ err) {
+    __shared__ float smem[1024];
+    const long long row = (long long)blockIdx.x;
+    if (row >= rows) { return; }
+    const %T%* xr = logits + row * vocab;
+    %T%* dr = dlogits + row * vocab;
+    float m = -3.4e38f;
+    for (long long j = threadIdx.x; j < vocab; j += blockDim.x) {
+        const float v = %LD%(xr[j]);
+        m = v > m ? v : m;
+    }
+    m = block_reduce_max(m, smem);
+    float s = 0.f;
+    for (long long j = threadIdx.x; j < vocab; j += blockDim.x) {
+        s += expf(%LD%(xr[j]) - m);
+    }
+    s = block_reduce_sum(s, smem);
+    const float inv = 1.f / s;
+    const float g = %LD%(dloss[row]);
+    long long t = (long long)target[row];
+    if (t < 0 || t >= vocab) { *err = 1; t = 0; }
+    for (long long j = threadIdx.x; j < vocab; j += blockDim.x) {
+        float p = expf(%LD%(xr[j]) - m) * inv;
+        if (j == t) { p -= 1.f; }
+        dr[j] = %ST%(p * g);
+    }
+}
+"""
+)
+
+
 # scan_linear: h_t = a_t * h_{t-1} + b_t, h_{-1} = h0.
 # One thread owns one tail element and walks the time axis in order. The
 # recurrence is inherently sequential, so the parallelism comes from the tail
@@ -1757,6 +1893,32 @@ def embedding_backward_source(ids_dtype) -> str:
     if name not in _IDS_C_TYPE:
         raise ValueError(f"embedding_backward 的 ids 只支持 int32/int8，收到 {ids_dtype}")
     return _EMBEDDING_BACKWARD_TMPL.replace("%IDS_T%", _IDS_C_TYPE[name])
+
+
+def _ids_template(template: str, ids_dtype, op: str) -> str:
+    """把 ``%IDS_T%`` 换成真实的 C 类型；只接受 IR 允许的两种下标类型。"""
+    name = str(ids_dtype)
+    if name not in _IDS_C_TYPE:
+        raise ValueError(f"{op} 的 idx 只支持 int32/int8，收到 {ids_dtype}")
+    return template.replace("%IDS_T%", _IDS_C_TYPE[name])
+
+
+def gather_source(ids_dtype) -> str:
+    return _ids_template(_GATHER_TMPL, ids_dtype, "gather")
+
+
+def gather_backward_source(ids_dtype) -> str:
+    return _ids_template(_GATHER_BACKWARD_TMPL, ids_dtype, "gather_backward")
+
+
+def cross_entropy_source(ids_dtype) -> str:
+    return _ids_template(_CROSS_ENTROPY_TMPL, ids_dtype, "cross_entropy")
+
+
+def cross_entropy_backward_source(ids_dtype) -> str:
+    return _ids_template(
+        _CROSS_ENTROPY_BACKWARD_TMPL, ids_dtype, "cross_entropy_backward"
+    )
 
 
 def binary_template(kind: str, scalar_a: bool = False, scalar_b: bool = False) -> str:
