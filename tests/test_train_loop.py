@@ -560,6 +560,52 @@ class TestTrainingStateAndSnapshot(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             trainer.verify_device_state()
 
+    def test_step_async_matches_step_bitwise(self):
+        """``step_async`` 只推迟损失的取用，不改变任何数值。"""
+        x, t = _data(n=8)
+
+        def run(async_):
+            g = _graph(batch=8)
+            store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+            trainer = _FakeDeviceTrainer(
+                g,
+                store,
+                SGD(store.arrays(), lr=0.1),
+                backend=_FakeDeviceBackend(),
+                device_state=True,
+            )
+            losses = []
+            for _ in range(3):
+                if async_:
+                    losses.append(trainer.step_async({"x": x, "t": t}).value())
+                else:
+                    losses.append(trainer.step({"x": x, "t": t}))
+            trainer.sync_to_host()
+            return np.array(losses), {name: store[name].copy() for name in store.names}
+
+        want_loss, want_params = run(False)
+        got_loss, got_params = run(True)
+        np.testing.assert_array_equal(got_loss, want_loss)
+        for name in want_params:
+            np.testing.assert_array_equal(got_params[name], want_params[name])
+
+    def test_step_async_handle_can_be_read_twice(self):
+        """句柄的 ``value()`` 只同步一次，重复读拿到同一份结果。"""
+        x, t = _data(n=8)
+        g = _graph(batch=8)
+        store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
+        trainer = _FakeDeviceTrainer(
+            g,
+            store,
+            SGD(store.arrays(), lr=0.1),
+            backend=_FakeDeviceBackend(),
+            device_state=True,
+        )
+        handle = trainer.step_async({"x": x, "t": t})
+        first = handle.value()
+        self.assertEqual(float(handle), float(first))
+        self.assertIs(handle.value(), first)
+
     def test_snapshot_does_not_alias_live_parameters(self):
         x, t = _data(n=8)
         trainer, store = self._trainer()

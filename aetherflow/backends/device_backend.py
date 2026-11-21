@@ -958,14 +958,27 @@ class DeviceBackend(Executor):
             self._alias_view(src)
         return out
 
-
-
     def to_host(self, value: Any) -> np.ndarray:
         """回到主机：bf16 的 ``uint16`` 容器解包成 f32 载体（与 IR 的载体一致）。"""
         if isinstance(value, self.cp.ndarray) and value.dtype == self.cp.uint16:
             return unpack_bf16(self.cp.asnumpy(value))
         return self.cp.asnumpy(value)
 
+    def to_host_async(self, value: Any, stream: Any = None):
+        """pinned 异步 D2H；后端给不出异步路径时退回同步。
+
+        解包 bf16（``uint16`` 容器）必须在主机侧做，所以那一类永远走同步：
+        设备端没有"解包成 f32"的拷贝，硬塞进异步只会读到还没转换的位模式。
+        """
+        if isinstance(value, self.cp.ndarray) and value.dtype != self.cp.uint16:
+            handle = self._host_copy(value, stream)
+            if handle is not None:
+                return handle
+        return super().to_host_async(value, stream)
+
+    def _host_copy(self, value: Any, stream: Any) -> Any:
+        """后端自定义的 pinned D2H；返回 ``None`` 表示只能同步拷。"""
+        return None
 
     # ------------------------------------------------------------------
     # 设备驻留

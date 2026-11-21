@@ -25,6 +25,30 @@ class ShapeMismatchError(ValueError):
     pass
 
 
+class _HostCopy:
+    """一次 D2H 的句柄：``value()`` 等待它落盘，重复调用只等一次。
+
+    只在**支持 pinned 异步拷贝**的后端上有等待成本；同步后端构造时就没有
+    事件，取值是零开销的。放在执行器这一层，是为了让"发起拷贝"与"取用值"
+    可以隔着一段计算——训练循环里损失的 D2H 就排在前向与反向之间。
+    """
+
+    __slots__ = ("_view", "_event")
+
+    def __init__(self, view: Any, event: Any = None) -> None:
+        self._view = view
+        self._event = event
+
+    def value(self) -> Any:
+        if self._event is not None:
+            self._event.synchronize()
+            self._event = None
+        return self._view
+
+    def __float__(self) -> float:
+        return float(self.value())
+
+
 # ``_GroupPlan.fast`` 的"已确认不能直连"标记。用空元组而不是 ``None``：
 # ``None`` 表示"还没试过"，第一次执行时才决定，整份计划因此不需要额外的标志位。
 _NO_FAST: Tuple = ()
@@ -212,6 +236,18 @@ class Executor:
 
     def to_host(self, value: Any) -> Any:
         return value
+
+    def to_host_async(self, value: Any, stream: Any = None) -> "_HostCopy":
+        """把值排进 ``stream`` 的 D2H，**不等它完成**，返回一个句柄。
+
+        默认实现是同步的：没有原生异步拷贝的后端（numpy、HIP 的普通页内存）
+        直接拷完再包装，句柄的 ``value()`` 立刻返回。调用方因此可以统一写成
+        "发起 → 继续排计算 → 最后取值"，在支持异步的后端上才真正重叠。
+
+        ``stream`` 必须是**这项计算实际所在的流**：replay 排在自定义流上、
+        拷贝却排在默认流上，两者之间没有顺序保证，读到的是未写完的缓冲。
+        """
+        return _HostCopy(self.to_host(value))
 
     def dispose(self, value: Any) -> None:
         """告诉后端某个中间值已经不会再被读取。默认什么都不做。

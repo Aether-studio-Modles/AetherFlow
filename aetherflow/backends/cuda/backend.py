@@ -17,6 +17,7 @@ import numpy as np
 
 from ...ir.graph import Node
 from ...lower.plan import CONV_CUDNN_MIN_GFLOPS
+from ...runtime.executor import _HostCopy
 from ..base import BackendCapabilityError
 from ..contracts import DeviceInfo
 from ..device_backend import DeviceBackend, GPU_OPS
@@ -198,6 +199,36 @@ class CudaBackend(DeviceBackend):
             self._pinned[ident] = view
         np.copyto(view, arr, casting="unsafe")
         return view
+
+    def _host_copy(self, value: Any, stream: Any) -> Any:
+        """pinned 缓冲上的异步 D2H，不等拷贝完成。
+
+        D2H 只有落在 pinned 内存上才是真异步：普通页内存要求驱动在拷贝期间
+        锁页，主机线程会一直等到传输结束。这里每次分配一块（张量小、cupy 的
+        pinned 分配器有缓存），``dest[...] = value`` 在**指定流**上排队，
+        句柄里记一个事件，``value()`` 才同步。
+
+        必须用调用方给的流：replay 排在自定义流上时，默认流上的拷贝与它之间
+        没有任何顺序保证，读到的会是上一轮的内容。
+        """
+        cp = self.cp
+        if not isinstance(value, cp.ndarray):
+            return None
+        nbytes = max(int(value.nbytes), 1)
+        host = cp.cuda.alloc_pinned_memory(nbytes)
+        view = np.frombuffer(host, dtype=value.dtype, count=value.size).reshape(
+            value.shape
+        )
+        target = cp.cuda.get_current_stream() if stream is None else stream
+        # 直接调 runtime 的 memcpyAsync，而不是 ``dest[...] = value``：pinned
+        # 指针不能塞进 ``cp.ndarray``（``alloc_pinned_memory`` 给的是
+        # PinnedMemoryPointer，``ndarray`` 只收 MemoryPointer），而这次拷贝
+        # 本来也不需要数组语义——只要"源地址、目标地址、字节数、流"。
+        cp.cuda.runtime.memcpyAsync(
+            int(host.ptr), int(value.data.ptr), nbytes,
+            cp.cuda.runtime.memcpyDeviceToHost, int(target.ptr),
+        )
+        return _HostCopy(view, target.record())
 
     def dispose(self, value: Any) -> None:
         """把中间值的地址立刻还给 arena（只在捕获期有效）。

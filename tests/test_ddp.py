@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -471,6 +472,103 @@ def _norm(grads):
     return float(
         np.sqrt(sum(float(np.sum(np.asarray(value) ** 2)) for value in grads.values()))
     )
+
+
+class _CountingCollective:
+    """包一层 collective：统计调用次数与同时进行的峰值，可选注入网络延迟。"""
+
+    def __init__(self, inner, delay=0.0):
+        self.inner = inner
+        self.delay = delay
+        self.rank = inner.rank
+        self.world_size = inner.world_size
+        self.calls = 0
+        self.active = 0
+        self.peak = 0
+        self._lock = threading.Lock()
+
+    def all_reduce(self, array, *, op="sum"):
+        with self._lock:
+            self.calls += 1
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            return self.inner.all_reduce(array, op=op)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def _many_param_graph(count=6, batch=4):
+    """``count`` 个同形参数依次相加：足够多的张量才看得出拼桶的效果。"""
+    g = Graph("buckets")
+    x = g.input("x", f32[batch, 4])
+    target = g.input("target", f32[batch, 4])
+    y = x
+    for i in range(count):
+        y = g.add(y, g.input(f"p{i}", f32[4, 4]))
+    g.output(mse(g, y, target), "loss")
+    return g
+
+
+class TestGradientBuckets(unittest.TestCase):
+    """拼桶：调用次数下降、数值逐位不变、桶之间并发提交。"""
+
+    count = 6
+
+    def _build(self, bucket_bytes, threads=1, delay=0.0):
+        graph = _many_param_graph(self.count)
+        store = ParameterStore(
+            {
+                f"p{i}": np.full((4, 4), 0.1 * (i + 1), np.float32)
+                for i in range(self.count)
+            }
+        )
+        trainer = Trainer(graph, store, SGD(store.arrays(), lr=0.1))
+        collective = _CountingCollective(
+            LoopbackWorld(1).collective(0), delay=delay
+        )
+        ddp = DistributedDataParallel(
+            trainer, collective, bucket_bytes=bucket_bytes, threads=threads
+        )
+        rng = np.random.default_rng(7)
+        batch = {
+            "x": rng.standard_normal((4, 4)).astype(np.float32),
+            "target": rng.standard_normal((4, 4)).astype(np.float32),
+        }
+        return store, collective, ddp, batch
+
+    def test_bucketing_cuts_collective_calls(self):
+        # 每个参数 4×4 f32 = 64 B，128 B 的桶正好装两个 → 6 个参数 3 次调用；
+        # 再加损失跨 rank 取均值的那一次，共 4 次。
+        store, collective, ddp, batch = self._build(bucket_bytes=128)
+        ddp.step(batch)
+        self.assertEqual(collective.calls, 4)
+
+    def test_zero_bucket_keeps_one_call_per_tensor(self):
+        store, collective, ddp, batch = self._build(bucket_bytes=0)
+        ddp.step(batch)
+        self.assertEqual(collective.calls, self.count + 1)
+
+    def test_bucketed_result_is_bitwise_identical(self):
+        _, _, one_by_one, batch = self._build(bucket_bytes=0)
+        _, _, bucketed, _ = self._build(bucket_bytes=128)
+        one_by_one.step(batch)
+        bucketed.step(batch)
+        for name in one_by_one.trainer.store.names:
+            np.testing.assert_array_equal(
+                bucketed.trainer.store[name], one_by_one.trainer.store[name]
+            )
+
+    def test_buckets_are_submitted_concurrently(self):
+        """带 20 ms 延迟的桶：三个桶并发提交，峰值必须 > 1。"""
+        _, collective, ddp, batch = self._build(
+            bucket_bytes=128, threads=3, delay=0.02
+        )
+        ddp.step(batch)
+        self.assertGreaterEqual(collective.peak, 2)
 
 
 class TestLaunch(unittest.TestCase):

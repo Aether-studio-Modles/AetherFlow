@@ -45,6 +45,7 @@ D2H 的字节数从"每卡一份整梯度"降到"一份整梯度"。
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -68,9 +69,15 @@ __all__ = [
     "DeviceCollectiveUnavailable",
     "DataParallelTrainer",
     "DistributedDataParallel",
+    "DEFAULT_BUCKET_BYTES",
 ]
 
 _REDUCTIONS = ("mean", "sum")
+
+#: 梯度桶上限（字节）。与 PyTorch DDP 同量级：桶越大，集合调用次数越少，
+#: 但拼接临时量与"等最慢的桶"的尾部也越大。25 MB 在 100G 网卡上是几十微秒
+#: 的传输，足够把每次调用的固定开销摊薄。
+DEFAULT_BUCKET_BYTES = 25 << 20
 
 
 #: 设备侧归约契约：``provider(per_device, target_device, reduction=...)``。
@@ -625,6 +632,8 @@ class DistributedDataParallel:
         collective: Any,
         *,
         reduction: str = "mean",
+        bucket_bytes: int = DEFAULT_BUCKET_BYTES,
+        threads: int = 2,
     ) -> None:
         if not isinstance(trainer, Trainer):
             raise TypeError(f"trainer 必须是 Trainer，得到 {type(trainer).__name__}")
@@ -649,6 +658,14 @@ class DistributedDataParallel:
             raise ValueError(
                 f"reduction 必须是 {_REDUCTIONS} 之一，收到 {reduction!r}"
             )
+        for label, value, low in (
+            ("bucket_bytes", bucket_bytes, 0),
+            ("threads", threads, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{label} 必须是 int，收到 {value!r}")
+            if value < low:
+                raise ValueError(f"{label} 必须 >= {low}，收到 {value}")
         if trainer.rng_rank != rank or trainer.rng_world_size != world:
             raise ValueError(
                 f"Trainer 的随机流是 rng_rank={trainer.rng_rank}/"
@@ -676,6 +693,9 @@ class DistributedDataParallel:
         self.trainer = trainer
         self.collective = collective
         self.reduction = reduction
+        # 0 表示不拼桶（逐参数归约，5.269 之前的行为）。
+        self.bucket_bytes = bucket_bytes
+        self.threads = threads
         self.steps = 0
         self._shapes = trainer.data_input_shapes()
         self._user_hook = trainer.grad_hook
@@ -699,8 +719,17 @@ class DistributedDataParallel:
 
         返回 ``None`` 的语义由用户钩子决定；但**各 rank 必须在同一步一起
         返回 ``None``**，否则一方更新、另一方不更新，下一步的参数就分叉了。
+
+        **拼桶**：逐个张量调用集合通信时，每次的固定开销（建消息、握手、
+        排队）与张量大小无关；几百个参数的模型光这一项就是几毫秒。这里把
+        相邻张量按 ``bucket_bytes`` 拼成一整块，调用次数从"参数个数"降到
+        "桶数"。每个元素仍只参与一次求和，数值与逐参数归约逐位相同。
+
+        **并发提交**：桶与桶之间没有依赖，交给线程池并发提交——拼下一个桶
+        的主机时间与上一桶的传输重叠。前提是集合通信在等待网络时释放 GIL
+        （socket / MPI 都是），否则线程只会轮流跑，不会更快。
         """
-        reduced: Dict[str, np.ndarray] = {}
+        arrays: Dict[str, np.ndarray] = {}
         for name, value in grads.items():
             array = np.asarray(value)
             if not np.issubdtype(array.dtype, np.floating):
@@ -708,9 +737,71 @@ class DistributedDataParallel:
                     f"梯度 {name!r} 的 dtype 是 {array.dtype}，"
                     "集合通信只接受浮点"
                 )
-            total = np.asarray(
-                self.collective.all_reduce(array, op="sum")
-            )
+            arrays[name] = array
+
+        plans = self._bucket_plan(arrays)
+        if self.threads <= 1 or len(plans) <= 1:
+            parts = [self._reduce_bucket(names, arrays) for names in plans]
+        else:
+            workers = min(self.threads, len(plans))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(self._reduce_bucket, names, arrays)
+                    for names in plans
+                ]
+                parts = [future.result() for future in futures]
+
+        merged: Dict[str, np.ndarray] = {}
+        for part in parts:
+            merged.update(part)
+        reduced: Dict[str, np.ndarray] = {}
+        for name, array in arrays.items():
+            total = merged[name]
+            if self.reduction == "mean":
+                # 显式 astype：`f4 / int` 在 NEP 50 下仍是 f4，但别依赖版本行为。
+                total = (total / self.world_size).astype(array.dtype, copy=False)
+            reduced[name] = total
+        if self._user_hook is None:
+            return reduced
+        return self._user_hook(reduced)
+
+    def _bucket_plan(self, arrays: Mapping[str, np.ndarray]) -> List[List[str]]:
+        """按 ``bucket_bytes`` 与 dtype 切桶，顺序沿用 ``grads`` 的顺序。
+
+        超过上限的单张量自己独占一桶——它拼不进任何别的桶，切块归约会把
+        一次传输变成多次，反而多付启动开销。
+        """
+        if not self.bucket_bytes:
+            return [[name] for name in arrays]
+        plans: List[List[str]] = []
+        current: List[str] = []
+        size = 0
+        dtype = None
+        for name, array in arrays.items():
+            nbytes = int(array.nbytes)
+            if current and (
+                array.dtype != dtype or size + nbytes > self.bucket_bytes
+            ):
+                plans.append(current)
+                current, size = [], 0
+            current.append(name)
+            dtype = array.dtype
+            size += nbytes
+            if nbytes >= self.bucket_bytes:
+                plans.append(current)
+                current, size, dtype = [], 0, None
+        if current:
+            plans.append(current)
+        return plans
+
+    def _reduce_bucket(
+        self, names: Sequence[str], arrays: Mapping[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
+        """归约一个桶：单张量原样传，多张量拼成一块只传一次。"""
+        if len(names) == 1:
+            name = names[0]
+            array = arrays[name]
+            total = np.asarray(self.collective.all_reduce(array, op="sum"))
             if total.shape != array.shape:
                 raise ValueError(
                     f"归约后的 {name!r} 形状是 {total.shape}，"
@@ -721,13 +812,25 @@ class DistributedDataParallel:
                     f"归约后的 {name!r} dtype 是 {total.dtype}，"
                     f"本 rank 的梯度是 {array.dtype}"
                 )
-            if self.reduction == "mean":
-                # 显式 astype：`f4 / int` 在 NEP 50 下仍是 f4，但别依赖版本行为。
-                total = (total / self.world_size).astype(array.dtype, copy=False)
-            reduced[name] = total
-        if self._user_hook is None:
-            return reduced
-        return self._user_hook(reduced)
+            return {name: total}
+
+        flat = np.concatenate([arrays[name].ravel() for name in names])
+        total = np.asarray(self.collective.all_reduce(flat, op="sum"))
+        if total.shape != flat.shape:
+            raise ValueError(
+                f"归约后的桶形状是 {total.shape}，本 rank 的桶是 {flat.shape}"
+            )
+        if total.dtype != flat.dtype:
+            raise TypeError(
+                f"归约后的桶 dtype 是 {total.dtype}，本 rank 的桶是 {flat.dtype}"
+            )
+        out: Dict[str, np.ndarray] = {}
+        offset = 0
+        for name in names:
+            array = arrays[name]
+            out[name] = total[offset:offset + array.size].reshape(array.shape)
+            offset += array.size
+        return out
 
     def step(
         self,

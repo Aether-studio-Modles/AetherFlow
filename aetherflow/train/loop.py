@@ -28,6 +28,7 @@ from ..ir.serialize import dumps as _serialize_dumps
 from ..ir.shape_contract import require_static_shapes
 from ..passes.autocast import Autocast
 from ..runtime.bf16 import pack_bf16, unpack_bf16
+from ..runtime.executor import _HostCopy
 from ._arrays import array_module
 from .amp import GradScaler
 from .bn import RunningStats, bn_sites, build_stats_graph
@@ -529,7 +530,7 @@ class Trainer:
         即逐个微批等权，与没有累积时的语义一致。
         """
         if self.device_state:
-            return self._step_device(batch, weight=weight)
+            return float(self._step_device(batch, weight=weight))
         feed = self._feed(batch)
         borrow = (
             (lambda segment: self._borrowed_params(feed, segment))
@@ -569,6 +570,37 @@ class Trainer:
             # 更新只落在分片里，``store`` 里那份借出的完整副本已经旧了。
             self._host_stale = True
         return float(out)
+
+    def step_async(
+        self,
+        batch: Optional[Mapping[str, np.ndarray]] = None,
+        *,
+        weight: Optional[float] = None,
+    ) -> _HostCopy:
+        """发起一步，立刻返回损失句柄；``handle.value()`` 才同步。
+
+        与 :meth:`step` 的区别只在**损失的 D2H 什么时候等**。设备态下这一步
+        的损失拷贝排在前向与反向之间：反向不读损失值（种子是常量 1 或当前
+        scale），所以拷贝一排队，反向的 replay 就可以跟着排，主机不必停在
+        那里等一次完整的传输。连续调用 ``step_async`` 时，每步那一次同步都
+        被推到调用方真正需要损失的时刻。
+
+        主机态没有设备拷贝，返回的句柄是"已经完成"的，语义与 ``step`` 相同。
+        """
+        if not self.device_state:
+            return _HostCopy(self.step(batch, weight=weight))
+        return self._step_device(batch, weight=weight)
+
+    def _host_async(self, value: Any, stream: Any = None) -> _HostCopy:
+        """损失的 D2H 句柄；后端没有异步面时退回同步拷贝。
+
+        ``to_host_async`` 不是后端契约的一部分（5.271）：第三方后端只要给出
+        ``to_host`` 就能训练，异步只是本家 CUDA 后端的优化，不实现也不会错。
+        """
+        fn = getattr(self.backend, "to_host_async", None)
+        if fn is None:
+            return _HostCopy(self.backend.to_host(value))
+        return fn(value, stream)
 
     def _to_resident(self, value: np.ndarray) -> np.ndarray:
         """f32 主副本 -> 低精度驻留缓冲（f16 容器或 bf16 位模式）。"""
@@ -814,7 +846,7 @@ class Trainer:
         self,
         batch: Optional[Mapping[str, np.ndarray]],
         weight: Optional[float] = None,
-    ) -> float:
+    ) -> _HostCopy:
         """参数留在显存的一步。整图与分段两种形态走同一条入口。"""
         feed = self.store.feed(dict(batch) if batch is not None else None)
         data = {
@@ -835,18 +867,19 @@ class Trainer:
 
     def _step_device_whole(
         self, data: Mapping[str, np.ndarray], weight: Optional[float] = None
-    ) -> float:
+    ) -> _HostCopy:
         """整图版：数据上拷一次、前向与反向各 replay 一次。
 
         全过程只有损失标量一次 D2H；梯度是显存里的图输出，直接进优化器。
+        这次 D2H 用异步句柄：反向 replay 不读损失，排完拷贝就可以继续排，
+        主机等它是在 ``step`` 取 ``float`` 的那一刻。
         """
         self._prepare_device(data)
-        backend = self.backend
 
         # 本批数据在这里（且只在这里）从主机拷进静态缓冲；host -> device 的
         # 拷贝由 replay 负责，所以直接传 host 数组即可。
         outs = self._fwd_plan.run_device({**data, **self._dev_params})
-        loss = float(backend.to_host(outs[self.output]))
+        loss = self._host_async(outs[self.output])
 
         # 反向图读的是前向刚写好的那批数据缓冲，不必再拷一遍。
         seeds = {**self._dev_data, **self._dev_params, **self._dev_seeds}
@@ -902,14 +935,13 @@ class Trainer:
 
     def _step_device_segments(
         self, data: Mapping[str, np.ndarray], weight: Optional[float] = None
-    ) -> float:
+    ) -> _HostCopy:
         """分段版：每段各有一张前向图与一张反向图，全部共享同一条流。
 
         显存省法不变（只留边界值），但边界与 cotangent 都在显存里，段间不再
         经过主机；每步仍然只有损失标量一次 D2H。
         """
         self._prepare_segments(data)
-        backend = self.backend
         segments = self._plan.segments
 
         # 数据只在"第一个用到它的段"里以主机数组传入，由 replay 走 pinned
@@ -923,7 +955,9 @@ class Trainer:
             outs = plan.run_device(feed)
             for orig, local in segment.outputs:
                 self._dev_acts[orig][...] = outs[local]
-        loss = float(backend.to_host(self._dev_acts[self._loss_value.name]))
+        loss = self._host_async(
+            self._dev_acts[self._loss_value.name], self._seg_stream
+        )
 
         # cotangent 与参数梯度都是"累加"出来的，每步先清零：不清零会读到
         # 上一轮的残留。损失输出的 cotangent 是 dL/dL = 1。
