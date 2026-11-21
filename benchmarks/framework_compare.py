@@ -36,21 +36,48 @@ from benchmarks.cases import CASES
 DEFAULT_CASES = ("matmul_1024", "conv2d_3x3_pad1", "maxpool2x2")
 
 
+def _stats(samples: List[float]) -> Dict[str, float]:
+    return {"best_ms": round(min(samples), 4),
+            "median_ms": round(statistics.median(samples), 4)}
+
+
+def _sample(fn: Callable[[], object], sync: Callable[[], None], burst: int) -> float:
+    t0 = time.perf_counter()
+    for _ in range(burst):
+        fn()
+    sync()
+    return (time.perf_counter() - t0) * 1e3 / burst
+
+
 def _measure(fn: Callable[[], object], sync: Callable[[], None], warmup: int,
              burst: int, rounds: int) -> Dict[str, float]:
     """稳态口径：连续 ``burst`` 次平摊，取多轮最好的一轮（与 cudnn_compare 一致）。"""
     for _ in range(warmup):
         fn()
     sync()
-    samples: List[float] = []
+    return _stats([_sample(fn, sync, burst) for _ in range(rounds)])
+
+
+def _measure_interleaved(fn_a: Callable[[], object], sync_a: Callable[[], None],
+                         fn_b: Callable[[], object], sync_b: Callable[[], None],
+                         warmup: int, burst: int, rounds: int):
+    """两边交替测，每轮各测一次。
+
+    共享机上的负载会漂移：先连续测完 A 再连续测 B，A 与 B 可能落在不同的
+    时钟 / 占用状态上。上一版就出现过同一形状两轮差 40%（2.25 vs 3.88 ms）的
+    情况。交替之后漂移同时作用在两边，比值才有意义（同 5.268 的做法）。
+    """
+    for _ in range(warmup):
+        fn_a()
+        fn_b()
+    sync_a()
+    sync_b()
+    samples_a: List[float] = []
+    samples_b: List[float] = []
     for _ in range(rounds):
-        t0 = time.perf_counter()
-        for _ in range(burst):
-            fn()
-        sync()
-        samples.append((time.perf_counter() - t0) * 1e3 / burst)
-    return {"best_ms": round(min(samples), 4),
-            "median_ms": round(statistics.median(samples), 4)}
+        samples_a.append(_sample(fn_a, sync_a, burst))
+        samples_b.append(_sample(fn_b, sync_b, burst))
+    return _stats(samples_a), _stats(samples_b)
 
 
 def _torch_call(name: str, tensors: Mapping[str, object], F):
@@ -161,13 +188,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         np.testing.assert_allclose(af_out, torch_out, rtol=1e-4, atol=1e-4,
                                    err_msg=f"{name} 的数值与 torch 不一致")
 
-        # 2) 纯算：输入常驻，输出不回传
-        dev_stats = _measure(
-            (lambda: backend.execute_device(graph, feed_dev))
-            if hasattr(backend, "execute_device")
-            else (lambda: backend.execute(graph, feed)),
-            sync_af, args.warmup, args.burst, args.rounds)
-        eager_stats = _measure(fn_torch, sync_torch, args.warmup, args.burst, args.rounds)
+        # 2) 纯算：输入常驻，输出不回传；两边交替测，抵消负载漂移
+        af_fn = ((lambda: backend.execute_device(graph, feed_dev))
+                 if hasattr(backend, "execute_device")
+                 else (lambda: backend.execute(graph, feed)))
+        dev_stats, eager_stats = _measure_interleaved(
+            af_fn, sync_af, fn_torch, sync_torch,
+            args.warmup, args.burst, args.rounds)
 
         compile_stats: Optional[Dict[str, float]] = None
         compile_ms: Optional[float] = None
