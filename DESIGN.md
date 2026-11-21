@@ -18220,3 +18220,50 @@ A800-40GB 上 `TestIndexMath` 与 `TestCudaGatherCrossEntropy` 共 13 条全部�
   的 VJP 规则"的显式错误，而不是零。
 - CE 的数值稳定性来自行最大值归约（与 `softmax` 同一条路径），但 `logits` 若已
   含 `inf` / `NaN`，结果按 IEEE 语义透传，不做掩码。
+
+### 5.287　训练步"双峰"的根因：共享卡上的另一个训练进程
+
+**现象**。`batch=128, d=1024` 的两层 MLP + CE + SGD，`graph_mode="auto"` 下同一个
+训练步在 **0.55 ms 与 3.05 ms** 之间**成块跳变**（连续 4 轮 3.07 然后连续 4 轮
+0.55），而 `graph_mode="off"` 稳定在 1.43 ms；同机 torch 是 0.69～0.73 ms。
+`graph_captures=1 / graph_replays=42`，捕获失败原因为空，所以不是"每步重新捕获"。
+
+**逐段拆解**（每步 10 次平摊，慢态）：
+
+| 段 | 耗时 |
+|---|---|
+| 输入下拷 + 图 launch（host 侧） | 0.10 ms |
+| `capture_stream.synchronize()`（等图） | 2.65 ms |
+| 参数更新 8 个原地 kernel（事件计时） | 0.054 ms |
+| `cudaDeviceSynchronize`（基准口径） | 2.51 ms |
+
+两项交叉验证把"图慢"排除掉了：
+
+- 用 `cudaEvent` 量**图本体**（只 launch、不碰输入缓冲）：**0.272～0.282 ms**，
+  30 次无一例外；
+- 小 kernel（64 个 float）与 4 MiB D2D 拷贝在默认流 / 捕获流 / 新建流上都是
+  **6～16 µs**，与流无关。
+
+但同一条测量里，图 launch 在三条流的每 15 次中各出现**一次 2.2～2.8 ms**——
+说明停顿是全设备级的，不归任何一条流。
+
+**根因**。`nvidia-smi --query-compute-apps` 显示这块 A800 上还跑着
+`train_photon.py`（20.7 GB、util 79%、功耗 260 W、clocks.sm 恒定 1410 MHz）。
+两个进程 time-slicing 同一块卡：我们的 work 每 2.5 ms 左右的窗口被切走一次，
+2.7 ms 的"停顿"是别人的 kernel 在跑。时钟恒定、功耗高但我们的算量对不上，
+这两条早就该指向"卡不是独占的"。
+
+**为什么 AF 比 torch 更吃亏**。一步里 AF 有 3 个同步点（replay 内的
+`wait_event`、`run_device` 的 stream sync、基准的 device sync），torch 只有
+一次 `synchronize`。每多一个同步点就多一次"撞上抢占"的机会，所以在共享卡上
+AF 的耗时被系统性放大成 3.05 ms，而 torch 只被抬到 0.73 ms——**0.24× 是环境
+伪影，不是框架缺陷**。
+
+**处置**。`benchmarks/framework_compare.py` 启动时查一次
+`--query-compute-apps`，发现别的计算进程就打印警告：交替对照的**比值**在同等
+污染下仍可用，绝对耗时不能读。要绝对数字只有一条路——先独占这张卡。
+
+**遗留**。这台 A800 没装 `nsys` / `ncu`，kernel 级时间线拿不到；本轮全部结论
+来自 `cudaEvent` 计时与分段 wall clock，够定位"停顿不在图里"，但不足以做
+逐 kernel 的归因。干净数字等卡空出来后重测。
+
