@@ -70,7 +70,12 @@ out = ReferenceBackend().execute(g, {
 from aetherflow.train import Trainer, DistributedDataParallel, PipelineTrainer
 from aetherflow.models import BlockSpec, build_transformer_block, build_mamba_model, build_snn
 from aetherflow.models.lm import LMRunner, ServingEngine
+from aetherflow.serve import OpenAIService, serve
 ```
+
+推理服务：`serve(OpenAIService(ServingEngine(backend, params, spec, capacity=4)))`
+即得到 OpenAI 兼容的 `/v1/completions` / `/v1/chat/completions`（含 SSE 流式）；
+分词与模板默认取 `ByteTokenizer` / `ChatTemplate`，也可注入。
 
 支持的可训练构件：MLP、CNN（conv / 转置卷积 / 分组 / depthwise / 池化 / BN）、
 RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）、多层 SNN
@@ -95,7 +100,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 | 自动微分 | 47 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` 把条件与体各捕获一次、状态常驻显存，但每轮仍要读一次谓词（无 device-side 分支，且实测不比宿主路径快，见 DESIGN 5.245） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast，未接进数据并行路径）、数据并行（主机中转归约）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
-| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码 |
+| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
 | 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb；roofline 式成本模型（六项分解 + 可行性剪枝）先算再测，按估算排序只测前 N 个 |
 | 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、Chrome Trace 导出（`python -m aetherflow.runtime.trace telemetry.json`）、NHWC 布局传播（`LayoutPropagation`，仅参考后端承接）、CI 四作业（含 wheel 构建与安装冒烟）、部署包、zip 硬件包 |
 
@@ -208,7 +213,9 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   `DeviceWhileLoop` 只是把条件与循环体各捕获一次、状态留在显存，每轮仍要读一次
   谓词，没有 device-side 分支或 Graph 条件节点（且本轮实测不比宿主路径快）；
 - **服务化**：分页 KV cache 与投机解码只有组件级交付（主干是 Mamba，没有增长 KV，
-  二者未接进 `generate` / `LMRunner`；投机解码只做贪心验收与 batch=1），无 OpenAI 兼容 API；
+  二者未接进 `generate` / `LMRunner`；投机解码只做贪心验收与 batch=1）；已有 OpenAI
+  兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /
+  工具调用显式 400），但没有认证、限流与多副本，`stop` 只在文本层截断、不提前取消；
 - **生态**：只吃 `torch.export` 的 aten 子集，无 define-by-run，无采样 profiler（只有把已有遥测导成 Chrome Trace 的离线路径）；
 - **硬件**：NVIDIA sm_75 与 AMD gfx1100 各一张卡，无 Intel / Apple / 移动端。
 

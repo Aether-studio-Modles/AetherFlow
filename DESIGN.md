@@ -16839,6 +16839,67 @@ fusion_is_bitwise_identical`（逐位 + 参考对照）。
 同卡不可行，给不出真机带宽数字，因此没有动设备态路径；`collective_support`
 的 `overlap` 仍为 `False`——只做了"桶之间并发"，不是"与反向重叠"。
 
+### 5.272　OpenAI 兼容的 HTTP 推理接口
+
+`ServingEngine` 已经是"请求队列 + 连续批处理"，但它只有 Python 入口。把
+`ByteTokenizer`、`ChatTemplate`、`ServingEngine` 串成一个 HTTP 服务，只需要
+协议与并发两件事——**这一层不碰模型**，三者都可替换（`aetherflow/serve`）。
+
+**为什么是兼容子集而不是全兼容**：`logprobs`、`n>1`、`function calling`、
+`response_format`、`logit_bias` 都要求模型或采样面提供框架没有的能力。返回
+200 再悄悄忽略参数，调用方会以为它生效了，直到线上才发现输出不对。所以这些
+字段**显式 400**，错误类型 `invalid_request_error`——"没有被执行"必须让调用
+方知道。
+
+**并发模型**
+
+- 一个后台线程驱动 `engine.step()` 与 `take_timed_out()`；每个 HTTP 请求一个
+  线程等自己的 `Event`。真正的解码并发度是 `ServingEngine.capacity`，不随
+  HTTP 线程数变化（`ThreadingHTTPServer` 只负责连接）。
+- `submit_tokens` 在**持锁的同一临界区**里入队并登记作业：`max_tokens=0` 的
+  请求直接进完成队列，驱动线程下一次 `step` 就能取到它；登记晚一步结果就丢了
+  （有专门的用例钉住）。
+- 作业失败（驱动线程抛异常）会唤醒全部等待者并转成 500/流内 error 帧，线程
+  不会静默死掉。
+
+**流式的语义**
+
+- `step` 只在请求**完成**时返回，所以 SSE 每轮读一次 `ServingEngine.progress()`
+  的只读快照，把"比已发送文本多出来的部分"推给客户端。增量是文本前缀差，
+  不是 token 数差——字节 tokenizer 的 token 边界不等于字符边界。
+- 一个多字节字符被切在 token 边界上时 `decode` 会抛错：这时**先不发**，下一轮
+  多一个 token 就能解出完整字符（`safe_decode` 返回 `None`）。这一刻不发比发
+  半个字符更接近客户端看到的文本。
+- 请求结束前用完整 token 再解一次（最后几个 token 可能没来得及进快照）。
+  若整串 id 最终仍不是合法 UTF-8（模型输出任意字节时会发生），给出**最长的
+  可解码前缀**——不是乱码、也不是断开连接；这与流式一直在做的事同源，只是
+  结束时没有下一轮可以等了。
+- `stop` 只在文本层截断，**不参与调度**：命中后引擎仍会生成到 `max_tokens`，
+  只是不再往客户端发。做成"提前取消"需要调度器支持文本级停止条件，目前没有。
+- 客户端断连会取消后台请求，不让它继续占着槽位生成没人要的结果。
+
+**判据**（`tests/test_openai_server.py`，18 条）
+
+- `/v1/models`、`/healthz` 的形状；
+- 非流式 completions / chat 的文本等于**另一个独立 `ServingEngine`**
+  （capacity=1）给出的结果——HTTP 层没有改变调度语义；
+- `stream=true` 的增量拼接**等于**非流式完整文本，且只有最后一帧带
+  `finish_reason` 与 `usage`，末尾是 `data: [DONE]`；
+- 400 面：空 prompt、`n>1`、`logprobs` / `logit_bias` / `best_of` /
+  `response_format` / 非 0 penalty、越界 token、空 messages、未知 role；
+- 429 / 504 / 500 的映射各用最小假引擎钉住；404 覆盖未知路径与错误方法；
+- `max_tokens=0` 返回空文本且 `completion_tokens=0`；
+- "半个 UTF-8 字符先不发"与"最长可解码前缀"各一条。
+
+测试用一层 `_AsciiBackend` 把 logits 限制在小写字母上：随机初始化模型吐出的
+任意字节会让"文本层"的判据退化成"能不能解码"，限制成 ASCII 后流式与非流式
+才有可比内容。
+
+**遗留**：没有认证、限流、多副本与背压（`max_pending` 只约束等待队列，满了
+返回 429，由调用方决定重试）；流式请求各自轮询 `progress()`，是 `O(并发)` 的
+快照复制，容量大时应改成"调度器推送增量"；`/v1/chat/completions` 只接受
+字符串 `content`，多模态内容数组显式 400。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
