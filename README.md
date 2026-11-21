@@ -76,6 +76,9 @@ from aetherflow.serve import OpenAIService, serve
 推理服务：`serve(OpenAIService(ServingEngine(backend, params, spec, capacity=4)))`
 即得到 OpenAI 兼容的 `/v1/completions` / `/v1/chat/completions`（含 SSE 流式）；
 分词与模板默认取 `ByteTokenizer` / `ChatTemplate`，也可注入。
+`api_key="sk-..."` 打开 Bearer 认证（`/healthz` 免认证），
+`rate_limit=60, rate_window=60.0` 打开滑动窗口限流（超限 429 + `Retry-After`）。
+`stop` 参与调度：命中后取消该请求、腾出槽位，流式会压住可能是 stop 开头的尾部。
 
 支持的可训练构件：MLP、CNN（conv / 转置卷积 / 分组 / depthwise / 池化 / BN）、
 RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）、多层 SNN
@@ -249,7 +252,8 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
 - **服务化**：分页 KV cache 与投机解码只有组件级交付（主干是 Mamba，没有增长 KV，
   二者未接进 `generate` / `LMRunner`；投机解码只做贪心验收与 batch=1）；已有 OpenAI
   兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /
-  工具调用显式 400），但没有认证、限流与多副本，`stop` 只在文本层截断、不提前取消；
+  工具调用显式 400），静态单密钥 Bearer 认证与进程内滑动窗口限流（5.285），
+  `stop` 命中后取消请求并腾出槽位；没有多副本与按密钥计量的集群配额；
 - **生态**：只吃 `torch.export` 的 aten 子集，无 define-by-run，无采样 profiler（只有把已有遥测导成 Chrome Trace 的离线路径）；
   前端覆盖算子 `torch.export` 的常用面（逐元素数学 / 激活 / 归约 / 形状 / 常量构造），
   但 `where` / `masked_fill` / 比较算子（IR 没有 bool 张量）、`topk`、`sign` / `round` / `floor` / `ceil`、

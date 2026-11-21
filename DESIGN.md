@@ -17961,3 +17961,66 @@ H2D——批越大往返越贵。把 `_device_step` 的后端能力接进 `Servi
 - `init_all` 的空设备列表由 provider 入口拒绝（`ValueError`）；库缺失与
   `ncclCommInitAll` 符号缺失都是 `NcclUnavailable`。
 - provider 不持有训练状态，`close()` 只销毁 communicator；可作上下文管理器。
+
+### 5.285　服务面的三件事：认证、限流、`stop` 参与调度
+
+**问题**
+
+`serve/openai.py` 从落地起就只有协议与并发：任何能连上端口的人都能提交生成，
+`max_pending` 只能保护队列，挡不住"不停地提交短请求"；`stop` 只在响应层截断
+文本——引擎会继续生成到 `max_tokens`，占着槽位产出一份没人要的结果，排队的
+请求跟着一起等。
+
+**做法**
+
+- **认证**：`OpenAIService(..., api_key="sk-...")`。`/v1/*` 要求
+  `Authorization: Bearer <key>`，用 `hmac.compare_digest` 比较（`==` 会在
+  首个不同字节处提前返回，泄漏密钥长度与公共前缀）。失败 401
+  `authentication_error`，带 `WWW-Authenticate: Bearer`。`/healthz` 免认证：
+  负载均衡器与容器编排不持有业务凭证，探活不该因此变红。
+- **限流**：`rate_limit`（每窗口请求数）+ `rate_window`（秒，默认 60）。
+  滑动窗口记录时间戳，而不是固定窗口——后者在窗口边界允许两倍突发。超限
+  429 `rate_limit_error` + `Retry-After`（向上取整到秒）。判定在解析请求体
+  之前，但**在认证之后**：无效 key 不消耗配额，否则猜密钥也能把正常调用方
+  的额度打光。时钟可注入（默认 `time.monotonic`），测试用假时钟逐位确定。
+- **`stop` 参与调度**：驱动线程在每个解码步**之前**用
+  `ServingEngine.progress()` 的快照求"最长可解码前缀"，命中任一 `stop` 就
+  `engine.cancel(rid)`，槽位本轮即可准入新请求；已生成的 token 仍作为结果
+  交给调用方，`job.stop_hit` 让 `finish_reason` 是 `"stop"`。
+- **流式的 hold-back**：`_sendable` 把"可能是 stop 开头"的尾部压住不发。
+  逐 token 推送时前缀已经发出去了，命中 stop 只能少发、不能撤回；压住
+  最后 `len(stop)-1` 个字符，命中就永远不发，没命中就随下一帧补发。
+- `submit_tokens(..., stops=...)` 拒绝空字符串：它在 `str.find` 里永远命中
+  位置 0，客户端会得到一条空回复，请求也会立刻被取消。
+
+**验证**
+
+| 面 | 判据 |
+|---|---|
+| 401 | 缺头、错 key、`Basic` 方案、无 `Bearer` 前缀四种都 401 + `authentication_error` + `WWW-Authenticate` |
+| 免认证面 | `/healthz` 200；`/v1/models` 无 key 401、有 key 200 |
+| 429 | 额度 2 时前两次 200、第三次 429 + `rate_limit_error` + `Retry-After ∈ [1, 10]`；时钟拨过窗口后恢复 |
+| 不占配额 | 三次无效 key 的 401 之后，仍能完整用掉两次额度 |
+| 非流式 stop | 探测出的前两个 token 作 stop：`completion_tokens == 2`、`finish_reason == "stop"` |
+| 流式 stop | 帧拼接为空（hold-back 生效）、末帧 `finish_reason == "stop"`、`completion_tokens < 8` |
+| 参数 | 空字符串 stop 与含空串的数组都 400 |
+
+全量 `unittest discover`：2842 条 OK（skipped=437）；`ruff check` 全过。
+
+**读法**
+
+- stop 的检测粒度是 **token**：跨 token 的 stop（"llo" 落在两个 token 里）会
+  多生成到完整命中为止，但不会多到 `max_tokens`。取消发生在采样后的下一个
+  调度点，因此最多多一个已采样 token。
+- 限流是**进程内全局**的：多进程部署时每个进程各有一份额度，别把它当集群
+  配额。需要按密钥/路径分别计量时，注入自己的准入逻辑，而不是改这里的窗口。
+- 认证是**静态单密钥**：没有轮转、吊销与审计。它是"别让端口裸奔"的下限，
+  不是多租户鉴权。
+
+**边界**
+
+- `api_key=None`（默认）时认证关闭；`rate_limit=None` 时限流关闭。两者都不
+  改变既有调用方行为。
+- 被限流/未认证的请求不读 body、不入队、不占解码槽位。
+- `Retry-After` 是建议值（最早一条出窗的时间），调用方可以更早重试，但会
+  继续收到 429。

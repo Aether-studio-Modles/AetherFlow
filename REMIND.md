@@ -139,9 +139,15 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **推理**：分页 KV cache 与投机解码是组件级交付，**未接进 `LMRunner`**——主干是
   Mamba，没有随上下文增长的 KV。投机只支持贪心验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
-  `response_format` / 非 0 penalty 显式 400；无认证、限流与多副本；`stop` 只在
-  文本层截断、不参与调度（命中后仍生成到 `max_tokens`）；流式由每个请求轮询
-  `ServingEngine.progress()` 快照，并发很大时应改成调度器推送增量。
+  `response_format` / 非 0 penalty 显式 400。认证是**静态单密钥** Bearer
+  （`api_key=...`，`/healthz` 免认证，`hmac.compare_digest` 比较），限流是
+  **进程内全局**滑动窗口（`rate_limit` / `rate_window`，超限 429 + `Retry-After`，
+  认证失败不占配额）；多副本与按密钥计量的集群配额没有。`stop` 已参与调度：
+  每个解码步之前检查在跑请求的最长可解码前缀，命中就 `cancel` 并腾槽，
+  `finish_reason` 为 `"stop"`；流式用 hold-back 压住可能是 stop 开头的尾部
+  （否则前缀已发出、撤回不了）。检测粒度是 token，跨 token 的 stop 会多生成到
+  完整命中为止。流式仍由每个请求轮询 `ServingEngine.progress()` 快照，并发很大
+  时应改成调度器推送增量。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
   无 `bool` 张量，因此 `where` / `masked_fill` / 比较算子 / `topk` 显式拒绝；
   `sign` / `round` / `floor` / `ceil`、`baddbmm`、原地 `copy_` 无对应语义；
