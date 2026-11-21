@@ -137,12 +137,15 @@ jobs:
       - name: 200 个随机种子
         run: python -m aetherflow.fuzz --iterations 200
 
-  gpu:
-    name: GPU 正确性 + 性能回归
+  gpu-correctness:
+    name: GPU 正确性（CUDA，固定节奏）
     # 需要一台装有 NVIDIA 驱动、CUDA 12.x 与 cupy 的自托管 runner，标签为 [self-hosted, gpu]。
-    # 只在手动触发与每日定时（趋势采集）时跑：避免每次 push 都占用自建机器；
-    # 也避免共享 runner 的抖动污染性能门禁。
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # 节奏固定为"main 的每次 push + 每日定时 + 手动"：正确性用例不测吞吐，机器被别的
+    # 任务占着也只会变慢，不会误报；性能门禁单独放在 gpu-perf，只跟定时/手动走。
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'schedule'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: [self-hosted, gpu]
     timeout-minutes: 30
     steps:
@@ -162,6 +165,46 @@ jobs:
           print(report.text())
           assert report.ok, "CUDA 后端未通过一致性检查"
           PY
+
+  hip:
+    name: HIP 正确性（ROCm，固定节奏）
+    # 需要一台装有 ROCm、能访问 /dev/kfd 与 /dev/dri 的 runner，标签为 [self-hosted, hip]。
+    # 跨厂商一致性是本项目唯一不可外包的结论，只在手动触发时验证等于平时没有验证，
+    # 所以与 CUDA 同节奏跑每日定时。
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, hip]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: 环境自检
+        run: |
+          python -c "
+          from aetherflow.backends.hip import HIP_AVAILABLE, HipBackend
+          assert HIP_AVAILABLE, 'ROCm 不可用：检查 runner 的设备挂载与驱动'
+          HipBackend()
+          print('hip backend ok')
+          "
+      - name: 单元测试（含 HIP 组）
+        run: python -m unittest discover -s tests -t .
+      - name: HIP 一致性报告
+        run: |
+          python - <<'PY'
+          from aetherflow import run_conformance
+          from aetherflow.backends.hip import HipBackend
+          report = run_conformance(HipBackend())
+          print(report.text())
+          assert report.ok, "HIP 后端未通过一致性检查"
+          PY
+
+  gpu-perf:
+    name: GPU 性能回归（CUDA，定时）
+    # 与 gpu-correctness 同一台机器，但只跑基准与趋势：性能数字对机器状态敏感
+    # （DESIGN 5.15），跟着每次 push 跑只会得到时绿时红的门禁。
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
       - name: 性能回归（对照同机基线）
         run: |
           python -m benchmarks.run --backend cuda \
