@@ -1215,12 +1215,17 @@ def _decode(
     constraint,
     resident: bool,
     graph_for,
+    device_step=None,
 ) -> List[List[int]]:
     """解码循环：图与驻留的生命周期由调用方决定。
 
     权重登记与释放不在这里做——``generate`` 用完即放，``LMRunner`` 跨请求
     保留。两条生命周期的数值路径必须完全相同，所以这里只认两个事实：权重
     是否已驻留（``resident``）与图从哪里来（``graph_for``）。
+
+    ``device_step`` 给出时，逐 token 解码改由它推进（见
+    :meth:`LMRunner._device_step`）：状态留在设备上，每步只把 logits 取回
+    主机。prefill 仍走 :func:`_prefill` 的普通执行路径。
 
     多序列按**左侧补 ``pad_id``** 对齐到同一宽度：每行首个真实 token 的
     位置置 ``reset=1``，pad 既不推进状态也不进入卷积窗口（与
@@ -1253,6 +1258,7 @@ def _decode(
         constraint=constraint,
         resident=resident,
         graph_for=graph_for,
+        device_step=device_step,
     )
 
 
@@ -1353,11 +1359,16 @@ def _sample(
     constraint,
     resident: bool,
     graph_for,
+    device_step=None,
 ) -> List[List[int]]:
     """从 ``logits`` 的末位置起逐 token 解码，返回每行的生成部分。
 
     ``state`` 是 ``_prefill`` 交出的状态；本函数只管采样与推进，不再关心
     前缀是从哪里来的（全量 prompt 还是缓存前缀）。
+
+    ``device_step`` 是一个 ``(ids, state) -> (logits, state)`` 的回调：给出时
+    decode 由它推进，``state`` 里装的就是设备数组，循环内不做状态往返。
+    ``logits`` 仍按块取回主机（采样是 numpy 实现），每步只回传 ``B*V``。
 
     ``prompts`` 只用于重复惩罚的历史：每行从自己的 prompt 起算，再追加它
     自己生成的 token——行与行之间不共享历史（批量里左填充的 pad 也不进历史，
@@ -1400,9 +1411,11 @@ def _sample(
         return generated
 
     # 本轮只采一次：结束后不再采样的行会进入 inactive，不再消耗随机数。
+    # logits 整块取回一次：逐行 to_host 会把一次 D2H 拆成 B 次。
+    first = _host_row(backend, logits)
     last: List[Optional[int]] = [None] * batch
     for row in range(batch):
-        token = _pick(row, logits[row, -1, :])
+        token = _pick(row, first[row, -1, :])
         if token == stop:
             active[row] = False
             continue
@@ -1414,7 +1427,9 @@ def _sample(
     if not any(active):
         return _finish()
 
-    dec_graph, dec_inputs, _ = graph_for(1, "last")
+    dec_graph = dec_inputs = None
+    if device_step is None:
+        dec_graph, dec_inputs, _ = graph_for(1, "last")
     for _ in range(limit - 1):
         if not any(active):
             break
@@ -1422,18 +1437,25 @@ def _sample(
         for row in range(batch):
             if active[row]:
                 ids[row, 0] = last[row]
-        step_feed = {} if resident else dict(params)
-        step_feed[dec_inputs["ids"].name] = ids
-        # decode 不重置：这一段必须接着 prefill 的状态
-        step_feed[dec_inputs["reset"].name] = np.zeros((batch, 1), dtype=np.float32)
-        for name in spec.state_shapes:
-            step_feed[dec_inputs[name].name] = state[name]
-        out = backend.execute(dec_graph, step_feed)
-        state = spec.carry_state(out)
+        if device_step is None:
+            step_feed = {} if resident else dict(params)
+            step_feed[dec_inputs["ids"].name] = ids
+            # decode 不重置：这一段必须接着 prefill 的状态
+            step_feed[dec_inputs["reset"].name] = np.zeros(
+                (batch, 1), dtype=np.float32
+            )
+            for name in spec.state_shapes:
+                step_feed[dec_inputs[name].name] = state[name]
+            out = backend.execute(dec_graph, step_feed)
+            state = spec.carry_state(out)
+            block = out["logits"]
+        else:
+            block, state = device_step(ids, state)
+        rows = _host_row(backend, block)
         for row in range(batch):
             if not active[row]:
                 continue
-            token = _pick(row, out["logits"][row, 0, :])
+            token = _pick(row, rows[row, 0, :])
             if token == stop:
                 active[row] = False
                 continue
@@ -1477,6 +1499,13 @@ class LMRunner:
     会话结束时它只会释放自己登记的那一份，不清掉别人的权重。
     权重更新后要重建会话（或显式 ``close`` 后新建）：本类不做"检测到权重
     变化就悄悄重传"，那会让"用旧权重算出看起来正常的结果"更难发现。
+
+    ``device_state=True`` 把逐 token 解码的状态留在设备上：decode 图
+    （``steps=1``）只捕获一次，每步 replay 时状态作为设备输入直接 D2D，
+    只有 logits 回主机（``B*V`` 个 float）。这要求 ``resident=True``——
+    否则捕获图必须把全部权重当可变输入，每步重传的字节数比原来更多。
+    束搜索仍走宿主路径（它按父假设 gather 状态，与单条 decode 不是同一
+    张图）；prefill 也仍是普通执行，第一步 decode 会把状态上传一次。
     """
 
     def __init__(
@@ -1486,6 +1515,7 @@ class LMRunner:
         spec: Optional[LMSpec] = None,
         *,
         resident: bool = False,
+        device_state: bool = False,
         max_graphs: int = 8,
     ) -> None:
         spec = spec or LMSpec()
@@ -1495,14 +1525,35 @@ class LMRunner:
             raise ValueError(f"max_graphs 必须 >= 1，得到 {max_graphs}")
         if resident:
             _require_resident(backend, True, "LMRunner(resident=True)")
+        if device_state:
+            if not resident:
+                raise ValueError(
+                    "LMRunner(device_state=True) 要求 resident=True："
+                    "decode 图必须把权重写死进捕获图，否则每步要把全部参数"
+                    "重新传一遍（比省下的状态往返更多）"
+                )
+            for attr in ("capture", "to_host", "to_array"):
+                if not callable(getattr(backend, attr, None)):
+                    raise ValueError(
+                        f"这个后端没有可用的 {attr}，"
+                        "不能把 decode 状态留在设备上"
+                    )
         self.backend = backend
         self.params = dict(params)
         self.spec = spec
         self.resident = bool(resident)
+        self.device_state = bool(device_state)
         self.max_graphs = max_graphs
         self._graphs: "OrderedDict[Tuple[int, str], Any]" = OrderedDict()
         self._resident_ready = False
         self._closed = False
+        # 设备态 decode 的捕获计划：状态留在计划自己的 arena 上，跨步复用。
+        # 它不进 ``_graphs``——计划与被捕获的图必须同生命周期，不能让 LRU
+        # 淘汰掉图却留着依赖它的计划。
+        self._decode_plan = None
+        self._decode_graph = None
+        self._decode_inputs = None
+        self._decode_batch: Optional[int] = None
         # 缓存前缀：最近一次 ``prime`` 已消费的 token 与带出的状态。
         self._prefix: List[int] = []
         self._state = None
@@ -1532,6 +1583,48 @@ class LMRunner:
 
     def _graph_for(self, length: int, head: str):
         return self._graph_for_batch(self.spec, length, head)
+
+    # -- 设备态解码 ---------------------------------------------------
+
+    def _decode_plan_for(self, batch: int):
+        """取（必要时捕获）逐 token decode 的计划。
+
+        捕获只发生一次：``steps=1``、``head="last"`` 的形状在会话里固定，
+        权重已驻留（写死进图），ids / reset / state 是每步可变的输入。
+        计划与图分开持有：计划里记的是捕获时的显存地址，图对象被回收后
+        地址仍然有效，但下一次重建要拿到同一份参数表。
+        """
+        if self._decode_plan is not None and self._decode_batch == batch:
+            return self._decode_plan, self._decode_inputs
+        if not self._resident_ready:
+            raise ValueError(
+                "设备态 decode 的图必须在权重驻留之后捕获；"
+                "请先走一次 prefill（generate / prime）再解码"
+            )
+        graph, inputs, _ = _stream_graph(1, self.spec.with_batch(batch), "last")
+        sample = {
+            inputs["ids"].name: np.zeros((batch, 1), dtype=np.int32),
+            inputs["reset"].name: np.zeros((batch, 1), dtype=np.float32),
+        }
+        for name, shape in self.spec.state_shapes.items():
+            sample[inputs[name].name] = np.zeros(shape, dtype=np.float32)
+        self._decode_plan = self.backend.capture(graph, sample)
+        self._decode_graph = graph
+        self._decode_inputs = inputs
+        self._decode_batch = batch
+        return self._decode_plan, self._decode_inputs
+
+    def _device_step(self, ids: np.ndarray, state):
+        """一步 decode：状态作为设备输入 D2D，只回传 logits。"""
+        plan, inputs = self._decode_plan_for(int(ids.shape[0]))
+        feed = {
+            inputs["ids"].name: ids,
+            inputs["reset"].name: np.zeros(ids.shape, dtype=np.float32),
+        }
+        for name in self.spec.state_shapes:
+            feed[inputs[name].name] = state[name]
+        out = plan.run_device(feed)
+        return out["logits"], self.spec.carry_state(out)
 
     @property
     def graph_count(self) -> int:
@@ -1686,6 +1779,7 @@ class LMRunner:
             constraint=constraint,
             resident=self.resident,
             graph_for=self._graph_for,
+            device_step=self._device_step if self.device_state else None,
         )[0]
 
     def generate_batch(
@@ -1731,6 +1825,7 @@ class LMRunner:
             constraint=constraints,
             resident=self.resident,
             graph_for=self._graph_for,
+            device_step=self._device_step if self.device_state else None,
         )
 
     def generate_beam(
@@ -1811,6 +1906,10 @@ class LMRunner:
             self.backend.release_parameters()
             self._resident_ready = False
         self._graphs.clear()
+        self._decode_plan = None
+        self._decode_graph = None
+        self._decode_inputs = None
+        self._decode_batch = None
         self._clear_prefix()
         self._closed = True
 

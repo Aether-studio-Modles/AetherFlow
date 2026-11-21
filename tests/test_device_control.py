@@ -118,6 +118,16 @@ class _NumpyPlan:
         return self.device_outputs()
 
 
+class _Stream:
+    """替身的流：只需要可同步（真机上分支 replay 之后要等它完成）。"""
+
+    def __init__(self):
+        self.syncs = 0
+
+    def synchronize(self):
+        self.syncs += 1
+
+
 class _NumpyDevice:
     """只满足设备端循环前置能力的替身后端。"""
 
@@ -132,7 +142,7 @@ class _NumpyDevice:
         self.plan_syncs = 0
 
     def new_stream(self):
-        stream = object()
+        stream = _Stream()
         self.streams.append(stream)
         return stream
 

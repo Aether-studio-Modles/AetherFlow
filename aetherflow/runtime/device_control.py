@@ -21,7 +21,9 @@
 
 ``DeviceConditional`` 是它的对偶：谓词与两个分支各捕获一次，每次只 replay
 谓词与**被选中的那一支**。未选中的分支一次都不执行——与 ``Conditional.run``
-的惰性一致；分支输出留在显存里，``run_device`` 不做任何 D2H。
+的惰性一致；分支输出留在显存里，``run_device`` 不做任何 D2H。分支 replay
+之后必须让捕获流完成：HIP 的默认流不会等它，否则 ``run`` 的收尾 D2H 会读到
+上一次 replay 的结果（CUDA 的 legacy 默认流隐式同步，所以只在 HIP 上暴露）。
 
 为什么放在 ``runtime`` 而不是 ``ir/control.py``
 -----------------------------------------------
@@ -420,7 +422,8 @@ class DeviceConditional:
     ) -> Dict[str, Any]:
         """按谓词走一支，返回仍在显存里的输出。
 
-        每次只有一次主机往返（谓词标量）与一次同步（谓词计划的 replay）；
+        每次只有一次主机往返（谓词标量）；分支 replay 是异步的，返回前让
+        捕获流完成，调用方的 ``to_host`` 才不会读到上一轮的输出。
         分支输出的 D2H/H2D 一次都不发生，未选中的分支不执行。
         """
         self._apply(feeds)
@@ -447,6 +450,11 @@ class DeviceConditional:
         # 异步 replay：只跑被选中的一支，未选中的计划连作业都不提交。
         self._plans[index].replay(self._feed(self._graphs[index], where))
         self.branches += 1
+        # 分支的 replay 是异步的，而 HIP 的默认流不会等这条捕获流：紧接着
+        # 的 ``to_host``（run 的收尾 D2H）会读到**上一次** replay 的输出。
+        # 返回"输出已在显存里且可读"就必须在这里等一次；这不是主机往返，
+        # 仍只读谓词一个标量。
+        self._stream.synchronize()
         produced = self._plans[index].device_outputs()
         result: Dict[str, Any] = {}
         for output, _ in self._outputs:

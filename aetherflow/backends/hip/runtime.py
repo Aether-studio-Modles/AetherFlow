@@ -560,6 +560,11 @@ _SUPPORTED = {
     np.dtype("float32"), np.dtype("float16"), np.dtype("float64"),
     np.dtype("complex64"), np.dtype("complex128"),
     np.dtype("int32"), np.dtype("int8"), np.dtype("bool"),
+    # uint16 不是 IR 的类型，而是 bf16 的设备容器（两字节位模式）。基类在
+    # ``_kind`` / ``quantize`` 里按 ``cp.uint16`` 判定 bf16，容器缺这个常量
+    # 会让任何图在第一次 ``invoke`` 就 AttributeError——HIP 的 bf16 支持面
+    # 是空集，但"不支持"必须由 ``invoke`` 的能力检查给出，而不是崩在属性上。
+    np.dtype("uint16"),
 }
 
 # 容器层对外暴露的 dtype 常量，与 ``cupy.float32`` 等价的用法
@@ -571,6 +576,8 @@ complex128 = np.complex128
 int32 = np.int32
 int8 = np.int8
 bool_ = np.bool_
+# bf16 位模式容器（见 _SUPPORTED 的说明）。
+uint16 = np.uint16
 ndarray = DeviceArray
 
 
@@ -1511,6 +1518,8 @@ _C_TYPES = {
     np.dtype("int32"): "int",
     np.dtype("int8"): "signed char",
     np.dtype("bool"): "bool",
+    # bf16 位模式：容器是 uint16，cast 内核按无符号短整型搬运位模式。
+    np.dtype("uint16"): "unsigned short",
 }
 
 # 逐元素二元运算：op 0/1/2/3 = + - * /。两个操作数各带一套（已广播的）
