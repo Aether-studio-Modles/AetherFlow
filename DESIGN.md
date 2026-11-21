@@ -87,7 +87,7 @@
 |---|---|---|
 | 一套 IR、可插拔后端 | ✅ | 三个后端：参考（CPU 语义）+ CUDA（NVIDIA 真机）+ HIP（AMD 真机）。插件只需实现 `capabilities` + `execute`，另有五项可选契约（device / codegen / tuning / memory / stream）与一个分配器契约（5.89、5.163）；HIP 是照文档接入的第一个真实实例（5.40） |
 | 完整 CUDA 生态 | 🟡 | 生产路径复用 cuBLAS（含卷积的 GEMM）与 cuSPARSE（5.203 起是 `sparse_linear` 的可选实现，默认不启用）；cuDNN 已在 5.69 接入为**对照物**（ctypes 直调 legacy API，只测量不执行生产图）；cuFFT 自 5.210 起接成 `fft` / `rfft` 的 CUDA 实现（`cufftPlanMany` + 显式归一化），但只有离线验证，真机未跑；cuBLASLt / cuRAND / NCCL 仍未接 |
-| 一套工作流换后端 | ✅ | 同一份 conformance 在 CUDA 与 HIP 上都是 5 refused / 0 failed（95 个用例、90 executed；参考后端 95 executed / 0 refused / 0 failed；HIP 的拒绝项是既有的 f64 与分组 depthwise 形态，加上没有 rocFFT 的 `fft` / `rfft` 三条）；装配层让迁移连 import 与类名都不用改：`get_backend()` 自动挑，或 `AETHERFLOW_BACKEND=hip` 指定（5.40、5.41）。HIP 的运行期面也已与 CUDA 对齐：pinned 暂存、跨流事件依赖与 `Trainer(device_state=True)` 的 SGD / Adam 都在真机跑通（5.156） |
+| 一套工作流换后端 | ✅ | 同一份 conformance 在 CUDA 与 HIP 上都跑过且 0 failed（111 个用例；参考后端本轮 111 executed / 0 refused / 0 failed；HIP 上一轮 90 executed / 2 refused / 0 failed，本轮未复跑，用例集扩到 111 后不能按差值推算；拒绝项是既有的 f64 与分组 depthwise 形态，加上没有 rocFFT 的 `fft` / `rfft`）；装配层让迁移连 import 与类名都不用改：`get_backend()` 自动挑，或 `AETHERFLOW_BACKEND=hip` 指定（5.40、5.41）。HIP 的运行期面也已与 CUDA 对齐：pinned 暂存、跨流事件依赖与 `Trainer(device_state=True)` 的 SGD / Adam 都在真机跑通（5.156） |
 | 主流模型架构 | 🟡 | 六类构件都有可训练表达（5.22）：MLP ✅；Transformer ✅（单块符号化 + 多层 decoder-only LM）；CNN 🟡（conv（含分组 / depthwise）/ 转置卷积（5.51）/ max-avg-自适应-全局池化 / BN / dropout / 残差块 / 分类网络；cuDNN 对照已做（5.69 首测自研分块核慢 4～12 倍；5.253 按"稳态 + 驻留输入"重读后小通道已同量级甚至更快（1x1_c32 为 0.72×），真实差距只剩宽通道 3x3/5x5；5.260 / 5.268 的 auto 进一步到 c8～c24 的 0.45～0.75×、c32/c64 的 1.02×/1.36×，c64 是唯一还没消掉的 1.36×）；RNN ✅（RNN / LSTM / GRU 时间展开）；SNN 🟡（多层 LIF + 替代梯度；稀疏事件表示与事件驱动的构件已交付（5.35、5.132、5.133），层间压缩自 5.136 起可微（`spike_linear`：脉冲梯度走普通 `matmul`，只有权重梯度走事件散射），5.204 又把 `sparse_linear` 的事件幅度梯度补成 `sparse_linear_values_grad`；剩余边界是 `dspikes` 仍是稠密 GEMM，且 HIP 上事件路径尚未达到加速门槛）；SSM 🟡（完整 Mamba block 第一版，递归收敛为 `scan_linear`；语言模型侧的跨块 reset 与左填充隔离见 5.178 / 5.179，固定块预填充 / 末位置投影 / 权重常驻的推理路径见 5.187，整数标签损失（one-hot 的 `B*T*V` → `B*T` 下标）见 5.188，跨请求复用的推理会话（图缓存 + 权重驻留）见 5.191，批量解码（左填充对齐 + 逐行独立停止）见 5.192，会话前缀缓存（`prime` 预先消费 system prompt、后续只跑增量，batch=1）见 5.193，采样面（top-p / 重复惩罚）与束搜索 `generate_beam`（k 条假设进 batch 维）见 5.194，请求级并发（请求队列 + 连续批处理，以解码步为调度单位、容量固定）见 5.196） |
 | 主流硬件 | 🟡 | NVIDIA（sm_75，RTX 2080 Ti）与 AMD（gfx1100，RX 7650 GRE / ROCm 7.2）各一台，同一套 conformance 全绿（5.40）；两家还各有一次库级对照——cuDNN（5.69 首测；5.260 / 5.268 的 auto 已到 c8～c24 的 0.45～0.75×、c32/c64 的 1.02×/1.36×）与 MIOpen（5.157 测的是自研分块核，慢 4.52×～37.03×；HIP 自 5.238 改走隐式 GEMM 后未对 MIOpen 复测，这个倍数不能当成 HIP 现状）；Intel / Apple / 移动端未接，同厂商多型号未铺开 |
 
@@ -95,10 +95,10 @@
 
 | 目标 | 现状 | 说明 |
 |---|---|---|
-| 静态图导入 | ✅ | torch.export → IR，覆盖 Transformer 与 CNN 的 aten 子集；未知算子明确报错 |
+| 静态图导入 | ✅ | torch.export → IR，覆盖 Transformer 与 CNN 的 aten 子集（代码里出现 116 个 `aten.*` 名字，含拒绝面的提示名，不等于全部承接）；未知算子明确报错 |
 | 动态图导入 | 🟡 | 不做 tape 式 define-by-run 执行：图必须静态，才能做构图期后端能力预检、让反向图自包含可序列化、并满足 CUDA Graph 的固定路径要求。补的是**构图手感**——`EagerGraph` / `Tensor` 用运算符直接写图，产物仍是同一份静态 IR（5.25）；数据相关的分支与循环由 `Conditional` / `WhileLoop` 显式表达，控制流是子图之间的关系、子图仍是普通静态图（5.201）；逐算子即时求值仍未做 |
 | 形状推导（含符号维） | ✅ | 编译期推导 + 运行期回校；空间维可以是 `floor((S + 2p - k) / s) + 1` 形式的派生表达式，一次构图多分辨率执行（5.53） |
-| 自动微分（含 SNN 非标准反传） | 🟡 | 语义 IR 层反向展开：46 条 VJP 规则，反向图仍是可序列化、可执行的普通 PORTABLE 图（5.17）；eager 前端可直接 `loss.backward()`，但它仍是这张图而不是 tape（5.77）；激活检查点由 `train/recompute.py` 的分段重算补上（5.75）；二阶导数由 `hessian_vector_product` 补上（对反向图再求导，判据是解析值 / 中心差分 / 二次目标一步 Newton，5.198），但只对具备 VJP 的算子成立；反向图专用优化自 5.207 起有两条：`backward(minimize=True)` 按求导目标限定 vjp 范围（无关分支不再建反向节点，梯度逐位不变），`backward_pipeline()` 用交换律 CSE + DCE 且不含融合；SNN 替代梯度只需替换算子 `vjp`，路已铺好 |
+| 自动微分（含 SNN 非标准反传） | 🟡 | 语义 IR 层反向展开：49 条 VJP 规则，反向图仍是可序列化、可执行的普通 PORTABLE 图（5.17）；eager 前端可直接 `loss.backward()`，但它仍是这张图而不是 tape（5.77）；激活检查点由 `train/recompute.py` 的分段重算补上（5.75）；二阶导数由 `hessian_vector_product` 补上（对反向图再求导，判据是解析值 / 中心差分 / 二次目标一步 Newton，5.198），但只对具备 VJP 的算子成立；反向图专用优化自 5.207 起有两条：`backward(minimize=True)` 按求导目标限定 vjp 范围（无关分支不再建反向节点，梯度逐位不变），`backward_pipeline()` 用交换律 CSE + DCE 且不含融合；SNN 替代梯度只需替换算子 `vjp`，路已铺好 |
 | 前端逻辑对所有后端一致 | ✅ | 执行骨架统一符号绑定与形状校验 |
 | 高层语义 IR | ✅ | 类型系统、verifier、可移植性标注 |
 | 中层优化 IR | ✅ | 独立一层：`passes/` 有八个可组合 pass（DCE / CSE / 交换律 CSE / simplify / 常量折叠 / 三个融合）、`PassManager` 在每个 pass 之后过 verifier、`registry.py` 提供注册表与按名入口（`run_pass` / `run_passes` / `build_pipeline`），三条管线（默认 / 融合 / 反向图）的名字序列只在 `DEFAULT_PASS_NAMES` / `FUSED_PASS_NAMES` / `BACKWARD_PASS_NAMES` 定义一处（5.36、5.197、5.207） |
@@ -110,7 +110,7 @@
 | 设备管理器接口 | ✅ | `device_info()` 为可选契约 `DeviceContract`（5.10）；stream 管理已提为独立契约 `StreamContract`（5.89，CUDA 与 HIP 都实现）；多设备枚举与切换在 5.164 补齐：HIP 的 `runtime` 绑上 `hipGetDeviceCount` / `hipGetDevice` / `hipSetDevice`，属性与 SM 数按设备索引缓存，CUDA 侧去掉写死的 0 号卡，两边共同实现 `DeviceManagerContract`（`enumerate_devices` / `current_device` / `set_device`，非法索引当场拒绝）；跨卡拷贝与数据并行最小闭环在 5.190 补齐（`copy_across_devices` 经主机中转、`allreduce` 主机侧归约、`DataParallelTrainer` 逐卡前向反向）；5.205 补了优化器状态分片（ZeRO-1，`ShardedOptimizer` 与整份优化器逐位一致）与 GPipe 式流水（`PipelineTrainer`：段间激活跨卡、micro-batch 顺序流转、参数梯度按份数加权），仍无 peer-to-peer、也没有前向与反向的重叠执行 |
 | 分层内存分配器接口 | 🟡 | `Arena` 的统计为可选契约 `MemoryContract`（5.10），分配器本身按 `AllocatorContract` 提炼并由 `MemoryContract.allocator()` 交出（5.89）；`plan_memory` 提供不执行、不需要 GPU 的编译期静态预算，其 `release` 参数与 `Executor.run_device` 的执行策略一一对应（5.36 / 5.105）。执行期分层通路已在两家都接通：HIP 是 `TieredAllocator`（<=64KiB 分档自由表 / <=2MiB Arena / >2MiB 直调，5.131），CUDA 复用 `cuda/memory.py::Arena` 并在 `execute` 期间成对安装 / 还原 cupy 分配器（5.170），两边都由 `memory_mode="tiered"` 显式打开、默认仍是 `container` |
 | 算子注册与调度接口 | ✅ | `KernelRegistry`：注册即声明、查表即调度（5.11）；同名多实现按 `cost` 选择（5.30）；插件算子扩展面 `register_operator` / `unregister_operator`（5.30） |
-| CUDA 一等插件 | ✅ | 57 个算子语义对齐（性能见 5.4；卷积见 5.12，池化见 5.13；反向图见 5.17；SNN 见 5.18；scan 见 5.19 / 5.35；新增五算子、两个反向算子、`pad` 与三个卷积/池化反向内核见 5.20；随机算子见 5.23；批归一化见 5.24；融合注意力见 5.32；f16 支持面见 5.33；分组卷积与自适应池化见 5.34；线性递归前向与伴随见 5.35；LayerNorm 残差与 SwiGLU 门控两个内核见 5.36；`erf` 见 5.39；任意轴归约 / softmax / 归一化见 5.153（非末维归约的两维铺法见 5.174）；池化三属性与 maxpool 下标见 5.154；scan 自适应分块见 5.155；隐式卷积仅作显式对照路径见 5.151；`spike_csr` 的块内扫描见 5.176；任意单轴 argmax 与多轴归约见 5.195；事件稀疏线性的两侧梯度见 5.132 / 5.204） |
+| CUDA 一等插件 | ✅ | 68 个算子语义对齐（性能见 5.4；卷积见 5.12，池化见 5.13；反向图见 5.17；SNN 见 5.18；scan 见 5.19 / 5.35；新增五算子、两个反向算子、`pad` 与三个卷积/池化反向内核见 5.20；随机算子见 5.23；批归一化见 5.24；融合注意力见 5.32；f16 支持面见 5.33；分组卷积与自适应池化见 5.34；线性递归前向与伴随见 5.35；LayerNorm 残差与 SwiGLU 门控两个内核见 5.36；`erf` 见 5.39；任意轴归约 / softmax / 归一化见 5.153（非末维归约的两维铺法见 5.174）；池化三属性与 maxpool 下标见 5.154；scan 自适应分块见 5.155；隐式卷积仅作显式对照路径见 5.151；`spike_csr` 的块内扫描见 5.176；任意单轴 argmax 与多轴归约见 5.195；事件稀疏线性的两侧梯度见 5.132 / 5.204） |
 | 新硬件只写插件 | ✅ | 契约分层 + 算子注册表 + 插件开发指南（5.30）齐备；HIP 后端是第一个真实实例——全部新增代码在 `backends/hip/` 一个包里，IR / verifier / 前端 / 优化 / 契约零改动，内核模板逐字复用（5.40）。第三方硬件包还能用 pip entry point（组 `aetherflow.backends`）注册，装包即被 `get_backend` 发现（5.41）；zip 包还能声明内容摘要与依赖，装包期就拒绝被改动或依赖不满足的包（5.64） |
 
 **三、核心模块**
@@ -119,9 +119,9 @@
 |---|---|---|
 | 插件内 codegen | ✅ | NVRTC 运行时编译（CUDA 侧）与 hipRTC 运行时编译（HIP 侧），目标机都不需要厂商 toolkit；公开入口 `DeviceBackend.kernel()` 已提炼为可选契约 `CodegenContract`（5.163） |
 | 内存分块 / 指令映射 | 🟡 | conv2d 有真正的分块（权重复用 + 寄存器复用 + 边界快速路径，见 5.16）；其余算子仍只有广播维折叠与 block size 选择。分块与布局的**决策**已在 5.54 收进 `lower/plan.py`（block / grid / vec / shared / OC tile 全部是纯函数并带约束校验），一维网格步进骨架已在 5.55 统一（`kernels.grid_stride`），多维索引在 5.57 逐字比对后确认只值得合并一处，其余按语义差异保持手写（5.177 起 `_split_output_index` / `_image_slice` / `_tap` 三处线性化收进 `lower/indexing.py` 的 `Layout`，生产源码逐 token 不变；布局决策仍留在各内核）；block 的取值在 5.65 变成"按规模推导"的纯函数（只有上限与下限两条规则，不含性能结论） |
-| 复用 / 转译 / 原生生成三模式 | ✅ | 三条都通：**原生生成**是 59 个算子的生产路径（L1 → L2 → 方言 → NVRTC / hipRTC），**复用**是 cuBLAS / cuDNN / cuSPARSE / hipBLAS / MIOpen 的库调用（cuSPARSE 自 5.203 起接管 `sparse_linear` 的可选路径），**转译**是 `lower/translate.py` 把别人写好的源码换成另一家方言的源码（5.202）。量化算子另算一类：`quantize_i8` / `dequantize_i8` 是两份直接交给 NVRTC / hipRTC 的源码（不经 L2），`linear_i8` 是组合实现（5.239）。转译只做逐 token 可证的改写：注释 / 字符串 / 未登记标识符原样、命中拒收项（PTX 内联汇编、带掩码的 warp 内建、半精度包装类型、Clang 位转换内建）当场报错并带行号；`compile_translated` 与原生生成共用同一个编译缓存，键含原文 sha256 |
+| 复用 / 转译 / 原生生成三模式 | ✅ | 三条都通：**原生生成**是 63 个算子的生产路径（L1 → L2 → 方言 → NVRTC / hipRTC），**复用**是 cuBLAS / cuDNN / cuSPARSE / hipBLAS / MIOpen 的库调用（cuSPARSE 自 5.203 起接管 `sparse_linear` 的可选路径），**转译**是 `lower/translate.py` 把别人写好的源码换成另一家方言的源码（5.202）。量化算子另算一类：`quantize_i8` / `dequantize_i8` 是两份直接交给 NVRTC / hipRTC 的源码（不经 L2），`linear_i8` 是组合实现（5.239）。转译只做逐 token 可证的改写：注释 / 字符串 / 未登记标识符原样、命中拒收项（PTX 内联汇编、带掩码的 warp 内建、半精度包装类型、Clang 位转换内建）当场报错并带行号；`compile_translated` 与原生生成共用同一个编译缓存，键含原文 sha256 |
 | 标准算子 / 自定义算子规范 | ✅ | `Op` 数据结构 + attrs schema + `register_operator` 命名空间护栏（5.30）；插件算子进 `OPS` 后立刻能被参考后端执行与 conformance 对拍 |
-| 语义在 IR 层、内核在各插件 | ✅ | 参考后端承接全部 65 个算子的语义（`fft` / `rfft` 走 `numpy.fft`）；CUDA 承接 62 个——61 个自研内核加 1 个由反量化与 GEMM 组合的 `linear_i8`，另有 cuFFT 的 `fft` / `rfft`（conv2d = 分块直算 / im2col + cuBLAS 两条生产路径，隐式 GEMM 只作显式对照、不进自动选择，5.151；分组 / depthwise 自 5.165 起有专用直算核，5.171 按真机数据把 `auto` 收窄为"只有 depthwise 走直算核"——CUDA 上非 depthwise 的 `g4` / `g2` 被 im2col + cuBLAS 反超（0.80× / 0.44×），HIP 上仍是正收益（2.07×），不能跨厂商外推；`conv_impl="grouped"` 可显式强制，5.34 的"按组切片复用 im2col"保留在 `conv_impl="im2col"` 下；maxpool2d = 自研索引 kernel，adaptive_avg_pool2d = 自研窗口 kernel，embedding 与池化/卷积反向的重叠写用原子加，attention = 不物化分数矩阵的分块 online softmax，scan_linear / scan_linear_backward = 一个尾元素一个线程、沿时间串行，长 T（>=512）且尾维 <=2048 时自动分块，见 5.35 / 5.155；归约与 softmax 的任意轴见 5.153；池化的 ceil_mode / count_include_pad / maxpool 下标见 5.154；融合形态也在这里：layernorm 的第 4 个 residual 输入、silu 的第 2 个 gate 输入，见 5.36）。dtype 上 f32 全覆盖，f16 也全覆盖 57 个（attention 自 5.121 起是混合精度：q/k/v/mask/out 存半精度，softmax 的行统计与输出累加仍在 float——f16 只省存储与带宽，不参与累加，5.152 补了跨块边界的用例）。HIP 承接同一批 62 个算子的方式不是复制：内核源码逐字复用上面这些模板，只换 f16 的存取与原子加（5.40） |
+| 语义在 IR 层、内核在各插件 | ✅ | 参考后端承接全部 71 个算子的语义（`fft` / `rfft` 走 `numpy.fft`）；CUDA 承接 68 个——67 个自研内核加 1 个由反量化与 GEMM 组合的 `linear_i8`，另有 cuFFT 的 `fft` / `rfft`（conv2d = 分块直算 / im2col + cuBLAS 两条生产路径，隐式 GEMM 只作显式对照、不进自动选择，5.151；分组 / depthwise 自 5.165 起有专用直算核，5.171 按真机数据把 `auto` 收窄为"只有 depthwise 走直算核"——CUDA 上非 depthwise 的 `g4` / `g2` 被 im2col + cuBLAS 反超（0.80× / 0.44×），HIP 上仍是正收益（2.07×），不能跨厂商外推；`conv_impl="grouped"` 可显式强制，5.34 的"按组切片复用 im2col"保留在 `conv_impl="im2col"` 下；maxpool2d = 自研索引 kernel，adaptive_avg_pool2d = 自研窗口 kernel，embedding 与池化/卷积反向的重叠写用原子加，attention = 不物化分数矩阵的分块 online softmax，scan_linear / scan_linear_backward = 一个尾元素一个线程、沿时间串行，长 T（>=512）且尾维 <=2048 时自动分块，见 5.35 / 5.155；归约与 softmax 的任意轴见 5.153；池化的 ceil_mode / count_include_pad / maxpool 下标见 5.154；融合形态也在这里：layernorm 的第 4 个 residual 输入、silu 的第 2 个 gate 输入，见 5.36）。dtype 上 f32 全覆盖，f16 也全覆盖 64 个（attention 自 5.121 起是混合精度：q/k/v/mask/out 存半精度，softmax 的行统计与输出累加仍在 float——f16 只省存储与带宽，不参与累加，5.152 补了跨块边界的用例）。HIP 承接同一批 68 个算子的方式不是复制：内核源码逐字复用上面这些模板，只换 f16 的存取与原子加（5.40） |
 | 复用 cuDNN / cuBLAS / cuSPARSE | ✅ | cuBLAS 是 matmul 的生产路径；cuDNN 在 5.74 接成 `conv_impl="auto"` 的可回落快路径（`groups=1` 的 f32/f16，缺库或形状不支持就静默回到自研核），显式 `conv_impl="cudnn"` 可强制并在缺库时报能力错误。本轮真机没有 libcudnn，cuDNN 数值对拍按设计跳过，5.69 的对照数字仍然有效。cuSPARSE 自 5.203 起是 `sparse_linear` 的可选实现（`sparse_impl="custom"｜"auto"｜"cusparse"`，默认 custom；覆盖 f32 值 + i32 索引），本轮因真机驱动掉线没有数值对拍，库路径没有设为默认 |
 | 自研底层内核 | ✅ | 逐元素（含 gelu、SwiGLU 门控）、归约（含任意单轴；非末维的两维铺法见 5.174）与 softmax（含任意单轴）、layernorm（含残差形态）/ rmsnorm、batch_norm、im2col、conv2d_tiled、分组 / depthwise 直算、隐式卷积（仅显式对照）、max/avgpool（含 ceil_mode 与 padded-边界分母）、maxpool 下标、adaptive_avg_pool2d、concat / pad copy、embedding gather / scatter、maxpool 与卷积的输入/权重梯度、SplitMix64 掩码、分块 attention（online softmax）、线性递归扫描（前向 + 伴随 + 自适应分块）、脉冲压缩（`spike_offsets` 前缀和 + `spike_csr` 块内扫描，见 5.176）、任意单轴 argmax 与多轴归约（5.195）、事件稀疏线性的两侧梯度（5.132 / 5.204）、int8 对称量化与反量化（一份源码同时喂 NVRTC 与 hipRTC，5.239） |
 | 跨后端统一自动调优 | 🟡 | `aetherflow/tuning/` 提供与后端无关的参数空间、搜索与配置库（5.37）；CUDA 侧开放 17 个逐元素算子的 block 与 conv2d 分块核的 `tile_w`（5.56）；归约类在 5.160 也开放了（此前按"shared 与 block 绑定"排除，核对内核后该前提不成立——暂存区是固定 4 KB、内核沿 `blockDim.x` 跨步读），`tunable_ops()` 里除 conv2d 外全部是 block 旋钮。HIP 侧继承同一套调优面（5.58 补齐了漏写的 `_conv_tile`，并加了构造字段对账测试）；遥测层 `InstrumentedBackend` 本就与后端无关，5.59 又把三个基准 CLI 的 `--backend` 从写死的 `ref/cuda` 改成查注册表，5.60 已在 WSL 的 ROCm（RX 7650 GRE / DXG 直通）上实跑：conformance 13/13、调优搜出 9 条配置并逐位对拍一致；分块参数虽已在 5.54 集中到 `lower/plan.py`，`tile_w`（5.56）与 `roc` / `cb`（5.74）三个旋钮都已开放；block 的"自动"值本身也是一个候选（`{"block": None}` 表示撤掉覆盖、回到按形状推导，5.65）。5.140 把测量改成每轮连测、逐轮反转的交替 A/B，输出配对差的 bootstrap 区间与"两半同向"检查：HIP 三次采集里逐元素 block 全部保留默认，conv2d 却给出三个不同赢家（1.20× / 1.00× / 1.09×）——区间能给出，赢家仍不可复现。5.141 又加了 `--order shuffle`（每轮固定种子随机排列）并做 alternate/shuffle 的 A/B 对照：7 次采集里 conv2d 4 次判收益、3 次判噪声，4 次赢家互不相同；"批次不稳"候选数随整机状态在 12～41/45 间波动，与排列无关。根因是轮内跨度（conv2d 一轮约 2.3 秒）；5.142 已把跨度接成拒绝下结论的门槛（`--max-round-seconds`），一次 HIP 采集里 conv2d 44/45 个候选被降级为 `long-round`，同时暴露"首轮显著慢于后续轮次"的冷启动偏置。5.143 又加了 `--warmup-rounds`（默认 0）把预热轮移出样本与跨度：预热耗时与 5.142 的首轮同量级，正式轮全部回到稳态；dropout 不再被跨度误伤，但 5.142 的两个"收益"（`block=512` / 256）随之消失，说明它们更可能来自首轮污染。5.144 再做两阶段搜索（`--staged`）：conv2d 从 45 个候选拆成 4 + 11 + 2，单轮跨度降到 0.21 / 0.65 秒，`long-round` 归零；但阶段 2 的 10/11 个候选两半不稳，赢家仍保留默认——剩下的瓶颈是整机漂移下的 8 轮样本量，不是跨度。5.145 把轮数加到 16：不稳数减半（10/11 → 5/11），但仍无可接受赢家，8 轮的唯一收益（1.08×）消失，且该候选两半差达 +13.18% / -12.07%（采集内整机漂移约 25%），故不采用加轮数；下一步是跨采集复现或控制环境。5.146 已实现跨采集复现（`--repeats`）：HIP 上两次独立采集各判出不同赢家（add_broadcast 的 `block=512` 1.0756× 与 `1024` 1.1316×、relu 的默认与 `128` 1.0346×），逐候选合并后全部判 `unreplicated` 并保留默认，conv2d 两次一致地 44 个 `long-round`。它拦下了"两次都显著但赢家不同"的假阳性，代价是采集时间翻倍；控制环境仍是根因方向。5.147 在 CUDA 真机（Tesla M40）补齐同一实验：9 个用例全部保留默认，两次各一次 `decided=True`（sigmoid 的 `512` 1.0144×、silu_gate 的 `128` 1.0139×）合并后都判 `unreplicated`；同一套 1.0 秒跨度门槛在 M40 上不触发（conv2d 最长轮 0.874s），而 HIP 上 44/45 个候选触发（2.68s），说明绝对秒数门槛跨机不可移植。5.148 把门槛改成相对量（`--max-round-factor`，以预热轮平均耗时为标尺）：HIP 上 conv2d 的 `long-round` 归零；单次采集判出的 3 个收益（add_same_1m 5.50%、add_broadcast 4.13%、conv2d 6.66%）叠加 `--repeats 2` 后全部 `unreplicated`。5.149 又在跨采集复现上加多数票（`--vote majority`，需 3 次以上）：HIP 三次采集里 8 个逐元素用例仍全部保留默认（多数候选的 2/3 票型是 `unstable`），conv2d 的 `cb=2 / tile_w=64` 以 2/3 票（2 faster + 1 noise、无 slower）转正，配对差 -11.75%（CI -14.20～-2.33，1.037×），而同一批采集按全票合并时 9 个用例全部保留默认（conv2d 42/45 个候选 `unreplicated`）——多数票把"全票过严"换成"少数候选可通过"，但通过者的区间跨度 11.9 个百分点，只能当弱证据。5.150 给每个候选补了逐次配对差（`replicate_diffs`，与 `replicates` 对齐、不可行记 `None`），并把 `--repeats` 加到 5：HIP 上 9 个用例仍全部保留默认，45 次"用例 × 采集"里 8 次单次判出赢家但**两两不同**（conv2d 三次三个赢家：`64/4/1` 1.076×、`64/2/2` 1.098×、`16/auto/1` 1.130×）；5.149 的 2/3 转正候选在 5 次里拿到 0 张 `faster`，逐次差 `+2.95 / +0.27 / +5.34 / -2.20 / -8.05`（中位 +0.27%），方向本身在采集间翻转——那次转正只是"赢家每次都在换"的一个切片；M40（5 次多数票，驱动 535.309.01 / CUDA 12.2 / cupy-cuda12x 14.2.0）同样 9 个用例全部保留默认、425 次判定只有 4 张 `faster`，同一转正候选逐次差 `+0.49 / +0.04 / +1.71 / +0.42 / +0.92`（5 次全为正、0 张更快），conv2d 另有 21 个候选 5/5 全票更慢（`64/2/2` 逐次 +13.2%～+19.2%）——两台机器一致：瓶颈是整机漂移与 1% 地板。5.160 再补两道：归约类 block 开放，以及 `--min-same-sign N`（逐轮核对方向，同号不足把 `faster` / `slower` 降为 `unstable`）。HIP 两次采集里 softmax / reduce_sum / layernorm 三个用例全部保留默认：单次最优差在 −4.5%～+5.3% 之间，但同号只有 3～4/5，或 5/5 更慢；两次之间方向还会翻转（reduce_sum 的 `128` 一次 −0.9%、一次 +5.3%），与 5.63 的"±3% 真实差异 + 整机漂移"一致。同号门槛把"4/5 同号 + 4.5% 收益"这类弱证据直接拦下 |
@@ -146,7 +146,7 @@
 |---|---|---|
 | 边界值测试 | 🟡 | 有严格性用例（f64 拒绝、conv 的 stride/pad/dilation 边界、池化的 ceil_mode × count_include_pad 组合、scan 的三态取值等；非最后维不再拒绝，5.153），5.200 把边界值收成系统化用例集（`tests/test_boundaries.py` 五组 20 条：形状 / dtype / 数值 / 序列化 / 长上下文，并把 `log(0)` 等宿主告警与 `axis=None` 的 `TypeError` 两处真实缺陷一并修掉）；5.181 把图输入 dtype 的三条静默转换（浮点→整数截断、窄化越界回绕、布尔当整数）变成显式报错，5.182 补了 f16 全 padding 批的 0/0 NaN |
 | 模糊测试 | ✅ | `aetherflow/fuzz.py`：按种子随机构图，检查校验 / 序列化往返 / 两次执行一致 / 默认优化管线前后逐位一致；每轮再注入一条非法属性，要求构图期明确拒绝（5.38）。5.139 把随机生成从 25 个算子扩到 31 个：卷积 / 池化 / attention / scan / embedding 也进随机图（属性先算到自洽，再在合法区间内取值）；但随机图仍只跑参考后端，符号维不随机。5.158 起可传 `backends=("cuda", "hip")` 让每张随机图再与硬件后端的输出按 1e-4 对拍：HIP 上 100 个种子 81 例对拍、19 例按契约拒绝（全部是 i32 未承接），符号维仍不随机。5.175 补上运行期这一层：8 条固定构造的"图合法、数据非法"用例（embedding 正/负越界下标、事件类越界 `indices` 与溢出 `offsets`、整数除零必须报错、浮点除零必须给 IEEE inf），失败与构图期共用同一通道、报告分开计数 |
-| 跨后端数值一致性基准 | ✅ | `run_conformance`：92 用例 + 5 条检查（5.9，用例集随 5.17 / 5.18 / 5.19 / 5.29 / 5.34 / 5.39 / 5.50 / 5.51 / 5.132～5.134 / 5.153～5.155 / 5.174 / 5.195 / 5.204 扩增）；本轮实测参考后端 92 executed / 0 refused / 0 failed、HIP 90 / 2 / 0（拒绝项不变：f64 与分组 depthwise 的既有形态）；CUDA 真机本轮未复跑（见 §7 的 5.203 条） |
+| 跨后端数值一致性基准 | ✅ | `run_conformance`：111 用例 + 5 条检查（5.9，用例集随 5.17 / 5.18 / 5.19 / 5.29 / 5.34 / 5.39 / 5.50 / 5.51 / 5.132～5.134 / 5.153～5.155 / 5.174 / 5.195 / 5.204 / 5.286 扩增）；本轮本地实测参考后端 111 executed / 0 refused / 0 failed；HIP 上一轮 90 / 2 / 0，本轮未复跑（拒绝项不变：f64 与分组 depthwise 的既有形态） |
 | 跨**硬件**一致性 | 🟡 | NVIDIA sm_75 与 AMD gfx1100 两个厂商各一台，同一套 conformance 逐项对齐（5.40）；仍只有各一张卡，同厂商多型号 / 多驱动版本未验证 |
 | CI 流水线 | 🟡 | `.github/workflows/ci.yml`：`cpu` 跑正确性（Python 3.10 / 3.11），`fuzz` 每次 push 跑 200 个随机种子，`gpu` 手动触发或**每日定时**、串起 verify_cuda → 全量测试 → conformance → 回归 → 调优往返 → 趋势采集（历史用 `actions/cache` 跨 run 接续、`--prune 200` 按图名裁剪）并上传产物（5.38、5.199）；**仍未在托管平台实跑** |
 | 性能回归门禁 | 🟡 | 10 个固定用例（每例 3 轮取最好）+ 同机基线 + 25% 阈值（5.15）；基线在 5.92 重采，带宿主指纹，真机上门禁已绿；`ci.yml` 的 GPU job 仍未在托管平台的 self-hosted runner 上跑过 |
@@ -199,7 +199,7 @@ kernel）、前端 conv / pool / flatten 导入（5.14，LeNet 三方对齐）�
 （5.16）都已跑通，cuDNN 对照也已在 5.69 补上（首测 4～12 倍，5.268 的 auto 已到 1.02×/1.36×）。第 3 项已落地第一版：10 个固定用例 + 两份同机基线 +
 25% 判定 + CI 配置（5.15、M3.5）；GPU job 尚未接上真实 self-hosted runner（作业脚本已在真机逐条执行验证，5.70；性能门禁因换宿主变红，5.92 重采基线后已转绿）。
 跨运行吞吐 / 显存趋势已可作为 CLI 显式采集（5.38）。
-第 4 项已完成第一版：`backward()` 在语义 IR 层展开，37 条 VJP 规则，反向图可序列化、
+第 4 项已完成第一版：`backward()` 在语义 IR 层展开，49 条 VJP 规则，反向图可序列化、
 可执行、可被任意后端承接（5.17）；CUDA 侧 MLP / layernorm / softmax 反向图已真机对拍，
 卷积与池化的反向在 CUDA 上明确拒绝。二阶导数只对具备 VJP 的算子成立（5.198）；激活检查点已由 5.75 的分段重算补上
 （不改 IR / 执行器，链式模型梯度与整图逐位一致）。eager 前端的 `loss.backward()` 也已在
@@ -220,6 +220,39 @@ tile_w。两侧都能出数据了，"同一个旋钮在两个厂商上各自最�
 每次 push 的 fuzz 作业并补全 GPU 作业的步骤（verify_cuda、调优往返、趋势产物）；
 `TelemetryRecorder.trend` 与 `benchmarks/trend.py` 提供跨运行的吞吐 / 显存聚合。
 GPU 作业仍未接上真实 runner。
+
+### 1.4 与主流框架的定位对照
+
+这一节只写**结构差异与能力边界**，不写任何一方的性能数字：性能对照分两层，
+库对库已有真机数据（5.69 / 5.157 / 5.173 / 5.253～5.268），框架对框架
+**尚未实测**（仓库里没有 torch / JAX 的基准脚本）。对其它框架的描述只到
+"执行模型与工程形态"这一层，不涉及版本细节，也不替它们下性能结论。
+
+| 维度 | AetherFlow | 其它框架的典型做法 | 可比性 |
+|---|---|---|---|
+| 执行模型 | 静态语义 IR：构图 → 校验 → 优化 → 后端预检 → 执行；`EagerGraph` 只改构图手感，产物仍是静态图 | PyTorch define-by-run + Dynamo 捕获；JAX 函数式 trace + `jit`；ONNX Runtime 解释 / 编译 ONNX 图；TVM 编译 Relay / Relax 图 | 都是"图或程序 → 后端"，但我们在构图期就把能力不足报掉 |
+| 微分 | IR 层展开成普通图（49 条 VJP），反向图可序列化、可执行、可再优化；二阶导只对具备 VJP 的算子成立 | PyTorch autograd 引擎按算子注册反向；JAX `vjp` / `jvp` 可任意阶；ONNX Runtime 以推理为主；TVM 的自动微分生态较小 | 不提供 tape，也不承诺"任意算子可导" |
+| 动态形状 | 前端拒绝 SymInt；执行器支持一次构图多形状（5.217）；训练循环与分段重算要求静态 | PyTorch / JAX 原生支持（JAX 按形状重编译） | 我们是"多形状绑定"，不是"动态图" |
+| 控制流 | `Conditional` / `WhileLoop` 是子图关系，判定回主机；设备端循环每次读一次谓词（5.245） | PyTorch 用 TorchScript / Dynamo 表达分支；JAX 的 `lax.cond` / `lax.while_loop` 编译进设备端 | 我们的控制流不追求设备端无同步 |
+| 后端接入 | 两个必需方法 + 六个可选契约；新硬件写一个包即可（HIP 为证），IR / 前端 / 优化零改动 | PyTorch 需 PrivateUse1 / dispatch key；JAX 需 PJRT plugin；ONNX Runtime 需 Execution Provider；TVM 需 BYOC | 接入面更窄，代价是生态工具要自己写 |
+| 算子覆盖 | 71 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
+| 精度 | f32 / f16 全覆盖（64 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化只有 weight-only int8，无 QAT |
+| 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
+| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（解码器未接 `generate`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面，但没有 HF 权重 / BPE / GGUF |
+| 生态 | 无预训练权重、无 Hub、无第三方算子库 | 各自有完整生态 | 差距最大的一层 |
+| 失败语义 | 能力未覆盖即显式报错（构图期拒绝或 `BackendCapabilityError`），捕获期登记、replay 后复查 | 常见做法是回落或静默降级 | 这是设计差异，不是能力差异 |
+
+**这张表怎么用**：定位是"可插拔后端 + 可验证跨厂商一致性的训练 / 推理基础设施"，
+不是"替代 PyTorch 的训练框架"。对外能说的只有三件事：同一张图换后端不改代码；
+跨厂商数值一致性可判定；支持不了的地方明确失败。
+
+**框架级性能对照的缺口**（这三层补齐之前，"比 X 快 / 慢"只能引用库对库数据）：
+
+1. 没有 torch eager / torch.compile 的基准脚本。A800 上的 torch 2.5.1 可以跑，
+   但前端兼容矩阵拒绝它，对比只能绕过前端、直接喂参考语义等价的图；
+2. 没有训练吞吐与峰值显存的同模型对照（`plan_memory` 是静态估计，不能当实测值）；
+3. JAX / ONNX Runtime / TVM 未安装，也没有与它们的数值对拍；
+4. CI 未在托管平台实跑、wheel 未发布，外部无法复现我们的数字。
 
 ---
 
