@@ -31,6 +31,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from aetherflow import backward
 from benchmarks.cases import CASES
 
 DEFAULT_CASES = ("matmul_1024", "conv2d_3x3_pad1", "maxpool2x2")
@@ -125,6 +126,118 @@ def _backend(device: str):
     return ReferenceBackend(), "ref"
 
 
+def _synthetic_train(batch: int = 128, d: int = 1024):
+    """两条 ``d x d`` 的 MLP + 交叉熵：前向、反向、参数更新都能对上 torch。"""
+    from aetherflow.ir.graph import Graph
+    from aetherflow.ir.types import f32, i32
+
+    g = Graph("train_mlp")
+    x = g.input("x", f32[batch, d])
+    w1 = g.input("w1", f32[d, d])
+    b1 = g.input("b1", f32[d])
+    w2 = g.input("w2", f32[d, d])
+    b2 = g.input("b2", f32[d])
+    labels = g.input("labels", i32[batch])
+    h = g.relu(g.add(g.matmul(x, w1), b1))
+    logits = g.add(g.matmul(h, w2), b2)
+    loss = g.reduce_mean(g.add_node("cross_entropy", [logits, labels], {}))
+    g.output(loss, "loss")
+
+    rng = np.random.default_rng(20261121)
+    feed = {
+        "x": rng.standard_normal((batch, d)).astype(np.float32),
+        "w1": (rng.standard_normal((d, d)) * 0.02).astype(np.float32),
+        "b1": np.zeros(d, dtype=np.float32),
+        "w2": (rng.standard_normal((d, d)) * 0.02).astype(np.float32),
+        "b2": np.zeros(d, dtype=np.float32),
+        "labels": rng.integers(0, d, size=batch).astype(np.int32),
+    }
+    return g, feed, (w1, b1, w2, b2)
+
+
+def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> int:
+    """训练一步的对照：前向 + 交叉熵 + 反向 + SGD。
+
+    反向图只构一次（``Trainer`` 也是这么做的），循环里只执行；torch 侧
+    ``loss.backward()`` 每步重建 autograd 图，这是两边的真实行为差异。
+    """
+    batch, dim = 128, 1024
+    graph, feed, params = _synthetic_train(batch, dim)
+    bwd = backward(graph, wrt=params)
+    lr = 1e-6
+
+    def to_dev(v):
+        return cp.asarray(v) if cp is not None else v
+
+    feed_dev = {k: to_dev(v) for k, v in feed.items()}
+    params_dev = [feed_dev[p.name] for p in params]
+    seed_dev = to_dev(np.float32(1.0))
+    grad_names = bwd.output_names
+    af_exec = (backend.execute_device if hasattr(backend, "execute_device")
+               else backend.execute)
+
+    def af_step():
+        out = af_exec(bwd, {**feed_dev, "dloss": seed_dev})
+        for p, name in zip(params_dev, grad_names):
+            p -= lr * out[name]
+
+    tensors = {k: torch.as_tensor(v, device=device) for k, v in feed.items()}
+    tensors["labels"] = tensors["labels"].long()
+    ps = [tensors["w1"], tensors["b1"], tensors["w2"], tensors["b2"]]
+    for p in ps:
+        p.requires_grad_(True)
+
+    def torch_step():
+        logits = F.relu(tensors["x"] @ ps[0] + tensors["b1"]) @ ps[2] + tensors["b2"]
+        loss = F.cross_entropy(logits, tensors["labels"])
+        loss.backward()
+        with torch.no_grad():
+            for p in ps:
+                p -= lr * p.grad
+                p.grad = None
+
+    # 对拍：同一份初始权重下的 dw1（前 4x4），不一致就不出数字
+    af_grad = backend.execute(bwd, {**feed, "dloss": np.float32(1.0)})[grad_names[0]]
+    logits = F.relu(tensors["x"] @ ps[0] + tensors["b1"]) @ ps[2] + tensors["b2"]
+    F.cross_entropy(logits, tensors["labels"]).backward()
+    torch_grad = ps[0].grad.detach().cpu().numpy()
+    np.testing.assert_allclose(af_grad[:4, :4], torch_grad[:4, :4],
+                               rtol=1e-3, atol=1e-5, err_msg="dw1 与 torch 不一致")
+    with torch.no_grad():
+        for p, key in zip(ps, ("w1", "b1", "w2", "b2")):
+            p.copy_(torch.as_tensor(feed[key], device=device))
+            p.grad = None
+
+    af_stats, torch_stats = _measure_interleaved(
+        af_step, sync_af, torch_step, sync_torch, 2, args.burst, args.rounds)
+
+    print(f"\n训练一步（batch={batch}, d={dim}, f32, lr={lr}；反向图复用）")
+    ratio = torch_stats["best_ms"] / af_stats["best_ms"]
+    print(f"{'case':<14}{'af':>10}{'torch':>10}{'torch/af':>10}")
+    print(f"{'mlp_train':<14}{af_stats['best_ms']:>10.3f}"
+          f"{torch_stats['best_ms']:>10.3f}{ratio:>9.2f}x")
+
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        for _ in range(args.burst):
+            torch_step()
+        torch.cuda.synchronize()
+        torch_peak = torch.cuda.max_memory_allocated() / 2**20
+
+        pool = cp.get_default_memory_pool()
+        base = pool.used_bytes()
+        af_peak = base
+        for _ in range(args.burst):
+            af_step()
+            af_peak = max(af_peak, pool.used_bytes())
+
+        print(f"峰值显存：torch allocated {torch_peak:.1f} MiB / "
+              f"cupy 池增量 {(af_peak - base) / 2**20:.1f} MiB"
+              "（口径不同，只能看量级）")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="torch eager / compile 与 AetherFlow 的同机对照")
     parser.add_argument("--cases", default=",".join(DEFAULT_CASES), help="逗号分隔的用例名")
@@ -135,6 +248,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--compile", action="store_true", help="额外测 torch.compile")
     parser.add_argument("--compile-mode", default="default",
                         help="torch.compile 的模式（default / max-autotune）")
+    parser.add_argument("--training", action="store_true",
+                        help="改测训练一步（前向 + 交叉熵 + 反向 + SGD）")
     args = parser.parse_args(argv)
 
     try:
@@ -163,6 +278,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     torch.backends.cuda.matmul.allow_tf32 = False
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.allow_tf32 = False
+
+    if args.training:
+        return _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args)
 
     names = [n for n in args.cases.split(",") if n]
     print(f"设备 {device}，torch {torch.__version__}，"
