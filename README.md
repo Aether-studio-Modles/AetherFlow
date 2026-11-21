@@ -90,6 +90,7 @@ RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）�
 python -m unittest discover -s tests -t .   # 本地必须用 Python 3.14（3.10 的 torch 会被兼容矩阵拦下）
 python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后端
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
+python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照
 ```
 
 当前基线：**2865 个用例**，本地 444 跳过（Python 3.14 + torch 2.13）全绿；
