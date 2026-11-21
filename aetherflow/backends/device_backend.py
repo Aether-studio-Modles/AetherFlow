@@ -546,6 +546,10 @@ class DeviceBackend(Executor):
         self._one_dev = self.cp.ones(1, dtype=self.cp.float32)
         # 设备驻留表：图输入名 -> 已上传到显存的数组（通常是权重）
         self._resident: Dict[str, Any] = {}
+        # 融合 Winograd 实际执行 **权重变换内核** 的次数。常量权重应该只在
+        # 第一次执行（或计划重建后）加一，图输入权重则每次执行都加一——
+        # 基准与测试因此可以直接验证"驻留有没有真的生效"，不必靠计时猜。
+        self.conv_weight_transforms = 0
         # BLAS handle 惰性创建：图里没有 matmul 就不必加载库、建 handle
         self._blas: Any = None
         # 捕获期正在使用的 arena；非捕获期为空，dispose 因此是零成本的
@@ -1359,17 +1363,12 @@ class DeviceBackend(Executor):
         任何一条不满足就把整组留在原路径上（``kernels`` 保持 ``None``），
         这样"未实现算子 / 不支持 dtype"仍在第一次执行时按原来的时机和文案
         抛出，不会因为预判而提前或消失。
+
+        两遍扫描：常量副本要先全部上传，第二遍才知道哪些 conv 的权重来自
+        常量（见 :meth:`_holds_constant_weight`）。
         """
+        constant_ids = set()
         for group in plan:
-            fns = []
-            for node in group.nodes:
-                fn = self._planned_kernel(node)
-                if fn is None:
-                    fns = None
-                    break
-                fns.append(fn)
-            if fns is not None:
-                group.kernels = tuple(fns)
             # 常量节点的值只写在属性里、与运行期输入无关，因此在计划期上传
             # 一次就够：每次执行都 H2D 一份，正是 5.161 里"折叠产物大而原
             # 计算便宜时反而倒退"（mask 用例逐节点 GPU 时间 +22.4%）的根因。
@@ -1381,6 +1380,51 @@ class DeviceBackend(Executor):
                     group.constants[node.output.id] = self._op_constant(
                         node, (), node.attrs
                     )
+                    constant_ids.add(node.output.id)
+        for group in plan:
+            fns = []
+            for node in group.nodes:
+                fn = self._planned_kernel(node)
+                if fn is None:
+                    fns = None
+                    break
+                if self._holds_constant_weight(node, constant_ids):
+                    # 权重是常量：Winograd 的 ``U = G g G^T`` 只与权重有关，
+                    # 可以跟着计划一起驻留（见 ``_conv2d_winograd_fused``）。
+                    fn = self._resident_conv2d(fn)
+                fns.append(fn)
+            if fns is not None:
+                group.kernels = tuple(fns)
+
+    @staticmethod
+    def _holds_constant_weight(node: Node, constant_ids) -> bool:
+        """conv 的权重是不是一个常量节点的输出。
+
+        只有这种情况才允许缓存权重变换的结果。判据是 IR 结构（权重由
+        ``constant`` 节点产生），不是"指针看起来没变"——后者在权重是图
+        输入时会把原地更新的新值算成旧值，且没有任何可观测的迹象。
+        """
+        if node.op.name != "conv2d" or len(node.inputs) < 2:
+            return False
+        if node.inputs[0].type.dtype is not DType.F32:
+            return False
+        return node.inputs[1].id in constant_ids
+
+    @staticmethod
+    def _resident_conv2d(fn):
+        """给 conv 内核挂一个"权重变换结果"的盒子（惰性、随计划存活）。
+
+        盒子在第一次真正走融合内核时才填：计划期还不知道 cuDNN 会不会
+        接管这一层，白算一次 ``U`` 只是浪费。盒子由 ``group.kernels``
+        持有，因此与执行计划同寿命；计划作废（``_clear_plan_values`` /
+        ``_drop_plan``）时盒子一起消失，不会跨图误用。
+        """
+        box: List[Any] = []
+
+        def call(node, args, attrs):
+            return fn(node, args, attrs, resident=box)
+
+        return call
 
     def _planned_kernel(self, node: Node):
         """按 IR 声明预判能否跳过 ``invoke`` 的校验；能就返回内核函数。
@@ -2164,7 +2208,7 @@ class DeviceBackend(Executor):
     # 卷积：分块直算 / im2col + cuBLAS
     # ------------------------------------------------------------------
 
-    def _op_conv2d(self, node, args, attrs):
+    def _op_conv2d(self, node, args, attrs, *, resident=None):
         """NCHW conv2d，两条实现路径语义完全一致（交叉相关、不翻转核）。
 
         - 分块直算（``_conv2d_tiled``）：不再物化列矩阵，权重缓存在 shared
@@ -2173,6 +2217,10 @@ class DeviceBackend(Executor):
           K 很大时 GEMM 更吃得饱，也是分块核放不下时的兜底。
 
         具体走哪条由 ``_pick_conv_impl`` 决定；选择依据写在那里，不散落在此。
+
+        ``resident`` 是执行计划给融合 Winograd 提供的权重变换缓存盒子
+        （见 ``_prepare_plan``）；只有权重来自常量节点的 conv 才有，其余
+        情况下为 ``None``，权重变换照旧每次重算。
         """
         cp = self.cp
         x, weight = args[0], args[1]
@@ -2235,7 +2283,7 @@ class DeviceBackend(Executor):
             # 分块核与隐式 GEMM 核的 shared memory 与累加器都是 float，只覆盖
             # f32 路径。f16 走 im2col + hgemm：GEMM 内部同样是 f32 累加，
             # 语义不变。
-            if self.conv_impl in ("tiled", "implicit", "winograd"):
+            if self.conv_impl in ("tiled", "implicit", "winograd", "winograd_fused"):
                 raise BackendCapabilityError(
                     f"conv2d 的 {self.conv_impl} 内核只支持 float32；"
                     "f16 请用 conv_impl='auto' 或 'im2col'"
@@ -2251,7 +2299,7 @@ class DeviceBackend(Executor):
             # M40 上测到 cuBLAS 的 im2col 路径反超（g2 0.47×、g4 0.81×），
             # 而 HIP 上同一形状是直算核更快；跨厂商没有统一结论，想省列矩阵
             # 就显式指定 conv_impl="grouped"。im2col 仍是默认回落路径。
-            if self.conv_impl in ("tiled", "implicit", "winograd"):
+            if self.conv_impl in ("tiled", "implicit", "winograd", "winograd_fused"):
                 raise BackendCapabilityError(
                     f"conv2d 的 {self.conv_impl} 内核只支持 groups=1；"
                     "分组卷积请用 conv_impl='auto'、'grouped' 或 'im2col'"
@@ -2274,6 +2322,25 @@ class DeviceBackend(Executor):
                     "请用 conv_impl='auto' 或 'im2col'"
                 )
             kernel_kind = "winograd"
+        elif self.conv_impl == "winograd_fused":
+            # 融合版的适用面与四段版相同（同一组系数），额外受 shared 预算
+            # 约束：``V`` 要整块留在共享内存里，``16*C*TT*4`` 字节。
+            if not conv_winograd_supported(
+                kh=kh, kw=kw, sh=sh, sw=sw, dh=dh, dw=dw
+            ):
+                raise BackendCapabilityError(
+                    "conv2d 的 winograd_fused 内核只支持 3x3、stride=1、dilation=1，"
+                    f"收到核 {kh}x{kw}、stride {(sh, sw)}、dilation {(dh, dw)}；"
+                    "请用 conv_impl='auto' 或 'im2col'"
+                )
+            need = 16 * c * CONV_WINOGRAD_TILE * 4
+            if need > CONV_SHARED_LIMIT:
+                raise BackendCapabilityError(
+                    f"conv2d 的 winograd_fused 内核需要 {need} B 共享内存"
+                    f"（C={c}、tile={CONV_WINOGRAD_TILE}），超过预算 "
+                    f"{CONV_SHARED_LIMIT} B；请用 conv_impl='auto' 或 'winograd'"
+                )
+            kernel_kind = "winograd_fused"
         else:
             kernel_kind = self._pick_conv_kernel(**dims)
         bias_fused = False
@@ -2295,8 +2362,10 @@ class DeviceBackend(Executor):
                 out = self._conv2d_winograd(x, weight, bias, **dims)
                 bias_fused = True
             elif kernel_kind == "winograd_fused":
-                # 融合版的写回同样融 bias
-                out = self._conv2d_winograd_fused(x, weight, bias, **dims)
+                # 融合版的写回同样融 bias；常量权重可跨执行复用权重变换
+                out = self._conv2d_winograd_fused(
+                    x, weight, bias, resident=resident, **dims
+                )
                 bias_fused = True
             else:
                 out = self._conv2d_im2col(x, weight, **dims)
@@ -2546,7 +2615,7 @@ class DeviceBackend(Executor):
         return out
 
     def _conv2d_winograd_fused(self, x, weight, bias, *, n, c, h, w, o, kh, kw,
-                               ho, wo, sh, sw, ph, pw, dh, dw, k):
+                               ho, wo, sh, sw, ph, pw, dh, dw, k, resident=None):
         """融合版 F(2x2,3x3)：两次 launch（权重变换 + 融合内核）。
 
         与 :meth:`_conv2d_winograd` 的差别只在中间量落在哪：``V`` 留在共享
@@ -2554,9 +2623,19 @@ class DeviceBackend(Executor):
         两块全局缓冲，也没有 cuBLAS 的那次提交。数值与四段版逐位一致
         （同一组系数、同样的求和顺序，实测相对 cuDNN ≤ 2e-7）。
 
-        ``U`` 仍每次执行重算一次：权重是图输入，运行期无法证明它没变，
-        按指针缓存会静默用旧权重。这一次 launch 在 c3～c24 上约 0.008～
-        0.015 ms，换来的是"不会算错"。
+        ``U`` 的驻留分两种情况，判据是 IR 结构而不是"指针没变"：
+
+        - 权重来自**常量节点**（``torch.export`` 的 ``get_attr`` / lifted
+          张量、图里显式 ``constant``）：执行计划在 ``_prepare_plan`` 里给了
+          ``resident`` 盒子，第一次算完就留在盒子里，之后每次执行只跑融合
+          内核。权重是常量意味着它的设备副本由计划独占、与计划同寿命，
+          "值没变"因此是可证的而不是猜的。
+        - 权重是**图输入**（基准脚本的常见形态，可以用新权重覆盖）：没有
+          盒子，每次执行重算一次 ``U``。这一次 launch 约 0.008～0.015 ms，
+          换来的是"绝不会拿旧权重算新输入"。
+
+        盒子里的 ``U`` 形状/dtype 与本次不符时同样重算并替换：那说明权重
+        本身变了，旧 ``U`` 不能再用。
         """
         cp = self.cp
         th = cdiv(ho, 2)
@@ -2565,20 +2644,30 @@ class DeviceBackend(Executor):
         tt = CONV_WINOGRAD_TILE
         dtype_key = self._kind(x)
 
-        u = cp.empty((16, o, c), dtype=x.dtype)
-        total = o * c
-        block, grid = self._grid("conv2d", total)
-        weight_kernel = self._kernel(
-            ("winograd_weight", dtype_key),
-            lambda: self.codegen.render(
-                self.codegen.winograd_weight_source(), x.dtype
-            ),
-            "winograd_weight",
-        )
-        weight_kernel(
-            (grid,), (block,),
-            (weight, u, np.int32(o), np.int32(c), np.int64(total)),
-        )
+        u = resident[0] if resident else None
+        if u is None or u.shape != (16, o, c) or u.dtype != x.dtype:
+            u = cp.empty((16, o, c), dtype=x.dtype)
+            self.conv_weight_transforms += 1
+            total = o * c
+            block, grid = self._grid("conv2d", total)
+            weight_kernel = self._kernel(
+                ("winograd_weight", dtype_key),
+                lambda: self.codegen.render(
+                    self.codegen.winograd_weight_source(), x.dtype
+                ),
+                "winograd_weight",
+            )
+            weight_kernel(
+                (grid,), (block,),
+                (weight, u, np.int32(o), np.int32(c), np.int64(total)),
+            )
+            if resident is not None:
+                # 盒子由执行计划持有（``group.kernels`` → 闭包），因此这块
+                # 显存与计划同寿命；计划作废时盒子一起消失。
+                if resident:
+                    resident[0] = u
+                else:
+                    resident.append(u)
 
         out = cp.empty((n, o, ho, wo), dtype=x.dtype)
         kernel = self._kernel(

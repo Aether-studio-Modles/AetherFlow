@@ -9,6 +9,7 @@ K 在 (32, 400] 且 im2col 物化缓冲 ``n*ho*wo*K`` 不超过 3.2M 元素时�
 
 import unittest
 
+from aetherflow import Graph, f32
 from aetherflow.backends.cuda import CudaBackend
 from aetherflow.backends.device_backend import DeviceBackend
 from aetherflow.backends.hip.backend import HipBackend
@@ -329,6 +330,59 @@ class TestAutoConvImplPick(unittest.TestCase):
                 ),
                 want,
             )
+
+
+class TestConstantWeightResident(unittest.TestCase):
+    """常量权重的 Winograd ``U`` 可以随执行计划驻留（5.257）。
+
+    判据必须是 **IR 结构**："权重由 ``constant`` 节点产生"。权重是图输入
+    时一律不缓存——那条路径允许调用方每次喂新权重，按指针或按"看起来没
+    变"缓存会把新权重算成旧值，且没有任何可观测迹象。
+    """
+
+    @staticmethod
+    def _conv_graph(constant_weight: bool):
+        g = Graph()
+        x = g.input("x", f32[1, 8, 8, 8])
+        if constant_weight:
+            w = g.constant(0.25, shape=(8, 8, 3, 3))
+        else:
+            w = g.input("w", f32[8, 8, 3, 3])
+        g.output(g.conv2d(x, w, stride=1, padding=1), "y")
+        conv = next(n for n in g.nodes if n.op.name == "conv2d")
+        return conv, w
+
+    def test_constant_weight_is_marked(self):
+        conv, w = self._conv_graph(constant_weight=True)
+        self.assertTrue(DeviceBackend._holds_constant_weight(conv, {w.id}))
+
+    def test_graph_input_weight_is_not_marked(self):
+        """权重是图输入、或常量集合里没有那个 id：都不驻留。"""
+        conv, _ = self._conv_graph(constant_weight=False)
+        self.assertFalse(DeviceBackend._holds_constant_weight(conv, set()))
+        conv, w = self._conv_graph(constant_weight=True)
+        self.assertFalse(DeviceBackend._holds_constant_weight(conv, set()))
+
+    def test_explicit_fused_impl_is_cuda_only(self):
+        """显式 ``conv_impl="winograd_fused"`` 只在 CUDA 开放（HIP 无此内核）。"""
+        self.assertIn("winograd_fused", CudaBackend.CONV_IMPLS)
+        self.assertNotIn("winograd_fused", HipBackend.CONV_IMPLS)
+
+    def test_box_is_filled_once_and_reused(self):
+        """盒子第一次填、之后复用；这正是"省掉一次 launch"的来源。"""
+        seen = []
+
+        def fn(node, args, attrs, *, resident=None):
+            seen.append(len(resident))
+            if not resident:
+                resident.append(object())
+            return resident[0]
+
+        call = DeviceBackend._resident_conv2d(fn)
+        first = call(None, [], {})
+        second = call(None, [], {})
+        self.assertIs(first, second)
+        self.assertEqual(seen, [0, 1])
 
 
 if __name__ == "__main__":
