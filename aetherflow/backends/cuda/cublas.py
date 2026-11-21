@@ -114,6 +114,12 @@ class Cublas:
         lib.cublasSetStream_v2.argtypes = [vp, vp]
         lib.cublasSetStream_v2.restype = ci
 
+        # 预置 workspace：CUDA Graph 捕获期间 cuBLAS 不能自己分配内部
+        # workspace，否则会退到不需要 workspace 的慢算法。提前给一块常驻
+        # 的，捕获与 eager 走同一条算法路径。大小由调用方决定。
+        lib.cublasSetWorkspace_v2.argtypes = [vp, vp, ctypes.c_size_t]
+        lib.cublasSetWorkspace_v2.restype = ci
+
         lib.cublasSgemm_v2.argtypes = [
             vp, ci, ci, ci, ci, ci, fp, vp, ci, vp, ci, fp, vp, ci,
         ]
@@ -158,6 +164,17 @@ class Cublas:
     # ------------------------------------------------------------------
     # GEMM
     # ------------------------------------------------------------------
+
+    def set_workspace(self, ptr: int, size: int) -> None:
+        """预置一块常驻 workspace（CUDA Graph 捕获期不能分配内部 workspace）。"""
+        if size <= 0:
+            raise ValueError("cuBLAS workspace 大小必须为正")
+        self._check(
+            self._lib.cublasSetWorkspace_v2(
+                self._handle, ctypes.c_void_p(ptr), ctypes.c_size_t(size)
+            ),
+            "cublasSetWorkspace_v2",
+        )
 
     def sgemm(self, a, b, out) -> None:
         """行主序 ``out[M, N] = a[M, K] @ b[K, N]``。"""

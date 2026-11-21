@@ -342,6 +342,7 @@ class CudaBackend(DeviceBackend):
         self._functions.clear()
         self._kernel_handles.clear()
         self._blas = None
+        self._blas_workspace = None
         # cuSPARSE handle 与 workspace 都绑在旧卡的 context 上，和 cuBLAS 同理
         self._cusparse = None
         # cuFFT 的 plan 绑在旧卡的 context 上
@@ -638,6 +639,13 @@ class CudaBackend(DeviceBackend):
                 self._blas = Cublas()
             except OSError as exc:
                 raise BackendCapabilityError(f"{self._LABEL}无法加载 cuBLAS：{exc}") from exc
+            size_mb = int(os.environ.get("AETHERFLOW_CUBLAS_WORKSPACE_MB", "0"))
+            if size_mb > 0:
+                # 常驻一块 workspace，让图捕获与 eager 走同一条算法路径；
+                # 显式请求才会分配，默认不改变原有行为。
+                buf = self.cp.zeros(size_mb << 20, dtype=self.cp.uint8)
+                self._blas_workspace = buf
+                self._blas.set_workspace(int(buf.data.ptr), int(buf.nbytes))
         return self._blas
 
     # ------------------------------------------------------------------
