@@ -17552,3 +17552,82 @@ d_conv=4）下状态是 48 张量 / 3.56 MiB：**每个 token 状态往返 7.12 
 契约与探针账。后续若要做设备态解码，先做的是**状态常驻**（decode 步用
 `execute_device` 而不是 `execute`，状态不回主机），它省掉的正是 7.12 MiB/token，
 且不需要条件节点；本轮没做，是为了不把"分支"悄悄换成另一个特性。
+
+### 5.279　设备态解码：状态常驻，每步只取回 logits
+
+**问题**：5.278 把问题定位清楚了——分支接不进去，但 decode 每步的
+"状态 D2H + 下一步 H2D"（真实规模 7.12 MiB/token）与分支无关，是状态没有常驻。
+采样只需要最后一行的 logits（128 KB），状态却每步都往返。
+
+**做法**（`models/lm.py`；不动 `generate` / 束搜索）
+
+1. **一个开关，不静默降级**：`LMRunner(device_state=True)`。它要求
+   `resident=True`——否则捕获图必须把全部权重当可变输入，每步重传的字节数比
+   省下的更多；还要求后端提供 `capture` / `to_host` / `to_array`。缺任一项在
+   构造期 `ValueError`，不偷偷回落到宿主路径。
+2. **decode 图只捕获一次**：`steps=1`、`head="last"` 的形状按 batch 固定，
+   权重驻留后写死进图；`ids` / `reset` / 全部状态是每步可变的输入。计划与图
+   分开持有、不进 `_graphs`——计划记的是捕获时的显存地址，不能被 LRU 淘汰掉
+   它依赖的图。
+3. **每步只回传 logits**：`_device_step` 把上一步的设备输出直接作为输入
+   （HIP 的 `HipGraphPlan.replay` 对同一块缓冲走 D2D），`run_device` 后只
+   `to_host(logits)`。状态对象在 Python 侧换了个键名，指针不动。
+4. **整块取回**：`_sample` 的 logits 从"逐行 `_host_row`"改成整块一次
+   `to_host`。批量 B 行时原来是 B 次 D2H，现在 1 次；这条对宿主路径同样生效。
+5. **prefill 不假装设备态**：仍是 `execute`（状态与 logits 回主机一次），第一步
+   decode 把状态上传一次（3.56 MiB）。省下的是第 2 步起的每 token 往返。
+
+**顺带修复（HIP 真机暴露，与解码无关但挡路）**
+
+- **容器缺 `cp.uint16`**：`hip/runtime.py` 的 dtype 常量表没有 `uint16`，而
+  `device_backend.py` 在 `_kind` / bf16 判定处按 `cp.uint16` 比较。结果是**任何
+  图**第一次 `invoke` 就 `AttributeError`（不是"bf16 不支持"的显式拒绝）。此前
+  HIP 用例一直跳过，所以从未暴露。补 `uint16 = np.uint16`、加进 `_SUPPORTED`
+  与 `_C_TYPES`（`unsigned short`）；HIP 的 bf16 支持面仍是空集，由 `invoke`
+  的能力检查拒绝，而不是崩在属性上。
+- **分支 replay 的异步时序**：`DeviceConditional.run_device` 的分支 replay 提交
+  到捕获流后立即返回，`run` 的收尾 D2H 走默认流。CUDA 的 legacy 默认流会隐式
+  同步，HIP 不会——真机症状是 `x=0` 得 10（走 then）、改成 `x=2` 仍得 -10（else
+  读到上一次的 0；直接 replay 该计划得 -8）。分支 replay 之后同步捕获流；这不
+  是主机往返，仍只读谓词一个标量。
+
+**判据**（新增 9 条，`tests/test_lm_device_state.py`）
+
+- 数值（3）：与宿主会话（`resident=True`）、模块级 `generate` 逐 token 一致
+  （含温度 / top-k / seed）；`generate_batch` 两行一致；`prime` 前缀后一致。
+- 往返账（2）：同一会话两次请求只捕获 1 次；decode 每步恰好一次 logits D2H、
+  状态 D2H 为 0；状态只在首步上传一次（`h2d == 2*steps + states`），此后每步
+  每张状态一次 D2D（`d2d == states*(steps-1)`）。
+- 形态（2）：束搜索不建计划、仍走宿主；`close` 丢弃计划。
+- 契约（2）：缺 `resident`、缺 `capture` / `to_host` 在构造期拒绝。
+- 真机（1）：WSL HIP 上与宿主路径逐 token 一致；prefill 之后 decode 每步只取回
+  `(1,1,V)`，状态形状的 `to_host` 次数正好等于 prefill 的块数。
+
+**负向对照**（真机，先红后绿）：去掉 `DeviceConditional.run_device` 的流同步，
+`test_conditional_matches_reference_on_hip` 变红（`-10.0 != -8.0`）；恢复后绿，
+并据此断定是"默认流不等捕获流"而不是数值错误。
+
+**验证**
+
+- 本地（Windows / Python 3.14 + torch 2.13）：`Ran 2812 tests / OK (skipped=429)`
+  ——比上一轮多 9 条新用例、多 1 条跳过（HIP 真机用例）；`ruff check` 通过。
+  用 Python 3.10 跑全量时 `test_frontend` 的 123 条仍因 torch 2.4.1 不在兼容矩阵内
+  报错（环境问题，同 5.276）。
+- WSL + ROCm 7.2.4 / RX 7650 GRE（`gfx1102`，DXG 直通）：
+  `tests.test_hip_backend` 72 条全过（修复前首次 `execute` 即 `AttributeError`）；
+  `tests.test_device_control` + `tests.test_lm_device_state` 共 44 条全过
+  （含 2 条 HIP 控制流与 1 条设备态解码真机用例）。
+- **环境前提**：WSL 必须 `export HSA_ENABLE_DXG_DETECTION=1`，否则
+  `hsa_init` 失败、`hipGetDeviceCount` 返回 0，`available()` 会正确地判为不可用。
+
+**边界**
+
+- **静态形状**：一张捕获图一组固定形状，换 batch 要重建计划（与 5.217 的设备态
+  捕获限制同源）。
+- **只省状态往返**：采样、停止判定、下一轮 `ids` 写回仍在主机；每步仍有同步与
+  128 KB logits D2H，不承诺比宿主路径更快。
+- **prefill 与首步**：prefill 仍回主机，状态第一步上传一次；短序列省不下多少。
+- **束搜索 / 投机解码**：按父假设 gather 状态或回滚快照，与单条 decode 不是同一
+  张图，仍走宿主路径。
+- **真机覆盖**：HIP 上验证的是小形状的逐 token 一致与往返次数，没有大模型的吞吐
+  数字；CUDA 未验证。

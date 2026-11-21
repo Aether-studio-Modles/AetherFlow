@@ -24,8 +24,10 @@
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行（主机中转）、
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
-  分页 KV cache 与贪心投机解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集
-  （`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式）。
+  **设备态解码**（`LMRunner(device_state=True)`）：decode 图捕获一次、状态常驻显存、
+  每步只把 logits 取回主机（DESIGN 5.279）；分页 KV cache 与贪心投机解码（组件级，
+  见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：`/v1/completions`、
+  `/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
   roofline 式成本模型（用于排序，不做性能预测）、Chrome Trace 导出。
 - **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）；
@@ -50,7 +52,7 @@ CUDA 后端需要 `cupy-cuda12x`；HIP 后端需要 ROCm 与自带的 `hip.runti
 | torch（可选） | 前端适配器声明区间 2.9–2.13，本版仅在 2.13.0 上验证；区间内未验证版本不承诺回归覆盖，越界显式抛 `UnsupportedTorchVersion` |
 | CUDA 后端 | CUDA 12.x + 驱动 550+（2×V100 `sm_70` 上验证）；cuFFT 提供 `fft` / `rfft` |
 | CUDA 实测机 | A800-SXM4-40GB、驱动 550.127、cuDNN 9.1（Ubuntu 22.04）。系统没装 CUDA toolkit，cuBLAS / cuDNN 由 miniconda 的 `nvidia/{cublas,cudnn}/lib` 提供，跑卷积必须把这两条加进 `LD_LIBRARY_PATH`；对照 cuDNN 再加 `NVIDIA_TF32_OVERRIDE=0` |
-| HIP 后端 | ROCm 7.2（RX 7650 GRE `gfx1100`，WSL 上验证） |
+| HIP 后端 | ROCm 7.2（RX 7650 GRE `gfx1100` / `gfx1102`，WSL + DXG 直通上验证）。WSL 内必须 `export HSA_ENABLE_DXG_DETECTION=1`，否则 `hsa_init` 失败、`hipGetDeviceCount` 返回 0 |
 
 ### 快速上手
 
@@ -83,8 +85,8 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 2767 个用例，427 跳过，全绿 |
-| HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1100`） | 2767 个用例，373 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 2812 个用例，429 跳过，全绿 |
+| HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / 2× Tesla V100（`sm_70`）/ CUDA 12.4 / 驱动 550 | 全绿（cuDNN 因驱动版本不匹配按设计跳过） |
 
 ```bash
@@ -112,10 +114,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
   状态与输出常驻显存，但每次判定仍要读一次谓词；实测**不比宿主路径快**，交付的是
   执行形态而非加速。没有 device-side 真分支，`Conditional` / `WhileLoop` 的判定
-  本身仍回主机（DESIGN 5.245 / 5.277）。**推理解码主路径接不进去**：判定输入是
-  主机采样出的 token、每步还要写回 `ids`，设备端循环的"条件→体"之间没有主机回调位
-  （DESIGN 5.278，负结果）。设备态解码若要做，先做状态常驻（`execute_device`），
-  不要指望条件节点。
+  本身仍回主机（DESIGN 5.245 / 5.277）。**解码的"分支"接不进去**：判定输入是主机
+  采样出的 token、每步还要写回 `ids`，设备端循环的"条件→体"之间没有主机回调位
+  （DESIGN 5.278，负结果）；**但 decode 的状态已经常驻**：
+  `LMRunner(device_state=True)` 捕获一次 `steps=1` 的 decode 图，状态每步 D2D、
+  只回传 logits 块（5.279）。它要求 `resident=True` 与静态形状（换 batch 重建
+  计划），prefill 与首步仍各回传/上传一次状态，束搜索与投机解码仍走宿主路径。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
@@ -217,6 +221,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   dtype 或连续性任一条不符就回落 `_op_conv2d`。只写快路径不写回退，图输入
   换个形状就会按旧步长读内存；这些前提在计划构建时看不见（取决于运行期
   数组），所以检查只能放在闭包入口，且必须是原路径而不是另一份近似逻辑。
+- **HIP 真机才暴露的两类问题**（5.279）：容器 dtype 表缺常量（`cp.uint16`）
+  会让**任何图**首次 `invoke` 就 `AttributeError`，而 HIP 用例常年跳过所以
+  一直没被发现——设备用例跳过时，"跳过"本身要当成未验证而不是通过；异步
+  `replay` 之后必须同步捕获流，HIP 的默认流不会等它（CUDA legacy 默认流隐式
+  同步），否则收尾 D2H 读到上一次 replay 的输出。WSL 里跑 HIP 必须带
+  `HSA_ENABLE_DXG_DETECTION=1`，否则设备数报 0。
 
 ---
 

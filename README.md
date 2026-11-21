@@ -89,7 +89,8 @@ python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后�
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
 ```
 
-当前基线：**2767 个用例**，本地 427 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）373 跳过，全绿。
+当前基线：**2812 个用例**，本地 429 跳过（Python 3.14 + torch 2.13）全绿；
+WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
 
@@ -99,9 +100,9 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 | 算子 | IR 里 67 个算子；CUDA / HIP 各自承接 64 个（63 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
 | 精度 | f32 全覆盖；f16 覆盖 60 个（64 个设备端算子去掉 3 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
 | 自动微分 | 47 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
-| 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环接不进这套形态——判定在主机采样之后（5.278） |
+| 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环接不进这套形态——判定在主机采样之后（5.278），但 decode 的**状态**可以常驻（5.279） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast，未接进数据并行路径）、数据并行（主机中转归约）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
-| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
+| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、**设备态解码**（`LMRunner(device_state=True)`：decode 状态常驻显存、每步只取回 logits，DESIGN 5.279）、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
 | 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb；roofline 式成本模型（六项分解 + 可行性剪枝）先算再测，按估算排序只测前 N 个 |
 | 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、Chrome Trace 导出（`python -m aetherflow.runtime.trace telemetry.json`）、NHWC 布局传播（`LayoutPropagation`，仅参考后端承接）、CI 四作业（含 wheel 构建与安装冒烟）、部署包、zip 硬件包 |
 
@@ -214,9 +215,11 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   运行期按实际形状算）；设备态的捕获计划、分段重算与需要合并维度的广播反向仍要求静态形状；
   控制流每次判定回主机；`DeviceWhileLoop` / `DeviceConditional` 只是把条件、分支
   各捕获一次、状态与输出留在显存，每次判定仍要读一次谓词，没有 device-side 真分支
-  或 Graph 条件节点（实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环
-  （`generate` / `LMRunner`）没有设备形态：判定输入是主机采样出的 token，每步还要把
-  它写回 `ids`，而设备端循环的"条件→体"之间没有主机回调位（5.278）；
+  或 Graph 条件节点（实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码的**分支**
+  仍接不进这套形态（判定输入是主机采样出的 token，每步还要把它写回 `ids`，
+  5.278），但 decode 的**状态**已能常驻：`LMRunner(device_state=True)` 捕获一次
+  `steps=1` 的 decode 图，每步只取回 logits（5.279）。它要求 `resident=True` 与静态
+  形状（换 batch 重建计划），不承诺比宿主路径更快，束搜索与投机解码仍走宿主；
 - **服务化**：分页 KV cache 与投机解码只有组件级交付（主干是 Mamba，没有增长 KV，
   二者未接进 `generate` / `LMRunner`；投机解码只做贪心验收与 batch=1）；已有 OpenAI
   兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /
@@ -226,7 +229,8 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   但 `where` / `masked_fill` / 比较算子（IR 没有 bool 张量）、`topk`、`sign` / `round` / `floor` / `ceil`、
   `copy_`、图内 `clamp` 边界、非零或 reflect 的 `pad`、非整数 `pow` 指数都**显式拒绝**，
   不会退化成近似实现；
-- **硬件**：NVIDIA sm_75 与 AMD gfx1100 各一张卡，无 Intel / Apple / 移动端。
+- **硬件**：NVIDIA sm_75 与 AMD gfx1100 / gfx1102 各一张卡，无 Intel / Apple / 移动端。
+  WSL 上的 HIP 需要 `HSA_ENABLE_DXG_DETECTION=1`，否则 `hsa_init` 失败、设备数报 0。
 
 反过来，主流框架没有的差异化能力：**SNN 的替代梯度与事件稀疏**、**SSM 的 scan**、
 **跨厂商同一套 IR 的逐项一致性验证**、**IR 的版本治理与跨版本迁移**、**插件契约分层**。
@@ -244,7 +248,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                2767 个用例
+tests/                2812 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
