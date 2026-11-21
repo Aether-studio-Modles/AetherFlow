@@ -119,8 +119,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   文本层截断、不参与调度（命中后仍生成到 `max_tokens`）；流式由每个请求轮询
   `ServingEngine.progress()` 快照，并发很大时应改成调度器推送增量。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
-  无 `bool` 常量、无 `arange`、`padding_idx` / `sparse` / `scale_grad_by_freq`
-  显式拒绝。
+  无 `bool` 张量，因此 `where` / `masked_fill` / 比较算子 / `topk` 显式拒绝；
+  `sign` / `round` / `floor` / `ceil`、`baddbmm`、原地 `copy_` 无对应语义；
+  非整数 `pow` 指数、图内 `clamp` 边界、非零或 reflect 的 `pad`、非默认
+  `softplus.threshold` 一律拒绝；常量构造（zeros / ones / full / arange 等）
+  落成图属性，单个常量上限 65536 元素；`padding_idx` / `sparse` /
+  `scale_grad_by_freq` 显式拒绝。
 - **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_mask` 只有
   参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积的差距按稳态口径读
   （DESIGN 5.253）：低 GFLOP 形状与 cuDNN 同量级（1x1_c32 是 0.72×），真实差距
