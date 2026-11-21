@@ -140,7 +140,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   5.9 → 0.83 ms，A800 设备侧多节点图 3.4～6.0×（1.66 → 0.40 ms），
   单节点图无收益。注意 5.261 的发现：conv-bn-relu 这类图在捕获期仍会做
   H2D，`_graph_failure` 报 `RuntimeError: ... H2D transfers are disallowed`，
-  实际回落到逐节点路径；这类图现在靠计划期展开提速（8 层 0.919 → 0.298 ms）。
+  实际回落到逐节点路径；这类图现在靠计划期展开提速（8 层 0.919 → 0.298 ms，
+  逐通道 BN 的 `channel4d` 由 5.262 从 0.905 降到 0.303 ms）。
   显式 `conv_impl="cudnn"` 时整图无法捕获（algo 查询是 host API），`auto`
   会在捕获期自动改走 tiled。
 
