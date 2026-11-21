@@ -53,6 +53,16 @@ _TORCH_DTYPE = {
 #: 参数或显式输入。
 MAX_IMPORTED_CONSTANT_ELEMENTS = 65536
 
+#: IR dtype -> torch dtype 名。用于把常量构造（zeros/full/arange）落成张量；
+#: i32 的载体在 torch 里用 int32（IR 没有 i64）。
+_IR_TO_TORCH = {
+    "f16": "float16",
+    "bf16": "bfloat16",
+    "f32": "float32",
+    "f64": "float64",
+    "i32": "int32",
+}
+
 
 @dataclass
 class ImportedModel:
@@ -622,6 +632,115 @@ def _clamp(g: Graph, x: Value, lo: Optional[float], hi: Optional[float]) -> Valu
     return g.sub(high, g.relu(g.sub(high, x)))
 
 
+def _const_like(g: Graph, x: Value, value: Any, node: Any, what: str) -> Value:
+    """把一个 Python 标量折成与 ``x`` 同 dtype 的常量节点。
+
+    IR 的逐元素算子只按 numpy 广播规则组合张量，没有"标量操作数"这种
+    第二种输入形态；标量必须先变成形状 ``()`` 的常量。整型张量遇到非整数
+    标量时拒绝——``int(3.5)`` 的静默截断会把语义改掉。
+    """
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 的 {what}={value!r} 不是 Python 标量，无法在构图期折叠"
+        )
+    dtype = x.type.dtype
+    if not dtype.is_float and float(value) != int(value):
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 的 {what}={value!r} 不是整数，但输入 dtype 是 {dtype.value}；"
+            "整数张量上的小数标量没有无损表示"
+        )
+    return _scalar(g, float(value) if dtype.is_float else int(value), dtype)
+
+
+def _pow_scalar(g: Graph, x: Value, exponent: Any, node: Any) -> Value:
+    """``x ** exponent``（指数是 Python 标量）用已有原语精确展开。
+
+    IR 没有通用 ``pow``：浮点指数只能通过 ``exp(y*log(x))`` 实现，而那条路
+    在 ``x <= 0`` 时不是原式（定义域不同），不能当成"等价降级"。因此只接
+    可精确展开的指数：0 / 0.5 / 整数 / -1，其余显式拒绝。
+    """
+    if isinstance(exponent, bool) or not isinstance(
+        exponent, (int, float, np.integer, np.floating)
+    ):
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 的 pow 指数不是 Python 标量（{exponent!r}）；"
+            "运行期指数在 IR 里没有对应算子"
+        )
+    value = float(exponent)
+    dtype = x.type.dtype
+    one = _const_like(g, x, 1.0, node, "pow 的常量")
+
+    def _int_pow(n: int) -> Value:
+        # 平方求幂：层数与乘法次数都只取决于静态指数
+        result: Optional[Value] = None
+        base = x
+        while n:
+            if n & 1:
+                result = base if result is None else g.mul(result, base)
+            n >>= 1
+            if n:
+                base = g.mul(base, base)
+        assert result is not None
+        return result
+
+    if value == 0.0:
+        if not all(isinstance(d, int) for d in x.type.shape):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 pow(0) 需要把标量 1 广播成静态形状"
+            )
+        return g.broadcast_to(one, shape=x.type.shape)
+    if value == 0.5:
+        return g.sqrt(x)
+    if value == 1.0:
+        return x
+    if value == 2.0:
+        return g.mul(x, x)
+    if value == -1.0:
+        return g.div(one, x)
+    if value == int(value) and abs(int(value)) <= 16:
+        n = int(value)
+        if not dtype.is_float and n < 0:
+            # 负整数指数在整数张量上是真分数，IR 没有这种语义
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 在 {dtype.value} 张量上使用了负指数 {n}"
+            )
+        return _int_pow(n) if n > 0 else g.div(one, _int_pow(-n))
+    raise UnsupportedOperatorError(
+        f"节点 {node.name} 的 pow 指数是 {exponent!r}，无法用已有算子精确展开；"
+        "IR 没有通用 pow（exp/log 在非正输入上不等价）。请把该运算改写为 "
+        "sqrt / 整数次幂，或在建模侧用 exp(y*log(x)) 并自行处理定义域"
+    )
+
+
+def _softplus(g: Graph, x: Value, beta: float, threshold: float, node: Any) -> Value:
+    """``softplus(x) = (1/beta) * log(1 + exp(beta*x))`` 的稳定恒等式展开。
+
+    用 ``max(z,0) + log(1 + exp(-|z|))``：指数项恒 ``<= 1``，不会溢出，
+    且对任意 ``z`` 都是精确等式（不是近似）。torch 的 ``threshold`` 只是
+    溢出保护：超过阈值时直接返回 ``x``，与精确值相差 ``exp(-threshold)``。
+    非默认阈值会改变 torch 的输出，因此显式拒绝而不是忽略。
+    """
+    if beta <= 0:
+        raise UnsupportedOperatorError(f"节点 {node.name} 的 softplus beta 必须为正，得到 {beta}")
+    if threshold != 20.0:
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 的 softplus threshold={threshold} 不是默认值 20；"
+            "该参数决定 torch 在哪一段直接返回 x，换值会改变输出"
+        )
+    dtype = x.type.dtype
+    if not dtype.is_float:
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 的 softplus 需要浮点 dtype，得到 {dtype.value}"
+        )
+    z = x if beta == 1.0 else g.mul(x, _const_like(g, x, beta, node, "beta"))
+    absz = g.add(g.relu(z), g.relu(g.neg(z)))
+    body = g.log(g.add(_scalar(g, 1.0, dtype), g.exp(g.neg(absz))))
+    out = g.add(g.relu(z), body)
+    return out if beta == 1.0 else g.div(out, _const_like(g, x, beta, node, "beta"))
+
+
 def _mean_dim(g: Graph, x: Value, dims, keepdim: bool) -> Value:
     """``mean`` 沿若干维 -> ``reduce_sum`` 再除以元素数（标量，可广播）。"""
     if not isinstance(dims, (list, tuple)):
@@ -890,6 +1009,184 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
             )
         return a(0)
 
+    # ------------------------------------------------------------------
+    # 恒等包装与 dtype 转换
+    # ------------------------------------------------------------------
+    if target == "aten._assert_tensor_metadata.default":
+        # torch.export 在 to()/layout 之后插入的元数据断言：没有张量语义。
+        return a(0)
+
+    if target == "aten.contiguous.default":
+        # IR 的张量没有步长概念，连续性不是语义的一部分。
+        return a(0)
+
+    if target in ("aten.to.dtype", "aten._to_copy.default", "aten.type_as.default"):
+        x = a(0)
+        if target == "aten.type_as.default":
+            target_dtype = a(1).type.dtype
+        else:
+            raw = kwargs.get("dtype")
+            if raw is None and len(args) > 1:
+                raw = args[1]
+            if raw is None:
+                # 纯 device / layout 拷贝：IR 没有设备与步长语义，值不变。
+                return x
+            target_dtype = _to_dtype(raw)
+        return g.cast(x, dtype=target_dtype) if target_dtype != x.type.dtype else x
+
+    if target == "aten.copy.default":
+        # 非原地 copy：结果是 src 按 self 的 dtype 落盘。原地 `copy_` 不在此列
+        # （它要求"写回旧值"，IR 没有图外状态）。
+        src = a(1)
+        dtype = a(0).type.dtype
+        return g.cast(src, dtype=dtype) if src.type.dtype != dtype else src
+
+    if target.startswith("aten.copy_."):
+        raise UnsupportedOperatorError(
+            f"节点 {node.name} 是原地 copy_；IR 的值不可变，也没有图外状态，"
+            "无法表达「写回后旧读者仍看到旧值」的语义"
+        )
+
+    # ------------------------------------------------------------------
+    # 一元数学族
+    # ------------------------------------------------------------------
+    if target in ("aten.tanh.default", "aten.exp.default", "aten.log.default",
+                  "aten.neg.default", "aten.neg_.default", "aten.sqrt.default",
+                  "aten.erf.default"):
+        return g.add_node(target.split(".")[1].rstrip("_"), [a(0)])
+
+    if target in ("aten.abs.default", "aten.abs_.default"):
+        # abs(x) = relu(x) + relu(-x)：两段互补，合起来精确等于 |x|
+        x = a(0)
+        return g.add(g.relu(x), g.relu(g.neg(x)))
+
+    if target == "aten.rsqrt.default":
+        x = a(0)
+        return g.div(_scalar(g, 1.0, x.type.dtype), g.sqrt(x))
+
+    if target == "aten.reciprocal.default":
+        x = a(0)
+        return g.div(_scalar(g, 1.0, x.type.dtype), x)
+
+    if target == "aten.square.default":
+        x = a(0)
+        return g.mul(x, x)
+
+    if target == "aten.log1p.default":
+        # log(1+x)：IR 没有 log1p 的专门内核，展开是同一个数学函数。
+        x = a(0)
+        return g.log(g.add(x, _const_like(g, x, 1.0, node, "log1p 的常量")))
+
+    if target == "aten.expm1.default":
+        x = a(0)
+        return g.sub(g.exp(x), _const_like(g, x, 1.0, node, "expm1 的常量"))
+
+    # ------------------------------------------------------------------
+    # 激活函数：用已有原语逐段展开，每一段都能独立验证
+    # ------------------------------------------------------------------
+    if target in ("aten.leaky_relu.default", "aten.leaky_relu_.default"):
+        slope = float(_aten_arg(args, kwargs, 1, "negative_slope", 0.01))
+        x = a(0)
+        # leaky_relu(x) = relu(x) - slope*relu(-x)：负半轴要回退 slope*x，
+        # 符号必须相减（relu(-x) 是正的 "距离"，不是 x 本身）。
+        return g.sub(
+            g.relu(x),
+            g.mul(_const_like(g, x, slope, node, "negative_slope"), g.relu(g.neg(x))),
+        )
+
+    if target in ("aten.elu.default", "aten.elu_.default"):
+        alpha = float(_aten_arg(args, kwargs, 1, "alpha", 1.0))
+        scale = float(_aten_arg(args, kwargs, 2, "scale", 1.0))
+        input_scale = float(_aten_arg(args, kwargs, 3, "input_scale", 1.0))
+        x = a(0)
+        z = x if input_scale == 1.0 else g.mul(
+            x, _const_like(g, x, input_scale, node, "input_scale")
+        )
+        # elu(z) = relu(z) + alpha*(exp(-relu(-z)) - 1)：正段是 z，负段是
+        # alpha*(exp(z)-1)，两段在 z=0 处都取 0。
+        negative = g.relu(g.neg(z))
+        body = g.add(
+            g.relu(z),
+            g.mul(
+                _const_like(g, x, alpha, node, "alpha"),
+                g.sub(g.exp(g.neg(negative)), _scalar(g, 1.0, x.type.dtype)),
+            ),
+        )
+        return body if scale == 1.0 else g.mul(
+            body, _const_like(g, x, scale, node, "scale")
+        )
+
+    if target in ("aten.hardsigmoid.default", "aten.hardsigmoid_.default"):
+        x = a(0)
+        shifted = g.add(x, _const_like(g, x, 3.0, node, "hardsigmoid 的常量"))
+        return g.div(_clamp(g, shifted, 0.0, 6.0), _const_like(g, x, 6.0, node, "hardsigmoid 的常量"))
+
+    if target in ("aten.hardswish.default", "aten.hardswish_.default"):
+        x = a(0)
+        shifted = g.add(x, _const_like(g, x, 3.0, node, "hardswish 的常量"))
+        gate = g.div(_clamp(g, shifted, 0.0, 6.0), _const_like(g, x, 6.0, node, "hardswish 的常量"))
+        return g.mul(x, gate)
+
+    if target == "aten.softplus.default":
+        beta = float(_aten_arg(args, kwargs, 1, "beta", 1.0))
+        threshold = float(_aten_arg(args, kwargs, 2, "threshold", 20.0))
+        return _softplus(g, a(0), beta, threshold, node)
+
+    if target == "aten.log_softmax.int":
+        dim = int(_aten_arg(args, kwargs, 1, "dim", -1))
+        return g.log(g.softmax(a(0), axis=dim))
+
+    # ------------------------------------------------------------------
+    # 截断与标量二元运算
+    # ------------------------------------------------------------------
+    if target in ("aten.clamp.default", "aten.clamp_min.default",
+                  "aten.clamp_max.default", "aten.relu6.default"):
+        x = a(0)
+        if target == "aten.relu6.default":
+            return _clamp(g, x, 0.0, 6.0)
+        if target == "aten.clamp_min.default":
+            lo, hi = _aten_arg(args, kwargs, 1, "min", None), None
+        elif target == "aten.clamp_max.default":
+            lo, hi = None, _aten_arg(args, kwargs, 1, "max", None)
+        else:
+            lo = _aten_arg(args, kwargs, 1, "min", None)
+            hi = _aten_arg(args, kwargs, 2, "max", None)
+        for name, value in (("min", lo), ("max", hi)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 clamp {name}={value!r} 不是常量；"
+                    "IR 的 clamp 边界写在属性里，运行期边界需要先改成输入再另建算子"
+                )
+        return _clamp(
+            g, x,
+            None if lo is None else float(lo),
+            None if hi is None else float(hi),
+        )
+
+    if target in ("aten.add.Scalar", "aten.sub.Scalar", "aten.mul.Scalar",
+                  "aten.div.Scalar", "aten.rsub.Scalar"):
+        x = a(0)
+        other = _aten_arg(args, kwargs, 1, "other", None)
+        if target == "aten.mul.Scalar":
+            return g.mul(x, _const_like(g, x, other, node, "乘数"))
+        if target == "aten.div.Scalar":
+            return g.div(x, _const_like(g, x, other, node, "除数"))
+        alpha = _aten_arg(args, kwargs, 2, "alpha", 1.0)
+        scaled = _const_like(g, x, float(other) * float(alpha), node, "other*alpha")
+        if target == "aten.rsub.Scalar":
+            return g.sub(scaled, x)
+        if target == "aten.sub.Scalar":
+            return g.sub(x, scaled)
+        return g.add(x, scaled)
+
+    if target in ("aten.pow.Tensor_Scalar", "aten.pow.Scalar"):
+        x = a(0)
+        return _pow_scalar(g, x, _aten_arg(args, kwargs, 1, "exponent", None), node)
+
     if target == "aten.hardtanh.default":
         lo = n(1) if len(args) > 1 else -1.0
         hi = n(2) if len(args) > 2 else 1.0
@@ -898,6 +1195,392 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
             a(0),
             None if lo is None else float(lo),
             None if hi is None else float(hi),
+        )
+
+    # ------------------------------------------------------------------
+    # 归约
+    # ------------------------------------------------------------------
+    if target == "aten.mean.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dtype"})
+        dtype_arg = _aten_arg(args, kwargs, 1, "dtype", None)
+        if dtype_arg is not None:
+            x = g.cast(x, dtype=_to_dtype(dtype_arg))
+        axes = tuple(range(x.type.rank))
+        if not axes:
+            raise UnsupportedOperatorError(f"节点 {node.name} 对秩 0 张量做 mean")
+        return g.reduce_mean(x, axis=axes, keepdims=False)
+
+    if target == "aten.sum.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dtype"})
+        dtype_arg = _aten_arg(args, kwargs, 1, "dtype", None)
+        if dtype_arg is not None:
+            x = g.cast(x, dtype=_to_dtype(dtype_arg))
+        axes = tuple(range(x.type.rank))
+        if not axes:
+            raise UnsupportedOperatorError(f"节点 {node.name} 对秩 0 张量做 sum")
+        return g.reduce_sum(x, axis=axes, keepdims=False)
+
+    if target == "aten.sum.dim_IntList":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dim", "keepdim", "dtype"})
+        dim = _aten_arg(args, kwargs, 1, "dim", None)
+        keepdim = bool(_aten_arg(args, kwargs, 2, "keepdim", False))
+        dtype_arg = _aten_arg(args, kwargs, 3, "dtype", None)
+        if dtype_arg is not None:
+            x = g.cast(x, dtype=_to_dtype(dtype_arg))
+        if dim is None or (isinstance(dim, (list, tuple)) and not dim):
+            axes = tuple(range(x.type.rank))
+        else:
+            axes = tuple(
+                _norm_dim(int(d), x.type.rank)
+                for d in (dim if isinstance(dim, (list, tuple)) else (dim,))
+            )
+        return g.reduce_sum(x, axis=axes, keepdims=keepdim)
+
+    if target == "aten.amax.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dim", "keepdim"})
+        dim = _aten_arg(args, kwargs, 1, "dim", None)
+        keepdim = bool(_aten_arg(args, kwargs, 2, "keepdim", False))
+        if dim is None or (isinstance(dim, (list, tuple)) and not dim):
+            axes = tuple(range(x.type.rank))
+        else:
+            axes = tuple(
+                _norm_dim(int(d), x.type.rank)
+                for d in (dim if isinstance(dim, (list, tuple)) else (dim,))
+            )
+        return g.reduce_max(x, axis=axes, keepdims=keepdim)
+
+    if target == "aten.max.dim":
+        # (values, indices)：两个槽位都用 IR 已有算子精确给出，而不是把 indices
+        # 填 None——那样下游一取下标就变成"未支持的多输出槽位"。
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dim", "keepdim"})
+        dim = _norm_dim(int(_aten_arg(args, kwargs, 1, "dim", 0)), x.type.rank)
+        keepdim = bool(_aten_arg(args, kwargs, 2, "keepdim", False))
+        values = g.reduce_max(x, axis=(dim,), keepdims=keepdim)
+        indices = g.argmax(x, axis=dim, keepdims=keepdim)
+        return (values, indices)
+
+    if target == "aten.argmax.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dim", "keepdim"})
+        dim = _aten_arg(args, kwargs, 1, "dim", None)
+        keepdim = bool(_aten_arg(args, kwargs, 2, "keepdim", False))
+        if dim is None:
+            # 全归约下标：IR 的 argmax 只接受单轴，先摊平到秩 1
+            if not all(isinstance(d, int) for d in x.type.shape):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的全局 argmax 需要静态形状，得到 {x.type.shape}"
+                )
+            flat = g.reshape(x, shape=(x.type.numel(),))
+            return g.argmax(flat, axis=0, keepdims=False)
+        return g.argmax(x, axis=_norm_dim(int(dim), x.type.rank), keepdims=keepdim)
+
+    # ------------------------------------------------------------------
+    # 掩码、前缀和与补齐
+    # ------------------------------------------------------------------
+    if target == "aten.tril.default":
+        x = a(0)
+        diagonal = int(_aten_arg(args, kwargs, 1, "diagonal", 0))
+        return g.tril(x, diagonal=diagonal)
+
+    if target == "aten.triu.default":
+        # triu(x, k) = tril(x^T, -k)^T：转置把上下三角互换，不新增算子。
+        x = a(0)
+        diagonal = int(_aten_arg(args, kwargs, 1, "diagonal", 0))
+        rank = x.type.rank
+        if rank < 2:
+            raise UnsupportedOperatorError(f"节点 {node.name} 的 triu 需要秩 >= 2")
+        perm = list(range(rank))
+        perm[-1], perm[-2] = perm[-2], perm[-1]
+        flipped = g.transpose(x, perm=tuple(perm))
+        return g.transpose(g.tril(flipped, diagonal=-diagonal), perm=tuple(perm))
+
+    if target == "aten.cumsum.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"dim", "dtype"})
+        dim = _norm_dim(int(_aten_arg(args, kwargs, 1, "dim", 0)), x.type.rank)
+        dtype_arg = _aten_arg(args, kwargs, 2, "dtype", None)
+        if dtype_arg is not None:
+            x = g.cast(x, dtype=_to_dtype(dtype_arg))
+        return g.cumsum(x, axis=dim)
+
+    if target == "aten.pad.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"pad", "mode", "value"})
+        pad = _aten_arg(args, kwargs, 1, "pad", None)
+        mode = str(_aten_arg(args, kwargs, 2, "mode", "constant"))
+        value = _aten_arg(args, kwargs, 3, "value", None)
+        if not isinstance(pad, (list, tuple)) or len(pad) % 2:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 pad 参数必须是成对的整数列表，得到 {pad!r}"
+            )
+        if mode != "constant":
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 pad mode={mode!r}；IR 只有零填充（constant）"
+            )
+        if value is not None and float(value) != 0.0:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 pad value={value}；IR 的 pad 只补零"
+            )
+        y = x
+        for pair_index in range(len(pad) // 2):
+            before, after = int(pad[2 * pair_index]), int(pad[2 * pair_index + 1])
+            if before < 0 or after < 0:
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的负 pad（裁剪）={(before, after)}；"
+                    "请改用 slice 显式表达裁剪"
+                )
+            if before == 0 and after == 0:
+                continue
+            dim = y.type.rank - 1 - pair_index
+            if dim < 0:
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 pad 指定了比输入秩更多的维度"
+                )
+            y = g.pad(y, dim=dim, before=before, after=after)
+        return y
+
+    # ------------------------------------------------------------------
+    # 形状与拼接
+    # ------------------------------------------------------------------
+    if target == "aten.expand_as.default":
+        x = a(0)
+        other = a(1)
+        if not all(isinstance(d, int) for d in other.type.shape):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 expand_as 目标形状含符号维 {other.type.shape}"
+            )
+        return g.broadcast_to(x, shape=other.type.shape)
+
+    if target == "aten.stack.default":
+        items = args[0]
+        if not isinstance(items, (list, tuple)) or not items:
+            raise UnsupportedOperatorError(f"节点 {node.name} 的 stack 输入不是非空序列")
+        values: List[Value] = []
+        for item in items:
+            value = env.get(getattr(item, "name", None))
+            if not isinstance(value, Value):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 stack 含非张量输入 {item!r}"
+                )
+            values.append(value)
+        dim = int(_aten_arg(args, kwargs, 1, "dim", 0))
+        rank = values[0].type.rank + 1
+        dim = _norm_dim(dim, rank)
+        lifted = []
+        for value in values:
+            shape = list(value.type.shape)
+            shape.insert(dim, 1)
+            lifted.append(g.reshape(value, shape=tuple(shape)))
+        return g.concat(*lifted, axis=dim)
+
+    if target == "aten.split_with_sizes.default":
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"split_sizes", "dim"})
+        sizes = _aten_arg(args, kwargs, 1, "split_sizes", None)
+        dim = _norm_dim(int(_aten_arg(args, kwargs, 2, "dim", 0)), x.type.rank)
+        if not isinstance(sizes, (list, tuple)) or not sizes:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 split_with_sizes 需要非空的尺寸序列，得到 {sizes!r}"
+            )
+        total = x.type.shape[dim]
+        if not isinstance(total, int):
+            raise UnsupportedOperatorError(f"节点 {node.name} 的切分维含符号 {total!r}")
+        if sum(int(s) for s in sizes) != total:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 split_with_sizes 尺寸之和 "
+                f"{sum(int(s) for s in sizes)} 与第 {dim} 维长度 {total} 不符"
+            )
+        parts: list = []
+        start = 0
+        for size in sizes:
+            stop = start + int(size)
+            parts.append(g.slice(x, dim=dim, start=start, stop=stop))
+            start = stop
+        return tuple(parts)
+
+    if target == "aten.narrow.default":
+        x = a(0)
+        dim = _norm_dim(int(n(1)), x.type.rank)
+        start = int(n(2))
+        length = int(n(3))
+        total = x.type.shape[dim]
+        if not isinstance(total, int):
+            raise UnsupportedOperatorError(f"节点 {node.name} 的 narrow 需要静态维")
+        if start < 0:
+            start += total
+        if start < 0 or length < 0 or start + length > total:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 narrow 区间 [{start}, {start + length}) "
+                f"越界（该维长度 {total}）"
+            )
+        return g.slice(x, dim=dim, start=start, stop=start + length)
+
+    if target == "aten.unbind.int":
+        x = a(0)
+        dim = _norm_dim(int(_aten_arg(args, kwargs, 1, "dim", 0)), x.type.rank)
+        total = x.type.shape[dim]
+        if not isinstance(total, int):
+            raise UnsupportedOperatorError(f"节点 {node.name} 的 unbind 需要静态维")
+        shape = list(x.type.shape)
+        shape.pop(dim)
+        parts = []
+        for index in range(total):
+            one = g.slice(x, dim=dim, start=index, stop=index + 1)
+            parts.append(g.reshape(one, shape=tuple(shape)))
+        return tuple(parts)
+
+    if target == "aten.squeeze.default":
+        x = a(0)
+        shape = tuple(d for d in x.type.shape if d != 1)
+        return g.reshape(x, shape=shape)
+
+    if target == "aten.flatten.default":
+        x = a(0)
+        start = _norm_dim(int(_aten_arg(args, kwargs, 1, "start_dim", 0)), x.type.rank)
+        end = _norm_dim(int(_aten_arg(args, kwargs, 2, "end_dim", -1)), x.type.rank)
+        shape = list(x.type.shape)
+        merged = 1
+        for d in shape[start : end + 1]:
+            if not isinstance(d, int):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 flatten 区间含符号维 {d!r}"
+                )
+            merged *= d
+        return g.reshape(x, shape=tuple(shape[:start]) + (merged,) + tuple(shape[end + 1 :]))
+
+    if target == "aten.t.default":
+        x = a(0)
+        if x.type.rank != 2:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 t() 要求秩 2，得到秩 {x.type.rank}"
+            )
+        return g.transpose(x, perm=(1, 0))
+
+    if target == "aten.mm.default":
+        return g.matmul(a(0), a(1))
+
+    if target == "aten.mv.default":
+        # IR 的 matmul 只接受秩 >= 2：把向量补成 (K,1)，乘完再去掉尾维。
+        x, v = a(0), a(1)
+        if x.type.rank != 2 or v.type.rank != 1:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 mv 要求 (M,K) 与 (K,)，"
+                f"得到秩 {x.type.rank} 与 {v.type.rank}"
+            )
+        k = v.type.shape[0]
+        column = g.reshape(v, shape=(k, 1))
+        return g.reshape(g.matmul(x, column), shape=(x.type.shape[0],))
+
+    if target == "aten.dot.default":
+        x, y = a(0), a(1)
+        if x.type.rank != 1 or y.type.rank != 1:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 dot 要求两个秩 1 张量，得到秩 {x.type.rank} 与 {y.type.rank}"
+            )
+        return g.reduce_sum(g.mul(x, y), axis=(0,), keepdims=False)
+
+    if target == "aten.addmm.default":
+        bias, x, y = a(0), a(1), a(2)
+        beta = float(_aten_arg(args, kwargs, 3, "beta", 1.0))
+        alpha = float(_aten_arg(args, kwargs, 4, "alpha", 1.0))
+        product = g.matmul(x, y)
+        if alpha != 1.0:
+            product = g.mul(product, _const_like(g, product, alpha, node, "alpha"))
+        scaled_bias = bias
+        if beta != 1.0:
+            scaled_bias = g.mul(bias, _const_like(g, bias, beta, node, "beta"))
+        return g.add(scaled_bias, product)
+
+    # ------------------------------------------------------------------
+    # 常量构造：尺寸与取值都是静态的，落成 ``constant`` 节点（有元素上限）
+    # ------------------------------------------------------------------
+    if target in ("aten.zeros.default", "aten.ones.default", "aten.full.default"):
+        size = n(0)
+        if not isinstance(size, (list, tuple)):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 size 不是静态序列：{size!r}"
+            )
+        shape = tuple(int(d) for d in size)
+        dtype_arg = kwargs.get("dtype")
+        dtype = _to_dtype(dtype_arg) if dtype_arg is not None else f32
+        fill: Any = 0.0 if target == "aten.zeros.default" else 1.0
+        if target == "aten.full.default":
+            fill = _aten_arg(args, kwargs, 1, "fill_value", None)
+            if hasattr(fill, "op") and hasattr(fill, "name"):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 fill_value 是图内值；IR 的常量填充要求静态取值"
+                )
+        return _constant_node(
+            g,
+            torch.full(shape, fill, dtype=getattr(torch, _IR_TO_TORCH[dtype.value])),
+            f"节点 {node.name} 的常量",
+        )
+
+    if target in ("aten.zeros_like.default", "aten.ones_like.default",
+                  "aten.full_like.default"):
+        x = a(0)
+        dtype_arg = kwargs.get("dtype")
+        dtype = _to_dtype(dtype_arg) if dtype_arg is not None else x.type.dtype
+        fill: Any = 0.0 if target == "aten.zeros_like.default" else 1.0
+        if target == "aten.full_like.default":
+            fill = _aten_arg(args, kwargs, 1, "fill_value", None)
+            if hasattr(fill, "op") and hasattr(fill, "name"):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 fill_value 是图内值；IR 的常量填充要求静态取值"
+                )
+        if not all(isinstance(d, int) for d in x.type.shape):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的形状含符号维 {x.type.shape}"
+            )
+        return _constant_node(
+            g,
+            torch.full(x.type.shape, fill, dtype=getattr(torch, _IR_TO_TORCH[dtype.value])),
+            f"节点 {node.name} 的常量",
+        )
+
+    if target in ("aten.arange.default", "aten.arange.start", "aten.arange.start_step"):
+        if target == "aten.arange.default":
+            start, end, step = 0, n(0), 1
+        elif target == "aten.arange.start":
+            start, end, step = n(0), n(1), 1
+        else:
+            start, end, step = n(0), n(1), n(2)
+        if any(hasattr(v, "name") for v in (start, end, step)):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 arange 边界是图内值；IR 的常量构造要求静态取值"
+            )
+        if float(step) == 0.0:
+            raise UnsupportedOperatorError(f"节点 {node.name} 的 arange step 为 0")
+        dtype_arg = kwargs.get("dtype")
+        if dtype_arg is None:
+            dtype = f32 if any(isinstance(v, float) for v in (start, end, step)) else i32
+        else:
+            dtype = _to_dtype(dtype_arg)
+        return _constant_node(
+            g,
+            torch.arange(
+                start, end, step, dtype=getattr(torch, _IR_TO_TORCH[dtype.value])
+            ),
+            f"节点 {node.name} 的常量",
+        )
+
+    if target == "aten.scalar_tensor.default":
+        value = n(0)
+        if hasattr(value, "name"):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 scalar_tensor 取值是图内值；IR 的常量构造要求静态取值"
+            )
+        dtype_arg = kwargs.get("dtype")
+        dtype = _to_dtype(dtype_arg) if dtype_arg is not None else f32
+        return _constant_node(
+            g,
+            torch.tensor(value, dtype=getattr(torch, _IR_TO_TORCH[dtype.value])),
+            f"节点 {node.name} 的常量",
         )
 
     if target == "aten.mean.dim":
@@ -937,25 +1620,41 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
         # 这次调用的返回值，原地写回对它们不可见，因此降级成同一个 ``relu`` 即可。
         return g.relu(a(0))
 
+    def operand(i: int, ref: Value, what: str) -> Value:
+        """取第 i 个操作数：图内值原样取，Python 标量折成与 ``ref`` 同 dtype 的常量。
+
+        ``x + 1.5`` / ``x * 2`` 在 FX 图里是 ``aten.add.Tensor`` 的第二个
+        参数为 float/int 字面量，而不是提升出来的常量张量——只按「参数一定是
+        节点」读会直接 AttributeError。
+        """
+        raw = args[i] if len(args) > i else None
+        if hasattr(raw, "name"):
+            return a(i)
+        return _const_like(g, ref, raw, node, what)
+
     if target in ("aten.add.Tensor", "aten.add_.Tensor"):
         # ``add_`` 同理：export 的图是 SSA 的，残差的 ``out += identity`` 只需按
         # ``add`` 求值，原地写回不会漏到别的读者那里。
         _reject_unknown_kwargs(node, kwargs, {"alpha"})
-        x, y = a(0), a(1)
+        x = a(0)
+        y = operand(1, x, "加数")
         alpha = _aten_arg(args, kwargs, 2, "alpha", 1.0)
         return g.add(x, _mul_alpha(g, y, alpha, node))
 
     if target == "aten.sub.Tensor":
         _reject_unknown_kwargs(node, kwargs, {"alpha"})
-        x, y = a(0), a(1)
+        x = a(0)
+        y = operand(1, x, "减数")
         alpha = _aten_arg(args, kwargs, 2, "alpha", 1.0)
         return g.sub(x, _mul_alpha(g, y, alpha, node))
 
     if target == "aten.mul.Tensor":
-        return g.mul(a(0), a(1))
+        x = a(0)
+        return g.mul(x, operand(1, x, "乘数"))
 
     if target == "aten.div.Tensor":
-        return g.div(a(0), a(1))
+        x = a(0)
+        return g.div(x, operand(1, x, "除数"))
 
     if target in ("aten.matmul.default", "aten.bmm.default"):
         return g.matmul(a(0), a(1))

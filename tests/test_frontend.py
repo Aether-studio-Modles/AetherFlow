@@ -133,7 +133,9 @@ class TestTorchExport(unittest.TestCase):
 
         class M(nn.Module):
             def forward(self, x):
-                return torch.tanh(x)
+                # sign 需要比较/选择语义（IR 没有 bool 张量），必须显式拒绝；
+                # tanh 等一元数学族在 P7 已接上，不再适合当反例。
+                return torch.sign(x)
 
         ep = torch.export.export(M().eval(), (torch.randn(4),))
         with self.assertRaises(UnsupportedOperatorError):
@@ -459,6 +461,367 @@ class TestTorchExport(unittest.TestCase):
                 return self.act(x)
 
         self._roundtrip(M().eval(), torch.randn(3, 7) * 2, atol=1e-6)
+
+    def test_unary_math_family(self):
+        """IR 已有的一元数学算子全部接上：每个都与 eager 逐点一致。"""
+        base = torch.randn(2, 3, 4) + 1.0
+        cases = {
+            "tanh": (lambda x: torch.tanh(x), base, 1e-6),
+            "exp": (lambda x: torch.exp(x - 2.0), base - 2.0, 1e-6),
+            "log": (lambda x: torch.log(x.abs() + 1.0), base, 1e-6),
+            "neg": (lambda x: -x, base, 1e-6),
+            "sqrt": (lambda x: torch.sqrt(x.abs() + 1.0), base, 1e-6),
+            "erf": (lambda x: torch.erf(x), base, 1e-6),
+            "rsqrt": (lambda x: torch.rsqrt(x.abs() + 1.0), base, 1e-5),
+            "reciprocal": (lambda x: torch.reciprocal(x + 1.0), base, 1e-6),
+            "square": (lambda x: x.square(), base, 1e-6),
+            "abs": (lambda x: x.abs(), base, 1e-6),
+            "log1p": (lambda x: torch.log1p(x.abs()), base, 1e-5),
+            "expm1": (lambda x: torch.expm1(x), base - 1.0, 1e-6),
+        }
+
+        for name, (fn, example, atol) in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                imported = self._roundtrip(M().eval(), example, atol=atol)
+                ops = [n.op.name for n in imported.graph.nodes]
+                self.assertTrue(ops, "降级后不应是空图")
+
+    def test_activation_expansions(self):
+        """没有专门 IR 算子的激活：用已有原语精确展开后与 eager 对拍。"""
+        cases = {
+            "leaky_relu": (lambda x: F.leaky_relu(x, 0.1), 1e-6),
+            "elu": (lambda x: F.elu(x, 1.3), 1e-6),
+            "hardsigmoid": (lambda x: F.hardsigmoid(x), 1e-6),
+            "hardswish": (lambda x: F.hardswish(x), 1e-6),
+            "relu6": (lambda x: F.relu6(x), 1e-6),
+            "softplus": (lambda x: F.softplus(x), 1e-6),
+            "log_softmax": (lambda x: F.log_softmax(x, dim=-1), 1e-5),
+        }
+        example = torch.randn(3, 8) * 3
+        for name, (fn, atol) in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                self._roundtrip(M().eval(), example, atol=atol)
+
+    def test_softplus_handles_large_values(self):
+        """稳定恒等式在 ±50 上不溢出：torch 的 threshold 保护与精确解只差 e^-20。"""
+        class M(nn.Module):
+            def forward(self, x):
+                return F.softplus(x)
+
+        example = torch.tensor([[-50.0, -21.0, 0.0, 20.0, 50.0, 80.0]])
+        self._roundtrip(M().eval(), example, atol=1e-6)
+
+    def test_softplus_custom_threshold_is_rejected(self):
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return F.softplus(x, threshold=5.0)
+
+        with self.assertRaisesRegex(UnsupportedOperatorError, "threshold"):
+            self.import_exported(torch.export.export(M().eval(), (torch.randn(3),)))
+
+    def test_clamp_variants(self):
+        cases = {
+            "clamp": lambda x: torch.clamp(x, -1.0, 2.0),
+            "clamp_min": lambda x: torch.clamp_min(x, 0.5),
+            "clamp_max": lambda x: torch.clamp_max(x, 0.5),
+        }
+        for name, fn in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                self._roundtrip(M().eval(), torch.randn(3, 5) * 2, atol=1e-6)
+
+    def test_clamp_with_tensor_bounds_is_rejected(self):
+        """IR 的 clamp 边界写在属性里；图内边界不能静默当成常量。"""
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x, lo):
+                return torch.clamp(x, min=lo)
+
+        args = (torch.randn(3, 4), torch.randn(3, 4))
+        with self.assertRaisesRegex(UnsupportedOperatorError, "clamp"):
+            self.import_exported(torch.export.export(M().eval(), args))
+
+    def test_scalar_binary_ops(self):
+        cases = {
+            "add": (lambda x: x + 1.5, lambda x: x + 1.5),
+            "sub": (lambda x: x - 1.5, lambda x: x - 1.5),
+            "mul": (lambda x: x * 2.5, lambda x: x * 2.5),
+            "div": (lambda x: x / 2.5, lambda x: x / 2.5),
+            "rsub": (lambda x: 1.5 - x, lambda x: 1.5 - x),
+        }
+        for name, (fn, _) in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                self._roundtrip(M().eval(), torch.randn(2, 5), atol=1e-6)
+
+    def test_pow_scalar_expansions(self):
+        cases = {
+            "square": (lambda x: x ** 2, 1e-6),
+            "cube": (lambda x: x ** 3, 1e-6),
+            "neg1": (lambda x: x ** -1, 1e-5),
+            "sqrt": (lambda x: x ** 0.5, 1e-6),
+            "zero": (lambda x: x ** 0, 0.0),
+            "pow16": (lambda x: x ** 16, 1e-5),
+        }
+        example = torch.rand(2, 4) + 0.5
+        for name, (fn, atol) in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                self._roundtrip(M().eval(), example, atol=atol)
+
+    def test_pow_fractional_exponent_is_rejected(self):
+        """exp(y*log(x)) 在非正输入上不是原式，不能当成等价降级。"""
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x ** 1.5
+
+        with self.assertRaisesRegex(UnsupportedOperatorError, "pow"):
+            self.import_exported(torch.export.export(M().eval(), (torch.rand(3) + 1.0,)))
+
+    def test_dtype_cast(self):
+        class M(nn.Module):
+            def forward(self, x):
+                # f32 -> f64 -> f32 往返：cast 只改 dtype，不改值
+                return x.to(torch.float64).to(torch.float32)
+
+        self._roundtrip(M().eval(), torch.randn(2, 3), atol=0.0)
+
+    def test_type_as_uses_the_other_tensor_dtype(self):
+        class M(nn.Module):
+            def forward(self, x, ref):
+                return x.type_as(ref)
+
+        x = torch.randn(3, 4)
+        ref = torch.randn(3, 4).double()
+        _, expected, got = self._import_and_run(M().eval(), (x, ref))
+        self.assertEqual(got.dtype, np.float64)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+    def test_cast_to_integer_matches_truncation(self):
+        """f32 -> i32 是向零截断，与 torch 的 to(int64) 在 i32 范围内逐点一致。"""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.to(torch.int64).to(torch.float32)
+
+        self._roundtrip(M().eval(), torch.randn(3) * 10, atol=0.0)
+
+    def test_floor_is_rejected(self):
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return torch.floor(x)
+
+        with self.assertRaises(UnsupportedOperatorError):
+            self.import_exported(torch.export.export(M().eval(), (torch.randn(3),)))
+
+    def test_reductions(self):
+        cases = {
+            "mean_all": lambda x: x.mean(),
+            "sum_all": lambda x: x.sum(),
+            "sum_dim": lambda x: x.sum(dim=1, keepdim=True),
+            "sum_multi": lambda x: x.sum(dim=(0, 2)),
+            "amax": lambda x: torch.amax(x, dim=1),
+            "amax_multi": lambda x: torch.amax(x, dim=(1, 2), keepdim=True),
+        }
+        example = torch.randn(2, 3, 4)
+        for name, fn in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                self._roundtrip(M().eval(), example, atol=1e-5)
+
+    def test_max_dim_values_and_indices(self):
+        class Values(nn.Module):
+            def forward(self, x):
+                return torch.max(x, dim=1)[0]
+
+        class Indices(nn.Module):
+            def forward(self, x):
+                return torch.max(x, dim=1)[1]
+
+        example = torch.randn(2, 5, 3)
+        for model, atol in ((Values().eval(), 1e-6), (Indices().eval(), 0.0)):
+            with self.subTest(model=type(model).__name__):
+                imported, expected, got = self._import_and_run(model, (example,))
+                np.testing.assert_allclose(got, expected, rtol=0, atol=atol)
+                self.assertIn("argmax", [n.op.name for n in imported.graph.nodes])
+
+    def test_argmax_global(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return torch.argmax(x)
+
+        example = torch.randn(3, 4)
+        _, expected, got = self._import_and_run(M().eval(), (example,))
+        self.assertEqual(int(got), int(expected))
+
+    def test_tril_triu_cumsum(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return torch.tril(x, -1) + torch.triu(x, 1) + torch.cumsum(x, dim=1)
+
+        self._roundtrip(M().eval(), torch.randn(3, 4), atol=1e-6)
+
+    def test_triu_diagonal(self):
+        cases = {
+            "k0": lambda x: torch.triu(x),
+            "k2": lambda x: torch.triu(x, 2),
+            "kneg": lambda x: torch.triu(x, -1),
+        }
+        for name, fn in cases.items():
+            with self.subTest(op=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                self._roundtrip(M().eval(), torch.randn(4, 5), atol=0.0)
+
+    def test_pad(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return F.pad(x, (1, 2, 0, 1))
+
+        imported = self._roundtrip(M().eval(), torch.randn(2, 3, 4), atol=0.0)
+        # 两对 pad 各自落到一个 IR 节点
+        self.assertEqual([n.op.name for n in imported.graph.nodes].count("pad"), 2)
+
+    def test_pad_reflect_is_rejected(self):
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return F.pad(x, (1, 1, 1, 1), mode="reflect")
+
+        with self.assertRaisesRegex(UnsupportedOperatorError, "mode"):
+            self.import_exported(torch.export.export(M().eval(), (torch.randn(1, 1, 4, 4),)))
+
+    def test_pad_nonzero_value_is_rejected(self):
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return F.pad(x, (1, 1), value=1.0)
+
+        with self.assertRaisesRegex(UnsupportedOperatorError, "value"):
+            self.import_exported(torch.export.export(M().eval(), (torch.randn(1, 1, 3, 3),)))
+
+    def test_expand_as_stack_and_split(self):
+        class M(nn.Module):
+            def forward(self, x):
+                y = torch.stack([x, x + 1.0], dim=0)
+                first, second = torch.split(y, [1, 1], dim=0)
+                return first + second
+
+        example = torch.randn(2, 3)
+        _, expected, got = self._import_and_run(M().eval(), (example,))
+        np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+
+    def test_unbind_and_expand_as(self):
+        class M(nn.Module):
+            def forward(self, x, ref):
+                a, b = torch.unbind(x, dim=0)
+                return (a + b).expand_as(ref)
+
+        x = torch.randn(2, 3, 4)
+        ref = torch.randn(3, 4)
+        _, expected, got = self._import_and_run(M().eval(), (x, ref))
+        np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+    def test_narrow_squeeze_flatten_and_t(self):
+        class M(nn.Module):
+            def forward(self, x):
+                y = x.narrow(1, 1, 2).unsqueeze(0)  # (1,2,2,4)
+                y = y.squeeze()                      # (2,2,4)
+                return y.reshape(4, 4).t().flatten()  # (16,)
+
+        self._roundtrip(M().eval(), torch.randn(2, 3, 4), atol=0.0)
+
+    def test_constant_construction(self):
+        cases = {
+            "zeros": lambda x: x + torch.zeros(2, 3),
+            "ones": lambda x: x + torch.ones(2, 3),
+            "full": lambda x: x + torch.full((2, 3), 2.5),
+            "arange": lambda x: x + torch.arange(3.0),
+            "zeros_like": lambda x: x + torch.zeros_like(x),
+            "ones_like": lambda x: x + torch.ones_like(x),
+            "full_like": lambda x: x + torch.full_like(x, 2.5),
+        }
+        for name, fn in cases.items():
+            with self.subTest(constructor=name):
+                class M(nn.Module):
+                    def forward(self, x):
+                        return fn(x)
+
+                imported = self._roundtrip(M().eval(), torch.randn(2, 3), atol=0.0)
+                ops = [n.op.name for n in imported.graph.nodes]
+                self.assertEqual(ops.count("constant"), 1, ops)
+
+    def test_constant_over_limit_is_rejected(self):
+        """塞进图属性的常量有元素上限；更大的值应改成参数或显式输入。"""
+        from aetherflow.frontend import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x + torch.zeros(300, 300)
+
+        with self.assertRaisesRegex(UnsupportedOperatorError, "65536"):
+            self.import_exported(
+                torch.export.export(M().eval(), (torch.randn(300, 300),))
+            )
+
+    def test_matmul_family(self):
+        class MM(nn.Module):
+            def forward(self, x, y):
+                return torch.mm(x, y)
+
+        class MV(nn.Module):
+            def forward(self, x, v):
+                return torch.mv(x, v)
+
+        class Dot(nn.Module):
+            def forward(self, x, y):
+                return torch.dot(x, y)
+
+        class AddMM(nn.Module):
+            def forward(self, b, x, y):
+                return torch.addmm(b, x, y, beta=0.5, alpha=2.0)
+
+        cases = [
+            (MM().eval(), (torch.randn(3, 4), torch.randn(4, 5))),
+            (MV().eval(), (torch.randn(3, 4), torch.randn(4))),
+            (Dot().eval(), (torch.randn(5), torch.randn(5))),
+            (AddMM().eval(), (torch.randn(3, 5), torch.randn(3, 4), torch.randn(4, 5))),
+        ]
+        for model, example in cases:
+            with self.subTest(model=type(model).__name__):
+                _, expected, got = self._import_and_run(model, example)
+                np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
 
     def test_shape_ops(self):
         class M(nn.Module):
