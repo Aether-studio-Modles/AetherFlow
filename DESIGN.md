@@ -17631,3 +17631,60 @@ d_conv=4）下状态是 48 张量 / 3.56 MiB：**每个 token 状态往返 7.12 
   张图，仍走宿主路径。
 - **真机覆盖**：HIP 上验证的是小形状的逐 token 一致与往返次数，没有大模型的吞吐
   数字；CUDA 未验证。
+
+### 5.280　设备态解码进服务化：三处捕获期缺陷与双厂商实测
+
+**问题**
+
+5.279 只覆盖单条会话。连续批处理（`ServingEngine`）每步仍把整块状态 D2H 再
+H2D——批越大往返越贵。把 `_device_step` 的后端能力接进 `ServingEngine` 之后，
+两家后端各暴露了捕获期缺陷，都不在解码逻辑里：
+
+1. **HIP：D2D 拷贝 `code=1`**（`n=131072`，正好一层 SSM 状态）。`Arena._coalesce`
+   把两次独立 `hipMalloc` 但虚拟地址相邻的空闲块合并，best-fit 随后切出跨越分配
+   边界的 slice；`hipMemcpyAsync` 按分配校验范围，直接拒绝。
+2. **CUDA：图输出与中间值同址**（`logits` 与 `l0_h` 都是 `0x...9e00`）。捕获轮
+   `release=True` 时输出是零拷贝视图（reshape / slice），其源按"最后一个读者"
+   回收后，地址被后续算子复用；图里两个输出写进同一块。
+3. **CUDA：捕获图与逐节点 `execute` 首步分叉**（argmax 4 vs 6）。`_shares_storage`
+   只认 `base is source`；当**源本身是视图**（SSM 状态被连续 slice / reshape）时，
+   `out.base` 指向最底层数组，判定失败 → 源被当成"没人再读"提前还给 arena →
+   地址分给后面的算子，下游读到被覆盖的数据。
+
+**做法**
+
+1. **服务化复用同一张 decode 图**（`ServingEngine(device_state=True)`）：
+   `batch=capacity` 的 `steps=1` 图捕获一次，状态整块留在显存（`_state_dev`）；
+   准入是低频事件，`_write_state_rows` 整块往返一次，逐 token 只 `to_host(logits)`。
+   与 5.279 同一条限制：要求 `resident=True` 与静态形状，缺能力在构造期报错。
+2. **arena 只合并同一 chunk 内的相邻块**（两家一致）：`_coalesce` 加
+   `_chunk_of(addr)` 判定。HIP 侧有 `recycle`，CUDA 侧没有，但"跨 chunk 不合并"
+   是分配器本身的约束，与回收策略无关。
+3. **捕获期为图输出物化独立缓冲**：`_capture_outputs` 记下输出 value id，
+   `_shared_view` 命中时 `empty` + 拷贝一次。只发生在捕获期，replay 地址仍然固定。
+4. **视图记账统一落在底层持有者**：`_storage_root` 追 `base` 链到底，
+   `_shares_storage` 比较两侧的根身份，`_alias_view` 按根地址记账。HIP 本就用
+   `_buffer`（天然是根），不受影响。
+
+**验证**
+
+- 本地（Windows / Python 3.14）：`Ran 2820 tests / OK (skipped=433)`；
+  `ruff check` 通过。新增用例覆盖"不跨 chunk 合并"（HIP 用伪造相邻 chunk 的
+  `_FakeArena`，CUDA 只走 `free` 账本）与 Serving 设备态的逐 token 一致。
+- WSL + ROCm 7.2.4 / `gfx1102`：`tests.test_hip_backend` 50 条全过；
+  中规模 ms/token（宿主 → 设备态）8 层 117.77 → 16.25（7.25×）、12 层
+  179.50 → 24.99（7.18×）、24 层 353.64 → 44.86（7.88×），逐 token 输出一致。
+- A800-SXM4-40GB（驱动 550.127，CUDA 12.4，`cupy-cuda12x` 14.2.0）：
+  真实规模（24 层 / `d_model=1024` / `vocab=32000`）宿主 86.408 →
+  设备态 14.162 ms/token（**6.10×**，best of 3，32 步，greedy 逐 token 一致）。
+  `tests.test_cuda_backend` + `tests.test_device_control` +
+  `tests.test_lm_device_state` 共 406 条 `OK (skipped=5)`。
+
+**边界**
+
+- **Serving 的 batch 固定**：容量在构造期定死，换容量重建计划（与 5.217 同源）。
+- **只省状态往返**：采样、停止判定、`ids` 写回与每步同步仍在主机；logits 仍要
+  回传。加速比来自"省掉的是整块状态、留下的是 128 KB logits"，不是"设备端全流程"。
+- **首步与准入**：prefill 与新增请求仍要一次整块状态上传；短序列收益有限。
+- **逐节点 `execute` 仍是诊断基准**：它不经过 arena 回收，永远比捕获图"安全"；
+  两者数值必须一致，这次分叉就是靠它定位的。

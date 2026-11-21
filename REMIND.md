@@ -24,8 +24,9 @@
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行（主机中转）、
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
-  **设备态解码**（`LMRunner(device_state=True)`）：decode 图捕获一次、状态常驻显存、
-  每步只把 logits 取回主机（DESIGN 5.279）；分页 KV cache 与贪心投机解码（组件级，
+  **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
+  decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279 / 5.280；
+  A800 24 层实测 86.4 → 14.2 ms/token）；分页 KV cache 与贪心投机解码（组件级，
   见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：`/v1/completions`、
   `/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
@@ -51,7 +52,7 @@ CUDA 后端需要 `cupy-cuda12x`；HIP 后端需要 ROCm 与自带的 `hip.runti
 | numpy | ≥ 1.24 |
 | torch（可选） | 前端适配器声明区间 2.9–2.13，本版仅在 2.13.0 上验证；区间内未验证版本不承诺回归覆盖，越界显式抛 `UnsupportedTorchVersion` |
 | CUDA 后端 | CUDA 12.x + 驱动 550+（2×V100 `sm_70` 上验证）；cuFFT 提供 `fft` / `rfft` |
-| CUDA 实测机 | A800-SXM4-40GB、驱动 550.127、cuDNN 9.1（Ubuntu 22.04）。系统没装 CUDA toolkit，cuBLAS / cuDNN 由 miniconda 的 `nvidia/{cublas,cudnn}/lib` 提供，跑卷积必须把这两条加进 `LD_LIBRARY_PATH`；对照 cuDNN 再加 `NVIDIA_TF32_OVERRIDE=0` |
+| CUDA 实测机 | A800-SXM4-40GB、驱动 550.127、CUDA 12.4、`cupy-cuda12x` 14.2（Ubuntu 22.04 / Python 3.10）。系统没装 CUDA toolkit，cuBLAS / cuDNN 由 miniconda 的 `nvidia/{cublas,cudnn}/lib` 提供，跑卷积必须把这两条加进 `LD_LIBRARY_PATH`；对照 cuDNN 再加 `NVIDIA_TF32_OVERRIDE=0` |
 | HIP 后端 | ROCm 7.2（RX 7650 GRE `gfx1100` / `gfx1102`，WSL + DXG 直通上验证）。WSL 内必须 `export HSA_ENABLE_DXG_DETECTION=1`，否则 `hsa_init` 失败、`hipGetDeviceCount` 返回 0 |
 
 ### 快速上手
@@ -117,9 +118,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   本身仍回主机（DESIGN 5.245 / 5.277）。**解码的"分支"接不进去**：判定输入是主机
   采样出的 token、每步还要写回 `ids`，设备端循环的"条件→体"之间没有主机回调位
   （DESIGN 5.278，负结果）；**但 decode 的状态已经常驻**：
-  `LMRunner(device_state=True)` 捕获一次 `steps=1` 的 decode 图，状态每步 D2D、
-  只回传 logits 块（5.279）。它要求 `resident=True` 与静态形状（换 batch 重建
-  计划），prefill 与首步仍各回传/上传一次状态，束搜索与投机解码仍走宿主路径。
+  `LMRunner(device_state=True)` / `ServingEngine(device_state=True)` 捕获一次
+  `steps=1` 的 decode 图，状态每步 D2D、只回传 logits 块（5.279 / 5.280；
+  A800 24 层 86.4 → 14.2 ms/token，RX 7650 GRE 8～24 层 7.2～7.9×）。它要求
+  `resident=True` 与静态形状（换 batch 重建计划），prefill 与首步仍各回传/上传
+  一次状态，束搜索与投机解码仍走宿主路径。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
@@ -227,6 +230,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `replay` 之后必须同步捕获流，HIP 的默认流不会等它（CUDA legacy 默认流隐式
   同步），否则收尾 D2H 读到上一次 replay 的输出。WSL 里跑 HIP 必须带
   `HSA_ENABLE_DXG_DETECTION=1`，否则设备数报 0。
+- **捕获期的零拷贝视图要按"独占内存"记账**（5.280）：arena 按"最后一个读者"
+  回收，视图的源可能比视图先被释放。`_shares_storage` 用 `base is source` 判定，
+  在**源本身是视图**时（状态连续 slice / reshape）必然失败，地址随即被复用——
+  HIP 上表现为跨 chunk 合并后 D2D `code=1`，CUDA 上表现为捕获图与逐节点
+  `execute` 首步分叉。判据：先让输出独占缓冲，再把记账统一到底层持有者；
+  验收时捕获图必须与 `execute` 数值一致（后者不走回收，是安全基准）。
 
 ---
 
