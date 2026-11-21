@@ -17485,7 +17485,10 @@ Python 3.10.12 拉取同一 commit：`tests.test_dynamic` 24 条通过；全量 
 3. 嵌套区域改成 `ValueError` → 异常类型判据变红。
 
 **验证**：本地 `py -3.14` + torch 2.13.0，`Ran 2803 tests / OK (skipped=428)`；
-`ruff check` 通过。本轮**没有可用的 HIP 设备**（本地无 ROCm，远端机器也没有），
+`ruff check` 通过。远端 Ubuntu 22.04 / Python 3.10.12 拉取同一 commit：
+`tests.test_device_control` 35 条通过（2 条 HIP 用例跳过）；全量 2803 条中非前端
+用例全通过，`test_frontend` 的 121 条仍因该机 torch 2.5.1 不在兼容矩阵内报错
+（同 5.276，环境问题）。本轮**没有可用的 HIP 设备**（本地与远端都没有 ROCm），
 真机用例保留但未执行；CUDA 未验证。不写"已验证"，也不拿 numpy 替身冒充真机。
 
 **边界**
