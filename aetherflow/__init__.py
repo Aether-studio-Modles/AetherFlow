@@ -4,7 +4,7 @@
 
 1. 前端与后端之间只有一份契约——IR。任何后端都不得读取前端对象。
 2. 每个算子都有一份不依赖加速库的参考语义，它是跨后端对齐的唯一真值。
-3. 每个节点都带可移植性标注，跨后端共享的优化路径只允许 PORATBLE 节点。
+3. 每个节点都带可移植性标注，跨后端共享的优化路径只允许 PORTABLE 节点。
 
 当前实现范围：高层语义 IR + JSON 序列化与版本治理 + 参考语义执行器 + 参考后端 +
 verifier + 中层优化 pass + torch.export 前端适配 + CUDA 后端 + 后端一致性套件 +
@@ -22,6 +22,19 @@ verifier + 中层优化 pass + torch.export 前端适配 + CUDA 后端 + 后端�
 尚未实现：完整的 define-by-run 执行（逐算子即时求值）、强化学习式的配置更新、
 硬件包的公钥分发与撤销链。
 """
+
+import sys as _sys
+
+# 运行期版本守卫：pyproject 的 requires-python 只约束安装器，源码目录直接导入、
+# 或旧解释器复用已装好的 site-packages 时都不会经过它。实测 3.8 能导入本包的一部分
+# 模块，但行为没有保证——"能导入、半可用"正是本项目明确拒绝的形态，所以在包入口
+# 显式拦一次，让错误落在版本上，而不是几十层调用之后。
+if _sys.version_info < (3, 10):  # pragma: no cover - 老解释器上无法执行测试
+    raise RuntimeError(
+        "AetherFlow 需要 Python 3.10 及以上，当前解释器是 "
+        f"{_sys.version.split()[0]}。请升级解释器，或用 py -3.14 之类的启动器"
+        "选择受支持的版本。"
+    )
 
 from .agent_api import (
     AgentQueryError,
