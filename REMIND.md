@@ -123,7 +123,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `steps=1` 的 decode 图，状态每步 D2D、只回传 logits 块（5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，RX 7650 GRE 8～24 层 7.2～7.9×）。它要求
   `resident=True` 与静态形状（换 batch 重建计划），prefill 与首步仍各回传/上传
-  一次状态，束搜索与投机解码仍走宿主路径。
+  一次状态；束搜索的状态重排也在显存里做（5.282，`embedding(state, parents)`
+  一张捕获图），投机解码仍走宿主路径。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
@@ -242,6 +243,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   宿主侧只差 6%（87.7～90.2 对 79.9～81.2）。宿主路径被整块状态往返拖住，对 SM
   争用不敏感；设备路径吃时钟与同卡其它进程。测这类数字前后各记一次 `nvidia-smi`
   （利用率 / 显存 / SM 时钟），跨时段的单点数字不能直接比。
+- **跨条目的宿主每步成本不可横比**（5.282）：同一段 decode 代码在 A800 上今天量到
+  8.7 ms/步（`resident=True`）与 106.8 ms/步（`resident=False`），而 5.281 记的
+  宿主是 77.3 且标注驻留。两个量级都复现得出来，说明宿主列对"权重是否驻留 /
+  计时范围"极度敏感；新数字只在同一口径内比较，不拿旧条目做加速比。
+- **HIP 上同进程第二个设备态会话会坏**（5.282）：24 层 / `d_model=1024` 时，先后
+  建两个 `LMRunner`（即使换后端实例）会给出 NaN logits 或"捕获期 arena 不够
+  4 MB"；纯 `generate`（不涉及束搜索）同样复现，一个进程一个配置就正常。基准
+  脚本按"每个配置一个子进程"写。
+- **HIP `d_model=512 / 12 层 / vocab=8192 / batch=2` 的 `generate_batch` 出 NaN**
+  （5.282 顺带发现）：同配置 batch=1 正常，`d_model=1024` 的 batch=2 正常，属
+  形状相关的内核问题，待查。
 
 ---
 
