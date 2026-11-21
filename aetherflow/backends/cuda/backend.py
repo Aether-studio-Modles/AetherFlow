@@ -691,6 +691,15 @@ class CudaBackend(DeviceBackend):
             # 上传一遍，让图里记录的是本轮地址（HIP 的 recycle 会收回预热
             # 期地址，CUDA 这里同样按"捕获轮的地址才算数"处理，两家一致）。
             self._drop_plan(graph)
+            # 重建必须在 ``begin_capture`` **之前**：重建会走 ``_prepare_plan``
+            # → ``_op_constant``，那一遍是 ``cudaMemcpyAsync`` 的 H2D，而捕获
+            # 流上任何 H2D 都会被驱动拒绝（"H2D transfers are disallowed"），
+            # 整张图随即退回逐节点执行。这里让它在默认流上完成，再让捕获流
+            # 等一次事件，图里读到的就是本轮上传的那份常量。
+            self._plan(graph)
+            ensure = cp.cuda.Event()
+            ensure.record()
+            stream.wait_event(ensure)
             with stream:
                 stream.begin_capture()
                 # 捕获期禁止任何 D2H 同步（embedding 的越界回读会破坏捕获），
