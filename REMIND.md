@@ -105,8 +105,13 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 ### 已知限制
 
 - **分布式**：NCCL / RCCL 已到设备侧绑定（AllReduce / AllGather / ReduceScatter /
-  Broadcast），但**未接进数据并行路径**，跨卡归约仍走主机中转；`overlap` 恒为
-  `False`。RCCL 只在单卡 `world=1` 上验证。ZeRO-1/2/3 与流水部分参见 DESIGN §7。
+  Broadcast）。单进程多卡可显式接设备侧归约：
+  `DataParallelTrainer(..., collective="device",
+  device_collective=nccl_device_collective(backend, devices))`（`ncclCommInitAll`
+  + 每卡原地 AllReduce，5.284），不注入时仍报 `DeviceCollectiveUnavailable`；
+  多进程 `DistributedDataParallel` **仍走主机中转**，`overlap` 恒为 `False`。
+  真机只到 `world=1`（RCCL 与 CUDA 各一条），两卡数值用例已写但当前没有多卡
+  机器、未执行。ZeRO-1/2/3 与流水部分参见 DESIGN §7。
 - **张量并行**：只有前向（列 / 行并行 + attention 头切分）。行并行返回**部分和**，
   需调用方归约；反向通信与优化器分片未接。
 - **量化**：weight-only int8。权重驻留 1 字节，GEMM 仍走 f32 反量化；

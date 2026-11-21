@@ -519,6 +519,29 @@ class TestCudaDataParallel(unittest.TestCase):
             )
         self.assertEqual(multi.steps, 2)
 
+    def test_nccl_provider_reduces_across_two_cards(self):
+        from aetherflow.train import nccl, nccl_device_collective
+
+        if not nccl.available():
+            self.skipTest("没有可加载的 NCCL")
+        backend = CudaBackend(device=0)
+        with nccl_device_collective(backend, [0, 1]) as collective:
+            left = backend.to_array(np.array([1.0, 2.0], np.float32))
+            backend.set_device(1)
+            right = backend.to_array(np.array([3.0, 4.0], np.float32))
+            backend.set_device(0)
+            out = collective({0: {"w": left}, 1: {"w": right}}, 0, reduction="sum")
+            np.testing.assert_allclose(backend.to_host(out["w"]), [4.0, 6.0])
+            np.testing.assert_allclose(backend.to_host(right), [4.0, 6.0])
+
+            left = backend.to_array(np.ones(2, np.float32))
+            backend.set_device(1)
+            right = backend.to_array(np.full(2, 3.0, np.float32))
+            backend.set_device(0)
+            out = collective({0: {"w": left}, 1: {"w": right}}, 0, reduction="mean")
+            np.testing.assert_allclose(backend.to_host(out["w"]), [2.0, 2.0])
+        self.assertEqual(backend.current_device(), self.origin)
+
 
 def _mean_provider(calls):
     """一个"设备侧"归约的替身：按 allreduce 的累加顺序求均值。

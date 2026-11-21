@@ -17914,3 +17914,50 @@ H2D——批越大往返越贵。把 `_device_step` 的后端能力接进 `Servi
 - 融合图按束宽捕获，与单条生成的 decode 计划分开；`close()` 一并释放。
 - `resident=True` 仍是前提；prefill 仍是普通执行，第一步 decode 上传一次状态。
 - `parents` 只有 `k` 个 int32 上传；死槽仍随 pad 推进，父行 0。
+
+### 5.284　数据并行接上设备侧归约：`ncclCommInitAll` + 原地 AllReduce
+
+**问题**
+
+`DataParallelTrainer` 的 `collective="device"` 接缝从 5.228 起就在（provider 注入、
+`DeviceAllReduce` 契约、`overlap` 声明），但一直没有内置实现：请求设备侧归约却
+没注入 provider 时只能抛 `DeviceCollectiveUnavailable`，实际能跑的跨卡归约仍是
+"每卡 D2H → 主机求和 → 每卡 H2D"。
+
+**做法**
+
+- `train/nccl.py`：登记 `ncclCommInitAll`（NCCL / RCCL 同名），新增
+  `init_all(devices)`——单进程内一次建好 world 个 communicator，不需要 unique id
+  分发。`NcclComm._from_handle` 补齐已有 handle 的字段。
+- `train/parallel.py`：新增 `NcclDeviceAllReduce` 与工厂
+  `nccl_device_collective(backend, devices)`。provider 对每个参数、每张卡发起
+  一次原地 `AllReduce(op="sum", stream=0)`；`reduction="mean"` 在设备上补
+  `array /= world_size`——绑定刻意不登记 `ncclAvg`，平均在哪一侧除留给调用方。
+  结束把当前设备还原成进入时的那张卡。
+- 不自动启用：没有库、没有多卡、或后端不是设备后端时，仍然显式报
+  `DeviceCollectiveUnavailable`，错误消息点名这个工厂。多进程 DDP
+  （`DistributedDataParallel`）仍只接受主机态，跨卡归约仍走主机中转——它每个
+  rank 一个进程，用不了 `ncclCommInitAll` 建出来的那组 communicator。
+
+**验证**
+
+| 面 | 结果 |
+|---|---|
+| 离线（假 comm） | 每名字 × 每卡各一次 `sum`、mean 的原地除、非法 reduction 拒绝、`close` 销毁全部 comm、缺库时抛 `NcclUnavailable` |
+| HIP world=1（RX 7650 GRE） | `ncclCommInitAll` 可建；sum / mean 均恒等；设备归位 |
+| A800 world=1 | `TestNcclProviderOnCuda` 通过 |
+| 两卡数值（sum / mean） | 用例已写（`TestCudaDataParallel`），**当前没有多卡机器，未执行** |
+
+**读法**
+
+- 归约留在设备上，主机侧只剩 `DataParallelTrainer` 统一取回的那一次 D2H；
+  相比主机中转省掉"每卡一份 D2H + 每卡一份 H2D"。
+- 只支持单进程多卡（`DataParallelTrainer`）。多进程 DDP 若要设备侧归约，得由
+  调用方按 `ncclCommInitRank` 自己建 provider 注入，本版不提供。
+- 计算/通信重叠仍未实现，`overlap` 恒为 `False`。
+
+**边界**
+
+- `init_all` 的空设备列表由 provider 入口拒绝（`ValueError`）；库缺失与
+  `ncclCommInitAll` 符号缺失都是 `NcclUnavailable`。
+- provider 不持有训练状态，`close()` 只销毁 communicator；可作上下文管理器。
