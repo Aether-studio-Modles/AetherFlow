@@ -15,11 +15,31 @@ from typing import Any
 
 import numpy as np
 
-__all__ = ["array_module", "to_host", "host_scalar"]
+__all__ = ["array_module", "register_array_module", "to_host", "host_scalar"]
+
+# 硬件包（第三方后端）的设备数组容器：每项是 (判定函数, 模块)。训练层不
+# import 具体后端——注册方在自己的包被导入时完成注册即可。
+_REGISTERED: list = []
+
+
+def register_array_module(matches, module) -> None:
+    """把第三方后端的设备数组容器接入训练层。
+
+    ``matches(arr)`` 为真时，训练层把 ``module`` 当作 ``xp``（同 numpy 的位置）
+    使用；``module`` 需要提供 ``ndarray`` / ``asarray`` / ``asnumpy`` /
+    ``array`` / ``zeros_like`` / ``sqrt`` 与逐元素运算符。
+
+    同一 ``matches`` 重复注册时覆盖前一项，避免模块被 reload 时表无限增长。
+    """
+    for index, (existing, _) in enumerate(_REGISTERED):
+        if existing is matches:
+            _REGISTERED[index] = (matches, module)
+            return
+    _REGISTERED.append((matches, module))
 
 
 def array_module(arr) -> Any:
-    """``arr`` 所属的数组模块：numpy、cupy 或 HIP 运行时。
+    """``arr`` 所属的数组模块：numpy、cupy、HIP 运行时或已注册的硬件包。
 
     HIP 的容器（``backends/hip/runtime.py::DeviceArray``）不是 numpy 子类，
     但它提供了优化器与梯度工具需要的那一面（``ndarray`` / ``asarray`` /
@@ -36,6 +56,9 @@ def array_module(arr) -> Any:
         from ..backends.hip import runtime
 
         return runtime
+    for matches, registered in _REGISTERED:
+        if matches(arr):
+            return registered
     return np
 
 
