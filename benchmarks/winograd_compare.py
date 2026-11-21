@@ -7,7 +7,7 @@ python -m benchmarks.winograd_compare
 python -m benchmarks.winograd_compare --rounds 5 --single
 ```
 
-三路耗时，同一形状、同一份数据：
+四路耗时，同一形状、同一份数据：
 
 1. ``输入权重``：``conv_impl="winograd_fused"``，权重是**图输入**。基准
    脚本的常见形态，调用方可以随时换权重，因此每次执行都要重算
@@ -16,10 +16,10 @@ python -m benchmarks.winograd_compare --rounds 5 --single
    权重变换的结果，``U`` 只在第一次执行（或计划重建后）算一次；
 3. ``cuDNN``：直调 cuDNN 的 legacy API，口径见 ``cudnn_compare``。
 
-最后一列 ``U/20`` 是连续执行 20 次里权重变换内核的调用次数，取自
+最后一列 ``U/20`` 是预热之后连续执行 20 次里权重变换内核的调用次数，取自
 ``DeviceBackend.conv_weight_transforms``——它是"驻留有没有真的生效"的
-直接证据，比计时更不容易被噪声骗。常量权重的一列应当恒为 1，输入权重
-的一列应当是 20。
+直接证据，比计时更不容易被噪声骗。常量权重的一列应当是 0，输入权重的一列
+应当是 20。
 
 **只比设备侧**：本项目侧走 ``execute_device``，输入先转成设备数组；cuDNN
 侧同样不出卡。``NVIDIA_TF32_OVERRIDE=0`` 必须设，否则 cuDNN 会走 TF32，
@@ -41,15 +41,19 @@ from benchmarks.conv_compare import SHAPES
 from benchmarks.cudnn_compare import measure, run_cudnn
 
 # 3x3 形状才进 Winograd；覆盖"自动接管窗口"（c8～c24）与两侧的对照点。
-STAGES = tuple(s for s in SHAPES if s[2][2] == 3 and s[2][3] == 3)
+# C 上界取 64：融合版把整块 ``V`` 放进共享内存（``16*C*TT*4`` 字节），
+# 48 KB 预算只到 C=96，c128 会被派发处明确拒绝。
+STAGES = tuple(s for s in SHAPES if s[2][2] == 3 and s[2][3] == 3 and s[1][1] <= 64)
 
 
 def build(shape, constant_weight: bool):
     """同一份权重数据，两种来源：图输入 / 常量节点。"""
     name, x_shape, w_shape, pad = shape
+    # 生成顺序必须与 ``cudnn_compare.build`` 完全一致（x → w → b），
+    # 否则三列测的不是同一份数据，数值对拍会以"算法错误"的形式失败。
     rng = np.random.default_rng(0)
-    w_np = (rng.standard_normal(w_shape) * 0.1).astype(np.float32)
     x_np = rng.standard_normal(x_shape).astype(np.float32)
+    w_np = (rng.standard_normal(w_shape) * 0.1).astype(np.float32)
     b_np = rng.standard_normal(w_shape[0]).astype(np.float32)
 
     g = Graph(name)
@@ -116,6 +120,10 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     backend = CudaBackend(conv_impl="winograd_fused")
     in_ms = _measure(backend, STAGES, constant_weight=False, rounds=args.rounds)
     const_ms = _measure(backend, STAGES, constant_weight=True, rounds=args.rounds)
+    tiled_ms = _measure(
+        CudaBackend(conv_impl="tiled"), STAGES, constant_weight=False,
+        rounds=args.rounds,
+    )
 
     # 数值：两条路径必须逐位一致；对 cuDNN 按 1e-4 对齐（Winograd 的变换
     # 会放大舍入误差，容差与 cudnn_compare 一致）。
@@ -131,18 +139,19 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"cuDNN {conv.version}（{conv.name}），"
           f"{'单次延迟' if args.single else '稳态（连续 20 次平摊）'}，ms")
     print(
-        f"{'shape':10s} {'输入权重':>9s} {'常量权重':>9s} {'cuDNN':>9s}"
+        f"{'shape':10s} {'tiled':>8s} {'输入权重':>9s} {'常量权重':>9s} {'cuDNN':>9s}"
         f" {'常量/cuDNN':>11s} {'U/20(输入)':>11s} {'U/20(常量)':>11s}"
     )
     for shape in STAGES:
         name = shape[0]
+        t = tiled_ms[name][key]
         i = in_ms[name][key]
         c = const_ms[name][key]
         d = cudnn_ms[name][key]
         gi = transform_growth(backend, shape, constant_weight=False)
         gc = transform_growth(backend, shape, constant_weight=True)
         print(
-            f"{name:10s} {i:9.4f} {c:9.4f} {d:9.4f}"
+            f"{name:10s} {t:8.4f} {i:9.4f} {c:9.4f} {d:9.4f}"
             f" {c / d:10.2f}x {gi:11d} {gc:11d}"
         )
     return 0

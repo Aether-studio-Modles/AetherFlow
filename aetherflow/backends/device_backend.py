@@ -46,6 +46,8 @@ from ..lower.plan import (
     CONV_TILE_OPTIONS,
     CONV_TILED_MAX_K,
     CONV_WINOGRAD_TILE,
+    CONV_WINOGRAD_FUSED_MIN_C,
+    CONV_WINOGRAD_FUSED_RESIDENT_MIN_C,
     SHARED_LIMIT,
     VEC4_ALIGN,
     attention_block,
@@ -2342,7 +2344,9 @@ class DeviceBackend(Executor):
                 )
             kernel_kind = "winograd_fused"
         else:
-            kernel_kind = self._pick_conv_kernel(**dims)
+            kernel_kind = self._pick_conv_kernel(
+                weight_resident=resident is not None, **dims
+            )
         bias_fused = False
         if kernel_kind == "grouped":
             # 分组直算在写回时融合 bias，与分块 / 隐式核一致
@@ -2414,6 +2418,7 @@ class DeviceBackend(Executor):
 
 
     def _pick_conv_kernel(self, *, n, o, k, kh, kw, ho, wo, c, sw, dw,
+                          weight_resident: bool = False,
                           **_ignored) -> str:
         """在 winograd / tiled / implicit / im2col 之间选一个实现。
 
@@ -2442,6 +2447,10 @@ class DeviceBackend(Executor):
 
         两条入口都要过 ``kh*kw > 1``（1x1 没有窗口重叠，隐式反而慢 6%）、
         ``k > CONV_TILED_MAX_K``（小 K 的分块直算仍更快）与 shared 预算。
+
+        ``weight_resident`` 表示这一层的权重来自常量节点、``U`` 可以驻留。
+        它只改融合版的下限（c3 也划算，见 5.257），其余判据不变——图输入
+        权重无法证明"值没变"，仍按 8 起。
         """
         if self.conv_impl == "implicit":
             return "implicit"
@@ -2449,7 +2458,12 @@ class DeviceBackend(Executor):
             self.conv_impl == "auto"
             and self.CONV_AUTO_WINOGRAD
             and conv_winograd_fused_preferred(
-                c=c, kh=kh, kw=kw, sw=sw, dw=dw, o=o, work=n * o * ho * wo
+                c=c, kh=kh, kw=kw, sw=sw, dw=dw, o=o, work=n * o * ho * wo,
+                # 权重是常量时权重变换那次 launch 不进每轮成本，下限放到 c3
+                min_c=(
+                    CONV_WINOGRAD_FUSED_RESIDENT_MIN_C if weight_resident
+                    else CONV_WINOGRAD_FUSED_MIN_C
+                ),
             )
         ):
             return "winograd_fused"

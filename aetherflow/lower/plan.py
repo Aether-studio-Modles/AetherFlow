@@ -40,6 +40,7 @@ __all__ = [
     "CONV_WINOGRAD_TILE",
     "CONV_WINOGRAD_FUSED_MIN_C",
     "CONV_WINOGRAD_FUSED_MAX_C",
+    "CONV_WINOGRAD_FUSED_RESIDENT_MIN_C",
     "CONV_IMPLICIT_MID_K_MAX",
     "CONV_IMPLICIT_MID_WORK",
     "CONV_CUDNN_MIN_GFLOPS",
@@ -157,6 +158,12 @@ CONV_WINOGRAD_TILE = 8
 # 0.103 ms 已与四段版持平，c64 退化到 0.246），所以停在 24。
 CONV_WINOGRAD_FUSED_MIN_C = 8
 CONV_WINOGRAD_FUSED_MAX_C = 24
+
+# 权重已驻留时的下限（5.257）。常量权重的 ``U`` 只在第一次执行时算，
+# 那次 launch 不再计入每轮成本，c3 因此也划算：A800-40GB 上 0.0502 ms，
+# 分块直算 0.0580、cuDNN 0.0450（1.12×）。图输入权重时 c3 仍是 0.0633，
+# 所以下限的分档必须跟着"权重是不是常量"走，不能一概放宽。
+CONV_WINOGRAD_FUSED_RESIDENT_MIN_C = 3
 
 # 隐式 GEMM 的甜点区（A800 实测，5.252）。分界不是像素数，而是 im2col 要
 # 物化的元素数 n*ho*wo*K：网格扫描里 <= 2.95M 的 15 个点在隐式上快 7～13%，
@@ -515,7 +522,8 @@ def conv_winograd_preferred(*, k: int, kh: int, kw: int, sw: int, dw: int,
 
 
 def conv_winograd_fused_preferred(*, c: int, kh: int, kw: int, sw: int,
-                                  dw: int, o: int, work: int) -> bool:
+                                  dw: int, o: int, work: int,
+                                  min_c: int = CONV_WINOGRAD_FUSED_MIN_C) -> bool:
     """auto 模式下是否该走**融合版** Winograd（A800-40GB 实测，5.256）。
 
     四段版（输入变换 + 16 个 cuBLAS GEMM + 输出变换）在 A800 上被固定开销
@@ -534,13 +542,17 @@ def conv_winograd_fused_preferred(*, c: int, kh: int, kw: int, sw: int,
 
     因此门槛只看 ``C``，不看 ``K``。其余几何条件与 ``conv_winograd_supported``
     相同；``TT*O`` 不能超过单块线程上限。
+
+    ``min_c`` 是下限的分档：权重是**常量节点**时调用方传
+    ``CONV_WINOGRAD_FUSED_RESIDENT_MIN_C``——那一次权重变换 launch 被省掉，
+    c3 也快于分块直算（5.257）。
     """
     return (
         kh == 3
         and kw == 3
         and sw == 1
         and dw == 1
-        and CONV_WINOGRAD_FUSED_MIN_C <= c <= CONV_WINOGRAD_FUSED_MAX_C
+        and min_c <= c <= CONV_WINOGRAD_FUSED_MAX_C
         and o * CONV_WINOGRAD_TILE <= BLOCK_MAX
         and work >= CONV_TILED_MIN_WORK
     )

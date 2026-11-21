@@ -504,6 +504,23 @@ class TestConvDecision(unittest.TestCase):
         for c in (8, 16, 24):
             self.assertTrue(pick(c), msg=f"c={c}")
 
+    def test_winograd_fused_resident_window_starts_at_c3(self):
+        """权重驻留后下限放到 c3（5.257）：省掉的那次 launch 正是 c3 的差距。
+
+        A800-40GB：c3 常量权重 0.0502 ms，分块直算 0.0580、cuDNN 0.0450；
+        图输入权重仍是 0.0633，所以这条放宽只对常量权重生效。
+        """
+
+        def pick(c):
+            return conv_winograd_fused_preferred(
+                c=c, kh=3, kw=3, sw=1, dw=1, o=32, work=1 << 20, min_c=3
+            )
+
+        for c in (3, 8, 16, 24):
+            self.assertTrue(pick(c), msg=f"c={c}")
+        for c in (2, 25, 32):
+            self.assertFalse(pick(c), msg=f"c={c}")
+
     def test_winograd_fused_geometry(self):
         """几何条件与 ``conv_winograd_supported`` 一致，另加线程上限。"""
 
