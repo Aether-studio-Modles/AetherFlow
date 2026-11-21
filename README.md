@@ -169,8 +169,10 @@ L1/L2 吸收。
   索引），8 层 `channel4d` 从 0.905 降到 **0.303 ms**；5.263 再把常量上的
   `reshape`（BN 参数由 `(C,)` 变 `(1,C,1,1)`）在计划期折成视图，`channel`
   从 1.022 降到 **0.302 ms**。三种形态现在齐平（差 ≤ 2%）；`channel` 形态的
-  捕获收益待共享机空闲后与 cuDNN 基准列一起复测。复现：
-  `python -m benchmarks.conv_graph_compare --blocks 8 --rounds 3`。
+  捕获收益待共享机空闲后与 cuDNN 基准列一起复测。5.267 又把 `clamp` 的上下界
+  与 `step` / `spike` 的阈值（都是属性里的编译期常量）内联进链，SSM 的
+  `clamp → mul → add` 与 SNN 的 `step → mul` 不再各写一次内存（NaN 仍透传）。
+  复现：`python -m benchmarks.conv_graph_compare --blocks 8 --rounds 3`。
 - 图重放：小算子的多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
   A800 设备侧 1.66 → 0.40 ms，LeNet 常驻 0.59 → 0.14 ms），单节点图无收益；
   默认 `graph_mode="off"`，语义差异需使用者知情。

@@ -16560,6 +16560,41 @@ BN 在推理时的**常见**形态，所以这条判据的缺口不是边角：�
 **回归**：`tests/test_cuda_backend.py` 339 passed / 5 skipped；本项只改动
 CUDA `capture` 的一段流程，不涉及参考后端与 HIP。
 
+### 5.267　把 clamp / step / spike 接进逐元素链
+
+链的成员以前是"L2 里已有一元/二元表达式表的算子"，`clamp`、`step`、`spike`
+被挡在外面：它们有一个**标量参数**，而链的 `ElemStep` 只描述"算子 + 张量
+操作数"。结果 SSM 的 `clamp(x, min=-80) → mul → add`、SNN 的
+`step(x, 0.5) → mul` 都要各写一次内存。
+
+这三个算子的参数都来自节点属性，是**编译期常量**，可以直接内联成表达式：
+
+- `ElemStep` 增加 `params: Tuple[Optional[float], ...]`（默认空）；
+- `apply_op(op, args, params)` 新增两个分支。`clamp` 生成
+  `Cond(x > hi, hi, x)` 再 `Cond(x < lo, lo, x)`——先上界后下界，与
+  `kernels.ew_clamp` 同序，**NaN 因此原样透传**（用 `fminf` / `fmaxf` 会
+  把 NaN 换成边界）；`step` / `spike` 生成 `Cond(x > thr, 1.f, 0.f)`，
+  默认阈值分别 0.0 / 1.0，与 `ir/ops.py` 的两张参考表一致。
+- 参数进源码缓存键（`(out, op, args, params)`）。这不是洁癖：同一张图里
+  `clamp(min=-80)` 与 `clamp(0, 1)` 很常见，只按算子名复用内核会静默换掉
+  边界；`step` 的旧内核把阈值当运行期标量，所以以前不存在这个问题。
+- `_group_elementwise` 不需要改：`clamp` 是一元、输出与输入同形同 dtype，
+  已经满足 `_chainable` 的全部条件。`_step_params` 负责从属性取参数。
+
+**验证**（A800-40GB 真机）
+
+- `step(0.5) → clamp(-1,1) → mul` 被分到**一组**（f32 与 f16 相同），与
+  numpy 手算逐位一致（最大绝对差 0.0）；
+- 单边 `clamp(min=0)` 把 `[-1, 0.5, NaN, 3]` 映射成 `[0, 0.5, NaN, 3]`——
+  NaN 透传成立；`spike` 默认阈值把 `[0.5, 1.0, 1.5, NaN]` 映射成
+  `[0, 0, 1, 0]`（`>` 而非 `>=`，NaN 比较为假取 0），与参考实现一致。
+- 新增 3 条纯 Python 用例（两组源码形态、两条分组判据）；远端
+  `tests/test_cuda_backend.py` + `tests/test_lower_kernel.py`
+  428 passed / 5 skipped。
+
+**回归**：两个受影响文件全绿；本轮未跑全量（改动的两个模块不在
+`frontend/compat.py` 的 53 条失败面里）。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
