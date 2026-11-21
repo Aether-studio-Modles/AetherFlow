@@ -22,6 +22,7 @@ from aetherflow import ReferenceBackend
 from aetherflow.models import (
     LMSpec,
     LMRunner,
+    ServingEngine,
     generate,
     generate_batch,
     generate_beam,
@@ -239,6 +240,64 @@ class _ResidentOnly:
         self.resident = {}
 
 
+class TestDeviceStateServing(unittest.TestCase):
+    """连续批处理：每步只 decode 一次，状态只在准入时往返。"""
+
+    def _requests(self, engine):
+        prompts = [[3, 4, 5], [6, 7], [8, 9, 10, 11], [12]]
+        return [
+            engine.submit(prompt, max_new_tokens=3, seed=index)
+            for index, prompt in enumerate(prompts)
+        ]
+
+    def test_continuous_batching_matches_host_and_captures_once(self):
+        spec = _small(batch=1, steps=6)
+        params = spec.init_params(seed=31)
+        with ServingEngine(
+            _DeviceRecorder(BACKEND), params, spec, capacity=2, resident=True
+        ) as engine:
+            self._requests(engine)
+            want = engine.run()
+
+        rec = _DeviceRecorder(BACKEND)
+        with ServingEngine(
+            rec, params, spec, capacity=2, resident=True, device_state=True
+        ) as engine:
+            self._requests(engine)
+            got = engine.run()
+            captures = rec.captures
+            d2h = list(rec.d2h)
+            replays = rec.replays
+
+        self.assertEqual(got, want)
+        self.assertEqual(captures, 1, "batch=capacity 的 decode 图只捕获一次")
+        logits = (2, 1, spec.vocab_size)
+        # 每个 decode 步只回传一次 logits 块
+        self.assertEqual(sum(1 for shape, _ in d2h if shape == logits), replays)
+        # 状态整块只在准入时往返：4 条请求、capacity=2，分两批准入
+        states = len(spec.state_shapes)
+        state_d2h = sum(1 for shape, _ in d2h if shape != logits)
+        self.assertEqual(state_d2h, 2 * states)
+        # 若 decode 每步都回传状态，这个数会是 replays * states
+        self.assertLess(state_d2h, replays * states)
+
+    def test_requires_resident(self):
+        spec = _small(batch=1, steps=4)
+        with self.assertRaisesRegex(ValueError, "resident=True"):
+            ServingEngine(
+                _DeviceRecorder(BACKEND), spec.init_params(seed=0), spec,
+                resident=False, device_state=True,
+            )
+
+    def test_requires_capture_capability(self):
+        spec = _small(batch=1, steps=4)
+        with self.assertRaisesRegex(ValueError, "capture"):
+            ServingEngine(
+                _ResidentOnly(), spec.init_params(seed=0), spec,
+                resident=True, device_state=True,
+            )
+
+
 class _CaptureOnly(_ResidentOnly):
     """能捕获、但没有把输出取回主机的能力。"""
 
@@ -275,41 +334,85 @@ try:  # 与 test_device_control 相同的容错导入
 except Exception:  # pragma: no cover - 没有 ROCm 的环境
     HIP_AVAILABLE, HipBackend = False, None
 
+try:  # CUDA 后端：能导入 cupy 且真的有一张可见的卡
+    from aetherflow.backends.cuda import CudaBackend
+    import cupy
+
+    CUDA_AVAILABLE = cupy.cuda.runtime.getDeviceCount() > 0
+except Exception:  # pragma: no cover - 没有 CUDA 的环境
+    CudaBackend, CUDA_AVAILABLE = None, False
+
+
+def _check_device_state_on_device(backend_cls):
+    """同一套真机判据：逐 token 一致 + 每步只取回 logits。"""
+    spec = _small(batch=1, steps=4, vocab_size=8)
+    params = spec.init_params(seed=24)
+    prompt = [3, 4, 5]
+    limit = 3
+    want = list(generate(
+        backend_cls(), params, prompt, spec, max_new_tokens=limit, chunk_size=2
+    ))
+
+    backend = backend_cls()
+    sizes = []
+    original = backend.to_host
+
+    def counting(value):
+        sizes.append(tuple(np.shape(value)))
+        return original(value)
+
+    backend.to_host = counting
+    with LMRunner(
+        backend, params, spec, resident=True, device_state=True
+    ) as runner:
+        got = list(runner.generate(prompt, max_new_tokens=limit, chunk_size=2))
+
+    assert got == want, (got, want)
+    logits = (1, 1, spec.vocab_size)
+    # prefill 的尾块取回一次 logits，decode 每步一次
+    assert sizes.count(logits) == limit, sizes
+    # 状态形状只出现在 prefill 的两块里；decode 没有再取回它们
+    state_like = [shape for shape in sizes if shape != logits]
+    assert len(state_like) == 2 * len(spec.state_shapes), sizes
+
+
+def _check_serving_device_state_on_device(backend_cls):
+    """连续批处理：capacity 固定、准入写行，输出与宿主路径一致。"""
+    spec = _small(batch=1, steps=4, vocab_size=8)
+    params = spec.init_params(seed=26)
+    prompts = [[3, 4], [5, 6, 7]]
+    want = None
+    with ServingEngine(
+        backend_cls(), params, spec, capacity=2, resident=True
+    ) as engine:
+        for index, prompt in enumerate(prompts):
+            engine.submit(prompt, max_new_tokens=2, seed=index)
+        want = engine.run()
+    with ServingEngine(
+        backend_cls(), params, spec, capacity=2, resident=True, device_state=True
+    ) as engine:
+        for index, prompt in enumerate(prompts):
+            engine.submit(prompt, max_new_tokens=2, seed=index)
+        got = engine.run()
+    assert got == want, (got, want)
+
 
 @unittest.skipUnless(HIP_AVAILABLE, "本机没有 HIP 设备")
 class TestDeviceStateOnHip(unittest.TestCase):
-    """真机：数值与宿主路径一致，decode 每步只回传 logits。"""
+    def test_runner_matches_host_and_only_logits_come_back(self):
+        _check_device_state_on_device(HipBackend)
 
-    def test_matches_host_path_and_only_logits_come_back(self):
-        spec = _small(batch=1, steps=4, vocab_size=8)
-        params = spec.init_params(seed=24)
-        prompt = [3, 4, 5]
-        limit = 3
-        want = list(generate(
-            HipBackend(), params, prompt, spec, max_new_tokens=limit, chunk_size=2
-        ))
+    def test_serving_matches_host(self):
+        _check_serving_device_state_on_device(HipBackend)
 
-        backend = HipBackend()
-        sizes = []
-        original = backend.to_host
 
-        def counting(value):
-            sizes.append(tuple(np.shape(value)))
-            return original(value)
+@unittest.skipUnless(CUDA_AVAILABLE, "本机没有 CUDA 设备")
+class TestDeviceStateOnCuda(unittest.TestCase):
+    def test_runner_matches_host_and_only_logits_come_back(self):
+        _check_device_state_on_device(CudaBackend)
 
-        backend.to_host = counting
-        with LMRunner(
-            backend, params, spec, resident=True, device_state=True
-        ) as runner:
-            got = list(runner.generate(prompt, max_new_tokens=limit, chunk_size=2))
-
-        self.assertEqual(got, want)
-        logits = (1, 1, spec.vocab_size)
-        # prefill 的尾块取回一次 logits，decode 每步一次
-        self.assertEqual(sizes.count(logits), limit)
-        # 状态形状只出现在 prefill 的两块里；decode 没有再取回它们
-        state_like = [shape for shape in sizes if shape != logits]
-        self.assertEqual(len(state_like), 2 * len(spec.state_shapes))
+    def test_serving_matches_host(self):
+        _check_serving_device_state_on_device(CudaBackend)
 
 
 if __name__ == "__main__":

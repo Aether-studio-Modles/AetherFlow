@@ -2028,6 +2028,10 @@ class ServingEngine:
       会建新图，`max_graphs` 用 LRU 封顶。
     - 只支持 `spec.batch=1` 的会话级构造：capacity 是调度器自己的概念，
       不借用 spec 的 batch 维。
+    - ``device_state=True`` 时，逐 token 的 decode 状态留在显存（``batch=capacity``
+      的图捕获一次），每步只回传 logits 块。代价是**准入**新请求时要把整块状态
+      取回主机、改掉那几行、再传回去（低频事件，一次整块往返）；空槽行仍随 pad
+      推进，结果被丢弃。它要求 ``resident=True``，并且同样只支持静态形状。
 
     **服务侧的三件事**（AF-35 补）：
 
@@ -2052,6 +2056,7 @@ class ServingEngine:
         capacity: int = 4,
         chunk_size: Optional[int] = None,
         resident: bool = False,
+        device_state: bool = False,
         max_graphs: int = 16,
         max_pending: Optional[int] = None,
         clock: Optional[Callable[[], float]] = None,
@@ -2087,6 +2092,20 @@ class ServingEngine:
             )
         self.resident = bool(resident)
         _require_resident(backend, self.resident, "ServingEngine(resident=True)")
+        self.device_state = bool(device_state)
+        if self.device_state:
+            if not self.resident:
+                raise ValueError(
+                    "ServingEngine(device_state=True) 要求 resident=True："
+                    "decode 图必须把权重写死进捕获图，否则每步要把全部参数"
+                    "重新传一遍"
+                )
+            for attr in ("capture", "to_host", "to_array"):
+                if not callable(getattr(backend, attr, None)):
+                    raise ValueError(
+                        f"这个后端没有可用的 {attr}，"
+                        "不能把 decode 状态留在设备上"
+                    )
         self.max_graphs = max_graphs
         self._graphs: "OrderedDict[Tuple[int, int, str], Any]" = OrderedDict()
         self._resident_ready = False
@@ -2098,6 +2117,12 @@ class ServingEngine:
         self.max_pending = max_pending
         self._clock = clock if clock is not None else time.monotonic
         self._next_id = 0
+        # 设备态：decode 图（batch=capacity）捕获一次，整块状态常驻显存；
+        # 只在准入新请求时把新行写进去（整块一次往返，低频事件）。
+        self._decode_plan = None
+        self._decode_graph = None
+        self._decode_inputs = None
+        self._state_dev = None
 
     # -- 图缓存 -------------------------------------------------------
 
@@ -2117,6 +2142,69 @@ class ServingEngine:
             self.backend.resident_parameters(item[0], self.params)
             self._resident_ready = True
         return item
+
+    # -- 设备态 decode -------------------------------------------------
+
+    def _decode_plan_for(self):
+        """捕获（一次）batch=capacity 的 decode 图，并建好整块设备状态。"""
+        if self._decode_plan is not None:
+            return self._decode_plan, self._decode_inputs
+        if not self._resident_ready:
+            raise ValueError(
+                "设备态 decode 的图必须在权重驻留之后捕获；"
+                "请先准入一个请求，让 prefill 把权重建好"
+            )
+        graph, inputs, _ = _stream_graph(
+            1, self.spec.with_batch(self.capacity), "last"
+        )
+        batch_spec = self.spec.with_batch(self.capacity)
+        sample = {
+            inputs["ids"].name: np.zeros((self.capacity, 1), dtype=np.int32),
+            inputs["reset"].name: np.zeros((self.capacity, 1), dtype=np.float32),
+        }
+        for name, shape in batch_spec.state_shapes.items():
+            sample[inputs[name].name] = np.zeros(shape, dtype=np.float32)
+        self._decode_plan = self.backend.capture(graph, sample)
+        self._decode_graph = graph
+        self._decode_inputs = inputs
+        self._state_dev = {
+            name: self.backend.to_array(np.zeros(shape, dtype=np.float32))
+            for name, shape in batch_spec.state_shapes.items()
+        }
+        return self._decode_plan, self._decode_inputs
+
+    def _write_state_rows(self, placements) -> None:
+        """把刚准入的几行状态写进设备整块。
+
+        准入是低频事件，这里整块往返一次；逐 token 的 decode 则完全不碰主机。
+        设备数组只支持切片、不支持整数索引降维，所以不能逐行 D2H——要么整块，
+        要么引入一张"写行"的图，那是用更多机制换一次低频拷贝，不值得。
+        """
+        if not placements:
+            return
+        for name in self.spec.state_shapes:
+            host = np.array(self.backend.to_host(self._state_dev[name]), copy=True)
+            for index, row in placements:
+                host[index] = row[name]
+            self._state_dev[name] = self.backend.to_array(host)
+
+    def _device_decode(self, ids: np.ndarray) -> np.ndarray:
+        """一步批量 decode：状态 D2D，只回传 logits 块。"""
+        plan, inputs = self._decode_plan_for()
+        feed = {
+            inputs["ids"].name: ids,
+            inputs["reset"].name: np.zeros(
+                (self.capacity, 1), dtype=np.float32
+            ),
+        }
+        for name in self.spec.state_shapes:
+            feed[inputs[name].name] = self._state_dev[name]
+        out = plan.run_device(feed)
+        carried = self.spec.carry_state(out)
+        self._state_dev = {
+            name: carried[name] for name in self.spec.state_shapes
+        }
+        return self.backend.to_host(out["logits"])
 
     # -- 请求生命周期 -------------------------------------------------
 
@@ -2313,30 +2401,44 @@ class ServingEngine:
                 request.feed_token = token
 
         # 2) 准入：空槽按 FIFO 填入等待请求，只对本次准入的做一次批量预填充
-        admitted: List[_ServingRequest] = []
+        admitted: List[Tuple[int, _ServingRequest]] = []
         for index, request in enumerate(self._slots):
             if request is not None or not self._pending:
                 continue
             request = self._pending.popleft()
             self._slots[index] = request
-            admitted.append(request)
+            admitted.append((index, request))
         if admitted:
             batch = len(admitted)
             state, logits = _prefill(
                 self.backend,
                 self.params,
-                [request.prompt for request in admitted],
+                [request.prompt for _, request in admitted],
                 self.spec.with_batch(batch),
                 chunk=self.chunk,
                 resident=self.resident,
                 graph_for=lambda length, head: self._graph_for(batch, length, head),
             )
             host_logits = _host_array(self.backend, logits)
-            for row, request in enumerate(admitted):
-                request.state = {
-                    name: _host_array(self.backend, value)[row]
-                    for name, value in state.items()
-                }
+            if self.device_state:
+                # 新请求的状态整块写进设备（一次低频往返），此后每步只 D2D
+                self._decode_plan_for()
+                self._write_state_rows([
+                    (
+                        index,
+                        {
+                            name: _host_array(self.backend, state[name])[row]
+                            for name in self.spec.state_shapes
+                        },
+                    )
+                    for row, (index, _request) in enumerate(admitted)
+                ])
+            for row, (_index, request) in enumerate(admitted):
+                if not self.device_state:
+                    request.state = {
+                        name: _host_array(self.backend, value)[row]
+                        for name, value in state.items()
+                    }
                 request.logits = host_logits[row, 0, :]
 
         # 3) 解码：需要喂 token 的槽位走一次容量为 capacity 的批量 decode
@@ -2346,42 +2448,48 @@ class ServingEngine:
             if request is not None and request.feed_token is not None
         ]
         if feeding:
-            graph, inputs, _ = self._graph_for(self.capacity, 1, "last")
             ids = np.full((self.capacity, 1), self.spec.pad_id, dtype=np.int32)
-            rows: Dict[str, List[np.ndarray]] = {
-                name: [] for name in self.spec.state_shapes
-            }
-            for index, request in enumerate(self._slots):
-                if request is None or request.state is None:
-                    for name, shape in self.spec.state_shapes.items():
-                        # state_shapes 带 batch 维；槽位里存的是"单行"，去掉首维
-                        rows[name].append(np.zeros(shape[1:], dtype=np.float32))
-                    continue
-                for name in self.spec.state_shapes:
-                    rows[name].append(request.state[name])
-                if request.feed_token is not None:
-                    ids[index, 0] = request.feed_token
-                    request.feed_token = None
-            feed = {} if self.resident else dict(self.params)
-            feed[inputs["ids"].name] = ids
-            feed[inputs["reset"].name] = np.zeros(
-                (self.capacity, 1), dtype=np.float32
-            )
-            for name in self.spec.state_shapes:
-                feed[inputs[name].name] = np.stack(rows[name], axis=0)
-            out = self.backend.execute(graph, feed)
-            state = self.spec.carry_state(out)
-            host_state = {
-                name: _host_array(self.backend, value)
-                for name, value in state.items()
-            }
-            host_logits = _host_array(self.backend, out["logits"])
             for index in feeding:
-                request = self._slots[index]
-                request.state = {
-                    name: host_state[name][index] for name in self.spec.state_shapes
+                ids[index, 0] = self._slots[index].feed_token
+                self._slots[index].feed_token = None
+            if self.device_state:
+                host_logits = self._device_decode(ids)
+                for index in feeding:
+                    self._slots[index].logits = host_logits[index, 0, :]
+            else:
+                graph, inputs, _ = self._graph_for(self.capacity, 1, "last")
+                rows: Dict[str, List[np.ndarray]] = {
+                    name: [] for name in self.spec.state_shapes
                 }
-                request.logits = host_logits[index, 0, :]
+                for index, request in enumerate(self._slots):
+                    if request is None or request.state is None:
+                        for name, shape in self.spec.state_shapes.items():
+                            # state_shapes 带 batch 维；槽位里存的是"单行"，去掉首维
+                            rows[name].append(np.zeros(shape[1:], dtype=np.float32))
+                        continue
+                    for name in self.spec.state_shapes:
+                        rows[name].append(request.state[name])
+                feed = {} if self.resident else dict(self.params)
+                feed[inputs["ids"].name] = ids
+                feed[inputs["reset"].name] = np.zeros(
+                    (self.capacity, 1), dtype=np.float32
+                )
+                for name in self.spec.state_shapes:
+                    feed[inputs[name].name] = np.stack(rows[name], axis=0)
+                out = self.backend.execute(graph, feed)
+                state = self.spec.carry_state(out)
+                host_state = {
+                    name: _host_array(self.backend, value)
+                    for name, value in state.items()
+                }
+                host_logits = _host_array(self.backend, out["logits"])
+                for index in feeding:
+                    request = self._slots[index]
+                    request.state = {
+                        name: host_state[name][index]
+                        for name in self.spec.state_shapes
+                    }
+                    request.logits = host_logits[index, 0, :]
         return finished
 
     def run(self) -> List[Tuple[int, List[int]]]:
@@ -2424,6 +2532,10 @@ class ServingEngine:
             self.backend.release_parameters()
             self._resident_ready = False
         self._graphs.clear()
+        self._decode_plan = None
+        self._decode_graph = None
+        self._decode_inputs = None
+        self._state_dev = None
         self._pending.clear()
         self._slots = [None] * self.capacity
         self._ready = []
