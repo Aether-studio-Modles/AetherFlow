@@ -24,6 +24,7 @@ torch 侧**不经过 AetherFlow 前端**：torch 2.5.1 不在兼容矩阵内，�
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -227,6 +228,14 @@ def _run_training(device, backend, cp, sync_af, sync_torch, torch, F, args) -> i
         print(f"图捕获 {getattr(backend, 'graph_captures', 0)} 次 / "
               f"命中 {getattr(backend, 'graph_replays', 0)} 次；"
               f"失败原因：{backend.graph_capture_failure(bwd) or '无'}")
+        stats = backend.graph_profile_stats(bwd)
+        if stats and stats["steps"]:
+            n = stats["steps"]
+            print("重放分段（每步 ms）："
+                  f"upload {stats['upload'] / n * 1e3:.3f} / "
+                  f"launch {stats['launch'] / n * 1e3:.3f} / "
+                  f"sync {stats['sync'] / n * 1e3:.3f} / "
+                  f"guards {stats['guards'] / n * 1e3:.3f}")
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         for _ in range(args.burst):
@@ -263,6 +272,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="AetherFlow 的图重放模式（off / auto / capture）")
     parser.add_argument("--no-update", action="store_true",
                         help="只算梯度、不更新参数（分离参数更新成本）")
+    parser.add_argument("--profile", action="store_true",
+                        help="打开图重放的分段计时（upload / launch / sync / guards）")
     args = parser.parse_args(argv)
 
     try:
@@ -275,6 +286,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.profile:
+        os.environ["AETHERFLOW_GRAPH_PROFILE"] = "1"
 
     backend, backend_kind = _backend(device, args.graph_mode)
     if device.startswith("cuda"):

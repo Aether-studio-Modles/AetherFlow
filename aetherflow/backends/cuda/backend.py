@@ -10,6 +10,8 @@ HIP 与 CUDA 是兄弟关系而不是父子关系。这里留下的是只有 NVI
 
 from __future__ import annotations
 
+import os
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
@@ -802,6 +804,11 @@ class CudaGraphPlan:
         # 捕获期登记的越界标志（embedding 一类按下标访存的算子）。
         # 图里写死的是这些设备标量的地址，每次 replay 都会重新置位。
         self._guards = tuple(guards or ())
+        # 分段计时默认关闭：四次 perf_counter 会污染 0.7 ms 级的对照。
+        # 基准脚本设 AETHERFLOW_GRAPH_PROFILE=1 打开，走的是同一条执行路径。
+        self._profile = os.environ.get("AETHERFLOW_GRAPH_PROFILE") == "1"
+        self.profile_stats = {"upload": 0.0, "launch": 0.0,
+                              "sync": 0.0, "guards": 0.0, "steps": 0}
 
     @property
     def buffers(self) -> Dict[str, Any]:
@@ -852,9 +859,21 @@ class CudaGraphPlan:
         设备态训练用它把梯度留在显存直接交给优化器：一步只把损失标量搬回
         主机，权重与梯度的往返彻底消失。
         """
+        if not self._profile:
+            self.replay(inputs)
+            self._stream.synchronize()
+            self._check_guards()
+            return dict(self._outputs)
         self.replay(inputs)
+        uploaded = time.perf_counter()
         self._stream.synchronize()
+        synced = time.perf_counter()
         self._check_guards()
+        done = time.perf_counter()
+        stats = self.profile_stats
+        stats["sync"] += synced - uploaded
+        stats["guards"] += done - synced
+        stats["steps"] += 1
         return dict(self._outputs)
 
     def _check_guards(self) -> None:
@@ -877,6 +896,7 @@ class CudaGraphPlan:
         # 隐式同步。进流之前记下当前流，显式建一条依赖，保证 replay 读到的
         # 是主机侧刚刚更新过的权重。
         previous = self.backend.cp.cuda.get_current_stream()
+        start = time.perf_counter() if self._profile else 0.0
         with self._stream:
             self._stream.wait_event(previous.record())
             for name in self._mutable:
@@ -900,7 +920,13 @@ class CudaGraphPlan:
                     )
                 else:  # 已在显存：设备内拷贝，当前流由上面的 with 保证
                     buf[...] = value
+            if self._profile:
+                uploaded = time.perf_counter()
             self._cg.launch(stream=self._stream)
+            if self._profile:
+                stats = self.profile_stats
+                stats["upload"] += uploaded - start
+                stats["launch"] += time.perf_counter() - uploaded
 
     def device_outputs(self) -> Dict[str, Any]:
         """当前设备上的输出（下一次 replay 会被覆盖）。"""

@@ -795,6 +795,18 @@ class DeviceBackend(
             return None
         return reason
 
+    def graph_profile_stats(self, graph) -> Optional[Dict[str, float]]:
+        """这张图捕获计划的累计分段耗时（需 ``AETHERFLOW_GRAPH_PROFILE=1``）。
+
+        键：``upload`` / ``launch`` / ``sync`` / ``guards``（秒）与 ``steps``。
+        ``launch`` 只计提交，GPU 执行时间落在 ``sync`` 里。
+        """
+        for holder, plan in self._graph_plans.values():
+            if holder() is graph:
+                stats = getattr(plan, "profile_stats", None)
+                return dict(stats) if stats else None
+        return None
+
     def graph_capture_failure(self, graph) -> Optional[str]:
         """查询这张图上一次捕获失败的原因（``"异常类型: 消息"``）。
 
