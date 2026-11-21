@@ -18,13 +18,15 @@
 拆开了：数值对了，再谈重叠。
 
 **集合通信到哪一级，写在声明里。** :func:`collective_support` 返回
-``CollectiveSupport``：参考 / CUDA / HIP 后端都没有接入设备侧归约
-（NCCL / RCCL），跨卡归约一律经主机中转；``overlap`` 恒为 False。请求
-``DataParallelTrainer(collective="device")`` 而进程里没有实现时，抛
+``CollectiveSupport``：未注入 provider 时，跨卡归约一律经主机中转；``overlap``
+恒为 False。单进程多卡的设备侧归约由 ``nccl_device_collective(backend,
+devices)`` 提供（``ncclCommInitAll`` + 每卡原地 AllReduce），显式注入给
+``DataParallelTrainer(collective="device")``。不注入时抛
 ``DeviceCollectiveUnavailable`` 并带上"为什么不行"——不静默降级回主机路径，
-否则调用方会以为通信留在设备上。想要设备侧归约，注入 ``device_collective``
-（契约见 ``DeviceAllReduce``）：归约留在设备上，只把结果拉回主机一次，
-D2H 的字节数从"每卡一份整梯度"降到"一份整梯度"。
+否则调用方会以为通信留在设备上。provider 契约见 ``DeviceAllReduce``：
+归约留在设备上，只把结果拉回主机一次，D2H 的字节数从"每卡一份整梯度"降到
+"一份整梯度"。多进程 DDP 的集合通信仍由调用方注入（每 rank 一个进程，
+不能用 ``ncclCommInitAll`` 的那组 communicator）。
 
 **代价如实写在接口上。** ``set_device`` 是丢弃而不是迁移旧卡缓存（5.169），
 所以每切一次卡，旧卡上的编译产物与捕获计划都会作废。这个循环因此不适合
@@ -165,10 +167,89 @@ def _device_collective_reason() -> str:
             "计算/通信重叠也未实现"
         )
     return (
-        f"{label} {version} 已可加载并已绑定调用面，但数据并行路径还没接它："
-        "跨卡归约仍经主机中转（D2H → 主机求和 → H2D）；"
-        "计算/通信重叠也未实现"
+        f"{label} {version} 已绑定调用面；单进程多卡可用 "
+        "parallel.nccl_device_collective(backend, devices) 作为 "
+        "device_collective 显式注入（ncclCommInitAll + 每卡原地 AllReduce），"
+        "未注入时仍经主机中转；计算/通信重叠也未实现"
     )
+
+
+class NcclDeviceAllReduce:
+    """单进程多卡的设备侧 AllReduce：``ncclCommInitAll`` + 每卡一次原地归约。
+
+    契约与注入式 provider 相同：``(per_device, target, *, reduction)`` 返回
+    ``target`` 卡上的归约结果（名字 → 设备数组）。归约**原地**改写每张卡上
+    的梯度，主机侧只付 ``DataParallelTrainer`` 统一取回的那一次 D2H——相比
+    ``HostCollective`` 的"每卡 D2H → 主机求和 → 每卡 H2D"省掉两趟往返。
+
+    ``reduction="mean"`` 在设备上补一次原地除法（``array /= world_size``），
+    不复用 ``ncclAvg``：绑定刻意只登记 sum / prod / max / min，平均由调用方
+    决定在哪一侧除。
+
+    **适用范围**：一个进程切多张卡（``DataParallelTrainer``）。每个 rank 一个
+    进程的多进程 DDP 仍用 ``ncclCommInitRank``，不能共享这组 communicator。
+    """
+
+    name = "nccl"
+
+    def __init__(self, backend: Any, devices: Any) -> None:
+        from . import nccl
+
+        self.backend = backend
+        self.devices = tuple(int(device) for device in devices)
+        if not self.devices:
+            raise ValueError("devices 不能为空")
+        self.world_size = len(self.devices)
+        self._comms = nccl.init_all(self.devices)
+
+    def close(self) -> None:
+        for comm in self._comms:
+            comm.destroy()
+        self._comms = []
+
+    def __enter__(self) -> "NcclDeviceAllReduce":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def __call__(
+        self,
+        per_device: Any,
+        target: Any,
+        *,
+        reduction: str = "mean",
+    ) -> Any:
+        if reduction not in ("mean", "sum"):
+            raise ValueError(f"reduction 必须是 mean / sum，收到 {reduction!r}")
+        names = tuple(sorted(per_device[target]))
+        origin = self.backend.current_device()
+        try:
+            for name in names:
+                for index, device in enumerate(self.devices):
+                    self.backend.set_device(device)
+                    self._comms[index].all_reduce(
+                        per_device[device][name], op="sum", stream=0
+                    )
+            # 集合调用是异步的，但都排在默认流（stream=0）上；调用方随后的
+            # 取回也是同步拷贝，按流序就能看到结果，不需要额外的设备同步。
+            if reduction == "mean" and self.world_size > 1:
+                for device in self.devices:
+                    self.backend.set_device(device)
+                    for name in names:
+                        per_device[device][name] /= self.world_size
+        finally:
+            self.backend.set_device(origin)
+        return {name: per_device[target][name] for name in names}
+
+
+def nccl_device_collective(backend: Any, devices: Any) -> NcclDeviceAllReduce:
+    """给 ``collective="device"`` 用的内置 provider（NCCL / RCCL）。
+
+    没有可加载的库时抛 ``NcclUnavailable``（与 ``train.nccl`` 同一套判定），
+    调用方据此退回 ``collective="host"``——这是能力缺失，不是参数错误。
+    """
+    return NcclDeviceAllReduce(backend, devices)
 
 
 def _check_multi_device_backend(backend: Any) -> None:
@@ -382,7 +463,8 @@ class DataParallelTrainer:
             support = collective_support(backend)
             raise DeviceCollectiveUnavailable(
                 f"collective='device' 需要设备侧归约实现，当前没有：{support.reason}；"
-                "请显式改用 collective='host'（经主机中转），或注入 device_collective"
+                "请显式改用 collective='host'（经主机中转），或注入 "
+                "device_collective=nccl_device_collective(backend, devices)"
             )
 
         if isinstance(devices, (str, bytes)) or not isinstance(devices, Sequence):
@@ -618,7 +700,8 @@ class DistributedDataParallel:
     调用——它看到的必须是全局梯度，否则裁剪阈值在各 rank 上都不一样。
 
     **只接受主机态。** 设备态训练的参数与梯度常驻显存，本层不做设备侧
-    集合通信（``collective_support`` 已声明未接入 NCCL）；``GradScaler``
+    集合通信（``nccl_device_collective`` 只服务于单进程多卡的
+    ``DataParallelTrainer``）；``GradScaler``
     也不行：某个 rank 溢出就跳过更新，其余 rank 却在集合调用上等它，直接
     挂死。ZeRO-3 自带 ReduceScatter，再接一层归约等于把梯度算两遍。
 

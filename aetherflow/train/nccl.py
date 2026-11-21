@@ -195,6 +195,12 @@ def _bind(lib: Any) -> None:
         ctypes.POINTER(vp), ctypes.c_int, NcclUniqueId, ctypes.c_int,
     ]
     lib.ncclCommInitRank.restype = ctypes.c_int
+    if hasattr(lib, "ncclCommInitAll"):
+        # 单进程多卡：一次把 world 个 communicator 建好，不需要 unique id 分发。
+        lib.ncclCommInitAll.argtypes = [
+            ctypes.POINTER(vp), ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.ncclCommInitAll.restype = ctypes.c_int
     lib.ncclCommDestroy.argtypes = [vp]
     lib.ncclCommDestroy.restype = ctypes.c_int
     if hasattr(lib, "ncclCommCount"):
@@ -268,6 +274,27 @@ def unique_id() -> NcclUniqueId:
     value = NcclUniqueId()
     _check(lib.ncclGetUniqueId(ctypes.byref(value)), "ncclGetUniqueId")
     return value
+
+
+def init_all(devices: Any) -> list:
+    """单进程多卡的 communicator：``ncclCommInitAll``，返回值与 ``devices`` 同序。
+
+    与 :func:`unique_id` + :class:`NcclComm` 的区别是**不需要跨进程分发 id**，
+    适合 ``DataParallelTrainer`` 这种"一个进程切多张卡"的形态。每个 rank 一个
+    进程的 DDP 仍用 ``ncclCommInitRank``。调用方负责在发起集合操作前把当前
+    设备切到对应卡（``DataParallelTrainer`` 的 provider 已经这么做）。
+    """
+    lib, name, vendor = _load()
+    if not hasattr(lib, "ncclCommInitAll"):
+        raise NcclUnavailable(f"{name} 缺少 ncclCommInitAll")
+    wanted = [int(device) for device in devices]
+    handles = (ctypes.c_void_p * len(wanted))()
+    devlist = (ctypes.c_int * len(wanted))(*wanted)
+    _check(lib.ncclCommInitAll(handles, len(wanted), devlist), "ncclCommInitAll")
+    return [
+        NcclComm._from_handle(lib, name, vendor, handles[i], i, len(wanted))
+        for i in range(len(wanted))
+    ]
 
 
 def _label() -> str:
@@ -374,6 +401,23 @@ class NcclComm:
             ),
             "ncclCommInitRank",
         )
+
+    @classmethod
+    def _from_handle(
+        cls, lib: Any, name: str, vendor: str, handle: Any,
+        rank: int, world_size: int,
+    ) -> "NcclComm":
+        """``ncclCommInitAll`` 已经建好的 handle：跳过 init，只补齐字段。"""
+        comm = cls.__new__(cls)
+        comm.lib = lib
+        comm.name = name
+        comm.vendor = vendor
+        comm.rank = rank
+        comm.world_size = world_size
+        comm._stream = None
+        comm.handle = handle
+        comm._destroyed = False
+        return comm
 
     # -- 生命周期 -----------------------------------------------------
 

@@ -42,10 +42,12 @@ from .parallel import (
     DeviceAllReduce,
     DeviceCollectiveUnavailable,
     DistributedDataParallel,
+    NcclDeviceAllReduce,
     allreduce,
     allreduce_grads,
     collective_support,
     copy_across_devices,
+    nccl_device_collective,
 )
 from .params import ParameterStore, default_init, init_array
 from .pipeline import PipelineStage, PipelineTrainer
@@ -100,6 +102,8 @@ __all__ = [
     "allreduce_grads",
     "copy_across_devices",
     "collective_support",
+    "nccl_device_collective",
+    "NcclDeviceAllReduce",
     "CollectiveSupport",
     "DeviceAllReduce",
     "DeviceCollectiveUnavailable",

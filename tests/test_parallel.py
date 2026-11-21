@@ -109,6 +109,91 @@ def _linear_store():
     )
 
 
+class _FakeComm:
+    """假 communicator：只记录调用，不改数据。
+
+    跨卡求和是 NCCL 的职责，不在 provider 的逻辑里；这里要验证的是
+    provider 发起了几次 ``sum``、是否在设备侧补了 mean 的除法，以及设备
+    切换是否归位。
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.destroyed = False
+
+    def all_reduce(self, array, *, op="sum", out=None, stream=None):
+        self.calls.append((op, stream))
+        return array
+
+    def destroy(self):
+        self.destroyed = True
+
+
+class TestNcclDeviceCollective(unittest.TestCase):
+    """内置 provider（``ncclCommInitAll``）：原地归约、mean 在设备侧补除。"""
+
+    def _make(self, count=2):
+        from unittest import mock
+
+        from aetherflow.train import parallel
+
+        backend = _FakeDevices(count)
+        comms = [_FakeComm() for _ in range(count)]
+        with mock.patch("aetherflow.train.nccl.init_all", return_value=comms):
+            collective = parallel.nccl_device_collective(backend, list(range(count)))
+        return backend, comms, collective
+
+    def _grads(self):
+        return {
+            0: {
+                "w": np.array([1.0, 2.0], np.float32),
+                "b": np.array([0.5], np.float32),
+            },
+            1: {
+                "w": np.array([3.0, 6.0], np.float32),
+                "b": np.array([1.5], np.float32),
+            },
+        }
+
+    def test_mean_is_applied_on_device(self):
+        backend, comms, collective = self._make()
+        grads = self._grads()
+        reduced = collective(grads, 0, reduction="mean")
+        np.testing.assert_allclose(reduced["w"], [0.5, 1.0])
+        np.testing.assert_allclose(reduced["b"], [0.25])
+        np.testing.assert_allclose(grads[1]["w"], [1.5, 3.0])
+        self.assertEqual([c.calls for c in comms], [[("sum", 0)] * 2] * 2)
+        # 归约结束后回到调用前的设备
+        self.assertEqual(backend.current_device(), 0)
+
+    def test_sum_keeps_scale(self):
+        _, _, collective = self._make()
+        reduced = collective(self._grads(), 0, reduction="sum")
+        np.testing.assert_allclose(reduced["w"], [1.0, 2.0])
+        np.testing.assert_allclose(reduced["b"], [0.5])
+
+    def test_rejects_unknown_reduction(self):
+        _, _, collective = self._make()
+        with self.assertRaises(ValueError):
+            collective(self._grads(), 0, reduction="avg")
+
+    def test_close_destroys_every_comm(self):
+        _, comms, collective = self._make()
+        collective.close()
+        self.assertTrue(all(comm.destroyed for comm in comms))
+        self.assertEqual(collective._comms, [])
+
+    def test_missing_library_is_explicit(self):
+        from aetherflow.train import nccl, nccl_device_collective
+
+        if nccl.available():
+            self.skipTest("本机可加载 NCCL / RCCL，这条只验证缺库时的拒绝面")
+        with self.assertRaises(nccl.NcclUnavailable):
+            nccl.init_all([0])
+        with self.assertRaises(nccl.NcclUnavailable):
+            nccl_device_collective(_FakeDevices(1), [0])
+
+
 class TestAllreduce(unittest.TestCase):
     """主机侧归约：数值、顺序、以及三种不一致都必须报错。"""
 
@@ -340,6 +425,41 @@ class TestDataParallelTrainer(unittest.TestCase):
                 g, store, SGD(store.arrays(), lr=0.1),
                 backend=_FakeDevices(2), devices=[0, 1],
             )
+
+
+@unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")
+class TestNcclProviderOnCuda(unittest.TestCase):
+    """内置 provider 的真机面：库可加载时能建 communicator 并原地归约。
+
+    world=1 只验证"能建、能调、能归位"（归约是恒等）；跨卡数值在
+    ``TestCudaDataParallel`` 的两卡用例里（需要至少 2 块可见设备）。
+    """
+
+    def setUp(self):
+        from aetherflow.train import nccl
+
+        if not nccl.available():
+            self.skipTest("没有可加载的 NCCL")
+        import cupy as cp
+
+        self.origin = int(cp.cuda.Device().id)
+
+    def tearDown(self):
+        import cupy as cp
+
+        cp.cuda.Device(self.origin).use()
+
+    def test_world_one_is_identity(self):
+        from aetherflow.train import nccl_device_collective
+
+        backend = CudaBackend(device=0)
+        with nccl_device_collective(backend, [0]) as collective:
+            host = np.array([1.0, 2.0], np.float32)
+            for reduction in ("sum", "mean"):
+                value = backend.to_array(host)
+                out = collective({0: {"w": value}}, 0, reduction=reduction)
+                np.testing.assert_allclose(backend.to_host(out["w"]), host)
+        self.assertEqual(backend.current_device(), self.origin)
 
 
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")
