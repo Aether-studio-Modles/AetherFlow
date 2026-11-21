@@ -90,6 +90,7 @@ __all__ = [
     "uninstall_hardware",
     "installed_hardware",
     "iter_installed",
+    "scan_errors",
     "build_factory",
 ]
 
@@ -523,11 +524,8 @@ def _record_from_dir(
 # --------------------------------------------------------------------------
 
 
-def iter_installed() -> Iterator[HardwareRecord]:
-    """遍历所有可识别的硬件包。
-
-    坏包跳过，不打断别人：manifest 不合法、文件摘要不符、依赖不满足，
-    都属于"这个包在这台机器上用不了"，不是"整个硬件目录坏了"。
+def _scan() -> Iterator[tuple]:
+    """遍历搜索根目录，产出 ``(目录名, record 或 None, 跳过原因)``。
 
     安装时验过的来源会被持久化到安装根目录的 ``.trust.json``，扫描时按
     记录把公钥重新作为信任锚传进去。否则带签名的包装好之后，下次启动
@@ -548,12 +546,35 @@ def iter_installed() -> Iterator[HardwareRecord]:
             trusted = [entry["public_key"]] if entry is not None else None
             try:
                 record = _record_from_dir(child, trusted)
-            except HardwarePackageError:
+            except HardwarePackageError as exc:
+                yield child.name, None, str(exc)
                 continue
             if record.name in seen:
                 continue
             seen.add(record.name)
+            yield record.name, record, ""
+
+
+def iter_installed() -> Iterator[HardwareRecord]:
+    """遍历所有可识别的硬件包。
+
+    坏包跳过，不打断别人：manifest 不合法、文件摘要不符、依赖不满足，
+    都属于"这个包在这台机器上用不了"，不是"整个硬件目录坏了"。跳过原因
+    不吞掉，见 ``scan_errors``。
+    """
+    for _name, record, _reason in _scan():
+        if record is not None:
             yield record
+
+
+def scan_errors() -> Dict[str, str]:
+    """当前扫描里被跳过的硬件包及其原因，键是安装目录名（通常就是包名）。
+
+    只报告、不改变行为。典型场景：换机器时直接把源码覆盖进已安装的包目录，
+    清单里的 sha256 与文件对不上；若把原因吞掉，``get_backend("iluvatar")``
+    只会说"未注册的后端"，看起来像根本没装。
+    """
+    return {name: reason for name, record, reason in _scan() if record is None}
 
 
 def installed_hardware() -> Dict[str, HardwareRecord]:

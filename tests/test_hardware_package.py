@@ -435,6 +435,29 @@ class TestDiscovery(_HardwareTest):
         (self.home / "broken" / "manifest.json").write_text("{ not json")
         self.assertEqual(get_backend(record.name).name, record.name)
 
+    def test_scan_errors_explain_why_a_package_is_skipped(self):
+        """坏包照旧跳过，但原因要能拿到：静默跳过等于"装没装"无从判断。"""
+        record = self._install()
+        (record.root / record.name / "backend.py").write_text("# 改过", encoding="utf-8")
+        reasons = hardware.scan_errors()
+        self.assertIn(record.name, reasons)
+        self.assertIn("摘要不符", reasons[record.name])
+
+    def test_tampered_install_is_explained_in_lookup_error(self):
+        """覆盖已安装的 .py 后，报错要指明校验失败并给出重装方式。
+
+        这正是换机器时"直接拷源码进包目录"的现象：包还在目录里，但 sha256
+        对不上而被跳过；报错若只说"未注册的后端"，很难定位。
+        """
+        record = self._install()
+        (record.root / record.name / "backend.py").write_text("# 改过", encoding="utf-8")
+        discovery.unregister_backend(record.name)
+        with self.assertRaises(LookupError) as ctx:
+            get_backend(record.name)
+        message = str(ctx.exception)
+        self.assertIn("摘要不符", message)
+        self.assertIn("install_hardware", message)
+
 
 class TestUninstall(_HardwareTest):
     def test_uninstall_removes_directory_and_registration(self):

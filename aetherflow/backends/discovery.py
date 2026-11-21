@@ -220,8 +220,34 @@ def get_backend(name: Optional[str] = None, *, fallback: bool = True, **kwargs):
     factory = _FACTORIES.get(target)
     if factory is None:
         known = "、".join(sorted(_FACTORIES)) or "（无）"
-        raise LookupError(f"未注册的后端 {target!r}；已注册: {known}")
+        raise LookupError(
+            f"未注册的后端 {target!r}；已注册: {known}{_hardware_skip_hint(target)}"
+        )
     return _build(target, factory, **kwargs)
+
+
+def _hardware_skip_hint(name: str) -> str:
+    """同名硬件包在目录里但扫描时被跳过，就把原因补进报错。
+
+    典型场景：换机器时直接把源码覆盖进已安装的包目录，清单里的 sha256 与
+    文件对不上。包被静默跳过，调用方只看到"未注册的后端"，很难联想到是
+    校验失败。这里只补诊断，不改变"坏包跳过、不影响其它后端"的行为。
+    """
+    try:
+        from .hardware import scan_errors
+    except Exception:
+        return ""
+    try:
+        reason = scan_errors().get(name)
+    except Exception:
+        return ""
+    if not reason:
+        return ""
+    return (
+        f"。注意：硬件包目录 {name!r} 存在但校验未通过，已被跳过：{reason}。"
+        "不要直接覆盖已安装的文件，请重新打包后用 "
+        "install_hardware(<zip 路径>, replace=True) 重装"
+    )
 
 
 def _build(name: str, factory: Callable[..., object], **kwargs):
