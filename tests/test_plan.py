@@ -488,10 +488,11 @@ class TestConvDecision(unittest.TestCase):
         self.assertFalse(conv_tiled_preferred(32, 4095))
 
     def test_winograd_fused_channel_window(self):
-        """融合版只在 ``8 <= C <= 24`` 打开（5.256）。
+        """融合版只在 ``8 <= C <= 24`` 打开（5.256 / 5.258）。
 
         下限来自 c3：融合 0.0631 ms 慢于分块直算的 0.0579；上限来自 c32：
-        融合的 device 时间已退化到 0.103 ms、与四段版持平，c64 更差。
+        ``U`` 沿 ``C`` 的读次数是 ``16*C`` 每线程，c32 的稳态中位数 0.1217
+        已输给四段版的 0.1046，分块搬进共享内存也没救回来。
         """
 
         def pick(c):
@@ -508,7 +509,8 @@ class TestConvDecision(unittest.TestCase):
         """权重驻留后下限放到 c3（5.257）：省掉的那次 launch 正是 c3 的差距。
 
         A800-40GB：c3 常量权重 0.0502 ms，分块直算 0.0580、cuDNN 0.0450；
-        图输入权重仍是 0.0633，所以这条放宽只对常量权重生效。
+        图输入权重仍是 0.0633，所以这条放宽只对常量权重生效。上限不变——
+        c32 上融合版仍然更慢。
         """
 
         def pick(c):
