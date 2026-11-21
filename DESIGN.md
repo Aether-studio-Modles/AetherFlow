@@ -15053,7 +15053,7 @@ detected`）。
 循环体里的内核也每轮重新派发一次。对比主流框架的差距清单里，这一条写作
 "设备端控制流"。
 
-**做法**（`runtime/device_loop.py`，`DeviceWhileLoop`）
+**做法**（`runtime/device_control.py`，`DeviceWhileLoop`）
 
 - 条件图与循环体各 `capture` 一次，**同一条流**；循环跑多少轮，捕获次数都是 2
   （`captures` 属性把这件事变成可判的数字）。
@@ -15109,6 +15109,8 @@ detected`）。
   CUDA Graph 的条件节点，本层不假装零同步。
 - **只支持条件与体都是单张 `Graph`**：嵌套控制区域没有可捕获的 launch 序列，
   明确拒绝并指回 `WhileLoop.run`。
+- 分支形态见 5.277（`DeviceConditional`）；模块随它一起更名为
+  `runtime/device_control.py`。
 - **换形状要新建计划**：一张捕获图只对应一组固定形状/dtype，复用会被显式拒绝。
 - **CUDA 真机本轮未验证**（那台机器已释放）；HIP 已验证，CUDA 走的是同一组
   `capture` / `replay` / `device_outputs` 接口。
@@ -17435,5 +17437,65 @@ Python 3.10.12 拉取同一 commit：`tests.test_dynamic` 24 条通过；全量 
 形状变化仍按模板分别建图，这正是 `capacity` 的作用。`build` 必须在声明轴上是
 形状多态的：依赖具体数字的算子（例如把总元素数算成 `int` 的 `reshape`）在该轴
 上会在构图期报错——这是显式边界，不是缺陷；要覆盖这类图就不要把那一维声明为
-动态。缓存仍不感知布局等形状之外的输入属性，也不是线程安全的。设备侧控制流
-（把分支/迭代做成可交付物）仍未开始，留给下一步。
+动态。缓存仍不感知布局等形状之外的输入属性，也不是线程安全的。设备侧分支见 5.277。
+
+### 5.277　设备端分支：三张图各捕获一次，未选分支不执行
+
+**问题**：5.245 只补了循环。`Conditional.run`（5.201）每次判定仍要把谓词拉回
+主机、再整图 `execute` 选中分支，分支体内的内核每次重新派发——"设备端控制流"
+只完成了半边。循环的对偶不是把 `Conditional` 塞进 `WhileLoop`，而是同样把
+三张图捕获下来、只 replay 被选中的那一支。
+
+**做法**（`runtime/device_control.py`，`DeviceConditional`；模块由
+`device_loop.py` 提升而来，循环与分支放在一起）
+
+- 谓词、`then`、`otherwise` 各 `capture` 一次，**同一条流**；捕获数恒为 3。
+- 每次 `run`：谓词计划 `run_device`（唯一一次同步与谓词 D2H），选中分支
+  `replay` 异步；未选中分支**连作业都不提交**——与宿主 `Conditional.run` 的
+  惰性逐条对齐。
+- `run_device` 不做任何 D2H，分支输出留在显存；`run` 收尾对每个输出做一次 D2H。
+- 自由输入建计划时上传一次，`run(feeds)` 给了新值才重传；形状/dtype 变化显式
+  `ValueError`（一张捕获图只对应一组固定形状）。
+- 契约与 5.245 同源：区域必须是单张 `Graph`（`GraphRegion`），嵌套控制区域抛
+  `DeviceLoopError` 并指回 `Conditional.run`；后端缺
+  `capture/new_stream/to_array/to_host` 在构造期 `TypeError`；计划缺
+  `replay/device_outputs` 在构造期 `DeviceLoopError`；缺输入、多给名字抛
+  `KeyError`；谓词输出缺失或运行期非标量抛 `ControlFlowError`（IR 已静态校验
+  0 维标量，这里只兜运行期）。
+- 异常类型沿用 `DeviceLoopError`：它描述的是"这个控制结构没有设备形态"，循环
+  与分支共用同一种失败语义，不为分支新造异常类型。
+
+**判据**（新增 16 条，其中 1 条真机）
+
+- 数值（4）：与宿主 `Conditional.run` 在阈值两侧逐位相等（含 0.999 / 1.0 边界）；
+  `run_device` 只读谓词、不 D2H；`run` 只多一次输出 D2H；谓词翻转时选中支跟着
+  翻转。
+- 捕获复用（4）：三张图各捕获一次、同一条流，重复 `run` 不再捕获；未选分支的
+  replay 次数恒为 0（按计划记账）；每次 `run` 一次同步（`syncs == 1`、后端的
+  计划同步计数 +1）；新自由输入只上传一次。
+- 契约（7）：嵌套区域、缺 `capture`、缺输入、多给名字、换形状、换 dtype、
+  非 `Conditional`，全部在构造期或入口显式拒绝。
+- 真机（1）：WSL HIP 上 3 次捕获、两支各跑一次与参考后端逐位一致（本机无 HIP，
+  跳过）。
+
+**负向对照**（3 组，全部先变红再还原）
+
+1. 未选中的分支也 replay → "未选分支不 replay"变红。
+2. 分支改用同步 `run_device` → 同步计数变红（`syncs` 2 ≠ 1）。
+3. 嵌套区域改成 `ValueError` → 异常类型判据变红。
+
+**验证**：本地 `py -3.14` + torch 2.13.0，`Ran 2803 tests / OK (skipped=428)`；
+`ruff check` 通过。本轮**没有可用的 HIP 设备**（本地无 ROCm，远端机器也没有），
+真机用例保留但未执行；CUDA 未验证。不写"已验证"，也不拿 numpy 替身冒充真机。
+
+**边界**
+
+- **谓词仍需一次主机往返**：没有 CUDA Graph 条件节点 / device-side 分支，本层
+  不假装零同步——与 5.245 同一原因。
+- **只支持单张 `Graph` 的区域**：分支里再嵌套 `Conditional` / `WhileLoop` 只会
+  得到"捕获了半个控制结构"，明确拒绝并指回宿主路径。
+- **只减少派发，不保证更快**：5.245 的 HIP 实测已说明捕获 replay 的同步开销
+  可能更贵；本层交付的是执行形态（捕获复用、未选分支不执行、可判的同步与往返
+  次数），不是加速开关。
+- **换形状要新建计划**；未接进 `Trainer` / `LMRunner` 主路径。
+- **真机覆盖缺口**：HIP 用例本轮未执行（无设备），CUDA 从未验证。

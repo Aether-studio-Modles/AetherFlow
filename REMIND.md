@@ -109,9 +109,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   无 int8 累加、无 fp8、无 QAT、无非对称零点——**不要期待"int8 算得更快"**。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
   显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
-- **设备端循环**：`DeviceWhileLoop` 把条件与体各捕获一次、状态常驻显存，但每轮仍
-  要读一次谓词；实测**不比宿主路径快**，交付的是执行形态而非加速。
-- **控制流**：没有设备端真分支；`Conditional` / `WhileLoop` 每次判定回主机。
+- **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
+  状态与输出常驻显存，但每次判定仍要读一次谓词；实测**不比宿主路径快**，交付的是
+  执行形态而非加速。没有 device-side 真分支，`Conditional` / `WhileLoop` 的判定
+  本身仍回主机（DESIGN 5.245 / 5.277）。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
