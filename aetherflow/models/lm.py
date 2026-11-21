@@ -2111,6 +2111,23 @@ class ServingEngine:
         """已超时但调用方还没取走的请求条数。"""
         return len(self._timed_out)
 
+    def progress(self) -> List[Tuple[int, List[int]]]:
+        """在跑请求的已生成 token 快照 ``(请求 id, tokens)``。
+
+        给流式服务用：``step`` 只在请求**完成**时返回，而 SSE 要在每个解码步
+        之后把新增的 token 推给客户端。这里只做只读快照（列表复制），不改
+        调度状态；请求完成后它从槽位消失，所以快照里不会有已完成的请求——
+        调用方必须以 ``step`` 的返回作为"结束"的唯一信号。
+
+        只在驱动 ``step`` 的那个线程之外读取是安全的：GIL 保证列表复制看不
+        到半更新的槽位，最坏情况是本次快照少了最后一个 token，下一轮补上。
+        """
+        return [
+            (slot.rid, list(slot.generated))
+            for slot in self._slots
+            if slot is not None
+        ]
+
     def take_timed_out(self) -> List[Tuple[int, List[int]]]:
         """取走并清空超时记录 ``(请求 id, 已生成 token)``。
 
