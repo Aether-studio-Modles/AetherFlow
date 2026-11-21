@@ -18004,8 +18004,9 @@ H2D——批越大往返越贵。把 `_device_step` 的后端能力接进 `Servi
 | 非流式 stop | 探测出的前两个 token 作 stop：`completion_tokens == 2`、`finish_reason == "stop"` |
 | 流式 stop | 帧拼接为空（hold-back 生效）、末帧 `finish_reason == "stop"`、`completion_tokens < 8` |
 | 参数 | 空字符串 stop 与含空串的数组都 400 |
+| 配置 | `api_key=""`、`rate_limit=0`、`rate_window=0` 构造期报错，`rate_limit=1.5` 报 `TypeError` |
 
-全量 `unittest discover`：2842 条 OK（skipped=437）；`ruff check` 全过。
+全量 `unittest discover`：2843 条 OK（skipped=437）；`ruff check` 全过。
 
 **读法**
 
