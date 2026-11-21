@@ -151,14 +151,16 @@ K 在 (32, 400] 且 im2col 物化缓冲 `n*ho*wo*K` 不超过 3.2M 元素时走�
 c24 反而慢 1.9 倍、c32/c64 持平——`U` 的重复读本来就被 L1/L2 吸收。
 复现：`python -m benchmarks.winograd_compare --rounds 3`。
 
-- 层 / 网络级（5.259 / 5.260）：`conv → mul → add → relu` 叠 4 层，
-  `mul+add+relu` 确实被合成一个内核（32 节点 → 24 组），但
-  `graph_mode="auto"` 在这张图上只有 1.01×——每个 block 的卷积本身有
-  0.09 ms，派发不占主导。捕获的收益来自"小算子 + 主机瓶颈"，不是"节点多"。
-  5.260 去掉静态 conv 的计划期开销后，4 层 `scalar` 从 0.460 降到 0.346 ms；
-  逐通道 BN（`(1,C,1,1)` 广播）仍不进融合链，每层因此多 32%～49%
-  （0.087 → 0.114 / 0.129 ms），是当前融合判据最明显的一处缺口。复现：
-  `python -m benchmarks.conv_graph_compare --blocks 4 --rounds 3`。
+- 层 / 网络级（5.259～5.261）：`conv → mul → add → relu` 叠 8 层，
+  `mul+add+relu` 被合成一个内核（64 节点 → 48 组）。5.260 把静态 conv 的
+  计划期开销去掉、5.261 把融合链的推导也挪到计划期，8 层 `scalar` 从
+  0.919 ms 降到 **0.298 ms**（每层 37 µs：19 µs 卷积 + 18 µs 提交），
+  4 层从 0.460 降到 0.157 ms。`graph_mode="auto"` 在这些图上仍显示 0.99×，
+  但原因已经查明：捕获期还在做 H2D（`RuntimeError: ... H2D transfers are
+  disallowed`），实际没有捕获成功，5.259 的结论按此修正。逐通道 BN
+  （`(1,C,1,1)` 广播）不进融合链，8 层 `channel4d` 0.891 ms 是 `scalar`
+  的 3 倍，是当前层/网络级最大的单点缺口。复现：
+  `python -m benchmarks.conv_graph_compare --blocks 8 --rounds 3`。
 - 图重放：小算子的多节点图收益显著（HIP 上 `transformer_block` 5.90 → 0.83 ms；
   A800 设备侧 1.66 → 0.40 ms，LeNet 常驻 0.59 → 0.14 ms），单节点图无收益；
   默认 `graph_mode="off"`，语义差异需使用者知情。

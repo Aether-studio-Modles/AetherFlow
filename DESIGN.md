@@ -16321,6 +16321,55 @@ BN 在推理时的**常见**形态，所以这条判据的缺口不是边角：�
   `_op_conv2d`：那里没有可证的"值没变"，缓存 `U` 不安全，但**解析与选择**
   本身与权重无关，后续可以按 IR 缓存这部分而只让 `U` 每轮重算。
 
+### 5.261　逐元素融合链也在计划期展开
+
+5.260 之后单 conv 已经到设备时间（`gpu 0.0248` ≥ `host 0.0249`），但 8 层
+图还有 0.68 ms。用 `overhead_compare` 的 `gpu` 列（CUDA events）一测就分明：
+
+| 用例 | `host` | `gpu` | 每层 |
+| --- | --- | --- | --- |
+| 8 层纯 conv | 0.155 | 0.155 | 19.4 µs |
+| 8 层纯逐元素（标量，融合成 1 内核/层） | 0.493 | 0.494 | 61.7 µs |
+| 8 层 conv-bn-relu | 0.675 | 0.670 | 84.4 µs |
+
+`host == gpu` 且远超内核应有的时间，说明 GPU 在空转等主机——每层 60 µs 不是
+算出来的，是 `_try_chain` 每步重新推导参数顺序、广播形状、线程铺法并组装
+源码键花掉的。一个 200704 元素的融合内核本身只要 2 µs 量级。
+
+**改动**
+
+- `_planned_chain`（`backends/device_backend.py`）：静态逐元素组在
+  `_prepare_plan` 里把 entries 顺序、`specs`、`out_shape`、`vec/block/grid`
+  与源码键一次算好。运行期只核对每个外部数组的形状 / dtype / 连续 / 16 字节
+  对齐，然后 `cp.empty` + 一次 launch；任一不符返回 `None`，回落 `_try_chain`。
+  内核仍惰性获取（计划期只建键），首次执行才编译，之后句柄留在闭包里。
+- `_GroupPlan.chain`（`runtime/executor.py`）：计划期展开结果的槽位；
+  `DeviceBackend.invoke_group` 优先用它，未命中再走 `_try_chain`。
+
+**复测**（A800-40GB，ms）
+
+| 用例 | 5.260 后 | 5.261 后 |
+| --- | --- | --- |
+| 8 层纯逐元素 | 0.493 | **0.146** |
+| 8 层 conv-bn-relu（`scalar`） | 0.682 | **0.303** |
+| 8 层 `channel4d`（逐通道 BN） | 0.891 | 0.891 |
+| 4 层 `scalar` | 0.346 | **0.157** |
+
+`conv_graph_compare` 的 8 层 `scalar` 从 5.259 的 0.919 降到 0.298（-68%），
+每层从 115 µs 降到 37 µs：19 µs 卷积 + 18 µs 融合链。数值与逐节点路径一致
+（`test_cuda_backend + test_conformance + test_plan` 448 passed）。
+
+**两个发现**
+
+- `graph_mode="auto"` 在这些图上**从未捕获成功**：`_graph_failure` 返回
+  `RuntimeError: the current stream is capturing, so H2D transfers are
+  disallowed`。所以 5.259 记的"捕获收益 1.00～1.01×"其实是"回落到了逐节点
+  路径"，不是"设备已饱和"。捕获期还在做 H2D 的入口需要单独排查；修好后
+  多节点图每层还能再省下这 18 µs 的提交。
+- 逐通道 BN（`(1,C,1,1)`）仍然进不了融合链，`channel4d` 8 层 0.891 ms 是
+  `scalar` 的 3 倍——每层 3 个独立逐元素内核，每个都要付一次解析与 launch。
+  这仍是当前层/网络级最大的单点缺口（5.259 已记为待做）。
+
 ## 6. 路线图
 
 ### M0　语义 IR + 参考执行 + 优化框架　✅ 已完成
