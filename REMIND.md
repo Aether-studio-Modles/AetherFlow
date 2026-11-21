@@ -83,8 +83,8 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 2677 个用例，416 跳过，全绿 |
-| HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1100`） | 2677 个用例，373 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 2767 个用例，427 跳过，全绿 |
+| HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1100`） | 2767 个用例，373 跳过，全绿 |
 | CUDA | Ubuntu 22.04 / 2× Tesla V100（`sm_70`）/ CUDA 12.4 / 驱动 550 | 全绿（cuDNN 因驱动版本不匹配按设计跳过） |
 
 ```bash
@@ -143,7 +143,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   设备侧的三段内核 + batched GEMM 仍是主体，与 cuDNN 的比值待机器空闲后按
   同进程交替复测（此前记录的 1.80×/4.27× 未复测）。**绝对值随机器变，
   跨机只比比值**。
-- **包发布**：CI 只构建 wheel 并上传 artifact，尚未接 PyPI / GitHub Release。
+- **包发布**：CI 在 `v*` tag 上通过 PyPI trusted publishing 发布（先校验 tag 与
+  `__version__` 一致）；GitHub Release 仍需手工创建。版本号只有
+  `aetherflow/__init__.py` 一处事实来源，`pyproject.toml` 通过 `dynamic` 读取。
 - **性能口径**：`execute()` 的契约是返回主机数组，每轮都付一次 D2H（A800 上
   4 MB 约 1.4 ms，比多数内核本身还贵）。测吞吐用 `execute_device()`，基准用
   `--device-outputs`；两种口径的数字不能互相比较（见 DESIGN 5.251）。

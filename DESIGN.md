@@ -17254,3 +17254,59 @@ LayerNorm、softmax、SDPA、reshape/切片/拼接。真实模型还会用到截
 "扩 IR"而不是"扩前端"，留给后续；`log_softmax` 走 `log(softmax(x))`，在
 概率下溢到 0 时会得到 `-inf` 而 torch 的稳定实现对同一输入给有限值——这是
 浮点表示差异，不是语义改变，但极端 logits 上会看到差别。
+
+### 5.274　工程化收口：门禁、单一事实来源与发布路径
+
+P8 不碰语义层，只把"别人能不能稳定地用上"补齐。判断标准是：这条改动能否
+在流水线里被自动验证；不能验证的（比如容器镜像）就先不做。
+
+**静态检查只开门槛规则**
+
+`ruff` 的规则集在 `pyproject.toml` 里固定为 `E9 + F`：语法错误、未定义名、
+未使用导入/变量。风格类规则（行宽、`lambda` 赋值、import 排序）不进门禁——
+代码库里有 13 处为了构图糖而写的 `sigmoid = lambda x: ...`，把 `E731` 打开
+只会制造与正确性无关的改动。门禁的价值在于"新代码不能带进明确的错误"，
+而不是"格式化历史代码"。
+
+首次全量检查的结果不是零：47 个 `F` 类问题里有三个值得记录：
+
+- `backends/hip/runtime.py` 的 `_module()` 引用了一个从未定义的 `_MODULE`，
+  而且函数没有任何调用者——纯死代码，删除。这类问题 `flake8` 能发现、
+  "看起来能跑"发现不了（注解有 `from __future__` 兜底，死函数没人调用）。
+- `ir/grad_rules.py` 的 softplus 反向里 `g` 取了但没用；`ir/ops.py` 的
+  sparse 反向里 `cols` 同理——都是重构后的残留，删掉即可。
+- `tests/test_hip_backend.py` 的"捕获期释放"用例靠 `dead = None` 触发引用
+  计数释放。自动修复把它改成裸表达式会让测试**静默失效**；改成
+  `del dead, host`，语义不变且不再是未使用变量。这条说明 lint 的自动修复
+  不能无条件信任，测试的副作用必须先读懂。
+
+**版本与兼容矩阵各只有一处事实来源**
+
+`pyproject.toml` 原来同时写死 `version = "0.1.0"` 与 `frontend = ["torch>=2.1"]`，
+而 `frontend/compat.py` 的矩阵是 2.9–2.13。两处都在描述"能装什么"，却给出
+了不同答案：按 `>=2.1` 装进来的 torch 会在导入时抛 `UnsupportedTorchVersion`。
+现在版本改成 `dynamic = ["version"]`（读 `aetherflow.__version__`），torch 约束
+改成 `>=2.9,<2.14`，并新增 `tests/test_packaging.py` 把两条对应关系钉死：
+
+- `pyproject` 里不能同时出现静态 `version`；
+- `frontend` extra 的下界等于矩阵 `min_version`，上界等于 `max_version + 1`。
+
+这类"文档/配置与代码各说各话"的漂移，只有写成测试才会在提交前暴露。
+
+**CI 补三个作业**
+
+- `lint`：`ruff check .`，规则集来自 `pyproject`；
+- `frontend`：在 torch 2.9 与 2.13 两端各跑一次 `tests/test_frontend`。
+  此前 CPU 作业不装 torch，前端测试在 CI 上**永远跳过**——本地能跑不等于
+  云端在跑。矩阵两端各钉一次，是为了让"声明支持"至少有两处实测；
+- `publish`：`v*` tag 触发，先校验 tag 与 `__version__` 一致，再用 PyPI
+  trusted publishing 发布。普通 push 与 PR 不持有 `id-token: write`。
+
+CPU 作业改为 `coverage run` 并上传 `.coverage`（只观测、不设阈值）。覆盖率
+作为门禁需要先有一段历史来定基线，现在设阈值只会得到拍脑袋的数字。
+
+**没做的**
+
+容器镜像、GitHub Release 自动创建、pre-commit 钩子。前两者在本地无法验证
+（没有 docker daemon、没有远端 release 权限），后者与 CI 的 `lint` 作业重复。
+工程化的取舍标准是"能否被验证"，而不是"清单上还有几项"。

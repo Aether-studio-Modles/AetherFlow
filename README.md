@@ -89,7 +89,7 @@ python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后�
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
 ```
 
-当前基线：**2677 个用例**，本地 416 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）373 跳过，全绿。
+当前基线：**2767 个用例**，本地 427 跳过、WSL HIP（RX 7650 GRE / ROCm 7.2）373 跳过，全绿。
 
 ## 4. 第一代版本的能力面
 
@@ -240,7 +240,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                2677 个用例
+tests/                2767 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
