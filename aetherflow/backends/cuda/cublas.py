@@ -27,6 +27,9 @@ _CUBLAS_OP_N = 0
 # 这些值在 CUDA 11 与 12 的 ABI 里是稳定的；不 include 头文件，直接按文档写。
 _CUDA_R_16F = 2
 _CUDA_R_32F = 0
+# CUDA_R_16BF：bf16 的 cudaDataType_t。设备上的 bf16 张量以 uint16 位模式
+# 驻留，位布局与 CUDA_R_16BF 完全一致，因此可以直接交给 cuBLAS。
+_CUDA_R_16BF = 14
 _CUBLAS_COMPUTE_32F = 68
 _CUBLAS_GEMM_DEFAULT = -1
 
@@ -233,6 +236,53 @@ class Cublas:
                 _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT,
             ),
             "cublasGemmStridedBatchedEx",
+        )
+
+    def bgemm(self, a, b, out) -> None:
+        """行主序 bf16 GEMM：``out[M, N] = a[M, K] @ b[K, N]``，内部 f32 累加。
+
+        输入输出都是两字节 bf16 位模式（设备上是 ``uint16`` 容器），
+        ``CUBLAS_COMPUTE_32F`` 表示乘加在 float 里完成——与内核里"读成 float
+        再算"一致。A800 上会落到 HMMA.bf16 的 Tensor Core 路径。
+        """
+        m, k = int(a.shape[-2]), int(a.shape[-1])
+        n = int(out.shape[-1])
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._check(
+            self._lib.cublasGemmEx(
+                self._handle, _CUBLAS_OP_N, _CUBLAS_OP_N,
+                n, m, k,
+                ctypes.byref(alpha),
+                _ptr(b), _CUDA_R_16BF, n,
+                _ptr(a), _CUDA_R_16BF, k,
+                ctypes.byref(beta),
+                _ptr(out), _CUDA_R_16BF, n,
+                _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT,
+            ),
+            "cublasGemmEx(bf16)",
+        )
+
+    def bgemm_batched(self, a, b, out, batch: int,
+                      stride_a: int, stride_b: int, stride_c: int) -> None:
+        """行主序 bf16 批量 GEMM，stride 以元素为单位；0 表示整批共用一份数据。"""
+        m, k = int(a.shape[-2]), int(a.shape[-1])
+        n = int(out.shape[-1])
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._check(
+            self._lib.cublasGemmStridedBatchedEx(
+                self._handle, _CUBLAS_OP_N, _CUBLAS_OP_N,
+                n, m, k,
+                ctypes.byref(alpha),
+                _ptr(b), _CUDA_R_16BF, n, stride_b,
+                _ptr(a), _CUDA_R_16BF, k, stride_a,
+                ctypes.byref(beta),
+                _ptr(out), _CUDA_R_16BF, n, stride_c,
+                batch,
+                _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT,
+            ),
+            "cublasGemmStridedBatchedEx(bf16)",
         )
 
     def close(self) -> None:

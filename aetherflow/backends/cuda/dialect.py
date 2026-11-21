@@ -1,4 +1,4 @@
-"""CUDA 方言：C 语法 + PTX 版 f16 存取。
+"""CUDA 方言：C 语法 + bf16 / f16 的存取（f16 走 PTX，bf16 走按位）。
 
 方言是**数据**：类型映射、存取函数名、辅助函数源码。打印逻辑在
 ``aetherflow/lower/cstyle.py``，因此新增一家硬件只需要在这里换数据，
@@ -15,21 +15,31 @@ __all__ = ["CUDA_DIALECT", "CAST_DIALECT"]
 
 CUDA_DIALECT = CStyleDialect(
     "cuda",
-    storage={DType.F32: "float", DType.F16: "unsigned short"},
-    load={DType.F32: "af_ld_f", DType.F16: "af_ld_h"},
-    store={DType.F32: "af_st_f", DType.F16: "af_st_h"},
-    atomic={DType.F32: "af_add_f", DType.F16: "af_add_h"},
+    storage={
+        DType.F32: "float",
+        DType.F16: "unsigned short",
+        DType.BF16: "unsigned short",
+    },
+    load={DType.F32: "af_ld_f", DType.F16: "af_ld_h", DType.BF16: "af_ld_b"},
+    store={DType.F32: "af_st_f", DType.F16: "af_st_h", DType.BF16: "af_st_b"},
+    atomic={DType.F32: "af_add_f", DType.F16: "af_add_h", DType.BF16: "af_add_b"},
     helpers={
         DType.F32: codegen._F32_HELPERS,
         DType.F16: codegen._F16_HELPERS,
+        DType.BF16: codegen._BF16_HELPERS,
     },
     reduce_helpers=codegen._REDUCE,
 )
 
 # ``cast`` 是唯一"输入与输出存储类型不同"的内核：按源 dtype 渲染决定用哪一套
-# 读取 helper，写回的目标类型由张量参数自己声明。因此它需要两套 helper 同时在场。
-# 只给这一个内核用，不并进 ``CUDA_DIALECT``——那会让所有内核的源码多出几十行，
-# 而 5.42 起有"生产源码与手写模板逐 token 相等"的对照用例盯着每一个字。
+# 读取 helper，写回的目标类型由张量参数自己声明。因此它需要所有可能用到的
+# helper 同时在场（f32 / f16 / bf16 任意方向）。只给这一个内核用，不并进
+# ``CUDA_DIALECT``——那会让所有内核的源码多出几十行，而 5.42 起有"生产源码
+# 与手写模板逐 token 相等"的对照用例盯着每一个字。
+_CAST_HELPERS = (
+    codegen._F32_HELPERS + codegen._F16_HELPERS + codegen._BF16_HELPERS
+)
+
 CAST_DIALECT = CStyleDialect(
     "cuda",
     storage=CUDA_DIALECT.storage,
@@ -37,8 +47,9 @@ CAST_DIALECT = CStyleDialect(
     store=CUDA_DIALECT.store,
     atomic=CUDA_DIALECT.atomic,
     helpers={
-        DType.F32: codegen._F32_HELPERS + codegen._F16_HELPERS,
-        DType.F16: codegen._F16_HELPERS + codegen._F32_HELPERS,
+        DType.F32: _CAST_HELPERS,
+        DType.F16: _CAST_HELPERS,
+        DType.BF16: _CAST_HELPERS,
     },
     reduce_helpers=CUDA_DIALECT.reduce_helpers,
 )

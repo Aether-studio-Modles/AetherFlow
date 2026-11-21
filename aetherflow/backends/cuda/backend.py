@@ -33,6 +33,20 @@ from .memory import Arena
 # 抛错（见 ``_register_kernels``），所以不存在"声明与实现分叉"的中间状态。
 CUDA_OPS: FrozenSet[str] = GPU_OPS
 
+# bf16 的支持面：先开"逐元素 + 搬运 + 归约 + 矩阵乘"这四类，覆盖 Transformer
+# 推理的主干。卷积 / 池化 / scan / sparse 仍留在 f32/f16——它们的内核里有权重
+# 布局与分块假设，bf16 版本要逐个验证数值，不能只靠模板替换就宣布支持。
+# 不在表里的 bf16 算子会被 ``invoke`` 明确拒绝（不做隐式降级）。
+BF16_OPS: FrozenSet[str] = frozenset({
+    "add", "sub", "mul", "div", "relu", "silu", "exp", "log", "sqrt", "neg",
+    "tanh", "sigmoid", "erf", "gelu", "clamp", "step", "spike",
+    "constant", "cast", "broadcast_to", "reshape", "transpose", "slice",
+    "concat", "pad",
+    "matmul",
+    "softmax", "layernorm", "rmsnorm",
+    "reduce_sum", "reduce_max", "reduce_mean",
+})
+
 _CONV_IMPLS = (
     "auto", "im2col", "tiled", "implicit", "winograd", "winograd_fused",
     "cudnn", "grouped",
@@ -51,6 +65,7 @@ class CudaBackend(DeviceBackend):
     name = "cuda"
     _LABEL = "CUDA 后端"
     _OPS = CUDA_OPS
+    _BF16_OPS = BF16_OPS
     CONV_IMPLS = _CONV_IMPLS
     SPARSE_IMPLS = _SPARSE_IMPLS
     # 中等 K 的 3x3/5x5 交给隐式 GEMM：A800 上比 im2col 快 7～13%（5.252）。

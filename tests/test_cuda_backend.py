@@ -13,7 +13,7 @@ from unittest import mock
 
 import numpy as np
 
-from aetherflow import Graph, ReferenceBackend, backward, f16, f32, f64, i8, i32
+from aetherflow import Graph, ReferenceBackend, backward, bf16, f16, f32, f64, i8, i32
 from aetherflow.backends.base import BackendCapabilityError
 from aetherflow.backends.cuda import CUDA_AVAILABLE, CudaBackend
 from aetherflow.backends.device_backend import _group_elementwise, _mask_shared_over_heads
@@ -839,6 +839,113 @@ class TestCudaMatmul(CudaTestCase):
         g.output(g.matmul(a, b), "y")
         with self.assertRaises(BackendCapabilityError):
             self.cuda.execute(g, {"a": self.rand(2, 1, 4, 8), "b": self.rand(2, 3, 8, 6)})
+
+
+class TestCudaBf16(CudaTestCase):
+    """bf16 的设备表示：``uint16`` 位模式 + 按位存取 + cuBLAS 的 CUDA_R_16BF。
+
+    这一组盯住三件事：
+
+    - **逐位一致**：逐元素链 / cast / constant / 归约 / softmax / layernorm
+      必须与参考后端（f32 载体 + ``round_bf16``）逐位相同，不是"近似"；
+    - **真 16 位存储**：计划里的期望 dtype 是 ``uint16``，而不是 f32 载体；
+    - **支持面之外明确失败**：conv2d 的 bf16 版本还没验证过，必须抛
+      ``BackendCapabilityError``，不能悄悄用 f32 算。
+    """
+
+    def test_device_container_is_two_bytes(self):
+        from aetherflow.ir.types import DType
+
+        self.assertEqual(self.cuda.device_dtype(DType.BF16), np.dtype(np.uint16))
+        self.assertEqual(self.cuda.device_dtype(DType.F32), np.dtype(np.float32))
+
+    def test_elementwise_chain_is_bit_exact(self):
+        g = Graph("ew")
+        x = g.input("x", bf16[64])
+        w = g.input("w", bf16[64])
+        b = g.input("b", bf16[64])
+        g.output(g.relu(g.add(g.mul(x, w), b)), "y")
+        feed = {"x": self.rand(64), "w": self.rand(64), "b": self.rand(64)}
+        got = self.cuda.execute(g, feed)["y"]
+        want = self.ref.execute(g, feed)["y"]
+        np.testing.assert_array_equal(got, want)
+        self.assertEqual(got.dtype, np.float32)
+
+    def test_cast_roundtrip_is_exact(self):
+        g = Graph("cast")
+        x = g.input("x", f32[16])
+        g.output(g.cast(g.cast(x, dtype=bf16), dtype=f32), "y")
+        feed = {"x": self.rand(16)}
+        got = self.cuda.execute(g, feed)["y"]
+        np.testing.assert_array_equal(got, self.ref.execute(g, feed)["y"])
+
+    def test_constant_is_quantized(self):
+        g = Graph("const")
+        x = g.input("x", bf16[8])
+        g.output(g.add(x, g.constant(
+            dtype=bf16, shape=(8,), data=[1.234567] * 8)), "y")
+        feed = {"x": self.rand(8)}
+        np.testing.assert_array_equal(
+            self.cuda.execute(g, feed)["y"], self.ref.execute(g, feed)["y"]
+        )
+
+    def test_matmul_small_is_bit_exact(self):
+        """小 K 上 cuBLAS 与 numpy 的 f32 累加顺序相同，可以逐位比对。"""
+        g = Graph("mm")
+        a = g.input("a", bf16[32, 64])
+        b = g.input("b", bf16[64, 16])
+        g.output(g.matmul(a, b), "y")
+        feed = {"a": self.rand(32, 64), "b": self.rand(64, 16)}
+        np.testing.assert_array_equal(
+            self.cuda.execute(g, feed)["y"], self.ref.execute(g, feed)["y"]
+        )
+
+    def test_matmul_batched_tensor_core(self):
+        """批量形状走 GemmStridedBatchedEx；容差是一个 bf16 ulp 的量级。"""
+        g = Graph("mm")
+        a = g.input("a", bf16[2, 64, 128])
+        b = g.input("b", bf16[2, 128, 64])
+        g.output(g.matmul(a, b), "y")
+        feed = {"a": self.rand(2, 64, 128), "b": self.rand(2, 128, 64)}
+        got = self.cuda.execute(g, feed)["y"]
+        want = self.ref.execute(g, feed)["y"]
+        np.testing.assert_allclose(got, want, rtol=2e-2, atol=2e-2)
+
+    def test_reduce_softmax_layernorm_are_bit_exact(self):
+        g = Graph("sum")
+        x = g.input("x", bf16[8, 32])
+        g.output(g.reduce_sum(x, axis=-1), "y")
+        feed = {"x": self.rand(8, 32)}
+        np.testing.assert_array_equal(
+            self.cuda.execute(g, feed)["y"], self.ref.execute(g, feed)["y"]
+        )
+
+        g = Graph("softmax")
+        x = g.input("x", bf16[8, 32])
+        g.output(g.softmax(x, axis=-1), "y")
+        np.testing.assert_array_equal(
+            self.cuda.execute(g, feed)["y"], self.ref.execute(g, feed)["y"]
+        )
+
+        g = Graph("ln")
+        x = g.input("x", bf16[8, 32])
+        gamma = g.input("g", bf16[32])
+        beta = g.input("b", bf16[32])
+        g.output(g.layernorm(x, gamma, beta), "y")
+        ln_feed = {"x": self.rand(8, 32), "g": np.ones(32, np.float32),
+                   "b": self.rand(32)}
+        np.testing.assert_array_equal(
+            self.cuda.execute(g, ln_feed)["y"], self.ref.execute(g, ln_feed)["y"]
+        )
+
+    def test_conv2d_outside_support_surface_is_rejected(self):
+        g = Graph("conv")
+        x = g.input("x", bf16[1, 4, 8, 8])
+        w = g.input("w", bf16[4, 4, 3, 3])
+        g.output(g.conv2d(x, w, padding=1), "y")
+        with self.assertRaises(BackendCapabilityError):
+            self.cuda.execute(g, {"x": self.rand(1, 4, 8, 8),
+                                  "w": self.rand(4, 4, 3, 3)})
 
 
 class TestCudaConv(CudaTestCase):

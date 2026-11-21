@@ -252,12 +252,78 @@ __device__ __forceinline__ float af_add_h(unsigned short* p, float v) {
 }
 """
 
+# bf16 同样存成 unsigned short，但存取是**纯位操作**：bf16 就是 f32 的高 16
+# 位，加宽是左移、收窄是高半字的 RNE 舍入。刻意不用 PTX 的 cvt 指令，也不用
+# cuda_bf16.h——cvt 的 bf16 形式要 sm_80，而按位实现从 Maxwell 起都能编；
+# 舍入规则与主机侧 ``runtime.bf16.round_bf16`` 逐条一致（尾数 LSB 为 1 时进位，
+# inf / nan 只截断，截断后尾数清零的 NaN 补 quiet 位）。
+_BF16_HELPERS = r"""
+__device__ __forceinline__ float af_ld_b(unsigned short h) {
+    return __uint_as_float(((unsigned int)h) << 16);
+}
+
+__device__ __forceinline__ unsigned short af_st_b(float v) {
+    unsigned int bits = __float_as_uint(v);
+    unsigned int lsb = (bits >> 16) & 1u;
+    unsigned int kept = (bits + 0x7FFFu + lsb) >> 16;
+    if ((bits & 0x7F800000u) == 0x7F800000u) {
+        // inf / nan: adding the bias would carry into the exponent, or wrap a
+        // mantissa of all ones into zero. They are already on the bf16 grid.
+        kept = bits >> 16;
+        if ((bits & 0x007FFFFFu) != 0 && (kept & 0x007Fu) == 0) {
+            kept |= 0x0040u;
+        }
+    }
+    return (unsigned short)kept;
+}
+
+__device__ __forceinline__ unsigned short af_cas_b(unsigned short* p,
+                                                   unsigned short assumed,
+                                                   unsigned short v) {
+#if __CUDA_ARCH__ >= 600
+    return atomicCAS(p, assumed, v);
+#else
+    unsigned long long addr = (unsigned long long)p;
+    unsigned int* base = (unsigned int*)(addr & ~2ULL);
+    unsigned int shift = (addr & 2ULL) ? 16u : 0u;
+    unsigned int mask = (addr & 2ULL) ? 0xFFFF0000u : 0x0000FFFFu;
+    unsigned int other = *base & ~mask;
+    for (;;) {
+        unsigned int assumed32 = other | (((unsigned int)assumed) << shift);
+        unsigned int desired = other | (((unsigned int)v) << shift);
+        unsigned int prev = atomicCAS(base, assumed32, desired);
+        if (prev == assumed32) return assumed;
+        unsigned short got = (unsigned short)((prev & mask) >> shift);
+        if (got != assumed) return got;
+        other = prev & ~mask;
+    }
+#endif
+}
+
+__device__ __forceinline__ float af_add_b(unsigned short* p, float v) {
+    unsigned short old = *p;
+    unsigned short assumed;
+    do {
+        assumed = old;
+        old = af_cas_b(p, assumed, af_st_b(af_ld_b(assumed) + v));
+    } while (assumed != old);
+    return af_ld_b(old);
+}
+"""
+
 # 占位符：render() 会把它替换成 _REDUCE + 对应 dtype 的辅助函数。
 PRELUDE = "%PRELUDE%"
 
 _STORAGE = {
     "f32": ("float", "af_ld_f", "af_st_f", "af_add_f"),
     "f16": ("unsigned short", "af_ld_h", "af_st_h", "af_add_h"),
+    "bf16": ("unsigned short", "af_ld_b", "af_st_b", "af_add_b"),
+}
+
+_HELPERS = {
+    "f32": _F32_HELPERS,
+    "f16": _F16_HELPERS,
+    "bf16": _BF16_HELPERS,
 }
 
 
@@ -267,12 +333,16 @@ def _dtype_key(dtype) -> str:
         return "f32"
     if name in ("float16", "f16"):
         return "f16"
-    raise ValueError(f"CUDA codegen 只支持 f32/f16，收到 {name}")
+    # bf16 在设备上的容器是 uint16（位模式）；numpy 侧只可能是这两个写法。
+    if name in ("uint16", "bfloat16", "bf16"):
+        return "bf16"
+    raise ValueError(f"CUDA codegen 只支持 f32/f16/bf16，收到 {name}")
 
 
 def _ir_dtype(dtype) -> DType:
     """运行期的 numpy dtype -> IR 的 DType（L2 用后者认类型）。"""
-    return DType.F32 if _dtype_key(dtype) == "f32" else DType.F16
+    key = _dtype_key(dtype)
+    return {"f32": DType.F32, "f16": DType.F16, "bf16": DType.BF16}[key]
 
 
 def render(template, dtype, *, f16_helpers: str | None = None, dialect=None) -> str:
@@ -295,10 +365,10 @@ def render(template, dtype, *, f16_helpers: str | None = None, dialect=None) -> 
 
     key = _dtype_key(dtype)
     storage, ld, st, add = _STORAGE[key]
-    if key == "f32":
-        helpers = _F32_HELPERS
+    if key == "f16" and f16_helpers is not None:
+        helpers = f16_helpers
     else:
-        helpers = _F16_HELPERS if f16_helpers is None else f16_helpers
+        helpers = _HELPERS[key]
     return (
         template.replace("%PRELUDE%", _REDUCE + helpers)
         .replace("%T%", storage)
@@ -1776,12 +1846,12 @@ def unary_source(kind: str) -> Kernel:
 
 
 def cast_fn(src, dst, dialect=None) -> str:
-    """f32 <-> f16 的转换源码（输入与输出存储宽度不同）。
+    """跨存储宽度的转换源码（f32 / f16 / bf16 三者任意方向）。
 
     这是唯一一个"两侧类型不一致"的内核：读取按**源** dtype 渲染（决定用
-    ``af_ld_f`` 还是 ``af_ld_h``），写回的目标类型由张量参数自己声明。
-    方言换成 ``CAST_DIALECT``，让它同时带上两套存取 helper。HIP 侧传入自己的
-    一份（f16 的 helper 换成 clang 版），L2 描述与其余逻辑逐字共用。
+    ``af_ld_f`` / ``af_ld_h`` / ``af_ld_b``），写回的目标类型由张量参数自己
+    声明。方言换成 ``CAST_DIALECT``，让它同时带上三套存取 helper。HIP 侧传入
+    自己的一份（f16 的 helper 换成 clang 版），L2 描述与其余逻辑逐字共用。
     """
     if dialect is None:
         from .dialect import CAST_DIALECT as dialect
@@ -1790,7 +1860,8 @@ def cast_fn(src, dst, dialect=None) -> str:
     if src_key == dst_key:
         raise ValueError(f"cast_fn 只处理跨宽度转换，收到 {src_key} -> {dst_key}")
     out_type = _STORAGE[dst_key][0]
-    out_store = "af_st_h" if dst_key == "f16" else None
+    # f32 是恒等 store，裸赋值即可；窄类型必须走各自的 RNE store helper。
+    out_store = None if dst_key == "f32" else _STORAGE[dst_key][2]
     return emit(ew_cast(out_type, out_store), dialect, _ir_dtype(src))
 
 

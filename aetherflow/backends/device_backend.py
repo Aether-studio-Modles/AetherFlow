@@ -78,6 +78,7 @@ from ..lower.plan import (
     REDUCE_TILE_X,
     scan_chunk,
 )
+from ..runtime.bf16 import pack_bf16, unpack_bf16
 from ..runtime.executor import Executor
 from ..tuning.space import TuningSpace
 from .base import BackendCapabilityError
@@ -246,7 +247,7 @@ def _chainable(node: Node) -> bool:
     if len(node.inputs) != arity:
         return False
     out_type = node.output.type
-    if out_type.dtype not in (DType.F32, DType.F16):
+    if out_type.dtype not in (DType.F32, DType.F16, DType.BF16):
         return False
     for value in node.inputs:
         t = value.type
@@ -495,6 +496,11 @@ class DeviceBackend(Executor):
     # 它的分块内核是混合精度（存储 f16、点积与在线 softmax 在 float 里累加，
     # 写回时舍入一次），shared 布局不随 dtype 变化。
     _F16_OPS: Optional[FrozenSet[str]] = None
+    # 允许 bf16 的算子集。``None`` = 这个后端不支持 bf16（HIP 目前如此）。
+    # bf16 在设备上的容器是 ``uint16`` 位模式（与 f16 同为两字节，但没有
+    # 原生 dtype），存取由 codegen 的 ``af_ld_b`` / ``af_st_b`` 按位完成，
+    # matmul 单独走 cuBLAS 的 CUDA_R_16BF。
+    _BF16_OPS: Optional[FrozenSet[str]] = None
     # conv2d 的实现选择。子类可以收窄（HIP 没有 cuDNN）。
     CONV_IMPLS: Tuple[str, ...] = _CONV_IMPLS
     # auto 是否允许在"K 超过分块阈值、核面积大于 1"时改走隐式 GEMM。
@@ -608,6 +614,10 @@ class DeviceBackend(Executor):
         # f16 支持面：子类声明的集合优先，否则就是全部已实现算子
         self._f16_ops: FrozenSet[str] = (
             self._OPS if self._F16_OPS is None else self._F16_OPS
+        )
+        # bf16 支持面：默认空集，子类显式声明才开启（见 ``_BF16_OPS``）
+        self._bf16_ops: FrozenSet[str] = (
+            frozenset() if self._BF16_OPS is None else self._BF16_OPS
         )
         # 自动图执行：auto 时 execute 会按"图 + 结构版本 + 输入签名"缓存捕获
         # 好的计划，命中就只 replay。键里带 id 与弱引用：图被回收后 id 可能
@@ -841,16 +851,52 @@ class DeviceBackend(Executor):
         报 ``Unresolved extern function '_ZN6__halfC1Ef'``——这条路径以前没人走过，
         因为整图 f16 的用例都是直接声明 f16 输入，从不产生 ``cast`` 节点。
         改用本地的 ``cast_source``（PTX 的 ``cvt`` 指令，不依赖 ``cuda_fp16.h``）。
+
+        bf16 同理：它的设备容器是 ``uint16`` 位模式，``astype`` 只会把位模式
+        当整数做数值转换。三条跨宽度路径（f32/f16/bf16 任意方向）都走同一个
+        ``cast_fn``，由 codegen 按源与目标的存储类型各自展开。
         """
         target = np.dtype(dtype)
         if value.dtype == target:
             return value
         src_key = self._kind(value)
-        dst_key = {np.dtype(np.float16): "f16", np.dtype(np.float32): "f32"}.get(target)
-        if dst_key is None or dst_key == src_key:
+        dst_key = {
+            np.dtype(np.float16): "f16",
+            np.dtype(np.float32): "f32",
+            np.dtype(np.uint16): "bf16",
+        }.get(target)
+        if dst_key is None:
             # 与设备存储无关的类型（f64 等）：交给 cupy，走不到 GPU 计算路径
             return value.astype(target, copy=False)
+        if dst_key == src_key:
+            return value
         return self._cast_kernel(value, target, src_key, dst_key)
+
+    def device_dtype(self, dtype: DType) -> np.dtype:
+        """bf16 在本后端以 ``uint16`` 位模式驻留（与 f16 同为两字节）。
+
+        其余类型就是 numpy 载体。HIP 没有声明 bf16 支持面，因此保持默认行为，
+        在 ``invoke`` 处明确拒绝。
+        """
+        if dtype is DType.BF16 and self._bf16_ops:
+            return np.dtype(np.uint16)
+        return np.dtype(dtype.np_dtype)
+
+    def quantize(self, value: Any, dtype: DType) -> Any:
+        """bf16 边界：舍入到 bf16 格点，并存成两字节位模式。
+
+        参考后端在主机侧 ``round_bf16``（载体仍是 f32）；设备端直接落到
+        ``uint16`` 容器，打包用 ``cast``（f32 -> bf16 的 store helper 就是
+        RNE，与主机侧逐位一致），不在边界上做一次 D2H 同步。
+        """
+        if dtype is not DType.BF16:
+            return value
+        cp = self.cp
+        if isinstance(value, cp.ndarray):
+            if value.dtype == cp.uint16:
+                return value
+            return self.cast(value, np.dtype(np.uint16))
+        return super().quantize(value, dtype)
 
 
 
@@ -913,6 +959,9 @@ class DeviceBackend(Executor):
 
 
     def to_host(self, value: Any) -> np.ndarray:
+        """回到主机：bf16 的 ``uint16`` 容器解包成 f32 载体（与 IR 的载体一致）。"""
+        if isinstance(value, self.cp.ndarray) and value.dtype == self.cp.uint16:
+            return unpack_bf16(self.cp.asnumpy(value))
         return self.cp.asnumpy(value)
 
 
@@ -1370,10 +1419,18 @@ class DeviceBackend(Executor):
                 continue
             if a.dtype == self.cp.float16 and name in self._f16_ops:
                 continue
+            if a.dtype == self.cp.uint16 and name in self._bf16_ops:
+                continue
             hint = ""
             if a.dtype in (self.cp.float16, self.cp.float64):
                 accept = "float16 / float32" if name in self._f16_ops else "float32"
                 hint = f"（{name} 目前只支持 {accept}）"
+            elif a.dtype == self.cp.uint16:
+                hint = (
+                    "（bf16 支持面不含这个算子，见 _BF16_OPS）"
+                    if self._bf16_ops
+                    else "（本后端未声明 bf16 支持）"
+                )
             raise BackendCapabilityError(
                 f"{self._LABEL}的 {name} 不支持 {a.dtype}{hint}。"
                 "不做隐式降级：请在前端显式插入 cast。"
@@ -1764,6 +1821,8 @@ class DeviceBackend(Executor):
                 continue
             if dtype == DType.F16 and name in self._f16_ops:
                 continue
+            if dtype == DType.BF16 and name in self._bf16_ops:
+                continue
             return None
         return fn
 
@@ -1836,7 +1895,12 @@ class DeviceBackend(Executor):
         if not arrays:
             return None
         dtype = arrays[0].dtype
-        if dtype not in (cp.float32, cp.float16):
+        if dtype not in (cp.float32, cp.float16, cp.uint16):
+            return None
+        if dtype == cp.uint16 and (
+            not self._bf16_ops
+            or any(node.op.name not in self._bf16_ops for node in group)
+        ):
             return None
         if any(a.dtype != dtype or not a.flags.c_contiguous for a in arrays):
             return None
@@ -1865,7 +1929,12 @@ class DeviceBackend(Executor):
             return None
 
         out = cp.empty(out_shape, dtype=dtype)
-        ir_dtype = DType.F32 if dtype == cp.float32 else DType.F16
+        if dtype == cp.float32:
+            ir_dtype = DType.F32
+        elif dtype == cp.float16:
+            ir_dtype = DType.F16
+        else:
+            ir_dtype = DType.BF16
         aligned = int(out.data.ptr) % VEC4_ALIGN == 0 and all(
             int(a.data.ptr) % VEC4_ALIGN == 0 for a in arrays
         )
@@ -1928,7 +1997,12 @@ class DeviceBackend(Executor):
         if not out_shape:
             return None
         ir_dtype = out_type.dtype
-        if ir_dtype not in (DType.F32, DType.F16):
+        if ir_dtype not in (DType.F32, DType.F16, DType.BF16):
+            return None
+        if ir_dtype is DType.BF16 and (
+            not self._bf16_ops
+            or any(node.op.name not in self._bf16_ops for node in nodes)
+        ):
             return None
         internal = {node.output.id for node in nodes[:-1]}
         order: List[int] = []
@@ -1982,11 +2056,16 @@ class DeviceBackend(Executor):
             return None
 
         cp = self.cp
-        cp_dtype = cp.float32 if ir_dtype is DType.F32 else cp.float16
+        if ir_dtype is DType.F32:
+            cp_dtype = cp.float32
+        elif ir_dtype is DType.F16:
+            cp_dtype = cp.float16
+        else:
+            cp_dtype = cp.uint16
         # ``codegen.render`` 要的是 ``numpy.dtype`` 实例；``cp.float32`` 是类型
         # 对象，直接传进去会被当成"未知 dtype"拒绝。
         render_dtype = np.dtype(cp_dtype)
-        kind = "f32" if ir_dtype is DType.F32 else "f16"
+        kind = {DType.F32: "f32", DType.F16: "f16", DType.BF16: "bf16"}[ir_dtype]
         # 对齐只有运行期才知道：先按对齐选铺法，闭包入口再核对指针。
         launch = plan_elementwise(
             n,
@@ -2338,9 +2417,23 @@ class DeviceBackend(Executor):
         保持「GPU 后端只支持 f32/f16」这条规则没有例外。
         """
         dtype = DType(attrs["dtype"])
+        if dtype is DType.BF16:
+            if not self._bf16_ops:
+                raise BackendCapabilityError(
+                    f"{self._LABEL}未声明 bf16 支持，constant 收到 bf16"
+                )
+            # bf16 常量以 uint16 位模式驻留：先在主机把值落到 bf16 格点再打包，
+            # 与 ``quantize`` 在节点边界上做的事逐位一致。
+            shape = tuple(int(d) for d in attrs["shape"])
+            data = attrs.get("data")
+            if data is None:
+                host = np.full(shape, np.float32(attrs["value"]), dtype=np.float32)
+            else:
+                host = np.asarray(data, dtype=np.float32).reshape(shape)
+            return self.cp.asarray(pack_bf16(host))
         if dtype not in (DType.F32, DType.F16):
             raise BackendCapabilityError(
-                f"{self._LABEL}只支持 float32/float16，constant 收到 {dtype.value}"
+                f"{self._LABEL}只支持 float32/float16/bf16，constant 收到 {dtype.value}"
             )
         np_dtype = np.float16 if dtype is DType.F16 else np.float32
         shape = tuple(int(d) for d in attrs["shape"])
@@ -2520,12 +2613,17 @@ class DeviceBackend(Executor):
         blas = self._cublas()
         blas.set_stream(self.current_stream_ptr())
 
-        # f16 走 GemmEx（f32 累加），f32 走 Sgemm：两条路径的累加精度一致，
-        # 差别只在输入输出的存储宽度。
+        # f16 / bf16 走 GemmEx（f32 累加），f32 走 Sgemm：三条路径的累加
+        # 精度一致，差别只在输入输出的存储宽度。bf16 的存储是 uint16 位模式，
+        # cuBLAS 按 CUDA_R_16BF 解释同一段内存，因此在 A800/sm_80 上会落到
+        # Tensor Core；HIP 没有声明 bf16 支持面，这个分支到不了。
         f16 = a.dtype == cp.float16
+        bf16 = a.dtype == cp.uint16
         if not batch_shape:
             if f16:
                 blas.hgemm(a, b, out)
+            elif bf16:
+                blas.bgemm(a, b, out)
             else:
                 blas.sgemm(a, b, out)
             return out
@@ -2535,6 +2633,8 @@ class DeviceBackend(Executor):
         stride_b = self._batch_stride(b.shape[:-2], batch_shape, k * n, "右操作数")
         if f16:
             blas.hgemm_batched(a, b, out, batch, stride_a, stride_b, m * n)
+        elif bf16:
+            blas.bgemm_batched(a, b, out, batch, stride_a, stride_b, m * n)
         else:
             blas.sgemm_batched(a, b, out, batch, stride_a, stride_b, m * n)
         return out
@@ -4975,7 +5075,11 @@ class DeviceBackend(Executor):
     def _op_cast(self, node, args, attrs):
         # 执行骨架也会按 IR 推导的 dtype 调 ``cast`` 钩子（正常路径）；这里同样
         # 走那条实现，保证"单独测这个算子"与"整图执行"是同一条代码路径。
-        return self.cast(args[0], DType(attrs["dtype"]).np_dtype)
+        # 目标是 bf16 时还要走一次 ``quantize``：``cast`` 的载体是 f32，
+        # 只按 numpy dtype 看它"不需要转换"，真正落到 uint16 的是打包那一步。
+        target = DType(attrs["dtype"])
+        out = self.cast(args[0], target.np_dtype)
+        return self.quantize(out, target) if target is DType.BF16 else out
 
 
 
@@ -5665,10 +5769,13 @@ class DeviceBackend(Executor):
 
 
     def _kind(self, a) -> str:
-        """内核源码与缓存的 dtype 键（``f32`` / ``f16``）。
+        """内核源码与缓存的 dtype 键（``f32`` / ``f16`` / ``bf16``）。
 
-        只区分这两种：其它 dtype 在 ``invoke`` 就已拒绝，走不到这里。
+        ``uint16`` 只可能是 bf16 的位模式容器（IR 没有 u16 类型）；其余
+        dtype 在 ``invoke`` 就已拒绝，走不到这里。
         """
+        if a.dtype == self.cp.uint16:
+            return "bf16"
         return "f16" if a.dtype == self.cp.float16 else "f32"
 
 

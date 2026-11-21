@@ -44,7 +44,8 @@ class _GroupPlan:
         "kernels", "constants", "_memo", "fast", "chain",
     )
 
-    def __init__(self, nodes: Tuple[Node, ...], static: bool) -> None:
+    def __init__(self, nodes: Tuple[Node, ...], static: bool,
+                 device_dtype=None) -> None:
         self.nodes = nodes
         # 批量派发用：逐节点的内核函数，由后端的 ``_prepare_plan`` 填。
         # ``None`` = 这份计划不能跳过运行期校验，仍走 ``invoke``。
@@ -64,11 +65,16 @@ class _GroupPlan:
         self.expected = nodes[-1].output.type if static else None
         # dtype 与形状无关，构建期解析成 np.dtype 存下来：``np.asarray(x, "float32")``
         # 每次都要做一次字符串→dtype 的解析，而这是每个节点的必经之路。
-        self.dtype = np.dtype(nodes[-1].output.type.dtype.np_dtype)
+        # 这里问的是**本后端的设备容器**：CUDA 的 bf16 以 uint16 驻留，与
+        # IR 的载体（f32）不是同一个 dtype。
+        self.dtype = (
+            np.dtype(nodes[-1].output.type.dtype.np_dtype)
+            if device_dtype is None
+            else np.dtype(device_dtype(nodes[-1].output.type.dtype))
+        )
         # IR 的 dtype 本身：bf16 的载体是 f32，但边界处要做 bf16 量化，
         # 只看 np.dtype 会把两件事混成一件。取组尾节点：组内前序节点的输出
-        # 不物化、也不进环境，所以没有"中间值需要量化"的边界；目前唯一的
-        # 分组实现是设备后端，而它拒绝 bf16，这条前提因此不会被打破。
+        # 不物化、也不进环境，所以没有"中间值需要量化"的边界。
         self.out_dtype = nodes[-1].output.type.dtype
         self._memo = None
         # 静态单节点组的直连记录，由 ``Executor._fast_step`` 在第一次执行时
@@ -174,6 +180,16 @@ class Executor:
     def cast(self, value: Any, dtype: np.dtype) -> Any:
         return np.asarray(value, dtype=dtype)
 
+    def device_dtype(self, dtype: DType) -> np.dtype:
+        """IR 类型在本后端里的**设备容器** dtype。
+
+        默认就是 numpy 载体（``DType.np_dtype``）。设备后端可能用另一种容器
+        表示同一个 IR 类型——CUDA 的 bf16 以 ``uint16`` 位模式驻留，于是
+        "bf16 节点输出应当是什么 dtype"不能只看载体（那是 f32）。计划里的
+        期望 dtype 因此由这个钩子给出，执行骨架不必知道各家怎么存。
+        """
+        return np.dtype(dtype.np_dtype)
+
     def quantize(self, value: Any, dtype: DType) -> Any:
         """把声明为 bf16 的值量化到 bf16 精度。
 
@@ -182,8 +198,8 @@ class Executor:
         **数值**基准，所以每个 bf16 类型的值在离开节点 / 进入图时都必须
         落到 bf16 的格点上。
 
-        设备后端目前不支持 bf16；真要有原生容器，子类覆盖这个方法即可，
-        不必改执行骨架。
+        设备后端若用原生容器（CUDA 是 uint16 位模式）驻留 bf16，覆盖这个方法
+        同时完成"舍入 + 打包"即可；执行骨架只需保证每个 bf16 边界都调到这里。
         """
         if dtype is DType.BF16 and isinstance(value, np.ndarray):
             return round_bf16(value)
@@ -470,7 +486,10 @@ class Executor:
         if hit is not None and hit[0] == graph.revision:
             return hit[1]
         static = all(v.type.is_static for v in graph.inputs)
-        plan = [_GroupPlan(group, static) for group in self.group_nodes(graph)]
+        plan = [
+            _GroupPlan(group, static, self.device_dtype)
+            for group in self.group_nodes(graph)
+        ]
         self._prepare_plan(plan)
         cache[graph] = (graph.revision, plan)
         return plan

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import importlib.util
 
-from .backend import CUDA_OPS, CudaBackend
+from .backend import BF16_OPS, CUDA_OPS, CudaBackend
 
 CUDA_AVAILABLE = importlib.util.find_spec("cupy") is not None
 
-__all__ = ["CudaBackend", "CUDA_OPS", "CUDA_AVAILABLE"]
+__all__ = ["CudaBackend", "CUDA_OPS", "BF16_OPS", "CUDA_AVAILABLE"]
