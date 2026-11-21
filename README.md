@@ -22,7 +22,7 @@ CUDA / HIP 两个真机后端、插件契约与一致性套件均已交付。规
 ## 2. 分层
 
 ```
-前端            torch.export 子集 / EagerGraph 构图糖 / 动态执行（按形状建图并复用）
+前端            torch.export 子集 / EagerGraph 构图糖 / 动态执行（按形状建图、声明动态轴后一次构图多次重放）
                 ↓
 高层语义 IR     TensorType（含符号维）/ verifier / JSON 序列化 + 版本治理 + 迁移
                 ↓
