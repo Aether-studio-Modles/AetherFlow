@@ -17310,3 +17310,65 @@ CPU 作业改为 `coverage run` 并上传 `.coverage`（只观测、不设阈值
 容器镜像、GitHub Release 自动创建、pre-commit 钩子。前两者在本地无法验证
 （没有 docker daemon、没有远端 release 权限），后者与 CI 的 `lint` 作业重复。
 工程化的取舍标准是"能否被验证"，而不是"清单上还有几项"。
+
+### 5.275　动态形状：把符号批维打通到训练循环
+
+**问题**：5.217 的契约表把 `graph` / `execute` 记为 `full`，`autodiff` 记为
+`per-op`，`trainer` 记为 `rejected`。这张表当时是如实的，但三处具体阻塞把它
+钉死在了 `rejected`：
+
+1. `reshape` 的 infer 拒绝 `SymExpr` 目标，`(B,4) -> (4*B,)` 在构图期就报错；
+2. 执行器的 `resolve_attrs` 只把 `str` 当符号去绑定，属性里的 `SymExpr`
+   原样交给后端，目标形状仍是一个对象而不是整数；
+3. 归约 / 广播的 VJP 一律走 `_static`：`reduce_mean` 要常量 `1/count`，
+   广播反向 `sum_to` 要用 `_prod` 在构图期算前导乘积。批维是符号时，
+   参数梯度必然要沿批维求和，训练循环因此整条断掉。
+
+**做法**：
+
+- `reshape` 只校验"目标里的符号都能在输入类型里找到"，静态可证时再做元素
+  数守恒检查；不可证的情况交给执行期——不静默算错，也不提前拒绝本来能跑的图。
+- `resolve_attrs` 递归解析 `SymExpr`（`dim_resolve` 按当前绑定求值），
+  属性里的 tuple/list 一并处理。执行器因此能把同一张符号图绑到不同 batch。
+- `reduce_sum` / `reduce_mean` 的 VJP 改为按原形状（含符号）工作：`keepdims=False`
+  时 reshape 到保维形状、再 `broadcast_to` 回输入形状；两者都已接受符号目标。
+  均值在归约轴全静态时仍用常量 `1/count`（数值与算子顺序不变），含符号时
+  用"标量 1 广播成保维形状 -> 沿归约轴 `reduce_sum`"得到运行期计数张量，
+  再与梯度相除。不用 `exp(x-x)` 之类的技巧：`x` 含 `inf` 时它会把计数污染成 NaN。
+- `sum_to`（广播反向）先做结构比较：形状相同直接返回，不需要任何具体数字。
+  需要求和时，内部广播维用 `transpose + reduce_sum(keepdims=True)`——只依赖
+  秩，不依赖各维数值；前导维全静态时保留原来的"合并成二维再一次归约"，
+  数值与算子顺序不变；含符号时改成"前导维转置到最后 -> 单轴归约 -> reshape
+  去掉那个 1"，reshape 的目标只有本来就已定义的保留维，不引入新符号。
+  `sum_axes`（去掉维、必须把若干维合并成二维）仍要求静态，与 conv / embedding
+  等规则一起留在 `per-op` 的拒绝侧。
+- `Trainer`：主机态不再拒绝符号输入。训练循环本身只做形状无关的参数更新，
+  损失若对符号维求平均，反向的计数在每一步按实际形状算。设备态的捕获计划把
+  每步的维度与地址写死在图里，仍在构造期用 `symbolic_inputs` 拒绝并给出
+  `device_state=False` 的建议；`data_input_shapes()` 遇到符号维也显式报错
+  （数据并行按每卡固定 batch 切分，没有"该切多少"的答案）。
+- 契约表同步：`autodiff` 的理由去掉"reshape 的目标形状需要具体数字"，改为
+  如实描述"归约与广播反向按运行期形状算 + `sum_axes` 一类需要合并维度的规则
+  仍要求静态"；`trainer` 从 `rejected` 改为 `per-op`。`recompute` 与
+  `torch-import` 不动。
+
+**用例**（`tests/test_shape_contract.py` 增至 19 条）：
+
+1. `reshape` 的目标可以是 `sym_mul(4, "B")`，batch 1/3/7 各跑一次，输出 `(4B,)`
+   且元素顺序正确；未定义的符号仍在构图期报错。
+2. 符号批维上的 `reduce_mean` 反向：`(B,4)` 沿最后一维求均值，梯度每元素
+   0.25（运行期计数路径），batch 1/3/7 一致；`reduce_sum` 反向梯度全 1。
+3. 主机态 `Trainer` 用同一张符号图跑 batch 1/3/5 各一步，损失有限且参数真的
+   被更新——`per-op` 不是"构造能过、跑起来再说"。
+4. 设备态 `Trainer` 在构造期拒绝符号输入，错误含「设备态训练要求静态形状」、
+   `%x` 与 `device_state=False`；`data_input_shapes()` 报「含符号维」。
+5. `test_autodiff` 里原来钉"符号广播反向必须报错"的用例改成数值对拍：
+   `a[B,1] + b[B,4]` 对 `a` 的梯度是每行 4，batch 1/3 都成立。
+
+**验证**：本地 `py -3.14` + torch 2.13.0，`Ran 2773 tests / OK (skipped=427)`；
+`ruff check` 改动文件全过。
+
+**边界**：这只是"动态形状全链路"的第一刀。分段重算（`recompute`）、设备态
+捕获、`torch.export` 的 SymInt 落成符号维、以及 `sum_axes` 这类需要合并维度的
+反向，都仍按契约表拒绝；下一步才是 trace-once 重放与设备侧控制流。原则不变：
+静态可证明的检查保留，不可证明的交给执行期报错，绝不静默算错。

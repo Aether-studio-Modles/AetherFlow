@@ -112,6 +112,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **设备端循环**：`DeviceWhileLoop` 把条件与体各捕获一次、状态常驻显存，但每轮仍
   要读一次谓词；实测**不比宿主路径快**，交付的是执行形态而非加速。
 - **控制流**：没有设备端真分支；`Conditional` / `WhileLoop` 每次判定回主机。
+- **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
+  计数在运行期按实际形状算。设备态捕获计划、分段重算、需要把若干维合并成二维的
+  广播反向（`sum_axes`）以及 torch 导入的 SymInt 仍要求静态形状，入口显式拒绝
+  （契约表见 DESIGN 5.217 / 5.275）。
 - **推理**：分页 KV cache 与投机解码是组件级交付，**未接进 `LMRunner`**——主干是
   Mamba，没有随上下文增长的 KV。投机只支持贪心验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
