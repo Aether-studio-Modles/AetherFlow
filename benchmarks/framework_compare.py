@@ -293,7 +293,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if device.startswith("cuda"):
         import cupy as cp
 
-        sync_af = cp.cuda.get_current_stream().synchronize
+        # 设备级同步：replay 跑在捕获流（非阻塞流）上，只同步「当前流」
+        # 会漏掉它，测出来的是提交时间而不是完成时间；torch 侧用的也是
+        # 全设备同步，两边必须同口径。
+        sync_af = cp.cuda.Device().synchronize
         sync_torch = torch.cuda.synchronize
     else:
         cp = None  # type: ignore[assignment]
