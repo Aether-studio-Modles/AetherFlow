@@ -17410,7 +17410,7 @@ y = runner.run({"x": np.ones((7, 4), np.float32)})["y"]   # 复用同一张图�
 以形状错误暴露。也不做"符号构图失败就退回按形状构图"的静默降级：那会让同一次
 运行的行为取决于第一次遇到的形状，正是 5.275 边界里说的"绝不静默算错"要避免的。
 
-**用例**（`tests/test_dynamic.py` 10 → 23，新增 13 条）：
+**用例**（`tests/test_dynamic.py` 10 → 24，新增 14 条）：
 
 1. 同一 `dynamic_axes={"x": {0: "B"}}` 下 batch 1/3/7 只建一次图，输出逐位正确；
    `shapes` 键是 `("B", 4)`。
@@ -17420,14 +17420,14 @@ y = runner.run({"x": np.ones((7, 4), np.float32)})["y"]   # 复用同一张图�
 5. 与参考后端逐位对拍（batch 1/4）；`matmul` 线性层在 batch 1/3/7 上复用同一张
    图，结果与 `x @ w` 一致。
 6. `build` 把模板轴写成整数 → 构图期 `ValueError`，消息含「必须使用传入的形状
-   模板」与图里的实际类型；声明了图里没有的输入、声明了却未喂入、轴越界、换算
-   后重复，全部显式报错。
+   模板」与图里的实际类型；把输入秩写小（声明的轴超出图里的秩）、声明了图里没有
+   的输入、声明了却未喂入、轴越界、换算后重复，全部显式报错。
 7. 声明本身：非映射、空映射、`bool` 轴、非字符串符号、与 dtype 同名的符号、非
    标识符符号，构造期即拒绝；`dynamic_axes=None` 保持 5.68 的按形状缓存不变。
 
-**验证**：本地 `py -3.14` + torch 2.13.0，`Ran 2786 tests / OK (skipped=427)`；
+**验证**：本地 `py -3.14` + torch 2.13.0，`Ran 2787 tests / OK (skipped=427)`；
 `ruff check aetherflow/dynamic.py tests/test_dynamic.py` 通过。远端 Ubuntu 22.04 /
-Python 3.10.12 拉取同一 commit：`tests.test_dynamic` 23 条通过；全量 2786 条里
+Python 3.10.12 拉取同一 commit：`tests.test_dynamic` 24 条通过；全量 2787 条里
 非前端用例全通过，`test_frontend` 的 121 条因该机 torch 2.5.1 不在兼容矩阵内报
 `UnsupportedTorchVersion`——这是环境问题，不是本轮回归。
 
