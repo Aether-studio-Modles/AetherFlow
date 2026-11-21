@@ -151,5 +151,102 @@ class FastPathBoundaryTest(unittest.TestCase):
         self.assertTrue(group.fast[7], "bf16 输出必须走量化，直连也要保留这一步")
 
 
+class ReleasePlanTest(unittest.TestCase):
+    def _executor(self, base):
+        class Traced(base):
+            def __init__(self):
+                self.produced = {}
+                self.released = []
+
+            def invoke(self, node, args, attrs):
+                out = super().invoke(node, args, attrs)
+                self.produced[id(out)] = node.output.id
+                return out
+
+            def dispose(self, value):
+                self.released.append(self.produced[id(value)])
+
+        return Traced()
+
+    def test_duplicate_edges_and_branch_release_in_order(self):
+        for base in (ReferenceExecutor, _Fast):
+            with self.subTest(base=base):
+                g = Graph()
+                x = g.input("x", f32[4])
+                a = g.relu(x)
+                b = g.add(a, a)
+                c = g.silu(a)
+                g.output(g.add(b, c), "y")
+                executor = self._executor(base)
+                feed = {"x": np.arange(4, dtype=np.float32)}
+                for _ in range(2):
+                    executor.released.clear()
+                    env = executor.run_device(g, feed, release=True)
+                    self.assertEqual(set(env), {x.id, g.outputs[0].id})
+                    self.assertEqual(executor.released, [a.id, b.id, c.id])
+                executor.released.clear()
+                env = executor.run_device(g, feed, release=False)
+                self.assertEqual(len(env), len(g.nodes) + 1)
+                self.assertEqual(executor.released, [])
+
+    def test_group_internal_values_are_not_disposed(self):
+        g = _linear()
+        executor = self._executor(_Grouped)
+        env = executor.run_device(g, _feed(), release=True)
+        self.assertEqual(set(env), {v.id for v in (*g.inputs, *g.outputs)})
+        self.assertEqual(executor.released, [])
+
+    def test_output_registration_rebuilds_release_plan(self):
+        g = Graph()
+        x = g.input("x", f32[4])
+        a = g.relu(x)
+        g.output(g.silu(a), "y")
+        executor = self._executor(_Fast)
+        feed = {"x": np.arange(4, dtype=np.float32)}
+        executor.run_device(g, feed, release=True)
+        old = executor._plan(g)
+        g.output(a, "saved")
+        executor.released.clear()
+        env = executor.run_device(g, feed, release=True)
+        self.assertIsNot(executor._plan(g), old)
+        self.assertIn(a.id, env)
+        self.assertEqual(executor.released, [])
+
+    def test_cached_constants_are_kept_after_preparation(self):
+        class Cached(_Fast):
+            def _prepare_plan(self, plan):
+                super()._prepare_plan(plan)
+                for group in plan:
+                    node = group.nodes[0]
+                    if node.op.name == "constant":
+                        group.constants[node.output.id] = self.invoke(node, [], node.attrs)
+
+        g = Graph()
+        x = g.input("x", f32[4])
+        c = g.constant(2.0, shape=(4,))
+        g.output(g.add(x, c), "y")
+        executor = self._executor(Cached)
+        feed = {"x": np.arange(4, dtype=np.float32)}
+        first = executor.run_device(g, feed, release=True)
+        second = executor.run_device(g, feed, release=True)
+        self.assertIs(first[c.id], second[c.id])
+        self.assertEqual(executor.released, [])
+        np.testing.assert_array_equal(second[g.outputs[0].id], feed["x"] + 2)
+
+    def test_symbolic_shapes_reuse_release_plan(self):
+        g = Graph()
+        x = g.input("x", f32["n", 4])
+        a = g.relu(x)
+        g.output(g.silu(a), "y")
+        executor = self._executor(_Fast)
+        for n in (2, 5, 2):
+            executor.released.clear()
+            env = executor.run_device(
+                g, {"x": np.zeros((n, 4), np.float32)}, release=True
+            )
+            self.assertEqual(env[g.outputs[0].id].shape, (n, 4))
+            self.assertEqual(executor.released, [a.id])
+
+
 if __name__ == "__main__":
     unittest.main()

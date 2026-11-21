@@ -65,7 +65,7 @@ class _GroupPlan:
 
     __slots__ = (
         "nodes", "args", "attrs", "expected", "dtype", "out_dtype",
-        "kernels", "constants", "_memo", "fast", "chain", "fused",
+        "kernels", "constants", "_memo", "fast", "chain", "fused", "release",
     )
 
     def __init__(self, nodes: Tuple[Node, ...], static: bool,
@@ -109,6 +109,8 @@ class _GroupPlan:
         # 静态单节点组的直连记录，由 ``Executor._fast_step`` 在第一次执行时
         # 填。``None`` = 这组仍走 ``invoke_group`` 的通用路径。
         self.fast = None
+        # 最后消费者执行后可摘掉的值，顺序与逐边计数归零的顺序一致。
+        self.release: Tuple[int, ...] = ()
 
     def resolve(self, binding: Dict[str, int]):
         """返回本组的 ``(attrs, expected)``。
@@ -405,18 +407,6 @@ class Executor:
         env: Dict[int, Any] = {}
         plan = self._plan(graph)
 
-        remaining: Dict[int, int] = {}
-        if release:
-            keep = {v.id for v in graph.inputs} | {v.id for v in graph.outputs}
-            # 常量是计划的一部分：它们由后端缓存、跨执行复用以省掉 H2D，
-            # 因此不能按"最后一次被读"回收——回收掉就等于把缓存打空，
-            # 下一轮重新上传，退回到修这个缺陷之前的行为。
-            for group in plan:
-                keep.update(group.constants)
-            for node in graph.nodes:
-                for a in node.inputs:
-                    remaining[a.id] = remaining.get(a.id, 0) + 1
-
         for value in graph.inputs:
             if value.name not in inputs:
                 raise KeyError(f"缺少图输入: {value.name}")
@@ -435,8 +425,8 @@ class Executor:
 
         for group in plan:
             # 常量组：值在计划期就已上传并随计划驻留，每次执行只需要把它写回
-            # 环境。它没有输入、没有 attrs 要看，也不会被回收（``keep`` 里已
-            # 包含），走完整路径等于每轮白做一次 args 构造与形状 / dtype 校验。
+            # 环境。它没有输入、没有 attrs 要看，回收计划也已排除它，走完整
+            # 路径等于每轮白做一次 args 构造与形状 / dtype 校验。
             if len(group.nodes) == 1:
                 cid = group.nodes[0].output.id
                 if cid in group.constants:
@@ -464,12 +454,10 @@ class Executor:
                 env[oid] = out
                 out = None
                 if release:
-                    for aid in used:
-                        remaining[aid] -= 1
-                        if remaining[aid] == 0 and aid not in keep:
-                            dead = env.pop(aid, None)
-                            if dead is not None:
-                                self.dispose(dead)
+                    for aid in group.release:
+                        dead = env.pop(aid, None)
+                        if dead is not None:
+                            self.dispose(dead)
                 continue
             # 组内前序节点的输出还没进环境（融合时它们甚至不会被物化），
             # 这里留 None 占位；``invoke_group`` 决定是内联计算还是逐个补读。
@@ -500,15 +488,11 @@ class Executor:
             out = None
 
             if release:
-                # 按组回收：融合后的中间值从未进过环境，这里只是把它们的
-                # 引用计数扣到 0；真正的回收发生在组的最后一个消费者之后。
-                for node in group.nodes:
-                    for a in node.inputs:
-                        remaining[a.id] -= 1
-                        if remaining[a.id] == 0 and a.id not in keep:
-                            dead = env.pop(a.id, None)
-                            if dead is not None:
-                                self.dispose(dead)
+                # 生命周期已在计划期算好；融合组内未物化的值不在环境里。
+                for aid in group.release:
+                    dead = env.pop(aid, None)
+                    if dead is not None:
+                        self.dispose(dead)
                 # 局部引用也得断：args 会把这个节点的输入一直持有到下一轮赋值，
                 # 那样"最后一次使用"就晚了一个节点，复用的空档被白白吃掉。
                 args = None
@@ -535,6 +519,22 @@ class Executor:
             for group in self.group_nodes(graph)
         ]
         self._prepare_plan(plan)
+        keep = {v.id for v in graph.inputs} | {v.id for v in graph.outputs}
+        # 后端上传的缓存常量跨执行存活，须等准备钩子填好后再排回收。
+        for group in plan:
+            keep.update(group.constants)
+        remaining: Dict[int, int] = {}
+        for node in graph.nodes:
+            for a in node.inputs:
+                remaining[a.id] = remaining.get(a.id, 0) + 1
+        for group in plan:
+            dead = []
+            for node in group.nodes:
+                for a in node.inputs:
+                    remaining[a.id] -= 1
+                    if remaining[a.id] == 0 and a.id not in keep:
+                        dead.append(a.id)
+            group.release = tuple(dead)
         cache[graph] = (graph.revision, plan)
         return plan
 
