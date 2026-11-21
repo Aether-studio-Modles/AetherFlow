@@ -607,6 +607,18 @@ class TestServiceUnit(unittest.TestCase):
         self.assertEqual(tokens, full[:2])
         self.assertLess(len(tokens), 8)
 
+    def test_bad_auth_and_rate_config_are_rejected(self):
+        """配置错误在构造期报错：空密钥等于没有认证，0 配额等于永久 429。"""
+        engine = object()
+        with self.assertRaises(ValueError):
+            OpenAIService(engine, api_key="")
+        with self.assertRaises(ValueError):
+            OpenAIService(engine, rate_limit=0)
+        with self.assertRaises(TypeError):
+            OpenAIService(engine, rate_limit=1.5)
+        with self.assertRaises(ValueError):
+            OpenAIService(engine, rate_window=0.0)
+
     def test_empty_stop_is_rejected_at_the_service_boundary(self):
         with self.assertRaises(ValueError):
             self.service.submit_tokens([2], stops=[""])
