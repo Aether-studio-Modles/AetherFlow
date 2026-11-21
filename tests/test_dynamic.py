@@ -189,6 +189,18 @@ class TestTraceOnce(unittest.TestCase):
         self.assertIn("必须使用传入的形状模板", message)
         self.assertIn("f32[2, 3]", message)
 
+    def test_build_must_keep_the_input_rank(self):
+        def flattened(shapes):
+            g = Graph("flattened")
+            x = g.input("x", f32[shapes["x"][1]])
+            g.output(x, "y")
+            return g
+
+        runner = DynamicRunner(flattened, dynamic_axes={"x": {1: "C"}})
+        with self.assertRaises(ValueError) as ctx:
+            runner.run({"x": np.ones((2, 3), np.float32)})
+        self.assertIn("build 必须让输入秩与传入的形状模板一致", str(ctx.exception))
+
     def test_declared_input_must_be_fed(self):
         runner = DynamicRunner(_relu, dynamic_axes={"z": {0: "B"}})
         with self.assertRaises(ValueError) as ctx:

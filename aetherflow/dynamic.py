@@ -237,6 +237,12 @@ def _require_traced_inputs(
                 f"图的实际输入是 {sorted(types)}"
             )
         for axis, symbol in axes.items():
+            if axis >= type_.rank:
+                raise ValueError(
+                    f"dynamic_axes 把 %{name} 的第 {axis} 维声明为符号 {symbol!r}，"
+                    f"但图里的输入只有 {type_.rank} 维（{type_}）；"
+                    "build 必须让输入秩与传入的形状模板一致"
+                )
             dim = type_.shape[axis]
             if isinstance(dim, int):
                 raise ValueError(
