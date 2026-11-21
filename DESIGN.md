@@ -18504,3 +18504,28 @@ AF耗时约1.76倍；auto AF **0.4746** / torch **0.5679** ms，AF耗时低约16
 在结果入文后删除。GitHub更新主分支时服务端返回`pre-receive hook declined`，
 未绕过规则或强推；Gitee和测试机照常同步，无新增依赖，未记录凭证。
 
+### 5.292　attention mask 前导维改用 reshape 降维
+
+2026-11-21，代码 `c4444f5`。设备后端原先用 `raw_mask = raw_mask[0]` 逐个去掉
+长度为 1 的多余前导维。numpy / cupy 的整数索引会降维，而天数（Iluvatar）的
+`DeviceArray.__getitem__` 只接受切片、拒绝降维索引，传 `(1,1,S,T)` mask 时
+直接抛 `TypeError`；一致性套件只覆盖 `(S,T)`，缺陷因此一直没暴露（REMIND 坑 12）。
+调用方此前只能自己 squeeze 成 `(S,T)`。
+
+现在把"去掉前导 1"拆成纯形状推导 `_mask_target_shape(mask_shape, keep)`：
+前导维含非 1 时返回 `None`，沿用原有 `BackendCapabilityError` 文案；否则给出
+目标形状，调用方对数组只做 `cp.ascontiguousarray(raw_mask).reshape(target)`，
+全程不出现整数索引。秩不变时不碰数组；前导维连续多个 1 也能一次 reshape 到
+`len(batch)+2`。numpy / cupy 的掩码语义与结果逐位不变，天数不再依赖调用方
+预 squeeze。非连续 mask 在降维处可能多一次连续化拷贝，之后广播路径本来也要
+拷贝，因此不改变输出，只记录这一处可能的额外复制。
+
+**验证**：主机侧新增 2 项形状推导测试（多前导 1、非 1 前导拒绝），
+`tests.test_cuda_backend`、`tests.test_attention`、`tests.test_hip_backend`
+本地 488 项中跳过 388 项、其余通过，Ruff 通过。测试机（GPU 正被其他任务占用）
+上传改动后运行 `TestCudaAttention` 与 `TestAttentionMaskSharing` 共 15 项全过，
+包含新增的 `(1,1,1,S,T)` 设备用例；未做性能测量，也未干预占用 GPU 的任务。
+天数上机需按 Iluvatar 包流程 `py -3.10 build.py` 后
+`install_hardware("dist/iluvatar-0.1.0.zip", replace=True)`，不能直接覆盖
+已安装的 `.py`（sha256 校验会失败）。本轮没有天数硬件，未宣称天数实测通过。
+

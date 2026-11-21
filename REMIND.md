@@ -294,6 +294,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   对每个 `embedding` 的 err 标量做一次 `int(err.item())`，48 个状态重排节点就是
   48 次同步读回，成本约 2.4 ms/步。把重排并进 decode 图只省掉一次 replay 的边界
   （0.8～1.5 ms），守卫总数不变；要再省必须把同一张图的守卫汇总成一个标量。
+- **设备张量不要用整数索引降维**（5.292）：`tensor[0]` 在 numpy / cupy 上
+  得到降维视图，天数 `DeviceArray` 只支持切片、会抛 `TypeError`。设备后端要
+  去掉长度 1 的前导维时按形状推导后 `reshape`；`attention` 的 `(1,1,S,T)`
+  mask 已改为这条路，调用方不再需要自己 squeeze。
 - **HIP 上同进程第二个设备态会话会坏**（5.282）：24 层 / `d_model=1024` 时，先后
   建两个 `LMRunner`（即使换后端实例）会给出 NaN logits 或"捕获期 arena 不够
   4 MB"；纯 `generate`（不涉及束搜索）同样复现，一个进程一个配置就正常。基准
