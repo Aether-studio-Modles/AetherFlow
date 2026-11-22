@@ -2585,6 +2585,19 @@ class TestCudaReductions(CudaTestCase):
         g.output(g.reduce_sum(x, axis=-1, keepdims=False), "y")
         self.assert_backends_equal(g, {"x": self.rand(4, 7)})
 
+    def test_reduce_sum_narrow_last_dim(self):
+        """窄末维（8/16/32）走"一个 block 打包多行"的新内核（5.297）。
+
+        行数故意选 1000：``cols=8`` 时 ny=32，grid=32 块，最后一块有越界行，
+        用来确认折叠分支不会写坏结果。``cols=33`` 越过阈值，仍走旧内核。
+        """
+        for cols in (1, 2, 8, 16, 32, 33):
+            with self.subTest(cols=cols):
+                g = Graph()
+                x = g.input("x", f32[1000, cols])
+                g.output(g.reduce_sum(x, axis=-1, keepdims=False), "y")
+                self.assert_backends_equal(g, {"x": self.rand(1000, cols)})
+
     def test_reduce_max_keepdims(self):
         g = Graph()
         x = g.input("x", f32[4, 7])

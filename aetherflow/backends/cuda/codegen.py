@@ -53,6 +53,7 @@ from ...lower.kernels import (
     reduce_max_last,
     reduce_mean_last,
     reduce_sum_last,
+    reduce_sum_rows,
     reduce_axis,
     reduce_axis_tiled,
     rmsnorm_last,
@@ -106,6 +107,27 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
         __syncthreads();
     }
     float r = smem[0];
+    __syncthreads();
+    return r;
+}
+
+// Reduce over threadIdx.x for each fixed threadIdx.y: the mirror image of
+// block_reduce_*_y. Used when the reduced dimension is narrow (d_state,
+// n_scales, head_dim ...) so one warp-sized block per row wastes the machine:
+// the block's y dimension packs many rows instead, and each row keeps the
+// exact halving tree block_reduce_sum uses (bit-identical results).
+__device__ __forceinline__ float block_reduce_sum_x(float v, float* smem) {
+    const int nx = blockDim.x;
+    const int base = threadIdx.y * nx;
+    smem[base + threadIdx.x] = v;
+    __syncthreads();
+    for (int s = nx >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            smem[base + threadIdx.x] += smem[base + threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    float r = smem[base];
     __syncthreads();
     return r;
 }
@@ -1953,6 +1975,15 @@ def binary_source(kind: str, scalar_a: bool = False, scalar_b: bool = False) -> 
 def reduce_sum_source() -> Kernel:
     """末维求和的 L2 描述（生产路径，5.42）。"""
     return reduce_sum_last()
+
+
+def reduce_sum_rows_source() -> Kernel:
+    """窄末维求和的 L2 描述：一个 block 打包多行（每行一个 warp 宽）。
+
+    只在 ``cols <= 32`` 时启用（见 ``device_reduce._reduce_last_dim``）：
+    这种形状下行数往往上百万，"一 block 一行"的调度开销远大于算术。
+    """
+    return reduce_sum_rows()
 
 
 def reduce_max_source() -> Kernel:

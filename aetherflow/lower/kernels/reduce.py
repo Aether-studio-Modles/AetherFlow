@@ -87,6 +87,81 @@ def reduce_sum_last() -> Kernel:
     return _reduce_last("reduce_sum_last", "block_reduce_sum")
 
 
+def reduce_sum_rows() -> Kernel:
+    """沿末维求和：一个 block 打包多行，每行一个 warp 的宽度。
+
+    ``cols`` 很窄（``d_state`` / ``n_scales`` / ``head_dim`` 这类 8～32）时，
+    ``reduce_sum_last`` 的"一个 block 一行"会把 8/16 个线程配一个 block：
+    行数上百万时就等于上百万次 block 调度，实测 29μs/次，而算术只有几十
+    纳秒。这里把行打包进 block 的 y 维，``blockDim.x`` 仍等于
+    ``plan_reduce(cols)``、每行的折半树与 ``block_reduce_sum`` 逐字相同，
+    所以结果与旧内核**逐位一致**，差别只在网格形状（block 数少
+    ``blockDim.y`` 倍）。
+
+    越界的行（最后一块）折叠到最后一行做一次无用的归约，不写回——这样
+    所有线程都参与 ``__syncthreads``，不会死锁。
+    """
+
+    def _row_ok() -> Expr:
+        return Bin("<", Var("row"), Var("rows"))
+
+    return Kernel(
+        name="reduce_sum_rows",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "rows"),
+            Scalar("long long", "cols"),
+        ),
+        body=(
+            Let(
+                "long long",
+                "row",
+                Bin(
+                    "+",
+                    Bin(
+                        "*",
+                        Cast("long long", Axis("bid")),
+                        Cast("long long", Axis("bdim", "y")),
+                    ),
+                    Cast("long long", Axis("tid", "y")),
+                ),
+            ),
+            Let(
+                "long long",
+                "r",
+                Cond(_row_ok(), Var("row"), Bin("-", Var("rows"), Num("1"))),
+            ),
+            Ptr("xr", "x", Bin("*", Var("r"), Var("cols"))),
+            Shared("float", "smem", REDUCE_SCRATCH),
+            Let("float", "s", Num("0.f")),
+            If(
+                _row_ok(),
+                (
+                    For(
+                        "i",
+                        Axis("tid"),
+                        Var("cols"),
+                        Axis("bdim"),
+                        (AugAssign(Var("s"), "+", Load("xr", Var("i"))),),
+                        type_name="long long",
+                    ),
+                ),
+            ),
+            Assign(Var("s"), Call("block_reduce_sum_x", (Var("s"), Var("smem")))),
+            If(
+                _row_ok(),
+                (
+                    If(
+                        Bin("==", Axis("tid"), Num("0")),
+                        (Store("out", Var("row"), Var("s")),),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
 def reduce_max_last() -> Kernel:
     """沿最后一维求最大值。"""
     return _reduce_last("reduce_max_last", "block_reduce_max", init="-3.4e38f", combine="max")

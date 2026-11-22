@@ -56,6 +56,27 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
     return r;
 }
 
+// Reduce over threadIdx.x for each fixed threadIdx.y: the mirror image of
+// block_reduce_*_y. Used when the reduced dimension is narrow (d_state,
+// n_scales, head_dim ...) so one warp-sized block per row wastes the machine:
+// the block's y dimension packs many rows instead, and each row keeps the
+// exact halving tree block_reduce_sum uses (bit-identical results).
+__device__ __forceinline__ float block_reduce_sum_x(float v, float* smem) {
+    const int nx = blockDim.x;
+    const int base = threadIdx.y * nx;
+    smem[base + threadIdx.x] = v;
+    __syncthreads();
+    for (int s = nx >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            smem[base + threadIdx.x] += smem[base + threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    float r = smem[base];
+    __syncthreads();
+    return r;
+}
+
 // Reduce over threadIdx.y for each fixed threadIdx.x: the strided
 // (outer, reduce, inner) reductions split the reduce axis across threadIdx.y.
 __device__ __forceinline__ float block_reduce_sum_y(float v, float* smem) {

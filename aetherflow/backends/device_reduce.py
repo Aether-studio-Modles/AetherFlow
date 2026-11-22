@@ -165,6 +165,24 @@ class _ReduceMixin:
         if x.size == 0:
             return out.reshape(target)
         dtype_key = self._kind(x)
+        if op == "reduce_sum" and cols <= 32:
+            # 窄末维（d_state / n_scales / head_dim 与长度 1 的轴）：行数常在
+            # 十万到百万级，"一 block 一行"等于把 1～32 个线程配一个 block，
+            # 实测 29μs/次里几乎全是 block 调度（5.297）。改成 block 的 y 维
+            # 打包多行：blockDim.x 仍是 plan_reduce 给出的折半树宽度，结果
+            # 与旧内核逐位一致，只是 block 数少 blockDim.y 倍。
+            nx = self._reduce_block(op, cols)
+            ny = max(1, min(256 // max(nx, 1), 32))
+            kernel = self._kernel(
+                (op, dtype_key, "rows"),
+                lambda: self.codegen.render(
+                    self.codegen.reduce_sum_rows_source(), x.dtype
+                ),
+                "reduce_sum_rows",
+            )
+            grid = ((rows + ny - 1) // ny,)
+            kernel(grid, (nx, ny), (x, out, np.int64(rows), np.int64(cols)))
+            return out.reshape(target)
         kernel = self._kernel(
             (op, dtype_key), lambda: self.codegen.render(source_fn(), x.dtype), func
         )
