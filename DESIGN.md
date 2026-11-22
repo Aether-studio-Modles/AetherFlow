@@ -18820,21 +18820,49 @@ test_conv_impl_pick / test_cusparse / test_kernel_registry / test_events`
 由 tile 选择解释。改动已**全部回退**（`cublas.py` 无新增、`device_linear.py`
 恢复三条 dtype 分支），不保留无用路径。
 
-**局限与更正**：上表 7 个形状取自 5.297 的窄末维归约清单与典型训练形状，**不是
-大档模型（4.215M 参数 / batch=2 / seq=8）的真实 matmul 清单**。真实清单尚未
-抓取（5.297 的测速脚本按规则已清理）。因此严格表述是：**在测过的形状上**
-tile 无收益，且 sgemm 与 torch 同形状同速；`M=16` 这类真实训练形状需单独抓
-分布后才能定论。
+**真实形状清单（A800，钩子 + `torch.profiler`，同一模型各跑一步）**：
+
+上一版 A/B 的 7 个形状确实不是模型真实清单，本轮补抓。AF 侧挂 `Cublas` 钩子，
+torch 侧用 `profiler(record_shapes=True)`，模型取 `embed=256 / layers=8 / seq=8 /
+batch=2 / vocab=24`（4.281M 参数，AF 前向 998 节点）：
+
+- AF 一步 **196 次** GEMM，**全部走 `sgemm_batched`**，且前导维是 `(batch=2,
+  seq=8)` 而不是合并后的 `16`。次数前四：`(2,8,256)x(256,256)`×72、
+  `(2,8,256)x(256,512)`×32、`(2,256,8)x(2,8,256)`×24、`(2,8,256)x(256,288)`×16。
+- torch 的 `aten::linear([2,8,256], [512,256])` 会先展平成 **`aten::mm([16,256],
+  [256,512])`**，落到 `ampere_sgemm_32x32_sliced1x4_tn`（M=16 的小 tile）、
+  `gemmSN_TN_kernel`（small-N）、`magma_sgemmEx_kernel` 与少量 `128x128_nt`。
+  即 5.297「torch 用小 tile」的说法**在真实形状上成立**，只是不发生在
+  大 M 窄 K 形状上。
+
+**真实形状 A/B**（同进程交错，`N=200`、`ROUNDS=7`，μs/次）：
+
+| 情形 | AF `sgemm`（合并 M=16） | AF `sgemm_batched`（b=2,m=8） | `torch.mm` | 合并/torch | batched/torch |
+|---|---|---|---|---|---|
+| lin 256→512 | 14.13 | 9.92 | 12.50 | 1.13 | **0.79** |
+| lin 256→256 | 13.84 | 9.92 | 12.34 | 1.12 | **0.80** |
+| lin 256→288 | 13.88 | 10.02 | 12.34 | 1.12 | **0.81** |
+| lm_head 256→24 | 21.33 | 10.01 | 21.33 | 1.00 | **0.47** |
+| wgrad 256x16@16x256 | 9.70 | 10.07 | 8.29 | 1.17 | 1.22 |
+| x 16x512@512x256 | 13.61 | 9.86 | 11.22 | 1.21 | **0.88** |
+| bmm 2x16x16@2x16x16 | — | 10.09 | 8.44 | — | 1.20 |
+| bmm 2x16x16@2x16x256 | — | 10.07 | 8.26 | — | 1.22 |
+| bmm 64x1x64@64x64x8 | — | 10.15 | 8.33 | — | 1.22 |
+
+**结论比上一版更强**：AF 现在走的 batched 路径在五个主形状上**比 torch 快
+12%~53%**，只有反向里的两个小形状（K=16 的权重梯度、batch 内 16x16）慢约
+1.2×。按 196 次 × ~10 μs ≈ **1.96 ms/步**，与 torch 一步约 235 个 GEMM kernel
+的 2 ms 量级持平。所以 GEMM 既不需要 Lt，也不需要形状驱动选 tile——**5.297 的
+「GEMM 5.73 ms/步」与本轮实测的 1.96 ms 也对不上，那 57.3 μs/次的均值同样不可
+信**（可能是把单次元素级/布局开销串进了统计，需在布局那一步重测口径）。
 
 **下一步（按证据顺序）**：
 
-1. 在 AF 的 `Cublas` 上挂钩子，记录大档模型一步内 **100 次** matmul 的
-   `(m, n, k, dtype)` 与逐次耗时，同时用 `torch.mm` 包装器抓 torch 版的形状
-   清单——先确认"次数/形状是否可比"，再谈单次速度。若 AF 的 100 次里有 torch
-   不做的重复 GEMM，那才是 2.6× 的来源。
-2. 之后仍是 5.297 排好的布局物化（`transpose` 397 次 `ascontiguousarray`）与
-   elementwise 链（`ew_bcast` 222 次/步、`cupy_copy` 782 次/步、`concat_copy`
-   484 次/步）。
+1. 布局物化：`transpose` 397 次 `ascontiguousarray`。
+2. elementwise 链：`ew_bcast` 222 次/步、`cupy_copy` 782 次/步、`concat_copy`
+   484 次/步。
+3. GEMM 只剩两处 1.2×：K=16 的权重梯度形状与 batch 内 16x16 小 bmm，合计约
+   0.2~0.3 ms/步，优先级低于前两项。
 
 **回归**：本轮无代码改动（回退到 HEAD），无需新增用例。远端 `/root/AetherFlow`
 的 `cublas.py` / `device_linear.py` 已同步回主线，`git diff` 为空。

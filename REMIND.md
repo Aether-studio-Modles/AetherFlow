@@ -341,13 +341,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   同算时报 `CScalar` 类型错。修法分别是 `GradientAccumulator.add` 按梯度设备迁移、
   `Optimizer.rebind` 让槽位跟随参数；不要用隐式主机往返"修好"它。回归：
   `test_device_state_resume_restores_pending_accumulation`。
-- **别假设 torch 用 sliced 小 tile**（5.298）：本机 torch 2.5.1 的 `torch.mm`
-  落到的仍是 `MATMUL_TILE_128x64`，行主序交换框架与 AF 逐字相同。逐形状实测
-  `cublasSgemm_v2` / `cublasLt` / `torch.mm` 三者同速（≤2%），32 MB workspace
-  也不改变。窄 K「大 M」形状（如 `(131072,8)x(8,768)`）是写带宽受限，271 μs
-  对应 1.50 TB/s，已到 A800 HBM 饱和区——这类形状换 tile 不可能有收益。
-  **正确顺序**：先抓两边的 `(m,n,k)` 形状清单与次数，确认可比，再谈单次速度；
-  只看混形状求出的均值（5.297 的 57.3 μs/次）会得出错误的归因。
+- **别用臆造形状判断 GEMM 差距**（5.298）：先抓真实清单再下结论。大档 HelixLM
+  （4.28M 参数 / batch=2 / seq=8）一步是 **196 次 batched GEMM，前导维 (2,8)，
+  不是合并后的 16**；torch 侧 `aten::linear` 展平成 `mm([16,256],…)`，用的是
+  `ampere_sgemm_32x32_sliced1x4_tn` / `gemmSN_*` 小 tile。真实形状 A/B：
+  AF 的 batched 在五个主形状上比 torch 快 12%~53%（`lm_head` 快 2.1×），只有
+  K=16 的权重梯度与 batch 内 16x16 小 bmm 慢 1.2×。反过来把 `(2,8)` 合并成
+  `16` 反而慢 12%~21%——**不要为了对齐 torch 去合并前导维**。
+  另一方面，大 M 窄 K 形状（如 `(131072,8)x(8,768)`）是写带宽受限（271 μs
+  ≈ 1.50 TB/s，A800 HBM 饱和），那里 sgemm / cublasLt / torch.mm 三者同速，
+  换 tile 不可能有收益。5.297 的「57.3 μs/次」均值把不同形状混在一起，不可
+  用于归因。
 
 ---
 
