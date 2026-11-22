@@ -8,6 +8,9 @@
 更新、dataloader 切批），把它塞进后端测试会让"后端契约"和"训练契约"混在一起。
 """
 
+import os
+import shutil
+import tempfile
 import unittest
 
 import numpy as np
@@ -239,3 +242,52 @@ class TestTrainOnCuda(unittest.TestCase):
         self.assertEqual(len(trainer._seg_fwd), len(trainer._plan.segments))
         self.assertEqual(len(trainer._seg_bwd), len(trainer._plan.segments))
         self.assertIsNot(trainer._dev_acts, trainer._dev_cots)
+
+    def test_device_state_resume_restores_pending_accumulation(self):
+        """设备态续训：存档里带未提交的累积窗口。
+
+        ``load_training_state`` 在显存建立之前把累加和恢复成主机数组；续训后
+        第一个微批的梯度是 cupy 数组，必须先把累加和搬到显存——不能对设备
+        数组做隐式主机转换，否则第一个微批就会抛 TypeError。
+        """
+        x, t = _linear_data(n=8)
+        data = {"x": x, "t": t}
+        g = _linear()
+
+        def new_trainer():
+            store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=5)
+            trainer = Trainer(
+                g,
+                store,
+                Adam(store.arrays(), lr=0.02),
+                backend=CudaBackend(graph_mode="off"),
+                device_state=True,
+                accumulate_steps=2,
+            )
+            return trainer, store
+
+        ref, ref_store = new_trainer()
+        ref_losses = [ref.step(data) for _ in range(4)]
+        ref.sync_to_host()
+
+        cut, _ = new_trainer()
+        for _ in range(3):  # 窗口里剩一个未提交的微批
+            cut.step(data)
+
+        workdir = tempfile.mkdtemp(prefix="af_dev_resume_")
+        path = os.path.join(workdir, "trainer.npz")
+        try:
+            cut.save_checkpoint(path)
+            resumed, store = new_trainer()
+            resumed.load_training_state(path)
+            tail = resumed.step(data)  # 补齐窗口并提交一次更新
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+        resumed.sync_to_host()
+        self.assertEqual(resumed.optimizer.step_count, ref.optimizer.step_count)
+        np.testing.assert_allclose(tail, ref_losses[3], rtol=1e-6, atol=1e-7)
+        for name in store.names:
+            np.testing.assert_allclose(
+                store[name], ref_store[name], rtol=1e-5, atol=1e-7
+            )

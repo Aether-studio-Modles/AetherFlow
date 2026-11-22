@@ -44,6 +44,10 @@ class Optimizer:
         设备态训练需要它：参数从主机数组换成显存数组之后，"优化器改的是哪
         一份数据"必须跟着换。名字集合不许变——动量与一阶/二阶矩都按名字
         索引，悄悄少一个名字会让续训的轨迹与预期不同。
+
+        **槽位也跟着参数走**：``load_training_state`` 把动量恢复成主机数组，
+        而设备态的参数表在 rebind 之后已经是显存数组；不迁过去，第一步就会
+        在 cupy 的 ufunc 里撞上 numpy 操作数。
         """
         if set(params) != set(self.params):
             raise KeyError(
@@ -58,6 +62,11 @@ class Optimizer:
                     f"变成 {tuple(arr.shape)}；换表不能改形状"
                 )
         self.params = params
+        for slot in self._slots().values():
+            for name, arr in list(slot.items()):
+                xp = array_module(params[name])
+                if array_module(arr) is not xp:
+                    slot[name] = xp.asarray(arr)
 
     # -- 子类实现 -----------------------------------------------------
 

@@ -172,6 +172,16 @@ class GradientAccumulator:
                 raise KeyError(
                     f"这个窗口里的梯度集合与第一个微批不一致：缺 {missing}，多 {extra}"
                 )
+            # 设备态续训：``load_training_state`` 恢复的累加和是主机副本（加载
+            # 时显存还没建好），而续训后第一个微批的梯度在显存。按梯度所在设备
+            # 迁移一次——设备数组不能隐式回到主机，否则这里会直接报类型错误。
+            xp_sum = array_module(next(iter(self._sum.values())))
+            xp_grad = array_module(next(iter(grads.values())))
+            if xp_sum is not xp_grad:
+                self._sum = {
+                    name: xp_grad.asarray(value, dtype=self.dtype)
+                    for name, value in self._sum.items()
+                }
             for name, grad in grads.items():
                 xp = array_module(self._sum[name])
                 arr = grad if isinstance(grad, xp.ndarray) else xp.asarray(grad)
