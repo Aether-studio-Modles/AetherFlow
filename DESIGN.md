@@ -18712,3 +18712,69 @@ test_conv_impl_pick / test_cusparse / test_kernel_registry / test_events`
 `test_device_state_defaults_on_for_device_backend`，覆盖默认开、参考后端留主机
 态、`sync_to_host` 前后主机值三点。
 
+### 5.297　窄末维归约：一个 block 打包多行，大档单步 28.6 → 23.5 ms
+
+**动机**：5.296 把训练一步的损失压到设备态之后，大档剩下的差距只能在 kernel
+里找。这一轮先做核时间线的单算子对比，再只修被数据点名的那个算子。
+
+**归因（A800-40GB 独占，跑前跑后 GPU 10 MiB / 0%）**：
+
+1. 图节点普查（本地，纯 CPU 构图）：大档前向 630 节点、反向 2464 节点。布局
+   类算子占 57%——`reshape` 649 次、`slice` 508 次、`transpose` 397 次、`pad`
+   196 次；`reshape` 是零拷贝视图不发射 kernel，`transpose` 每次都
+   `ascontiguousarray` 真实物化。matmul 前向 25 次、反向 75 次。
+2. 归约普查（本地）：前向 12 个末维归约里 8 个 `cols<=32`；反向 196 个归约
+   **全部** `cols<=32`，主要是 `(8192,8)`、`(1024,8)`、`(131072,16)`、
+   `(65536,8)`、`(4096,16)`、`(73728,8)`、`(1048576,8)`、`(65536,32)`。
+3. AF 设备态 kernel 表（10 步合计）：`reduce_sum_last` 58.4 ms / 1990 次
+   （29.3 μs/次，5.84 ms/步）排第一；`ampere_sgemm_128x128_nn` 57.3 ms /
+   1000 次（57.3 μs/次，5.73 ms/步）；`ew_bcast` 31.7 ms / 2220 次、
+   `cupy_copy` 28.6 ms / 7820 次、`concat_copy` 15.7 ms / 4840 次、
+   `ew_bin` 11.6 ms / 3980 次。
+4. torch 同类对照（10 步合计）：GEMM 用小 tile 拼（`32x32_sliced1x4` 约
+   19 μs/次、`64x32_sliced1x4` 约 19 μs/次），GEMM 类合计约 2.2 ms/步；
+   `reduce_kernel` 24 次/步约 0.33 ms/步；elementwise 三类合计约 2.6 ms/步。
+5. eager 前端（非设备态）每步 49 个输入（含全部参数）重新 H2D：CUPTI 里
+   `Memcpy HtoD (Pinned→Device)` 490 次 / 9.2 ms、`cudaPointerGetAttributes`
+   490 次、`cudaEventQuery` 1166 次。这解释了 eager wall≈21 ms 而纯 kernel
+   只有约 6.9 ms——设备态已经把这段消掉，本轮的差距与它无关。
+
+结论：归约的次数与语义冗余是最大单项。`_reduce_last_dim` 在 `cols<=32` 时仍
+按"一个 block 一行"发射，`plan_reduce(cols)` 返回 1..32 个线程，于是百万行
+就是百万次 block 调度，而每次只做 8~32 个 float 的加法。
+
+**改动**：
+
+- 新增 L2 内核 `reduce_sum_rows`（`lower/kernels/reduce.py`）：`blockDim.x`
+  仍是 `plan_reduce(cols)` 个线程沿 cols 求和，`blockDim.y` 打包多行
+  （`ny = min(256 // nx, 32)`），grid 按 `ny` 行一组发射。越界行把行号折叠到
+  最后一行参与 `__syncthreads`，但只在 `row < rows` 时写回——不能为了"省一次
+  `if`"让部分线程提前退出，那会让块内屏障死锁。
+- prelude 增加 `block_reduce_sum_x`（`backends/cuda/codegen.py`）：按
+  `threadIdx.y` 切片 smem，每行仍是 `block_reduce_sum` 的折半树，因此结果与
+  旧内核**逐位一致**，不是"近似相同"。示例方言 `examples/hardware/novac`
+  照抄同一份 prelude（该测试要求两份逐字一致）。
+- `device_reduce.py` 在 `reduce_sum` 且 `cols<=32` 时分流到新内核；`cols>32`
+  与其它归约仍走原路径。
+- 新增 `test_reduce_sum_narrow_last_dim`：`(1000, cols)`，cols 取
+  1/2/8/16/32/33，同时覆盖新路径与回落边界。
+
+**判据（A800，同一进程内 A/B）**：
+
+- 禁用分流（临时把阈值改为 `cols <= 0`）：设备态单步 **28.649 ms**，
+  `reduce_sum_last` 58.4 ms/10 步；torch 28.826 ms，约 1.01×。
+- 启用分流：设备态单步 **23.475 / 23.473 ms**（两次重复），torch 28.921 /
+  30.251 ms，**1.22~1.28×**。kernel 侧 `reduce_sum_rows` 9.63 ms/10 步
+  （137 次/步，7.03 μs）+ `reduce_sum_last` 3.35 ms/10 步（62 次/步，
+  5.40 μs），合计 1.30 ms/步，比 5.84 ms/步省 4.54 ms，与 wall 的 5.18 ms
+  差在同一量级。
+- 正确性：A800 `tests.test_cuda_backend.TestCudaReductions` 18 项通过；
+  主机 `pytest tests --ignore=tests/test_frontend.py` **2381 通过、449 跳过、
+  277 subtests 通过**（该机 torch 2.4.1 不在兼容矩阵，frontend 与本次无关）。
+
+**剩余差距**：GEMM 仍是 AF 的 5.73 ms/步对 torch 约 2.2 ms/步——AF 固定用
+128x128 tile，遇到 `(131072,8)x(8,768)` 这类窄 K 形状时每个 tile 只做很少的
+乘加；下一项应做 GEMM 的形状驱动选 tile。之后是布局物化（`transpose` 397 次
+`ascontiguousarray`）与 elementwise 链（`ew_bcast` 222 次/步、`cupy_copy`
+782 次/步、`concat_copy` 484 次/步），再往后才是多进程 DP/ZeRO-2。
+
