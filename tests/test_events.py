@@ -188,6 +188,19 @@ class TestEventsOnDevice(unittest.TestCase):
             self.cp.asnumpy(s),
         )
 
+    def test_roundtrip_with_empty_steps_on_device(self):
+        sparse = np.zeros((7, 2, 3), dtype=np.float32)
+        sparse[1, 0, 2] = 1
+        sparse[1, 1, 0] = 1
+        sparse[4, 1, 2] = 1
+        for source in (sparse, np.zeros_like(sparse), sparse[:0]):
+            with self.subTest(shape=source.shape, nnz=int(source.sum())):
+                events = dense_to_events(self.cp.asarray(source), pool=EventPool())
+                output = events_to_dense(events, dtype=np.float16)
+                self.assertIsInstance(output, self.cp.ndarray)
+                self.assertEqual(output.dtype, np.dtype(np.float16))
+                np.testing.assert_array_equal(self.cp.asnumpy(output), source)
+
     def test_pool_reuses_device_buffer(self):
         pool = EventPool()
         s = _pulses(self.rng, (4, 8), density=0.4)

@@ -15,7 +15,7 @@
 事，当前没有实现——缺口写在 DESIGN 5.35。
 
 **多后端。** 这里不 import cupy：数组属于哪个库由类型模块名判断，numpy 与
-cupy 的公共 API（``reshape`` / ``nonzero`` / ``repeat`` / ``bincount``）足够
+cupy 的公共 API（``reshape`` / ``nonzero`` / ``searchsorted`` / ``bincount``）足够
 写出同一份实现，因此同一套代码既能在主机侧做数据预处理，也能直接跑在显存上。
 """
 
@@ -151,8 +151,14 @@ def events_to_dense(events: SpikeEvents, dtype=np.float32):
     """
     xp = _array_module(events.indices)
     dense = xp.zeros((events.steps, events.size), dtype=dtype)
-    if events.nnz:
-        rows = xp.repeat(xp.arange(events.steps), events.counts)
+    if events.indices.size:
+        if xp is np:
+            rows = np.repeat(np.arange(events.steps), events.counts)
+        else:
+            # CuPy repeat does not accept device repeats. Right insertion also
+            # skips repeated offsets from empty steps without a host readback.
+            positions = xp.arange(events.indices.size, dtype=events.offsets.dtype)
+            rows = xp.searchsorted(events.offsets, positions, side="right") - 1
         dense[rows, events.indices] = 1
     return dense.reshape((events.steps, *events.shape))
 

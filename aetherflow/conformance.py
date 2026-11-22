@@ -51,7 +51,7 @@ from .backends.reference_backend import ReferenceBackend
 from .ir.graph import Graph
 from .ir.ops import OPS
 from .ir.serialize import dumps, loads, to_dict
-from .ir.types import c64, f32, f64, i8, i32
+from .ir.types import c64, f16, f32, f64, i8, i32
 from .ir.verifier import verify_portable_only
 from .models.transformer import BlockSpec, build_transformer_block
 
@@ -323,6 +323,24 @@ def _attention(with_mask: bool = False, shape: tuple = (2, 2, 3, 2)):
             args.append(g.input("mask", f32[mask_shape]))
             feed["mask"] = np.zeros(mask_shape, dtype=np.float32)
         g.output(g.attention(*args, scale=1.0 / np.sqrt(shape[-1])), "y")
+        return g, feed
+
+    return build
+
+
+def _paged_decode(dtype, *, window=0):
+    def build(rng):
+        g = Graph("paged_decode")
+        feed = {
+            "q": rng.standard_normal((3, 4, 16)).astype(dtype.np_dtype),
+            "k_pages": rng.standard_normal((6, 4, 2, 16)).astype(dtype.np_dtype),
+            "v_pages": rng.standard_normal((6, 4, 2, 16)).astype(dtype.np_dtype),
+            "block_table": np.array([[5, 0, 3], [4, -1, 2], [-1, -1, -1]], dtype=np.int32),
+            "lengths": np.array([10, 7, 0], dtype=np.int32),
+        }
+        inputs = [g.input(name, (i32 if x.dtype.kind == "i" else dtype)[x.shape])
+                  for name, x in feed.items()]
+        g.output(g.paged_decode(*inputs, window=window), "y")
         return g, feed
 
     return build
@@ -1381,6 +1399,10 @@ def default_cases() -> List[Case]:
               note="融合注意力：一个节点代替缩放+softmax+第二个 matmul，中间分数矩阵不进图"),
         _case("attention_masked", _attention(with_mask=True),
               note="加性 mask 走第 4 个输入；分块内核必须与物化实现逐位一致"),
+        _case("paged_decode_f32", _paged_decode(f32),
+              note="GQA, shuffled physical pages, a partial tail, and an empty row"),
+        _case("paged_decode_f16", _paged_decode(f16, window=5), atol=5e-4, rtol=2e-3,
+              note="f16 storage, sliding window, and invalid page masking"),
         _case("layernorm_last", _layernorm()),
         _case("layernorm_axis0", _layernorm(axes=(0,), norm=(5, 1)),
               note="非最后维归一化：先置换到 [keep..., norm...] 再走同一个内核"),

@@ -2047,6 +2047,89 @@ register(
 )
 
 
+def paged_decode_options(attrs: dict, dim: int, capacity: int) -> Tuple[int, int, float]:
+    """Normalize the shared reference/device options after checking tensor shapes."""
+    window, max_len = attrs.get("window", 0), attrs.get("max_len", capacity)
+    if type(window) is not int or window < 0:
+        raise ValueError("paged_decode window must be a nonnegative integer")
+    if type(max_len) is not int or not 0 <= max_len <= capacity:
+        raise ValueError(f"paged_decode max_len must be an integer in [0, {capacity}]")
+    scale = attrs.get("scale", dim ** -0.5)
+    if type(scale) not in (int, float):
+        raise TypeError("paged_decode scale must be a number")
+    bound = float(np.finfo(np.float32).max)
+    if not -bound <= scale <= bound:
+        raise ValueError("paged_decode scale must be within the finite float32 range")
+    return window, max_len, float(scale)
+
+
+def _infer_paged_decode(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) not in (5, 7):
+        raise ValueError("paged_decode expects q, k_pages, v_pages, block_table, lengths[, current_k, current_v]")
+    q, k, v, table, lengths = inputs[:5]
+    if (q.rank, k.rank, v.rank, table.rank, lengths.rank) != (3, 4, 4, 2, 1):
+        raise ValueError("paged_decode expects [B,H,D], [P,T,Hkv,D] twice, [B,N], [B]")
+    if any(not t.is_static or any(d <= 0 for d in t.shape) for t in inputs):
+        raise ValueError("paged_decode requires positive static dimensions")
+    if q.dtype not in (DType.F16, DType.F32) or q.dtype != k.dtype or q.dtype != v.dtype:
+        raise TypeError("paged_decode requires matching f16 or f32 query and pages")
+    if table.dtype != DType.I32 or lengths.dtype != DType.I32:
+        raise TypeError("paged_decode block_table and lengths must be i32")
+    batch, heads, dim = q.shape
+    if k.shape != v.shape or dim != k.shape[-1] or table.shape[0] != batch or lengths.shape != (batch,):
+        raise ValueError("paged_decode has incompatible tensor shapes")
+    if heads % k.shape[2]:
+        raise ValueError("paged_decode query heads must be divisible by KV heads")
+    if len(inputs) == 7 and any(t != TensorType(q.dtype, (batch, k.shape[2], dim))
+                                for t in inputs[5:]):
+        raise ValueError("paged_decode current K/V must match page dtype and have shape [B,Hkv,D]")
+    paged_decode_options(attrs, dim, table.shape[1] * k.shape[1])
+    return q
+
+
+def _ref_paged_decode(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    q, k, v, table, lengths = args[:5]
+    current = len(args) == 7
+    batch, heads, dim = q.shape
+    pool, page_size, kvheads, _ = k.shape
+    window, max_len, scale = paged_decode_options(attrs, dim, table.shape[1] * page_size)
+    out = np.zeros_like(q)
+    for row in range(batch):
+        end = min(max(int(lengths[row]), 0), max_len)
+        start = max(0, end + current - window) if window else 0
+        positions = np.arange(start, end, dtype=np.intp)
+        pages = table[row, positions // page_size]
+        valid = (pages >= 0) & (pages < pool)
+        if not current and not valid.any():
+            continue
+        page, slot = pages[valid], positions[valid] % page_size
+        keys, values = k[page, slot], v[page, slot]
+        if current:
+            keys = np.concatenate((keys, args[5][row:row + 1]))
+            values = np.concatenate((values, args[6][row:row + 1]))
+        keys, values = keys.astype(np.float64), values.astype(np.float64)
+        grouped_q = q[row].reshape(kvheads, heads // kvheads, dim).astype(np.float64)
+        scores = np.einsum("hgd,thd->hgt", grouped_q, keys) * scale
+        weight = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        weight /= weight.sum(axis=-1, keepdims=True)
+        out[row] = np.einsum("hgt,thd->hgd", weight, values).reshape(heads, dim)
+    return out
+
+
+register(
+    Op(
+        name="paged_decode",
+        infer=_infer_paged_decode,
+        reference=_ref_paged_decode,
+        attrs_schema=("scale", "window", "max_len"),
+        doc="Inference-only single-query grouped attention over physical KV pages. "
+        "Clamp lengths to [0, max_len], keep the last window logical tokens (0 means all), "
+        "then mask invalid page IDs. A fully masked or empty row returns zeros. "
+        "Optional current K/V logically follows the clamped history and counts toward the window.",
+    )
+)
+
+
 def _infer_layernorm(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (3, 4):
         raise ValueError(
