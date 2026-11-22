@@ -1,4 +1,4 @@
-﻿﻿# AetherFlow 设计与现状
+﻿# AetherFlow 设计与现状
 
 > 状态：M0（语义 IR + 参考执行 + 优化框架）、M1（torch.export 导入）、M2 第一版（CUDA 后端）、
 > M3（设备驻留 / 首条融合 / 运行期计划 / 内存规划）、M4（IR 版本化、后端一致性套件、
@@ -18556,4 +18556,52 @@ manifest 的 `name`，通常一致）不猜，只按目录名匹配。
 `.py` 后 `get_backend(name)` 的 `LookupError` 里同时含"摘要不符"与
 `install_hardware`。`tests.test_hardware_package` 与 `tests.test_backend_discovery`
 共 72 项通过，Ruff 通过。未触碰天数硬件，包侧与 `build.py` 无改动。
+
+---
+
+### 5.294　Module / Parameter：把"声明参数 + 构图一次"变成可迁移的一等入口
+
+**动机**：5.25 的 eager 前端解决了"怎么写算子"，模型侧却仍然每写一个都要手工做
+四件事：`g.input` 声明每个参数、维护参数名表、拼 `feed`、自己存 `state_dict`。
+已有构图函数（如 HelixLM 的 `build_helix_lm`）更尴尬：继续直接喂
+`dict[str, ndarray]` 拿不到参数视图，改写成 eager 写法又等于重写模型。
+
+**做法**（`frontend/module.py`，两个类，不引入第二套执行机制）：
+
+- `Parameter(Tensor)`：构图期的 `Value` + 执行期的主机数组。`data` 的 setter 只做
+  原地写入，不换数组对象——`ParameterStore` 与优化器持有的是同一个引用。
+- `Module`：`param()` 声明图输入与数组（名字用点号前缀 `l0.attn.wq`，初始化种子
+  混入完整名，同形状不同层不会拿到同一份初值）；第一次 `__call__` 执行 `forward`
+  构图并把返回值登记为图输出，之后只能 `run()` 重放，第二次调用直接报错。
+- `adopt(name, value, data)`：接管图上**已经存在**的输入。迁移路径的关键——让
+  `build_helix_lm` 照旧自己 `g.input(...)`，构图完成后再把输入包成 `Parameter`。
+- 参数视图四个：`arrays()`（引用，交给优化器）、`state_dict()`（深拷贝）、
+  `load_state_dict()`、`feed()`（外部输入 + 当前参数，同名冲突直接报错）。
+- `Tensor.__getattr__` 把算子表映射成方法：`x.relu()`、`x.reshape(shape=(3, 2))`，
+  签名与 `Graph` DSL 逐字一致（`g.op(*inputs, **attrs)`），不另造 PyTorch 风格的
+  位置参数版本；实测 IR 文本与手写 `add_node` 完全相同。
+
+**两个必须做对的细节**（都属"单测看不出、训练时静默错"）：
+
+1. `param()` 从 `graph.input()` 拿到的是 `Tensor`，登记 `Parameter` 时必须同时替换
+   前端记录（`_replace_tensor`）。漏了它，`backward()` 的缺省求导目标仍是旧
+   `Tensor`，梯度能算出来但不会写回参数，表现为"训练一步不动"。
+2. `adopt()` 必须**拷贝**外部数组。调用方通常把 torch 的 `state_dict()` 直接
+   `.numpy()` 传进来，那是共享内存的视图；不拷贝等于两个框架写同一份权重，双方
+   优化器各走一步、参数只前进一次。首次对拍的征兆是第 1 步参数差 2×lr 且方向相反。
+
+**判据要分层**：与 torch 对拍 HelixLM（逐层独立 26 个参数 / 共享权重 15 个）时，
+前向 2.9e-8、反向 2.8e-9、resume 逐位 0；但 **100 步 Adam 的逐参数偏差会到 3.9e-4**
+——Adam 的更新近似 `sign(grad)`，两侧 1 ulp 的差足以让个别参数的更新方向翻转 ±lr，
+再被自适应步长放大。所以短程（20 步）逐参数卡 2e-5，全程（100 步）只看端到端 MSE
+的相对偏差（实测 1.6e-4，门限 1e-3）。拿 100 步的逐参数偏差当硬门禁，只会在实现
+正确时随 BLAS 版本随机变红。
+
+**验证**：`tests/test_eager_module.py` 17 项（声明、重名、静态形状、构图一次、
+adopt 的同图 / 异图 / 未知 / 形状 / 拷贝、state_dict 往返、feed 冲突），
+`tests/test_eager_frontend.py` 新增 3 项算子方法用例，两者共 42 项通过，Ruff 通过。
+Nucleus 侧 `HelixAFModule` 与 `verify_af_helix_module.py` 按上述判据两档全过。
+
+**明确没做**：没有嵌套子模块（参数名用点号扁平表达，P1 再补）；没有参数共享
+（`shared_layers` 由构图函数自己决定）；仍然只构图一次，不是 define-by-run。
 

@@ -315,6 +315,21 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   （5.282 顺带发现）：同配置 batch=1 正常，`d_model=1024` 的 batch=2 正常。
   **本轮同机复测未复现**：`chunk=2/4/8/32` × `plain/device` 全部与参考后端一致；
   保留这条是为了提醒"形状相关的内核问题"曾经存在，而不是断言现在仍有。
+- **`Module.param` 登记 `Parameter` 必须替换前端记录**（5.294）：`graph.input()`
+  返回的是 `Tensor`，只把 `.value` 交给 `Parameter` 而不调 `_replace_tensor`，
+  `backward()` 的缺省求导目标仍是旧 `Tensor`——梯度能算出来，但不会写回参数，
+  现象是"训练一步不动"，且前向数值完全正常。新增参数类入口时照此检查。
+- **`Module.adopt` 必须拷贝外部数组**（5.294）：torch 的 `state_dict()` 直接
+  `.numpy()` 得到的是共享内存视图。不拷贝就是两个框架写同一份权重，双方优化器
+  各走一步、参数只前进一次；对拍征兆是第 1 步参数差 2×lr 且方向相反。
+  回归用例：`test_adopt_copies_data`。
+- **长程 Adam 对拍只卡 loss**（5.294）：Adam 更新近似 `sign(grad)`，两侧 1 ulp
+  的浮点差能翻转单个参数的更新方向（±lr），100 步后逐参数差到 1e-4 量级属正常。
+  判据分层：前 20 步逐参数 < 2e-5，全程 100 步看 MSE 相对偏差 < 1e-3；拿 100 步
+  逐参数差当硬门禁，会在实现正确时随 BLAS 版本随机变红。
+- **`Tensor` 的算子方法是算子表的转发**（5.294）：`__getattr__` 只接受 `OPS`
+  里的名字，签名与 `Graph` DSL 一致（`x.reshape(shape=...)` 而不是
+  `x.reshape(3, 2)`）；不改 `Graph` 的调用约定，也不为 PyTorch 风格另开一套。
 
 ---
 
