@@ -341,6 +341,13 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   同算时报 `CScalar` 类型错。修法分别是 `GradientAccumulator.add` 按梯度设备迁移、
   `Optimizer.rebind` 让槽位跟随参数；不要用隐式主机往返"修好"它。回归：
   `test_device_state_resume_restores_pending_accumulation`。
+- **别假设 torch 用 sliced 小 tile**（5.298）：本机 torch 2.5.1 的 `torch.mm`
+  落到的仍是 `MATMUL_TILE_128x64`，行主序交换框架与 AF 逐字相同。逐形状实测
+  `cublasSgemm_v2` / `cublasLt` / `torch.mm` 三者同速（≤2%），32 MB workspace
+  也不改变。窄 K「大 M」形状（如 `(131072,8)x(8,768)`）是写带宽受限，271 μs
+  对应 1.50 TB/s，已到 A800 HBM 饱和区——这类形状换 tile 不可能有收益。
+  **正确顺序**：先抓两边的 `(m,n,k)` 形状清单与次数，确认可比，再谈单次速度；
+  只看混形状求出的均值（5.297 的 57.3 μs/次）会得出错误的归因。
 
 ---
 

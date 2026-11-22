@@ -18778,3 +18778,64 @@ test_conv_impl_pick / test_cusparse / test_kernel_registry / test_events`
 `ascontiguousarray`）与 elementwise 链（`ew_bcast` 222 次/步、`cupy_copy`
 782 次/步、`concat_copy` 484 次/步），再往后才是多进程 DP/ZeRO-2。
 
+### 5.298　GEMM 形状驱动选 tile：负结果，tile 不是那 2.6× 的来源
+
+**动机**：按 5.297 的结论做「形状驱动选 tile」。假设是 AF 固定用
+`ampere_sgemm_128x128_nn`，窄 K 形状上每 tile 只做很少乘加，而 cublasLt 的
+启发式能按 `(m, n, k)` 选到 sliced 小 tile，从而吃掉 5.73 → 2.2 ms/步 的差距。
+
+**归因（A800-40GB，跑前跑后各查一次 `nvidia-smi`，全程独占到 10 MiB / 0%）**：
+
+1. **先证伪旧前提**：`torch.mm((131072,8), (8,768))` 在 cublasLt 日志里的框架
+   与 AF 完全相同——`Adesc rows=768 cols=8 ld=768`、`Bdesc rows=8 cols=131072
+   ld=8`，全部 `CUBLAS_OP_N`；启发式只返回 1 个结果 `MATMUL_TILE_128x64`
+   （`maxWorkspaceSizeinBytes=8519680`、`minBytesAlignment=16`）。5.297 里
+   「torch 用小 tile 拼、约 19 μs/次」在本机 torch 2.5.1 上不成立。
+2. **实现 Lt 路径再测**（ctypes 绑定 `libcublasLt`，只开 f32；
+   `CUBLASLT_MATMUL_PREF_SEARCH_MODE` 不设、workspace 上限按预置量给）：
+   窄 K 四形状 `(131072,768,8)`、`(65536,4096,16)`、`(32,64,16)`、`(7,5,3)`
+   与 `sgemm` **maxdiff=0**；f16/bf16 原样回退旧路径；CUDA Graph 捕获期首次
+   调用（含描述符创建与启发式）即可成功，replay maxdiff=0。
+3. **逐形状 A/B**（同一进程内交错取样，`batch=20`、`rounds=7`、取最小 μs/次）：
+
+   | 形状 (m,k)x(k,n) | sgemm | Lt | torch | Lt/sgemm |
+   |---|---|---|---|---|
+   | (131072,8)x(8,768) | 271.87 | 272.69 | 272.44 | 1.00 |
+   | (131072,16)x(16,768) | 284.52 | 284.62 | 284.52 | 1.00 |
+   | (131072,8)x(8,8) | 16.54 | 16.95 | 16.59 | 0.98 |
+   | (131072,32)x(32,64) | 49.51 | 50.12 | 49.56 | 0.99 |
+   | (65536,16)x(16,4096) | 704.92 | 704.20 | 705.59 | 1.00 |
+   | (8192,1024)x(1024,4096) | 3623.27 | 3627.01 | 3623.99 | 1.00 |
+   | (1024,1024)x(1024,1024) | 130.05 | 132.04 | 130.25 | 0.98 |
+
+   三者同速（差距 ≤2%）。预置 32 MB workspace（足以容纳 split-K 所需）后复测，
+   七行仍全部 0.98~1.00。
+4. **带宽核算**：`(131072,768,8)` 的流量是输出 `131072×768×4 ≈ 402.7 MB` 加
+   输入约 4.2 MB，共约 407 MB；271 μs 对应 **1.50 TB/s**，已在 A800 的 HBM
+   实测带宽（峰值 2.0 TB/s）饱和区。这类"大 M、窄 N/K"的形状是纯写带宽受限，
+   任何 tile 都无法加速。
+
+**结论（负结果）**：`cublasLt` 在这些形状上与 `cublasSgemm_v2` 同速，且两者
+都与 torch 同速。5.297 记录的「GEMM 57.3 μs/次 vs torch 约 19~22 μs/次」不能
+由 tile 选择解释。改动已**全部回退**（`cublas.py` 无新增、`device_linear.py`
+恢复三条 dtype 分支），不保留无用路径。
+
+**局限与更正**：上表 7 个形状取自 5.297 的窄末维归约清单与典型训练形状，**不是
+大档模型（4.215M 参数 / batch=2 / seq=8）的真实 matmul 清单**。真实清单尚未
+抓取（5.297 的测速脚本按规则已清理）。因此严格表述是：**在测过的形状上**
+tile 无收益，且 sgemm 与 torch 同形状同速；`M=16` 这类真实训练形状需单独抓
+分布后才能定论。
+
+**下一步（按证据顺序）**：
+
+1. 在 AF 的 `Cublas` 上挂钩子，记录大档模型一步内 **100 次** matmul 的
+   `(m, n, k, dtype)` 与逐次耗时，同时用 `torch.mm` 包装器抓 torch 版的形状
+   清单——先确认"次数/形状是否可比"，再谈单次速度。若 AF 的 100 次里有 torch
+   不做的重复 GEMM，那才是 2.6× 的来源。
+2. 之后仍是 5.297 排好的布局物化（`transpose` 397 次 `ascontiguousarray`）与
+   elementwise 链（`ew_bcast` 222 次/步、`cupy_copy` 782 次/步、`concat_copy`
+   484 次/步）。
+
+**回归**：本轮无代码改动（回退到 HEAD），无需新增用例。远端 `/root/AetherFlow`
+的 `cublas.py` / `device_linear.py` 已同步回主线，`git diff` 为空。
+
