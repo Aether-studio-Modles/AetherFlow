@@ -5377,5 +5377,62 @@ class TestCudaTuning(unittest.TestCase):
         )
 
 
+class TestGpuClockElapsed(unittest.TestCase):
+    """``_CudaGpuClock.elapsed`` 要同时兼容两代 cupy 的事件计时接口。
+
+    cupy 13 移除了 ``cupy.cuda.Event.elapsed_time``，只剩
+    ``runtime.eventElapsedTime(start.ptr, stop.ptr)``。旧实现直接调前者，抛出的
+    ``AttributeError`` 会被调用方当成"没有计时"静默吞掉——整块逐节点 GPU
+    归因能力形同虚设，而且不会报错。这里用替身把两条分支都钉住，不需要 GPU。
+    """
+
+    class _OldEvent:
+        """旧版 cupy 的事件：自带 ``elapsed_time``。"""
+
+        def __init__(self, ptr):
+            self.ptr = ptr
+
+        def elapsed_time(self, stop):
+            return 1.5
+
+    class _NewEvent:
+        """cupy 13+ 的事件：只有 ``ptr``，计时走 runtime。"""
+
+        def __init__(self, ptr):
+            self.ptr = ptr
+
+    class _Backend:
+        def __init__(self, runtime):
+            self.cp = mock.MagicMock()
+            self.cp.cuda.runtime = runtime
+
+    def test_new_cupy_uses_runtime_event_elapsed_time(self):
+        from aetherflow.backends.cuda.backend import _CudaGpuClock
+
+        calls = []
+
+        class _Runtime:
+            @staticmethod
+            def eventElapsedTime(start, stop):
+                calls.append((start, stop))
+                return 2.25
+
+        clock = _CudaGpuClock(TestGpuClockElapsed._Backend(_Runtime))
+        start, stop = self._NewEvent(11), self._NewEvent(22)
+        self.assertEqual(clock.elapsed(start, stop), 2.25)
+        self.assertEqual(calls, [(11, 22)], "必须传 .ptr 而不是事件对象")
+
+    def test_old_cupy_prefers_event_method(self):
+        from aetherflow.backends.cuda.backend import _CudaGpuClock
+
+        class _Runtime:
+            @staticmethod
+            def eventElapsedTime(start, stop):  # 不该被走到
+                raise AssertionError("旧版 cupy 应优先用 elapsed_time")
+
+        clock = _CudaGpuClock(TestGpuClockElapsed._Backend(_Runtime))
+        self.assertEqual(clock.elapsed(self._OldEvent(1), self._OldEvent(2)), 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()

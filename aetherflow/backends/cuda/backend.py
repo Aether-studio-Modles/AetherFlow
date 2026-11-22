@@ -968,7 +968,13 @@ class _CudaGpuClock:
         self._cp.cuda.Device().synchronize()
 
     def elapsed(self, start, stop) -> float:
-        return float(start.elapsed_time(stop))
+        # cupy 13 起 ``Event.elapsed_time`` 被移除，只剩 runtime 的
+        # ``eventElapsedTime``；不兼容这一条会让逐节点 GPU 计时静默失效
+        # （调用方把异常当"没有计时"处理），整块归因能力都用不上。
+        method = getattr(start, "elapsed_time", None)
+        if method is not None:
+            return float(method(stop))
+        return float(self._cp.cuda.runtime.eventElapsedTime(start.ptr, stop.ptr))
 
     def release(self, start, stop) -> None:
         for event in (start, stop):
