@@ -19,10 +19,13 @@ from .compat import (
     parse_torch_version,
 )
 from .eager import EagerGraph, Tensor
+from .module import Module, Parameter
 from .torch_export import ImportedModel, UnsupportedOperatorError, import_exported
 
 __all__ = [
     "EagerGraph",
+    "Module",
+    "Parameter",
     "Tensor",
     "ImportedModel",
     "UnsupportedOperatorError",

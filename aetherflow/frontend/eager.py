@@ -20,6 +20,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from ..ir.graph import Graph, Value
+from ..ir.ops import OPS
 from ..ir.types import DType, TensorType
 
 
@@ -141,6 +142,24 @@ class Tensor:
 
     def __neg__(self):
         return self._graph.add_node("neg", [self._value])
+
+    def __getattr__(self, name: str):
+        """算子方法：``x.relu()`` 等价于 ``g.add_node("relu", [x])``。
+
+        签名与 ``Graph`` 的构图语法糖完全一致：位置参数是算子输入，关键字
+        参数是属性（``x.reshape(shape=(...))``、``x.transpose(perm=(0, 2, 1))``）。
+        不另造一套 PyTorch 风格签名，避免同一个算子出现两种参数约定。
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in OPS:
+            raise AttributeError(f"Tensor 没有属性 {name!r}，也不是已知算子")
+        op_name = name
+
+        def call(*args, **attrs):
+            return self._graph.add_node(op_name, (self, *args), attrs or None)
+
+        return call
 
     # -- 明确的拒绝 ---------------------------------------------------
 
@@ -295,6 +314,22 @@ class EagerGraph(Graph):
         bwd = backward(self, wrt=[t.value for t in targets])
         self._bwd_cache = (key, bwd)
         return bwd
+
+    def _replace_tensor(self, old: Tensor, new: Tensor) -> None:
+        """把记录里的前端张量换成子类实例（``Parameter`` 用）。
+
+        IR 不变：``new.value`` 必须就是 ``old.value``。由 ``input()`` 造出的
+        张量同时进 ``_tensors`` 与 ``_input_tensors``，两处都要换，否则
+        ``backward`` 的缺省求导目标会漏掉参数。
+        """
+        if new.value is not old.value:
+            raise ValueError("替换张量必须共用同一个 Value")
+        self._tensors[new.value.id] = new
+        for index, tensor in enumerate(self._input_tensors):
+            if tensor is old:
+                self._input_tensors[index] = new
+                return
+        raise ValueError(f"%{old.name} 不在图输入记录里")
 
     def _remember(self, tensor: Tensor) -> None:
         """记住前端 Tensor，供 ``backward`` 回写梯度。

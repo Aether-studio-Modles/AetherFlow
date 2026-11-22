@@ -86,6 +86,44 @@ class TestOperatorSugar(unittest.TestCase):
         data = np.ones((3, 4), dtype=np.float32)
         np.testing.assert_allclose(self._out(g, {"x": data}), data / 2.0, rtol=1e-6)
 
+    def test_tensor_op_methods_match_graph_dsl(self):
+        """``x.relu()`` 与 ``g.relu(x)`` 必须产出同一份 IR。"""
+        g = EagerGraph()
+        x = g.input("x", f32[2, 3])
+        g.output(x.relu().reshape(shape=(3, 2)).transpose(perm=(1, 0)), "y")
+
+        h = Graph()
+        hx = h.input("x", f32[2, 3])
+        h.output(
+            h.transpose(h.reshape(h.relu(hx), shape=(3, 2)), perm=(1, 0)),
+            "y",
+        )
+        self.assertEqual(g.to_ir(), h.to_ir())
+
+    def test_tensor_op_method_values(self):
+        g = EagerGraph()
+        x = g.input("x", f32[2, 3])
+        g.output(x.softmax(axis=-1), "p")
+        g.output(x.gelu(), "a")
+        data = np.array([[-1.0, 0.0, 2.0], [0.5, 0.25, -0.5]], dtype=np.float32)
+        shifted = data - data.max(axis=-1, keepdims=True)
+        expect = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+        got = self.ref.execute(g, {"x": data})
+        np.testing.assert_allclose(got["p"], expect, rtol=1e-6)
+        c = np.float32(0.7978845608028654)
+        expect_gelu = 0.5 * data * (
+            1.0 + np.tanh(c * (data + np.float32(0.044715) * data**3))
+        )
+        np.testing.assert_allclose(got["a"], expect_gelu, rtol=1e-5, atol=1e-6)
+
+    def test_tensor_op_method_rejects_unknown_names(self):
+        g = EagerGraph()
+        x = g.input("x", f32[2, 3])
+        with self.assertRaises(AttributeError):
+            x.not_an_op
+        with self.assertRaises(AttributeError):
+            x._private
+
 
 class TestExplicitRejections(unittest.TestCase):
     """构图期的错误必须当场抛出，不能靠数值对拍兜底。"""
