@@ -65,7 +65,8 @@ class TestTrainOnCuda(unittest.TestCase):
         g = _linear()
         store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=0)
         trainer = Trainer(
-            g, store, SGD(store.arrays(), lr=0.1), backend=CudaBackend()
+            g, store, SGD(store.arrays(), lr=0.1), backend=CudaBackend(),
+            device_state=False,  # 本用例直接读 store 断言收敛，走主机态
         )
         losses = trainer.run(DataLoader({"x": x, "t": t}, 8), epochs=50)
 
@@ -87,7 +88,10 @@ class TestTrainOnCuda(unittest.TestCase):
         results = []
         for backend in (None, CudaBackend()):
             store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=7)
-            trainer = Trainer(g, store, SGD(store.arrays(), lr=0.05), backend=backend)
+            trainer = Trainer(
+                g, store, SGD(store.arrays(), lr=0.05), backend=backend,
+                device_state=False,  # step 后直接读 store 对拍，走主机态
+            )
             loss = trainer.step({"x": x, "t": t})
             results.append((loss, {name: store[name].copy() for name in store.names}))
 
@@ -122,7 +126,10 @@ class TestTrainOnCuda(unittest.TestCase):
         for mode in ("off", "auto"):
             backend = CudaBackend(graph_mode=mode)
             store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=11)
-            trainer = Trainer(g, store, SGD(store.arrays(), lr=0.05), backend=backend)
+            trainer = Trainer(
+                g, store, SGD(store.arrays(), lr=0.05), backend=backend,
+                device_state=False,  # step 后直接读 store 对拍，走主机态
+            )
             losses = [trainer.step({"x": x, "t": t}) for _ in range(10)]
             runs[mode] = (
                 losses,
@@ -158,6 +165,7 @@ class TestTrainOnCuda(unittest.TestCase):
             host_store,
             SGD(host_store.arrays(), lr=0.05),
             backend=CudaBackend(graph_mode="off"),
+            device_state=False,  # 对照组必须走主机态
         )
         host_losses = [host_trainer.step({"x": x, "t": t}) for _ in range(10)]
 
@@ -291,3 +299,34 @@ class TestTrainOnCuda(unittest.TestCase):
             np.testing.assert_allclose(
                 store[name], ref_store[name], rtol=1e-5, atol=1e-7
             )
+
+    def test_device_state_defaults_on_for_device_backend(self):
+        """device_state 默认 None：设备后端自动开，参考后端留主机态。
+
+        主机态在设备后端上每步都要把全部参数重新 H2D，小模型实测只有
+        torch 的 0.34×；默认开设备态是训练性能的前提。
+        """
+        g = _linear()
+        store = ParameterStore.from_graph(g, exclude=("x", "t"), seed=3)
+        trainer = Trainer(
+            g, store, SGD(store.arrays(), lr=0.01),
+            backend=CudaBackend(graph_mode="off"),
+        )
+        self.assertTrue(trainer.device_state)
+
+        # 设备态下主机 store 在 step 后仍是初值，sync 之后才变
+        before = {n: a.copy() for n, a in store.arrays().items()}
+        x, t = _linear_data(n=8)
+        trainer.step({"x": x, "t": t})
+        for name, arr in before.items():
+            np.testing.assert_array_equal(store[name], arr)
+        trainer.sync_to_host()
+        self.assertTrue(
+            any(not np.array_equal(store[n], a) for n, a in before.items())
+        )
+
+        # 参考后端没有捕获能力，必须留在主机态
+        store2 = ParameterStore.from_graph(g, exclude=("x", "t"), seed=3)
+        ref = Trainer(g, store2, SGD(store2.arrays(), lr=0.01))
+        self.assertFalse(ref.device_state)
+

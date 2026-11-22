@@ -127,6 +127,14 @@ class Trainer:
     代价是 ``store`` 里的主机数组在训练期间是旧值，要主机侧数值时调
     ``sync_to_host()``；图与形状必须固定。
 
+    **默认值 ``None`` 表示自动选择**：设备后端（有 ``capture``）上开设备态，
+    参考后端或下列冲突场景留在主机态。这不是便利开关——主机态在设备后端上
+    每步都要把全部参数重新 H2D，HelixLM 实测 0.28M 参数只有 torch 的 0.34×、
+    4.2M 参数 0.27×；同一张图换设备态是 1.42× / 0.86×。以下情况自动留在
+    主机态：``mixed_precision="bf16"``（设备后端只支持 f32/f16 缓冲）、
+    ``zero3``（与常驻参数互斥）、含 BatchNorm 的图（running stats 未接）。
+    需要每步读 ``store`` 或调试捕获时，显式传 ``False``。
+
     两个开关可以叠加：``segments`` 打开时，每一段各捕获一张前向图与一张反向
     图，段与段之间靠显存里的边界值衔接（边界值一组缓冲、cotangent 另一组），
     因此"省激活"和"省往返"同时成立。注意每段的捕获计划各持自己的 arena，
@@ -229,7 +237,7 @@ class Trainer:
         backend: Optional[Backend] = None,
         output: Optional[str] = None,
         segments: Optional[int] = None,
-        device_state: bool = False,
+        device_state: Optional[bool] = None,
         mixed_precision: Optional[str] = None,
         master_weights: bool = False,
         grad_hook: Optional[Callable[[Dict[str, np.ndarray]], Optional[Dict[str, np.ndarray]]]] = None,
@@ -273,6 +281,23 @@ class Trainer:
         if isinstance(rng_rank, bool) or not 0 <= int(rng_rank) < int(rng_world_size):
             raise ValueError(
                 f"rng_rank 必须落在 [0, {rng_world_size})，得到 {rng_rank!r}"
+            )
+
+        # 设备后端的默认训练态：参数常驻显存，前反向各一张捕获图，每步只
+        # 传本批数据与损失标量。主机态在设备后端上每步都要把全部参数重新
+        # H2D，实测 HelixLM 0.28M 参数 0.34×、4.2M 参数 0.27×（torch=1×）；
+        # 同样的图换成设备态分别是 1.42× / 0.86×。以下情况必须留在主机态：
+        # bf16（设备后端只支持 f32/f16 缓冲）、ZeRO-3（与常驻参数互斥）、
+        # 含 BatchNorm 的图（设备态的 running stats 未接）。显式传 False
+        # 可以回主机态，用于调试或需要每步读 store 的场景。
+        sites = bn_sites(graph)
+        if device_state is None:
+            device_state = bool(
+                backend is not None
+                and hasattr(backend, "capture")
+                and mixed_precision != "bf16"
+                and zero3 is None
+                and not sites
             )
 
         if master_weights and mixed_precision not in ("f16", "bf16"):
@@ -400,7 +425,7 @@ class Trainer:
         # 训练态 BN 的 running stats：IR 的 batch_norm 只要当前 batch 的统计量，
         # eval 需要的那对累积值由这里维护（见 ``train/bn.py``）。
         self.bn_momentum = bn_momentum
-        self._bn_sites = bn_sites(graph)
+        self._bn_sites = sites
         self._bn_running: Optional[RunningStats] = None
         self._bn_stats_graph: Optional[Graph] = None
         if self._bn_sites and bn_momentum is not None:
