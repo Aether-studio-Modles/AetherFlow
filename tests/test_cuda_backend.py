@@ -16,6 +16,7 @@ import numpy as np
 from aetherflow import Graph, ReferenceBackend, backward, bf16, f16, f32, f64, i8, i32
 from aetherflow.backends.base import BackendCapabilityError
 from aetherflow.backends.cuda import CUDA_AVAILABLE, CudaBackend
+from aetherflow.backends.cuda.backend import CudaGraphPlan
 from aetherflow.backends.device_backend import _group_elementwise, _mask_shared_over_heads
 from aetherflow.backends.device_shared import _mask_target_shape
 from aetherflow.lower.plan import (
@@ -28,6 +29,32 @@ from aetherflow.lower.plan import (
 from aetherflow.models import BlockSpec, build_transformer_block
 from aetherflow.models import LIFSpec, build_snn, mean_rate
 from aetherflow.runtime.executor import Executor
+
+
+class TestCudaGraphInputValidation(unittest.TestCase):
+    def test_capture_rejects_lossy_initial_index_before_allocating(self):
+        backend = CudaBackend.__new__(CudaBackend)
+        backend.cp = mock.Mock()
+        backend.to_array = np.asarray
+        graph = Graph()
+        idx = graph.input("ids", i32[1])
+        graph.output(idx, "y")
+        with self.assertRaisesRegex(ValueError, "%ids"):
+            backend.capture(graph, {"ids": np.array([2**32], dtype=np.int64)})
+        backend.cp.empty.assert_not_called()
+
+    def test_replay_rejects_lossy_integer_inputs_before_enqueuing_work(self):
+        backend, graph, stream = mock.Mock(), mock.Mock(), mock.MagicMock()
+        buffers = {"q": np.zeros(1, dtype=np.float32), "ids": np.zeros(1, dtype=np.int32)}
+        plan = CudaGraphPlan(backend, graph, stream, buffers, {}, list(buffers), None)
+        for bad, error in ((np.array([0.5]), TypeError), (np.array([True]), TypeError),
+                           (np.array([2**32], dtype=np.int64), ValueError), ([0.5], TypeError)):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(error, "%ids"):
+                    plan.replay({"q": np.ones(1, dtype=np.float32), "ids": bad})
+        stream.__enter__.assert_not_called()
+        graph.launch.assert_not_called()
+        np.testing.assert_array_equal(buffers["q"], 0)
 
 
 class TestConvTilePlan(unittest.TestCase):

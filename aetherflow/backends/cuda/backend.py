@@ -19,7 +19,7 @@ import numpy as np
 
 from ...ir.graph import Node
 from ...lower.plan import CONV_CUDNN_MIN_GFLOPS
-from ...runtime.executor import _HostCopy
+from ...runtime.executor import _check_input_dtype, _HostCopy
 from ..base import BackendCapabilityError
 from ..contracts import DeviceInfo
 from ..device_backend import DeviceBackend, GPU_OPS
@@ -686,7 +686,7 @@ class CudaBackend(DeviceBackend):
         天然有序，不必再建跨流事件依赖（激活重算的分段模式就是这样用的）。
         """
         cp = self.cp
-        declared = [v.name for v in graph.inputs]
+        declared = {v.name: v.type for v in graph.inputs}
         shared = dict(shared_buffers or {})
         unknown = sorted(set(shared) - set(declared))
         if unknown:
@@ -704,6 +704,12 @@ class CudaBackend(DeviceBackend):
             else:
                 raise KeyError(f"capture 缺少图输入: {name}")
             buf = shared.get(name)
+            want = np.dtype(declared[name].dtype.np_dtype)
+            if want.kind == "i" and src.dtype != want:
+                _check_input_dtype(src, want, name)
+                if buf is not None:
+                    raise TypeError(f"Shared buffer %{name} must use the declared dtype {want}")
+                src = self.cast(src, want)
             if buf is None:
                 # 静态缓冲：捕获记录的是固定地址，之后每次 run 往这里拷新值。
                 # 拷贝本身留到预热用的那条流上做——``to_array`` 出来的是主机
@@ -901,6 +907,27 @@ class CudaGraphPlan:
 
     def replay(self, inputs: Mapping[str, Any]) -> None:
         """只下拷输入并 replay，不等 GPU 结束（输出留在设备上）。"""
+        validated = []
+        # Check all inputs before enqueuing any copy into the captured buffers.
+        for name in self._mutable:
+            if name not in inputs:
+                raise KeyError(f"缺少图输入: {name}")
+            buf = self._buffers[name]
+            value = inputs[name]
+            if tuple(np.shape(value)) != tuple(buf.shape):
+                raise ValueError(
+                    f"输入 %{name} 形状 {tuple(np.shape(value))} 与捕获时的 "
+                    f"{tuple(buf.shape)} 不一致：一张 CUDA Graph 只对应一组固定形状"
+                )
+            if value is buf:
+                continue
+            # BF16 storage is uint16; only i8/i32 IR inputs are signed integers.
+            if buf.dtype.kind == "i":
+                if not hasattr(value, "dtype"):
+                    value = np.asarray(value)
+                if value.dtype != buf.dtype:
+                    _check_input_dtype(value, buf.dtype, name)
+            validated.append((name, buf, value))
         # 捕获流是非阻塞流，和默认流（优化器原地更新权重的地方）之间没有
         # 隐式同步。进流之前记下当前流，显式建一条依赖，保证 replay 读到的
         # 是主机侧刚刚更新过的权重。
@@ -908,19 +935,7 @@ class CudaGraphPlan:
         start = time.perf_counter() if self._profile else 0.0
         with self._stream:
             self._stream.wait_event(previous.record())
-            for name in self._mutable:
-                if name not in inputs:
-                    raise KeyError(f"缺少图输入: {name}")
-                buf = self._buffers[name]
-                value = inputs[name]
-                if tuple(np.shape(value)) != tuple(buf.shape):
-                    raise ValueError(
-                        f"输入 %{name} 形状 {tuple(np.shape(value))} 与捕获时的 "
-                        f"{tuple(buf.shape)} 不一致：一张 CUDA Graph 只对应一组固定形状"
-                    )
-                if value is buf:
-                    # 共享缓冲：调用方（设备态训练）已经把它写在这块地址上了
-                    continue
+            for name, buf, value in validated:
                 if isinstance(value, np.ndarray):
                     # 主机数组：先进 pinned 暂存再异步 H2D，主机不必等这次拷贝完
                     buf.set(
