@@ -377,6 +377,13 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   另注：5.300 的基准是 Mamba LM（3.39M 参数、fwd 608 / bwd 2722、
   9.92~10.78 ms/步），与 5.296~5.299 的 Transformer（4.28M、998 / 2464、
   26.07 ms）不是同一模型，绝对 ms 不可跨节比较。
+- **远端执行与文档同步的两个坑**（5.300）：`_remote.py exec` 对带引号的
+  命令不可靠——`git commit -m "docs: ..."` 只收到 `docs:`，`python3 -c "..."`
+  被切成 `import` 一个词；复杂命令要写成脚本文件上传后执行，提交信息用
+  `-F 文件`。本地上传的文本是 CRLF，直接 `git add` 会让整篇 diff 变成重写
+  （5.300 首次远端提交 19434 行增/19303 行删），必须先
+  `bytes.replace(b"\r\n", b"\n")` 再提交。另外远端只是运行副本，DESIGN /
+  REMIND 不必同步进它的 git。
 
 ---
 
