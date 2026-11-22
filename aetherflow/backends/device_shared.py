@@ -108,6 +108,7 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "embedding_backward": frozenset({1}),
     "gather": frozenset({1}),
     "gather_backward": frozenset({1}),
+    "paged_decode": frozenset({3, 4}),
     "cross_entropy": frozenset({1}),
     "cross_entropy_backward": frozenset({1}),
     "dropout_mask": frozenset({1}),

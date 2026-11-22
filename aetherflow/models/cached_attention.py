@@ -1,7 +1,7 @@
 """带 KV cache 的增量注意力解码：把分页缓存里的 K/V 送进同一套 IR。
 
 这一层回答的问题是"已经有 ``t`` 个 token 的 K/V，怎么只算当前这一个 token"，
-而不是"怎么把 attention 写得更快"。它不新增算子：
+而不是"怎么把 attention 写得更快"。默认路径采用连续 K/V：
 
 - 图输入是当前 token 的隐状态 ``(B, 1, d)``、每层**已经取回**的 K/V
   ``(B, cache_steps, H, D)`` 与一个加性掩码；
@@ -18,8 +18,7 @@
    训练图与推理图是两张各自干净的图。
 2. **只吃隐状态。** 位置编码由调用方在进图前加好；词表投影不在这里做。
    ``TransformerSpec.vocab`` 必须为 0，否则同名的 ``w_head`` 会被静默忽略。
-3. **缓存布局由 :class:`aetherflow.runtime.paged_cache.PagedKVCache` 决定。**
-   这里拿到的永远是"按块表拼好的连续副本"，它不知道页号，也不该知道。
+3. **默认读连续副本。** 显式选择 ``direct_paged`` 时改为直接读取物理页。
 """
 
 from __future__ import annotations
@@ -29,8 +28,9 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from ..backends.base import BackendCapabilityError
 from ..ir.graph import Graph, Value
-from ..ir.types import f32
+from ..ir.types import f32, i32
 from ..runtime.paged_cache import PagedKVCache
 from .transformer import TransformerSpec
 
@@ -74,7 +74,7 @@ def _check_spec(spec: TransformerSpec) -> None:
 
 
 def build_cached_decoder_step(
-    g: Graph, spec: TransformerSpec, *, cache_steps: int
+    g: Graph, spec: TransformerSpec, *, cache_steps: int, page_size: int | None = None
 ) -> Tuple[Dict[str, Value], Value, Dict[str, Value]]:
     """构建单步增量解码图，返回 ``(inputs, y, new_kv)``。
 
@@ -96,6 +96,9 @@ def build_cached_decoder_step(
     输出表：``y`` 与 ``l{i}_k_out`` / ``l{i}_v_out``（本步新算出的
     ``(B, 1, H, D)``，调用方负责写回缓存；名字带 ``_out`` 是因为图里输入与
     输出不能同名）。
+
+    指定 ``page_size`` 时，K/V 输入改用物理页；``mask`` 改为 ``block_table``
+    和 ``lengths``。``lengths`` 不含当前 token，``cache_steps`` 包含当前 token。
     """
     if isinstance(cache_steps, bool) or not isinstance(cache_steps, int):
         raise TypeError(f"cache_steps 必须是 int，得到 {type(cache_steps).__name__}")
@@ -107,26 +110,35 @@ def build_cached_decoder_step(
     batch = spec.batch
     scale_value = 1.0 / math.sqrt(dh)
 
-    inputs: Dict[str, Value] = {
-        "x": g.input("x", f32[batch, 1, d]),
-        "mask": g.input("mask", f32[1, 1, 1, cache_steps + 1]),
-    }
+    inputs: Dict[str, Value] = {"x": g.input("x", f32[batch, 1, d])}
+    if page_size is None:
+        inputs["mask"] = g.input("mask", f32[1, 1, 1, cache_steps + 1])
+        kv_shape = (batch, cache_steps, h, dh)
+    else:
+        if type(page_size) is not int or page_size < 1:
+            raise ValueError("page_size must be a positive integer")
+        if type(batch) is not int or batch < 1:
+            raise ValueError("paged decoder requires a positive static batch")
+        pages = (cache_steps + page_size - 1) // page_size
+        inputs["block_table"] = g.input("block_table", i32[batch, pages])
+        inputs["lengths"] = g.input("lengths", i32[batch])
+        kv_shape = (pages * batch, page_size, h, dh)
     for layer in range(spec.num_layers):
         for base in _layer_weight_names():
             inputs[f"l{layer}_{base}"] = g.input(
                 f"l{layer}_{base}", f32[spec.param_shapes[f"l{layer}_{base}"]]
             )
         inputs[f"l{layer}_k"] = g.input(
-            f"l{layer}_k", f32[batch, cache_steps, h, dh]
+            f"l{layer}_k", f32[kv_shape]
         )
         inputs[f"l{layer}_v"] = g.input(
-            f"l{layer}_v", f32[batch, cache_steps, h, dh]
+            f"l{layer}_v", f32[kv_shape]
         )
     for base in ("final_g", "final_b"):
         inputs[base] = g.input(base, f32[spec.param_shapes[base]])
 
     scale = None
-    if not spec.fused_attention:
+    if page_size is None and not spec.fused_attention:
         scale = g.constant(scale_value, dtype=f32, shape=(1,))
 
     x = inputs["x"]
@@ -139,6 +151,18 @@ def build_cached_decoder_step(
         q = g.matmul(h1, inputs[prefix + "wq"])
         k = g.matmul(h1, inputs[prefix + "wk"])
         v = g.matmul(h1, inputs[prefix + "wv"])
+
+        if page_size is not None:
+            qh, kh, vh = (g.reshape(t, shape=(batch, h, dh)) for t in (q, k, v))
+            ctx = g.paged_decode(
+                qh, inputs[prefix + "k"], inputs[prefix + "v"], inputs["block_table"],
+                inputs["lengths"], kh, vh, max_len=cache_steps - 1,
+            )
+            merged = g.reshape(ctx, shape=(batch, 1, d))
+            x = _finish_layer(g, spec, inputs, prefix, x, merged)
+            new_kv[prefix + "k_out"] = g.reshape(kh, shape=(batch, 1, h, dh))
+            new_kv[prefix + "v_out"] = g.reshape(vh, shape=(batch, 1, h, dh))
+            continue
 
         qh = g.transpose(
             g.reshape(q, shape=(batch, 1, h, dh)), perm=(0, 2, 1, 3)
@@ -172,13 +196,7 @@ def build_cached_decoder_step(
             ctx = g.matmul(attn, v_all)
 
         merged = g.reshape(g.transpose(ctx, perm=(0, 2, 1, 3)), shape=(batch, 1, d))
-        x = g.add(x, g.matmul(merged, inputs[prefix + "wo"]))
-
-        h2 = g.layernorm(
-            x, inputs[prefix + "ln2_g"], inputs[prefix + "ln2_b"], axes=(-1,), eps=spec.eps
-        )
-        act = g.gelu(g.matmul(h2, inputs[prefix + "w1"]))
-        x = g.add(x, g.matmul(act, inputs[prefix + "w2"]))
+        x = _finish_layer(g, spec, inputs, prefix, x, merged)
 
         # 输出名必须与输入名（缓存里的 ``l{i}_k``）区分开：图里同名只能是
         # 同一个 Value，输入与输出不能共用一个名字。
@@ -187,6 +205,15 @@ def build_cached_decoder_step(
 
     y = g.layernorm(x, inputs["final_g"], inputs["final_b"], axes=(-1,), eps=spec.eps)
     return inputs, y, new_kv
+
+
+def _finish_layer(g, spec, inputs, prefix, x, merged):
+    x = g.add(x, g.matmul(merged, inputs[prefix + "wo"]))
+    h2 = g.layernorm(
+        x, inputs[prefix + "ln2_g"], inputs[prefix + "ln2_b"], axes=(-1,), eps=spec.eps
+    )
+    act = g.gelu(g.matmul(h2, inputs[prefix + "w1"]))
+    return g.add(x, g.matmul(act, inputs[prefix + "w2"]))
 
 
 def _causal_step_mask(cache_steps: int, valid: int) -> np.ndarray:
@@ -205,6 +232,51 @@ def _host(backend, value) -> np.ndarray:
     return np.asarray(convert(value) if convert is not None else value)
 
 
+def _direct_forward(backend, params, spec, values, block_size):
+    if "paged_decode" not in backend.capabilities():
+        raise BackendCapabilityError("direct_paged requires a backend with paged_decode")
+    steps, d = values.shape
+    n_pages = (steps + block_size - 1) // block_size
+    g = Graph("direct_paged_decoder_step")
+    inputs, y, new_kv = build_cached_decoder_step(g, spec, cache_steps=steps, page_size=block_size)
+    g.output(y, "y")
+    for name, kv in new_kv.items():
+        g.output(kv, name)
+
+    # Use the explicit executor rather than auto-capture, which can copy all mutable
+    # inputs into graph buffers on every replay. The page pools are session-private.
+    on_device = callable(getattr(backend, "run_device", None)) and callable(getattr(backend, "to_array", None))
+    to_array = backend.to_array if on_device else np.asarray
+    feed = {}
+    page_buffers = {name[:-4] for name in new_kv}
+    for name, value in inputs.items():
+        if name in ("x", "lengths", "block_table"):
+            continue
+        if name in page_buffers:
+            feed[name] = to_array(np.zeros(value.type.shape, dtype=np.float32))
+        else:
+            if name not in params:
+                raise KeyError(f"params 缺少权重 {name!r}")
+            feed[name] = to_array(np.asarray(params[name], dtype=np.float32))
+    feed["block_table"] = to_array(np.arange(n_pages, dtype=np.int32)[None, :])
+    rows = to_array(values)
+    lengths = to_array(np.arange(steps, dtype=np.int32))
+    result = to_array(np.zeros((1, steps, d), dtype=np.float32))
+    for step in range(steps):
+        feed["x"] = rows[None, step:step + 1]
+        feed["lengths"] = lengths[step:step + 1]
+        if on_device:
+            env = backend.run_device(g, feed, release=True)
+            out = {name: env[value.id] for name, value in zip(g.output_names, g.outputs)}
+        else:
+            out = backend.execute(g, feed)
+        result[:, step:step + 1] = out["y"]
+        page, slot = divmod(step, block_size)
+        for name in new_kv:
+            feed[name[:-4]][page, slot] = out[name][0, 0]
+    return _host(backend, result)
+
+
 def cached_forward(
     backend,
     params: Dict[str, np.ndarray],
@@ -212,6 +284,7 @@ def cached_forward(
     xs,
     *,
     block_size: int = 4,
+    direct_paged: bool = False,
 ) -> np.ndarray:
     """逐 token 走增量解码，返回 ``(1, T, d)`` 的隐状态序列。
 
@@ -222,6 +295,8 @@ def cached_forward(
     页宽 ``block_size`` 只影响分配粒度，不影响数值；``T`` 个 token 至少需要
     ``ceil(T / block_size)`` 页，这里按需分配，用完不回收（调用方持有返回值，
     缓存生命周期就是这次调用）。
+
+    ``direct_paged=True`` 走分页算子，不整理历史 K/V。后端不支持时明确报错。
     """
     _check_spec(spec)
     if isinstance(spec.batch, bool) or not isinstance(spec.batch, int):
@@ -246,6 +321,10 @@ def cached_forward(
         raise TypeError(f"block_size 必须是 int，得到 {type(block_size).__name__}")
     if block_size < 1:
         raise ValueError(f"block_size 必须 >= 1，得到 {block_size}")
+    if type(direct_paged) is not bool:
+        raise TypeError("direct_paged 必须是 bool")
+    if direct_paged:
+        return _direct_forward(backend, params, spec, values, block_size)
 
     cache = PagedKVCache(
         num_blocks=(steps + block_size - 1) // block_size,

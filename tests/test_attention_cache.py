@@ -13,6 +13,7 @@ from dataclasses import replace
 import numpy as np
 
 from aetherflow import Graph, ReferenceBackend
+from aetherflow.backends.cuda import CUDA_AVAILABLE, CudaBackend
 from aetherflow.models import (
     TransformerSpec,
     build_transformer,
@@ -99,6 +100,16 @@ class TestCachedForward(unittest.TestCase):
         spec = _spec(num_layers=1, num_heads=1, d_model=4, d_ff=8)
         self._check(spec, 5, 2)
 
+    def test_direct_paged_matches_dense_across_boundaries(self):
+        for fused in (False, True):
+            spec = _spec(fused_attention=fused)
+            params = _params(spec)
+            for steps, page_size in ((1, 4), (7, 3), (8, 4)):
+                xs = np.random.default_rng(steps).normal(size=(steps, spec.d_model)).astype(np.float32)
+                with self.subTest(fused=fused, steps=steps, page_size=page_size):
+                    got = cached_forward(BACKEND, params, spec, xs, block_size=page_size, direct_paged=True)
+                    np.testing.assert_allclose(got, _dense(xs, params, spec), rtol=1e-4, atol=1e-5)
+
     def test_rejections(self):
         spec = _spec()
         params = _params(spec)
@@ -123,6 +134,17 @@ class TestCachedForward(unittest.TestCase):
             cached_forward(BACKEND, params, spec, xs, block_size=True)
         with self.assertRaisesRegex(KeyError, "缺少权重"):
             cached_forward(BACKEND, {}, spec, xs)
+
+
+@unittest.skipUnless(CUDA_AVAILABLE, "requires CuPy and a CUDA device")
+class TestCudaCachedForward(unittest.TestCase):
+    def test_direct_matches_dense_across_multiple_tiles(self):
+        backend = CudaBackend(graph_mode="auto")
+        spec = _spec(fused_attention=True, d_model=32, num_heads=4, d_ff=64, seq=135)
+        params = _params(spec)
+        xs = np.random.default_rng(4).normal(size=(135, spec.d_model)).astype(np.float32)
+        got = cached_forward(backend, params, spec, xs, block_size=16, direct_paged=True)
+        np.testing.assert_allclose(got, _dense(xs, params, spec), rtol=2e-4, atol=2e-5)
 
 
 if __name__ == "__main__":

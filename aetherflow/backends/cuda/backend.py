@@ -21,6 +21,7 @@ from ...ir.graph import Node
 from ...lower.plan import CONV_CUDNN_MIN_GFLOPS
 from ...runtime.executor import _check_input_dtype, _HostCopy
 from ..base import BackendCapabilityError
+from ..capabilities import BackendCapabilities, OpCapability
 from ..contracts import DeviceInfo
 from ..device_backend import DeviceBackend, GPU_OPS
 from . import codegen
@@ -29,12 +30,13 @@ from .cudnn import CudnnConv, CudnnUnavailable
 from .cufft import CufftPlan, CufftUnavailable, available as cufft_available
 from .cusparse import CusparseSpMM, CusparseUnavailable
 from .memory import Arena
+from .paged_decode import launch_paged_decode
 
 # 类级能力声明。它存在的唯一理由：**不建 CUDA 上下文也能读到**。构图的工具、
 # 预检脚本、"这张图这个后端接不接得住"的判断，都不该为了问一句能力而初始化
 # 一块显卡。运行期的事实来源是 ``self.kernels``；构造时两者对账，不一致直接
 # 抛错（见 ``_register_kernels``），所以不存在"声明与实现分叉"的中间状态。
-CUDA_OPS: FrozenSet[str] = GPU_OPS
+CUDA_OPS: FrozenSet[str] = GPU_OPS | {"paged_decode"}
 
 # bf16 的支持面：先开"逐元素 + 搬运 + 归约 + 矩阵乘"这四类，覆盖 Transformer
 # 推理的主干。卷积 / 池化 / scan / sparse 仍留在 f32/f16——它们的内核里有权重
@@ -143,6 +145,12 @@ class CudaBackend(DeviceBackend):
             memory_mode=memory_mode,
             sparse_impl=sparse_impl,
         )
+
+    def _register_vendor_kernels(self, registry) -> None:
+        registry.register("paged_decode", self._op_paged_decode)
+
+    def _op_paged_decode(self, node, args, attrs):
+        return launch_paged_decode(self, args, attrs)
 
     def _memory_scope(self):
         """执行期分层内存：把 cupy 的分配器临时换成本后端的 ``Arena``。
@@ -603,8 +611,8 @@ class CudaBackend(DeviceBackend):
         """
         caps = super().capabilities()
         if cufft_available():
-            return caps | _FFT_OPS
-        return caps
+            caps = caps | _FFT_OPS
+        return BackendCapabilities(caps, {"paged_decode": OpCapability(backward=False)})
 
     # ------------------------------------------------------------------
     # 编译与 BLAS

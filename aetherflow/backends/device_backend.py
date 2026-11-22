@@ -473,12 +473,16 @@ class DeviceBackend(
         r.register("spike_offsets", self._op_spike_offsets)
         r.register("spike_csr", self._op_spike_csr)
 
+        self._register_vendor_kernels(r)
         if r.capabilities() != self._OPS:
             raise RuntimeError(
                 "CUDA 插件的能力声明与注册的内核不一致："
                 f"声明 {sorted(self._OPS - r.capabilities())} 未注册，"
                 f"注册 {sorted(r.capabilities() - self._OPS)} 未声明"
             )
+
+    def _register_vendor_kernels(self, registry: KernelRegistry) -> None:
+        """Register vendor-specific implementations before checking capabilities."""
 
     def to_array(self, value: Any) -> Any:
         cp = self.cp
