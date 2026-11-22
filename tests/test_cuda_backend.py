@@ -3989,7 +3989,10 @@ class TestCudaGraph(CudaTestCase):
         （"H2D transfers are disallowed"），整图退回逐节点执行。
         """
         g = Graph()
-        table = g.constant(np.arange(20, dtype=np.float32).reshape(10, 2) * 0.1)
+        table = g.constant(
+            dtype=f32, shape=(10, 2),
+            data=(np.arange(20, dtype=np.float32).reshape(10, 2) * 0.1).tolist(),
+        )
         ids = g.constant(dtype=i32, shape=(5,), data=[0, 3, 2, 9, 1])
         x = g.input("x", f32[5, 2])
         g.output(g.add(g.embedding(table, ids), x), "y")
