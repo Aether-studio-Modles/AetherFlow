@@ -2494,6 +2494,15 @@ class TestCudaIndexed(CudaTestCase):
         g, feed = self._embedding(i8, (3, 5), (100, 4))
         self.assert_backends_equal(g, feed)
 
+    def test_embedding_i32_constant_ids(self):
+        """i32 常量要能物化成设备张量：HelixLM 的分组尺度表就是常量索引。"""
+        g = Graph()
+        table = g.input("table", f32[10, 4])
+        ids = g.constant(dtype=i32, shape=(5,), data=[0, 3, 2, 9, 1])
+        g.output(g.embedding(table, ids), "y")
+        got = self.assert_backends_equal(g, {"table": self.rand(10, 4)})
+        self.assertEqual(got.shape, (5, 4))
+
     def test_embedding_out_of_range_rejected(self):
         """越界不能静默 clamp 成 0：必须显式报错。"""
         g = Graph()

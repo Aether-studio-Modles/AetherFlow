@@ -260,7 +260,11 @@ class _ElementwiseMixin:
         """常量节点：值在属性里，直接物化一份设备张量。
 
         零输入节点绕过了 ``invoke`` 里对输入 dtype 的检查，所以这里自己查一次，
-        保持「GPU 后端只支持 f32/f16」这条规则没有例外。
+        保持「内核只吃 f32/f16/bf16」这条规则没有例外。
+
+        i32 常量是唯一的非浮点例外：它不进任何算术内核，只作为索引表喂给
+        ``embedding`` / ``gather``（HelixLM 的"按通道分组选尺度"就是这样）。
+        参考后端本来就支持，GPU 后端拒绝物化会让这类模型连构图都跑不起来。
         """
         dtype = DType(attrs["dtype"])
         if dtype is DType.BF16:
@@ -275,11 +279,12 @@ class _ElementwiseMixin:
             else:
                 host = np.asarray(data, dtype=np.float32).reshape(shape)
             return self.cp.asarray(pack_bf16(host))
-        if dtype not in (DType.F32, DType.F16):
+        if dtype is not DType.I32 and dtype not in (DType.F32, DType.F16):
             raise BackendCapabilityError(
-                f"{self._LABEL}只支持 float32/float16/bf16，constant 收到 {dtype.value}"
+                f"{self._LABEL}只支持 float32/float16/bf16 与索引用的 int32，"
+                f"constant 收到 {dtype.value}"
             )
-        np_dtype = np.float16 if dtype is DType.F16 else np.float32
+        np_dtype = {DType.F32: np.float32, DType.F16: np.float16, DType.I32: np.int32}[dtype]
         shape = tuple(int(d) for d in attrs["shape"])
         data = attrs.get("data")
         if data is None:
