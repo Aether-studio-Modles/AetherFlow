@@ -3981,6 +3981,25 @@ class TestCudaGraph(CudaTestCase):
                 plan.run(feed)["y"], expected, rtol=1e-5, atol=1e-6
             )
 
+    def test_capture_with_i32_constant(self):
+        """i32 索引表常量也必须走计划期物化（捕获流禁止 H2D）。
+
+        HelixLM 的"按通道分组选尺度"用 i32 常量喂 embedding。常量若等到
+        捕获轮才第一次上传，驱动会拒掉捕获流上的 H2D
+        （"H2D transfers are disallowed"），整图退回逐节点执行。
+        """
+        g = Graph()
+        table = g.constant(np.arange(20, dtype=np.float32).reshape(10, 2) * 0.1)
+        ids = g.constant(dtype=i32, shape=(5,), data=[0, 3, 2, 9, 1])
+        x = g.input("x", f32[5, 2])
+        g.output(g.add(g.embedding(table, ids), x), "y")
+
+        feed = {"x": self.rand(5, 2)}
+        plan = self.cuda.capture(g, feed)
+        expected = self.ref.execute(g, feed)["y"]
+        for _ in range(3):
+            np.testing.assert_allclose(plan.run(feed)["y"], expected, rtol=1e-5, atol=1e-6)
+
     def test_cnn_capture(self):
         """conv -> relu -> maxpool：一个最小 CNN 尖峰，整图捕获并 replay。"""
         g = Graph()

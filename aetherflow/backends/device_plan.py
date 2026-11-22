@@ -61,7 +61,11 @@ class _PlanMixin:
                 continue
             node = group.nodes[0]
             if node.op.name == "constant":
-                if node.output.type.dtype in (DType.F32, DType.F16):
+                # i32 也在其中：它是 embedding / gather 的索引表，同样与运行期
+                # 无关。漏掉它，捕获轮会在 ``begin_capture`` 之后才第一次
+                # 物化，驱动直接拒绝捕获流上的 H2D（"H2D transfers are
+                # disallowed"），整张图退回逐节点执行。
+                if node.output.type.dtype in (DType.F32, DType.F16, DType.I32):
                     value = self._op_constant(node, (), node.attrs)
                     group.constants[node.output.id] = value
                     constant_ids.add(node.output.id)
