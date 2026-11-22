@@ -330,6 +330,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **`Tensor` 的算子方法是算子表的转发**（5.294）：`__getattr__` 只接受 `OPS`
   里的名字，签名与 `Graph` DSL 一致（`x.reshape(shape=...)` 而不是
   `x.reshape(3, 2)`）；不改 `Graph` 的调用约定，也不为 PyTorch 风格另开一套。
+- **autocast 重写未命名输出不能沿用旧值名**（5.295）：`output_names` 对未命名
+  输出返回的是值名 `v<id>`；重写插入 cast 后值会重新编号，把旧名当别名写进新图
+  就会与自动名撞车（`名字重复: v245`）。任何 `Module(...)` 构图 + 混合精度都会
+  撞上。判断"有没有显式别名"要拿原值的 SSA 名，不能用重写后的新值名。回归：
+  `test_rewrite_does_not_collide_and_matches_f32`。
+- **设备态续训要迁两处状态，不只是参数**（5.295）：`load_training_state` 在显存
+  建立之前执行，累积窗口与优化器槽位都会恢复成主机数组。续训第一步会连撞两次：
+  ① 窗口里 cupy 梯度撞上 numpy 累加和；② Adam 的 `m/v` 还是 numpy，与显存参数
+  同算时报 `CScalar` 类型错。修法分别是 `GradientAccumulator.add` 按梯度设备迁移、
+  `Optimizer.rebind` 让槽位跟随参数；不要用隐式主机往返"修好"它。回归：
+  `test_device_state_resume_restores_pending_accumulation`。
 
 ---
 

@@ -18605,3 +18605,47 @@ Nucleus 侧 `HelixAFModule` 与 `verify_af_helix_module.py` 按上述判据两�
 **明确没做**：没有嵌套子模块（参数名用点号扁平表达，P1 再补）；没有参数共享
 （`shared_layers` 由构图函数自己决定）；仍然只构图一次，不是 define-by-run。
 
+### 5.295　训练基础设施在 AMP 与设备态续训下的三个缺口
+
+**动机**：B3 在 HelixLM 上把 DataLoader、梯度累积、checkpoint 续训、AMP 串成
+闭环后，三处"单测覆盖不到、但真实训练一定撞上"的问题才暴露出来。三处都没有
+新增执行机制，只是把状态搬移与命名规则补完整。
+
+**缺口一：autocast 重写未命名输出**。`Module` 构图会把 `forward` 的返回值
+登记成图输出但不给别名，`output_names` 因此退化成值名 `v<id>`。Autocast 重写
+图时为保别名，拿"重写后的新值名"与输出名比较：插入 cast 后值重新编号，两者
+不再相等，旧值名便被当成显式别名写进新图，与自动名撞车（`名字重复: v245`）。
+任何 `Module` 构图 + `mixed_precision` 都会撞上。修法是比较**原值**的 SSA 名
+（`name == value.name`），未命名继续不命名。
+回归：`tests/test_autocast.py::TestAutocastUnnamedOutput`
+（matmul → softmax 之间必插 cast，编号一定错位）。
+
+**缺口二：续训恢复的累加和留在主机**。`load_training_state` 必须在第一次
+`step` 之前调用，此时设备计划还没建立，`GradientAccumulator.load_state_dict`
+按主机参数表恢复了累加和。设备态续训的第一个微批梯度是 cupy 数组，累加器
+却还在主机侧，`xp.asarray(设备数组)` 被 cupy 拒绝（不允许隐式回主机）。
+修法：`add()` 发现"已有累加和的 array module ≠ 本微批梯度的 array module"
+时，把累加和一次性迁到梯度所在设备。窗口的语义不变——只有设备换了一次。
+
+**缺口三：续训恢复的优化器槽位留在主机**。同类问题但位置不同：
+`Optimizer.rebind` 把参数表换成显存数组时只换了 `params`，`m/v` 槽位仍是
+恢复出来的主机数组。第一步更新 `m += (1-beta1) * g` 里 `g` 是 cupy、`m` 是
+numpy，cupy 的 ufunc 报 `Unsupported type numpy.ndarray`（CScalar 路径）。
+修法：`rebind` 在换表后让槽位跟随参数的 array module 迁移；名字与形状校验
+保持原样。
+
+**判据**（Nucleus `verify_af_helix_b3.py`，A800 设备态）：
+
+- DataLoader：3 轮 18 步，末轮均值降 27.4%；与 torch 同序轨迹 loss 1.8e-7、
+  参数 8.9e-7。
+- 梯度累积：`accumulate_steps=2` × 微批 2，窗口均值与整批 torch 的 loss
+  1.1e-7、六次更新后参数 1.8e-7；优化器步数恰为 6。
+- 续训（中断在第 3 步，窗口里剩 1 个微批）：中断前与续训段 loss 都是 0，
+  最终参数 6.0e-8；游标恢复到 epoch=1/batch=3，优化器步数 4 与不中断一致。
+- AMP f16（含 GradScaler）：首步 loss 相对偏差 4.7e-6、整段 5.0e-5，
+  `skipped=0`，scale 稳定在 16384；逐参数差 7.6e-2 只作参考（Adam 的
+  sign 离散性，与 B2 同口径）。
+- 回归：主机 `pytest tests --ignore=tests/test_frontend.py` 2379 项通过；
+  A800 `tests.test_cuda_backend + test_cuda_train + test_autocast` 420 项通过
+  （1 项按条件跳过），跑前跑后 GPU 均为 10 MiB / 0%。
+
