@@ -295,6 +295,21 @@ cuBLAS。方法上有一条必须记下来：先连测 A 再连测 B 时，同�
 图重放默认值保持关闭，但这些共享卡样本不足以给出可靠胜率或期望提速。
 需要独占复测和设备时间线，再决定默认值及优化顺序。
 
+**独占复测（2026-11-22，A800 空闲，同一 `framework_compare --training`）**：
+同机无其他计算进程，每轮 40 次、9 轮取中位数：
+
+| 配置 | AetherFlow | torch eager | torch / af |
+|---|---|---|---|
+| 逐节点派发 + 参数更新 | 0.896 ms | 0.552 ms | 0.62× |
+| 逐节点派发、不含更新 | 0.751 ms | 0.457 ms | 0.61× |
+| 图重放 + 参数更新 | 0.486 ms | 0.532 ms | 1.09× |
+| 图重放、不含更新 | 0.387 ms | 0.443 ms | 1.14× |
+
+图外 SGD 占 0.145 ms（AF）对 0.095 ms（torch）。这个形状（两层 MLP、
+8.4 MB 参数）的主机态上限只有 0.62×：每步仍有 18 组 Python 派发与校验，
+而 torch 走的是常驻参数 + 单进程 autograd。真实训练的参数规模下必须开
+设备态，见 5.296。
+
 预置 cuBLAS workspace 已试过：`AETHERFLOW_CUBLAS_WORKSPACE_MB=32`
 （`cublasSetWorkspace_v2`）各跑 5 次，开是 2 快 3 慢、不开是 1 快 4 慢，
 本轮没有消除双峰。这不支持“设置 workspace 即可解决”的假设，也不能仅凭
@@ -18648,4 +18663,52 @@ numpy，cupy 的 ufunc 报 `Unsupported type numpy.ndarray`（CScalar 路径）�
 - 回归：主机 `pytest tests --ignore=tests/test_frontend.py` 2379 项通过；
   A800 `tests.test_cuda_backend + test_cuda_train + test_autocast` 420 项通过
   （1 项按条件跳过），跑前跑后 GPU 均为 10 MiB / 0%。
+
+### 5.296　Trainer 默认设备态：训练一步从 0.33× 回到 1.33×
+
+**动机**：框架对比里训练的逐节点派发只有 torch 的 0.62×、真实模型探针更低，
+这是"别人凭什么选我们"最前面的那道门槛。这一轮只做一件事：把"训练一步"拆开
+归因，定位损失发生在哪一段，然后修掉。
+
+**归因（A800-40GB 独占，跑前跑后 GPU 10 MiB / 0%）**：
+
+1. 两层 MLP 基准（8.4 MB 参数，`benchmarks/framework_compare.py --training`，
+   `--rounds 9 --burst 40 --warmup 20`）：逐节点派发 + 图外 SGD 0.896 ms
+   （torch 0.552 ms，0.62×）；去掉参数更新 0.751 ms（0.61×），说明差距不在
+   优化器；图外 SGD 单独 0.145 ms（torch 0.095 ms）。同一张图开图重放：
+   带更新 0.486 ms（1.09×）、不带更新 0.387 ms（1.14×）。结论：主机态下
+   每步把 8.4 MB 参数重新 H2D，就把上限压在 0.62× 附近。
+2. HelixLM 0.28M 参数 / 254 节点：主机态 40.348 ms（0.325×），设备态
+   9.224 ms（1.421×），torch eager 13.103 ms；loss 8.319477 三方逐位相同。
+3. HelixLM 4.215M 参数 / 502 节点（`graph_mode=auto`）：主机态 57.025 ms
+   （0.526×），设备态 33.738 ms（0.889×），torch 29.998 ms；loss 差 1.14e-07。
+
+即"训练慢"不是反向展开或优化器的问题，而是默认配置走了主机态：参数每步
+往返，图重放也救不回来（重放省的是派发，不是 H2D）。
+
+**改动**：`Trainer(device_state=None)` 的默认值从 `False` 改成 `None`，含义是
+按后端自动选：后端有 `capture`、`mixed_precision != "bf16"`、`zero3 is None`、
+图里没有 BatchNorm 时开设备态，否则留主机态。三类回退都有硬理由——设备后端
+只支持 f32/f16 缓冲，ZeRO-3 与常驻参数互斥，设备态 BN 的 running stats 未接。
+显式 `True` / `False` 语义不变；原先四个直接读 `store` 断言数值的 CUDA 用例
+改成显式 `False` 并在注释里写清原因，避免把"默认值"与"这一步要读主机值"
+混在一起。
+
+**复测**：0.28M 从 0.325× 到 1.330×（探针 default 档 9.852 ms，与 device 档
+9.224 ms 只差一次显式传参）；4.215M 从 0.526× 到 0.894×（33.543 ms）。默认
+配置不再要求用户知道"该开 device_state"，开箱即是最快的那一档。
+
+**剩余差距**：大模型 0.89× 里那 11% 不在训练循环——502 个节点每个一次 kernel
+发射，差距应落到算子与 kernel 效率上。下一项应做核时间线的单算子对比，而不是
+继续抠主机侧派发开销。
+
+**回归**：主机 `pytest tests --ignore=tests/test_frontend.py` 2379 项通过（该机
+torch 2.4.1 不在兼容矩阵，`tests/test_frontend.py` 的 `UnsupportedTorchVersion`
+与本改动无关）；A800 `tests.test_cuda_train + tests.test_cuda_backend` 386 项
+通过（1 跳过），另 `test_parallel / test_lm_device_state / test_snn /
+test_ssm_streaming / test_autocast / test_conformance / test_backend_contracts /
+test_conv_impl_pick / test_cusparse / test_kernel_registry / test_events`
+320 项通过（5 跳过）。新增
+`test_device_state_defaults_on_for_device_backend`，覆盖默认开、参考后端留主机
+态、`sync_to_host` 前后主机值三点。
 
