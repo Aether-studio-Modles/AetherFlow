@@ -341,6 +341,41 @@ class TestAutocastRejects(unittest.TestCase):
             Autocast(dtype="f64")
 
 
+class TestAutocastUnnamedOutput(unittest.TestCase):
+    """未命名输出（``Module`` 构图就是这样）：别名是 None，不是旧值名。
+
+    重写会插入 cast、把值重新编号；旧值名 ``v<id>`` 若被当成别名写进新图，
+    就会与自动名撞车（``名字重复: v3``）。这条链在 matmul 与 softmax 之间
+    必插一个 cast，编号一定错位，正好覆盖该场景。
+    """
+
+    def _graph(self):
+        g = Graph("unnamed")
+        x = g.input("x", f32[4, 3])
+        w = g.input("w", f32[3, 3])
+        mm = g.add_node("matmul", [x, w])
+        g.output(g.add_node("softmax", [mm], {"axis": -1}))
+        return g
+
+    def test_rewrite_does_not_collide_and_matches_f32(self):
+        g = self._graph()
+        # output_names 与值名相同，说明输出没有显式别名（Module 风格）。
+        self.assertEqual(g.output_names[0], g.outputs[0].name)
+
+        out = Autocast().run(g)
+        self.assertEqual(len(out.outputs), 1)
+
+        rng = np.random.default_rng(0)
+        feed = {
+            "x": rng.normal(size=(4, 3)).astype(np.float32),
+            "w": rng.normal(size=(3, 3)).astype(np.float32),
+        }
+        want = BACKEND.execute(g, feed)[g.output_names[0]]
+        got = BACKEND.execute(out, feed)[out.output_names[0]]
+        self.assertEqual(got.dtype, np.float32)
+        np.testing.assert_allclose(got, want, rtol=1e-2, atol=1e-3)
+
+
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 CUDA 运行时")
 class TestAutocastOnCuda(unittest.TestCase):
     """图重写之后必须真的能在设备上跑：f16 的 cast / matmul / softmax 都有人接。"""

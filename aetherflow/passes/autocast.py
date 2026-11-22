@@ -135,7 +135,10 @@ class Autocast(Pass):
             nv = mapping[value.id]
             if nv.type.dtype != value.type.dtype:
                 nv = out.add_node("cast", [nv], {"dtype": value.type.dtype.value})
-            out.output(nv, None if name == nv.name else name)
+            # 未命名输出的 ``output_names`` 会退化成原值名（``v<id>``），不能拿它
+            # 跟重写后的新值名比：插了 cast 之后编号会错位，旧名会与自动名撞车。
+            # 用原值的 SSA 名判断"有没有显式别名"，未命名就继续不命名。
+            out.output(nv, None if name == value.name else name)
         return out
 
     # -- 规则 ---------------------------------------------------------
