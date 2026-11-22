@@ -352,6 +352,15 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   ≈ 1.50 TB/s，A800 HBM 饱和），那里 sgemm / cublasLt / torch.mm 三者同速，
   换 tile 不可能有收益。5.297 的「57.3 μs/次」均值把不同形状混在一起，不可
   用于归因。
+- **布局物化的账要按 kernel 数算，不是按字节算**（5.299）：一步 1174 次
+  `ascontiguousarray` 物化（90 MB）在 A800 上值 **2.4 ms（9%）**，而同样字节的
+  纯流量按峰值只有 0.12 ms——成本几乎全是每次约 1.7 μs 的固定项。标定单次成本
+  要捕成小图按 replay 摊（`us ≈ 1.7 + 字节 / 0.2 TB/s`，转置的有效带宽只有约
+  0.2 TB/s）；用 `event` 包住 Python 调用会把分配开销算进去、高估 2~3×。
+  计数还有两个坑：`transpose` 本身零拷贝，别把它和 `ascontiguousarray` 记成
+  两次；设备态捕获会**预热一轮再捕获一轮**，Python 侧计数必须除以 2。
+  同模型 torch 41.68 ms vs AF 26.07 ms（AF 快 1.60×），这一项不是差距主因，
+  不值得为它改 strided 寻址。
 
 ---
 
