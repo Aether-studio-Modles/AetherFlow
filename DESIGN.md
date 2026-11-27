@@ -19151,3 +19151,61 @@ CV / 语音专用算子（NMS / ROIAlign）。理由统一：要么与"语义简
 bool 常量写进属性时被当成整数；`topk` 的并列定序必须写进语义，否则参考端与
 设备端的下票顺序可能不同。
 
+**实施进展：A1–A3 已落地，A4 暂缓**
+
+A1（比较算子）已完成。`DType.BOOL` 本来就在 `ir/types.py`（numpy 侧是
+`bool`），缺的只是"谁产出"和"怎么存"：`eq` / `ne` / `lt` / `le` / `gt` / `ge`
+注册进算子表，`infer` 复用既有广播推断、输出 `bool`，`reference` 直接调 numpy；
+bool 参与 `+ - * / pow` 等算术在 `infer` 阶段就报 `TypeError`，所以"bool 只能
+由比较产出"这条约束是类型系统强制的，不是约定。设备端 bool 是 1 字节存储
+（`_STORAGE["bool"] = "unsigned char"`），由 `BOOL_DIALECT` 提供
+`af_ld_q` / `af_st_q`（0/1 ↔ float），布尔常量写回走 `Store(raw=True)`，不套
+store helper——否则 helper 会把 `__ldg` 的 float 语义带进来。比较无梯度，
+不注册 vjp，`backward` 遇到会明确报错而不是静默给 0。
+
+A2（`where` / `masked_fill`）已完成。`where` 没有新写索引代码，`ew_where_same`
+与 `ew_where_bcast` 就是逐元素骨架多维护一路 stride；`_collapse_dims` 从
+"两输入"泛化成 `*strides`（二元调用方解包 `(dim, step_a, step_b)` 不受影响），
+三元调用传 `(cond, a, b)`。`ew_where_bcast` 同样有 5.300 的两套形态：2 的幂
+用 `rem & (dim-1)` / `rem >> sh[d]`，否则 `rem % dim` / `rem / dim`。
+`masked_fill` 不新增算子，前端三个变体（`.Scalar` / `.Tensor` / `_`）统一降成
+`where(mask, value, x)`；标量 value 用既有的 `branch()` 折成与张量同 dtype，
+避免把 f32 标量塞进 f16 图。vjp 用 `where` 自己表达：
+`g_a = sum_to(where(cond, g, 0))`、`g_b = sum_to(where(cond, 0, g))`，bool 分支
+返回 `None`——不需要 bool→float 的 `cast`。
+
+A3（一元补齐）已完成。`sign` / `round` / `floor` / `ceil` 进 `UNARY_EXPR`、
+手写对照表与前端白名单，NHWC 逐元素集合同步收录（布局 pass 不为这四者开
+分支）。`round` 必须用 `nearbyintf`（默认舍入模式是 round-half-to-even，与
+`torch.round` / `np.round` 一致），**不能用 `roundf`**（half-away-from-zero，
+差在 x.5 上）；`sign` 用嵌套三目保证 0→0 且 NaN 透传，不能写成
+`(x > 0) - (x < 0)`（NaN 会变成 0）。四者梯度都是 `None`，与 `step` 同口径。
+
+前端承接：`aten.where.*` 三种签名都归一到 `condition / input / other`，先定位
+张量分支确定 dtype 再校验 cond——`cond` 必须是 bool，两侧 dtype 不一致直接报
+`UnsupportedOperatorError`，不做静默 fallback（与"语义精确、数值可校验"的
+既定边界一致）。端到端已跑通三类模型：`torch.masked_fill(x, mask, 7.5)`、
+`torch.where(x > y, x - y, y - x)`、bool 输入直通 `where`，参考后端输出与
+torch 逐位相等。
+
+**规模与回归**：算子表 71 → **82**（+6 比较、+`where`、+4 取整），VJP 规则
+49 → **54**（`where` 一条 + 四取整各一条 `None`；可微算子仍是 49 个）。
+`python -m unittest discover -s tests` → **2934 tests, OK**（skipped 452，全部
+是需要 GPU 的用例）。
+
+**A4（`topk`）暂缓，理由是三件独立的事叠在一起**：
+
+1. IR 节点是单输出——`Op.infer` 返回一个 `TensorType`、`reference` 返回一个
+   数组。要返回 values + indices，只能拆成 `topk_values` / `topk_indices` 两个
+   算子各算一遍，或在前端用 `argmax + eq/where` 组合出来；
+2. 设备端不能复用逐元素骨架：需要"k 轮块内选择 + 跳过已选下标"的专用内核
+   （O(k²n)，要 `Shared("int", "sel", k)`，cache key 得含 k），这是新内核族，
+   不是加一路 stride 能解决的；
+3. 远端 GPU 与另一个 agent 共用，本轮新增的比较 / `where` / 取整内核还没上机
+   跑参考↔CUDA↔HIP 一致性。**先上机把这批验掉，再决定 `topk` 走拆算子还是
+   前端组合**——否则等于在一个还没验证过的设备栈上再叠一层。
+
+**验收核对**：IR 拒绝 bool 算术 ✅；参考后端数值 ✅（`conformance.py` 新增
+8 条比较、2 条 `where`、4 条取整）；`torch.export` 端到端 ✅；测试全绿 ✅；
+参考↔CUDA 一致性 ⏳（内核已就绪，等机器空闲）。
+

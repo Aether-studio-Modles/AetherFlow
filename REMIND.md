@@ -384,6 +384,39 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   （5.300 首次远端提交 19434 行增/19303 行删），必须先
   `bytes.replace(b"\r\n", b"\n")` 再提交。另外远端只是运行副本，DESIGN /
   REMIND 不必同步进它的 git。
+- **`round` 只能是 `nearbyintf`，`sign` 不能写成差值**（5.301）：`roundf` 是
+  half-away-from-zero，`torch.round` / `np.round` 是 half-to-even，差在 x.5 上，
+  且只在正好 .5 时出现——数值用例要故意喂 ±0.5 / ±1.5 / ±2.5，否则测不出来。
+  `sign` 写 `(x>0)-(x<0)` 会把 NaN 变成 0（两个比较都假），必须用嵌套三目把
+  原值透传。
+- **bool 张量是 1 字节存储，写回不能套 store helper**（5.301）：`_STORAGE`
+  多一个 `"bool" → unsigned char`、`BOOL_DIALECT` 提供 `af_ld_q` / `af_st_q`
+  做 0/1 与 float 的转换；但 `Store` 对 bool 输出必须 `raw=True`，否则 helper
+  会把 float 语义带进来。先例是 `ew_cast` / `ew_mod_int`，新增 bool 产出算子
+  照抄。
+- **三输入广播的 `_collapse_dims` 要传三组 stride**（5.301）：签名已泛化成
+  `_collapse_dims(shape, *strides)`，二元调用方解包 `(dim, step_a, step_b)`
+  不受影响；`where` 传 `(cond, a, b)`。合并判据必须对三组都成立，否则会把
+  cond 的 stride 当成 a/b 的、合并出越界下标。
+- **替换以"后续定义行"结尾的代码块会删掉那个定义**（5.301，本轮踩了两次）：
+  用 `def broadcast_template(...)` / `class TestTorchExportOnCuda` 当 old_string
+  的结尾、new_string 忘了原样保留，结果 `NameError: broadcast_template` 与
+  测试类凭空消失。锚点要么选"上一段的最后一行"，要么把锚点行原样抄进
+  new_string 末尾。改完立刻跑一次相关测试，别等到全量。
+- **临时脚本放在仓库根会被同名包遮蔽**（5.301）：`g:\Cloumi` 下就有 `aetherflow`
+  目录，脚本 `import aetherflow` 命中的是仓库根（命名空间包），报
+  `is a namespace package, use of unknown location`。要么把 cwd 设成
+  `g:\Cloumi\aetherflow`，要么用
+  `python -c "import runpy; runpy.run_path(r'脚本', run_name='__main__')"`。
+- **接入前端算子前先 grep 测试里的"不支持"反例**（5.301）：`sign` / `floor`
+  原本被 `test_unsupported_op_is_rejected` 当反例，接入后两条测试直接翻红
+  （`UnsupportedOperatorError not raised`）。反例要换成真的不支持的算子
+  （现在是 `torch.trunc`），并补正向用例。
+- **`topk` 不能做成单算子**（5.301）：`Op.infer` 返回单个 `TensorType`、
+  `reference` 返回单个数组，values + indices 必须拆成两个算子，或在前端用
+  `argmax + eq/where` 组合。设备端还需要"k 轮块内选择 + 跳过已选下标"的专用
+  内核（`Shared("int","sel",k)`，cache key 含 k），不能像 `where` 那样只加
+  一路 stride。
 
 ---
 
