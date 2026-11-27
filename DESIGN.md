@@ -19257,3 +19257,48 @@ torch 逐位相等。
   因此所有一致性用例的输入都避开次正规数，否则会得到一个与代码无关的假失败；
   真实模型里出现次正规数的概率可忽略。此事记入 REMIND。
 
+### 5.302　阶段 B：设备侧归约、分桶反向重叠与最小启动器
+
+**B1：`DistributedDataParallel` 在设备态直接交给 NCCL。** 新增
+`NcclDeviceCollective`（`train/zero.py`），契约与 `NcclHostCollective` 相同，
+但少一次往返：
+
+- 输入是设备数组（带 `__cuda_array_interface__`）时把缓冲原地交给 NCCL，
+  归约结果留在显存；输入是主机数组（损失标量那条极小的路径）时才做
+  H2D → NCCL → D2H。
+- `device_side = True` 是显式声明。DDP 只在 collective 带这个属性时才接受
+  设备态 Trainer，否则构造期报错，不静默退回主机中转。设备态还要求
+  `bucket_bytes=0`（没有通用的设备拼接）与 `threads=1`（同一个 NCCL
+  communicator 不能被多线程同时调用）。
+- `reduction="mean"` 直接以 `op="mean"` 交给适配器，在设备上补一次原地除法；
+  `train/nccl.py` 仍只登记 sum / prod / max / min。
+- 归约层有 5 条单测（设备态拒绝无声明 collective、拒绝拼桶 / 多线程、走
+  `op="mean"`、原地归约返回同一缓冲、拒绝非浮点梯度）。**端到端未验证**：
+  手上只有单卡 A800 与两卡数值用例，`world > 1` 的真机联调要等设备。
+
+**B2：反向按桶拆开，桶就绪即发。** `Trainer.enable_bucket_overlap` 为每个
+参数桶建一张独立反向图，桶算完立刻回调；DDP 的 `overlap=True` 把回调接到
+后台单线程 `_BucketReducer` 上：
+
+- 单线程而不是线程池：集合调用必须各 rank 同序。桶的提交顺序由反向图执行
+  顺序决定（各 rank 图相同），并发提交会让顺序取决于调度——一侧先发 A、
+  另一侧先发 B 就会互相等死。
+- 权重更新仍在 `grad_hook` 里等全部桶归约完才发生；`reduction="mean"` 与
+  形状 / dtype 校验沿用主机路径，数值与"整图反向 + 一次归约"逐位相同
+  （单测在 6 参数 / 3 桶上逐步对拍）。
+- **代价**：每桶反向都要重算从损失到该桶的共同链式路径，桶越多越慢。因此
+  overlap 要求 `bucket_bytes > 0`（禁止逐参数一桶），并限制在主机态、
+  `accumulate_steps=1`、无 checkpoint 分段、`threads=1`。
+- 为什么不做执行器逐节点回调：整图反向是一次 `backend.execute`，本层拿不到
+  "某个参数梯度算完"的时刻；把反向拆成桶是对后端零改动的最小做法。
+
+**B3：rank / world 从环境变量读。** `DistributedDataParallel.from_env` 复用
+`env_rank` / `env_world_size`（`AF_RANK` / `AF_WORLD_SIZE`），`collective`
+缺省 `HostCollective.from_env()`；最小启动器仍是 `host_collective.launch`，
+不新造一套。设备态由调用方显式传 `NcclDeviceCollective(comm)`——
+communicator 的 `init_rank` 参数本层不猜。
+
+**规模与回归**：`python -m unittest discover -s tests` → **2958 tests, OK**
+（skipped 452，全部需要 GPU）。新增 15 条：DDP 设备态 6 条、分桶重叠 5 条、
+`NcclDeviceCollective` 4 条。
+
