@@ -24,7 +24,7 @@ import sys
 
 import numpy as np
 
-from aetherflow import Graph, ReferenceBackend, f32, i8, i32
+from aetherflow import Graph, ReferenceBackend, boolean, f32, i8, i32
 from aetherflow.backends.cuda import CudaBackend
 from aetherflow.conformance import run_conformance
 
@@ -360,6 +360,83 @@ def _extra_cases() -> list:
         g.output(g.add_node("clamp", [x], {"min": -0.5, "max": 0.5}), "y")
         return g, {"x": _rand(rng, 4, 6, scale=2.0)}
 
+    def where_bcast_pow2():
+        """折叠后每维都是 2 的幂：走掩码 + 右移的 pow2 内核。
+
+        与 ``where_bcast``（div 路径）不是同一份代码，两个分支都必须有真机证据。
+        """
+        g = Graph("where_pow2")
+        c = g.input("c", boolean[8, 1, 8])
+        a = g.input("a", f32[8, 4, 8])
+        b = g.input("b", f32[8])
+        g.output(g.where(c, a, b), "y")
+        return g, {
+            "c": rng.integers(0, 2, size=(8, 1, 8)).astype(bool),
+            "a": _rand(rng, 8, 4, 8),
+            "b": _rand(rng, 8),
+        }
+
+    def where_bcast_odd_rank3():
+        """非 2 的幂 + 中间维广播：div 余数路径，折叠后的组数不能算错。"""
+        g = Graph("where_odd")
+        c = g.input("c", boolean[3, 1, 5])
+        a = g.input("a", f32[3, 7, 5])
+        b = g.input("b", f32[5])
+        g.output(g.where(c, a, b), "y")
+        return g, {
+            "c": rng.integers(0, 2, size=(3, 1, 5)).astype(bool),
+            "a": _rand(rng, 3, 7, 5),
+            "b": _rand(rng, 5),
+        }
+
+    def compare_feeds_where():
+        """比较结果直接当 where 的条件：bool 数据流必须端到端成立。"""
+        g = Graph("cmp_where")
+        x = g.input("x", f32[3, 9])
+        y = g.input("rhs", f32[3, 9])
+        g.output(g.where(g.gt(x, y), x, y), "y")
+        return g, {
+            # 量化到整数格点，保证 eq/ne 之外还有大量并列（选哪支都合法）
+            "x": np.round(_rand(rng, 3, 9) * 2.0),
+            "rhs": np.round(_rand(rng, 3, 9) * 2.0),
+        }
+
+    def rounding_boundaries():
+        """.5 取偶、负数与 -0：round / floor / ceil 三条内核一起对拍。"""
+        g = Graph("rounding")
+        x = g.input("x", f32[4, 8])
+        y = g.add(g.round(x), g.floor(x))
+        g.output(g.add(y, g.ceil(x)), "y")
+        return g, {
+            "x": np.array(
+                [[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 0.0, -0.0],
+                 [-3.7, -0.1, 0.1, 3.7, 1.4999999, 1.5000001, -1.4999999, -1.5000001],
+                 [1e-8, -1e-8, 2.0, -2.0, 7.5, 8.5, -7.5, -8.5],
+                 [1e6, -1e6, 0.49999997, -0.49999997, 123.456, -123.456, 4.5, -4.5]],
+                dtype=np.float32,
+            )
+        }
+
+    def sign_special():
+        """±0 / ±inf / NaN：sign 写成 (x>0)-(x<0) 会让 NaN 变成 0。
+
+        刻意**不**用 1e-38 这类次正规数：实测这台 V100 上（CUDA 12.4 + cupy
+        14.2）GPU 对 subnormal 的比较一律为 false（``cp.sign(1e-38)`` 自己
+        也返回 0），是环境级 FTZ 行为，与参考后端的 numpy 语义天然不同。
+        拿它当一致性判据只会得到一个与代码无关的假失败。
+        """
+        g = Graph("sign_special")
+        x = g.input("x", f32[3, 6])
+        g.output(g.sign(x), "y")
+        return g, {
+            "x": np.array(
+                [[0.0, -0.0, np.inf, -np.inf, np.nan, 3.5],
+                 [-3.5, 1e-30, -1e-30, 1e30, -1e30, -1.0],
+                 [2.0, -2.0, 0.5, -0.5, np.nan, 0.0]],
+                dtype=np.float32,
+            )
+        }
+
     def mod_negative_floor():
         """负被除数 / 负模数：C 的截断取余在这里会差一个模数。"""
         g = Graph()
@@ -405,6 +482,11 @@ def _extra_cases() -> list:
         ("cumsum_mid_axis", cumsum_mid_axis),
         ("tril_negative_diagonal", tril_negative_diagonal),
         ("clamp_two_sided", clamp_two_sided),
+        ("where_bcast_pow2", where_bcast_pow2),
+        ("where_bcast_odd_rank3", where_bcast_odd_rank3),
+        ("compare_feeds_where", compare_feeds_where),
+        ("rounding_boundaries", rounding_boundaries),
+        ("sign_special", sign_special),
         ("mod_negative_floor", mod_negative_floor),
         ("silu_gate_odd_length", silu_gate_odd),
         ("layernorm_residual_odd_cols", layernorm_residual_odd),
@@ -589,7 +671,7 @@ def _run_tuning_check(cuda: CudaBackend) -> list:
     case = next(c for c in TUNE_CASES if c.name == "relu_1m")
     try:
         space = cuda.tuning_space("relu")
-        store = search(cuda, cases=[case], rounds=1)
+        store = search(cuda, cases=[case], rounds=2)
         hits, problems = apply_and_verify(cuda, store, cases=[case])
     except Exception as exc:  # noqa: BLE001
         print(f"  [FAIL] tuning: {type(exc).__name__}: {exc}")
