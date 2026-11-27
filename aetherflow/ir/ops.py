@@ -212,15 +212,56 @@ def _norm_axes(axis, rank: int) -> Tuple[int, ...]:
     return norm
 
 
+def _reject_bool(dtype: DType, where: str) -> None:
+    """布尔张量只能参与比较与 ``where``，不参与算术。
+
+    设备端的 bool 容器是 1 字节，``add`` 之类的内核会把它当数值算，结果虽然
+    能跑但语义上无意义（``真 + 真 = 2`` 存回 bool 又变成 1）。这里显式拒绝，
+    让用户在图上插一个 ``cast`` 把意图写清楚。
+    """
+    if dtype is DType.BOOL:
+        raise TypeError(
+            f"{where}不接受 bool 输入：布尔张量只能参与比较与 where，"
+            "要参与算术请先显式 cast 成数值类型"
+        )
+
+
 def _elementwise_binary_infer(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     a, b = inputs
     if a.dtype != b.dtype:
         raise TypeError(f"二元算子要求两侧 dtype 一致，得到 {a.dtype.value} 与 {b.dtype.value}；请显式插入 cast")
+    _reject_bool(a.dtype, "二元算术算子")
     return TensorType(a.dtype, _broadcast_shape(a.shape, b.shape))
 
 
 def _elementwise_unary_infer(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    _reject_bool(inputs[0].dtype, "一元算术算子")
     return inputs[0]
+
+
+def _compare_infer(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """比较：两侧同 dtype（布尔也可以互比），输出 bool，形状按广播。
+
+    输出类型钉死 BOOL 而不是跟随输入：后端的 bool 存储只有 1 字节，与 f32
+    不同宽，跟随输入会让"比较结果"这块缓冲被当成浮点写。
+    """
+    a, b = inputs
+    if a.dtype != b.dtype:
+        raise TypeError(
+            f"比较算子要求两侧 dtype 一致，得到 {a.dtype.value} 与 {b.dtype.value}；"
+            "请显式插入 cast"
+        )
+    return TensorType(DType.BOOL, _broadcast_shape(a.shape, b.shape))
+
+
+def _compare_ref(np_fn):
+    """比较的参考实现：结果为 numpy bool，与 BOOL 的承载类型一致。"""
+
+    def ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+        with np.errstate(all="ignore"):
+            return np.asarray(np_fn(args[0], args[1]), dtype=np.bool_)
+
+    return ref
 
 
 def _binary_ref(np_fn):
@@ -254,6 +295,26 @@ for _name, _np_fn in (
             infer=_elementwise_binary_infer,
             reference=_binary_ref(_np_fn),
             doc=f"逐元素 {_name}，支持 numpy 广播",
+        )
+    )
+
+
+# 比较算子：唯一产出 BOOL 的一族。没有 vjp——比较在数学上不可导，注册一条
+# 规则会让"对 mask 求梯度"这件事看起来合法。
+for _name, _np_fn in (
+    ("eq", np.equal),
+    ("ne", np.not_equal),
+    ("lt", np.less),
+    ("le", np.less_equal),
+    ("gt", np.greater),
+    ("ge", np.greater_equal),
+):
+    register(
+        Op(
+            name=_name,
+            infer=_compare_infer,
+            reference=_compare_ref(_np_fn),
+            doc=f"逐元素比较 {_name}，输出 bool，支持 numpy 广播",
         )
     )
 

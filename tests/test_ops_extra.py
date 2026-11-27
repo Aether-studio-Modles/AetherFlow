@@ -958,5 +958,67 @@ class TestBatchNorm(unittest.TestCase):
             backward(g)
 
 
+class TestCompare(unittest.TestCase):
+    """比较算子：输出 bool，是掩码的唯一产生端。"""
+
+    def _graph(self, op, sa, sb):
+        g = Graph(op)
+        a = g.input("a", f32[sa])
+        b = g.input("b", f32[sb])
+        g.output(g.add_node(op, [a, b]), "y")
+        return g
+
+    def test_matches_numpy_and_outputs_bool(self):
+        rng = np.random.default_rng(3)
+        av = np.round(rng.standard_normal((4, 6)) * 2).astype(np.float32)
+        bv = np.round(rng.standard_normal((4, 6)) * 2).astype(np.float32)
+        cases = {
+            "eq": np.equal,
+            "ne": np.not_equal,
+            "lt": np.less,
+            "le": np.less_equal,
+            "gt": np.greater,
+            "ge": np.greater_equal,
+        }
+        for op, fn in cases.items():
+            with self.subTest(op=op):
+                g = self._graph(op, (4, 6), (4, 6))
+                out = _run(g, {"a": av, "b": bv})["y"]
+                self.assertEqual(out.dtype, np.bool_)
+                np.testing.assert_array_equal(out, fn(av, bv))
+
+    def test_broadcast_matches_numpy(self):
+        rng = np.random.default_rng(4)
+        av = np.round(rng.standard_normal((2, 3, 4)) * 2).astype(np.float32)
+        bv = np.round(rng.standard_normal((4,)) * 2).astype(np.float32)
+        g = self._graph("gt", (2, 3, 4), (4,))
+        out = _run(g, {"a": av, "b": bv})["y"]
+        self.assertEqual(out.shape, (2, 3, 4))
+        np.testing.assert_array_equal(out, av > bv)
+
+    def test_bool_input_compare(self):
+        """bool 张量之间也能比较：``ne(mask, mask)`` 是掩码异或的常见写法。"""
+        from aetherflow import boolean
+
+        g = Graph("mask")
+        m = g.input("m", boolean[2, 3])
+        g.output(g.add_node("ne", [m, m]), "y")
+        self.assertEqual(g.outputs[0].type, boolean[2, 3])
+
+    def test_arithmetic_on_bool_rejected(self):
+        from aetherflow import boolean
+
+        g = Graph("bad")
+        a = g.input("a", boolean[2, 3])
+        b = g.input("b", boolean[2, 3])
+        with self.assertRaises(TypeError):
+            g.add_node("add", [a, b])
+
+    def test_compare_has_no_gradient(self):
+        g = self._graph("eq", (2, 3), (2, 3))
+        with self.assertRaises(NoGradientError):
+            backward(g)
+
+
 if __name__ == "__main__":
     unittest.main()

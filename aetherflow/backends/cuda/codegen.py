@@ -342,12 +342,25 @@ _STORAGE = {
     "f32": ("float", "af_ld_f", "af_st_f", "af_add_f"),
     "f16": ("unsigned short", "af_ld_h", "af_st_h", "af_add_h"),
     "bf16": ("unsigned short", "af_ld_b", "af_st_b", "af_add_b"),
+    "bool": ("unsigned char", "af_ld_q", "af_st_q", "af_add_q"),
 }
+
+# boolean is stored as one byte with values in {0, 1}: reads widen to float and
+# writes normalise any non-zero value back to 1. That lets the L2 layer emit a
+# comparison result as an ordinary float expression. ``af_add_q`` is a stub --
+# no kernel reduces into a bool -- it only keeps the four-slot storage tuple
+# self-consistent.
+_BOOL_HELPERS = r"""
+__device__ __forceinline__ float af_ld_q(unsigned char v) { return v ? 1.f : 0.f; }
+__device__ __forceinline__ unsigned char af_st_q(float v) { return v != 0.f ? 1 : 0; }
+__device__ __forceinline__ float af_add_q(unsigned char* p, float v) { return 0.f; }
+"""
 
 _HELPERS = {
     "f32": _F32_HELPERS,
     "f16": _F16_HELPERS,
     "bf16": _BF16_HELPERS,
+    "bool": _BOOL_HELPERS,
 }
 
 
@@ -365,13 +378,20 @@ def _dtype_key(dtype) -> str:
     # bf16 在设备上的容器是 uint16（位模式）；numpy 侧只可能是这两个写法。
     if name in ("uint16", "bfloat16", "bf16"):
         return "bf16"
-    raise ValueError(f"CUDA codegen 只支持 f32/f16/bf16，收到 {name}")
+    if name in ("bool", "bool_"):
+        return "bool"
+    raise ValueError(f"CUDA codegen 只支持 f32/f16/bf16/bool，收到 {name}")
 
 
 def _ir_dtype(dtype) -> DType:
     """运行期的 numpy dtype -> IR 的 DType（L2 用后者认类型）。"""
     key = _dtype_key(dtype)
-    return {"f32": DType.F32, "f16": DType.F16, "bf16": DType.BF16}[key]
+    return {
+        "f32": DType.F32,
+        "f16": DType.F16,
+        "bf16": DType.BF16,
+        "bool": DType.BOOL,
+    }[key]
 
 
 def render(template, dtype, *, f16_helpers: str | None = None, dialect=None) -> str:
@@ -2023,14 +2043,51 @@ def argmax_source() -> Kernel:
     return argmax_last()
 
 
-def broadcast_binary_source(kind: str) -> Kernel:
+def broadcast_binary_source(kind: str, *, pow2: bool = False) -> Kernel:
     """支持 numpy 多维广播的逐元素二元内核的 L2 描述（生产路径）。
 
     广播通过"对齐后的 stride"实现：被广播的维度 stride 置 0，
     于是同一份输入元素会被多个输出位置复用。维度上限 4，
     超过时由后端拒绝（而不是悄悄换实现）。
+
+    ``pow2`` 交给主机侧按实际维度决定：全为 2 的幂时用掩码/右移还原坐标，
+    否则退回 div/mod。两种形态是两份源码，内核缓存键必须区分。
     """
-    return ew_broadcast(kind)
+    return ew_broadcast(kind, pow2=pow2)
+
+
+def compare_source(
+    kind: str,
+    *,
+    scalar_a: bool = False,
+    scalar_b: bool = False,
+    pow2: bool | None = None,
+    dtype=None,
+    dialect=None,
+) -> str:
+    """比较内核源码：输出容器固定是 1 字节 bool。
+
+    ``pow2 is None`` 表示两侧同形（扁平网格），否则是广播版且由主机告知
+    维度是否为 2 的幂。``dtype`` 是**输入**的存储类型：参数声明、读取 helper
+    与 prelude 都由它决定，输出则钉死成 bool 并裸写（比较结果本身就是 0/1）。
+    bool 输入（``ne(mask, 0)``）需要 1 字节容器的方言，因此单独走
+    ``BOOL_DIALECT``。
+    """
+    if pow2 is None:
+        template = ew_binary(kind, scalar_a=scalar_a, scalar_b=scalar_b, compare=True)
+    else:
+        template = ew_broadcast(kind, pow2=pow2, compare=True)
+    ir_dtype = _ir_dtype(np.dtype("float32") if dtype is None else dtype)
+    if dialect is None:
+        if ir_dtype is DType.BOOL:
+            from .dialect import BOOL_DIALECT
+
+            dialect = BOOL_DIALECT
+        else:
+            from .dialect import CUDA_DIALECT
+
+            dialect = CUDA_DIALECT
+    return emit(template, dialect, ir_dtype)
 
 
 def broadcast_template(kind: str) -> str:

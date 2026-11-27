@@ -28,6 +28,25 @@ class _ElementwiseMixin:
     def _op_div(self, node, args, attrs):
         return self._binary("div", args)
 
+    # 比较算子：与二元算术共用广播骨架，只把输出换成 bool、运算符换成比较。
+    def _op_eq(self, node, args, attrs):
+        return self._binary("eq", args, compare=True)
+
+    def _op_ne(self, node, args, attrs):
+        return self._binary("ne", args, compare=True)
+
+    def _op_lt(self, node, args, attrs):
+        return self._binary("lt", args, compare=True)
+
+    def _op_le(self, node, args, attrs):
+        return self._binary("le", args, compare=True)
+
+    def _op_gt(self, node, args, attrs):
+        return self._binary("gt", args, compare=True)
+
+    def _op_ge(self, node, args, attrs):
+        return self._binary("ge", args, compare=True)
+
     def _op_clamp(self, node, args, attrs):
         """按属性里的标量上下界截断；缺省的一侧由 ``has_lo`` / ``has_hi`` 关掉。
 
@@ -265,6 +284,9 @@ class _ElementwiseMixin:
         i32 常量是唯一的非浮点例外：它不进任何算术内核，只作为索引表喂给
         ``embedding`` / ``gather``（HelixLM 的"按通道分组选尺度"就是这样）。
         参考后端本来就支持，GPU 后端拒绝物化会让这类模型连构图都跑不起来。
+
+        bool 常量同样只是搬运：它来自常量折叠（例如整张图里的掩码比较），
+        只作 ``where`` 的 cond，不参与算术（算术在 IR 层就被拒绝）。
         """
         dtype = DType(attrs["dtype"])
         if dtype is DType.BF16:
@@ -279,12 +301,17 @@ class _ElementwiseMixin:
             else:
                 host = np.asarray(data, dtype=np.float32).reshape(shape)
             return self.cp.asarray(pack_bf16(host))
-        if dtype is not DType.I32 and dtype not in (DType.F32, DType.F16):
+        if dtype is not DType.I32 and dtype not in (DType.F32, DType.F16, DType.BOOL):
             raise BackendCapabilityError(
-                f"{self._LABEL}只支持 float32/float16/bf16 与索引用的 int32，"
+                f"{self._LABEL}只支持 float32/float16/bf16、索引用的 int32 与 bool，"
                 f"constant 收到 {dtype.value}"
             )
-        np_dtype = {DType.F32: np.float32, DType.F16: np.float16, DType.I32: np.int32}[dtype]
+        np_dtype = {
+            DType.F32: np.float32,
+            DType.F16: np.float16,
+            DType.I32: np.int32,
+            DType.BOOL: np.bool_,
+        }[dtype]
         shape = tuple(int(d) for d in attrs["shape"])
         data = attrs.get("data")
         if data is None:
@@ -301,7 +328,7 @@ class _ElementwiseMixin:
         # 目标形状与输入相同时广播退化成恒等，拿到的是同一个对象或视图
         return self._shared_view(out, args[0], node)
 
-    def _binary(self, kind: str, args: List[Any]):
+    def _binary(self, kind: str, args: List[Any], *, compare: bool = False):
         a, b = args
         try:
             out_shape = tuple(np.broadcast_shapes(a.shape, b.shape))
@@ -311,31 +338,45 @@ class _ElementwiseMixin:
             ) from exc
 
         if a.shape == b.shape:
-            return self._binary_kernel(kind, a, b, mode=0)
+            return self._binary_kernel(kind, a, b, mode=0, compare=compare)
         # 标量快速路径：只有当广播结果形状恰好等于另一侧形状时才能直接用
         # （例如 (5,) 与 (1,1) 的广播结果是 (1,5)，不能走这条路径）
         if a.size == 1 and out_shape == b.shape:
-            return self._binary_kernel(kind, a, b, mode=1)  # a 是标量
+            return self._binary_kernel(kind, a, b, mode=1, compare=compare)  # a 是标量
         if b.size == 1 and out_shape == a.shape:
-            return self._binary_kernel(kind, a, b, mode=2)  # b 是标量
-        return self._binary_broadcast(kind, a, b, out_shape)
+            return self._binary_kernel(kind, a, b, mode=2, compare=compare)  # b 是标量
+        return self._binary_broadcast(kind, a, b, out_shape, compare=compare)
 
-    def _binary_kernel(self, kind: str, a, b, mode: int):
+    def _binary_kernel(self, kind: str, a, b, mode: int, *, compare: bool = False):
         cp = self.cp
         tensor = b if mode == 1 else a
-        out = cp.empty_like(tensor)
+        # 比较的输出容器是 bool：它比输入窄，不能 empty_like 跟随输入。
+        out = (
+            cp.empty(tensor.shape, dtype=cp.bool_)
+            if compare
+            else cp.empty_like(tensor)
+        )
         n = int(tensor.size)
         if n == 0:
             return out
         scalar_a, scalar_b = mode == 1, mode == 2
         dtype_key = self._kind(tensor)
-        kernel = self._kernel(
-            ("bin", kind, dtype_key, mode),
-            lambda: self.codegen.render(
-                self.codegen.binary_source(kind, scalar_a, scalar_b), tensor.dtype
-            ),
-            "ew_bin",
-        )
+        if compare:
+            kernel = self._kernel(
+                ("cmp", kind, dtype_key, mode),
+                lambda: self.codegen.compare_source(
+                    kind, scalar_a=scalar_a, scalar_b=scalar_b, dtype=tensor.dtype
+                ),
+                "ew_cmp",
+            )
+        else:
+            kernel = self._kernel(
+                ("bin", kind, dtype_key, mode),
+                lambda: self.codegen.render(
+                    self.codegen.binary_source(kind, scalar_a, scalar_b), tensor.dtype
+                ),
+                "ew_bin",
+            )
         # 标量侧直接传设备指针，不在主机上取值：避免一次强制同步（见 codegen 注释）
         lhs = a.reshape(1) if scalar_a else a
         rhs = b.reshape(1) if scalar_b else b
@@ -343,7 +384,8 @@ class _ElementwiseMixin:
         kernel((grid,), (block,), (lhs, rhs, out, np.int64(n)))
         return out
 
-    def _binary_broadcast(self, kind: str, a, b, out_shape: tuple):
+    def _binary_broadcast(self, kind: str, a, b, out_shape: tuple, *,
+                          compare: bool = False):
         """多维广播：把两侧 stride 对齐到输出形状，广播维 stride 置 0。
 
         广播的维度会被折叠（相邻且两侧 stride 都连续的维合并成一个），
@@ -352,7 +394,11 @@ class _ElementwiseMixin:
         cp = self.cp
         a = self._contig(a)
         b = self._contig(b)
-        out = cp.empty(out_shape, dtype=a.dtype)
+        out = (
+            cp.empty(out_shape, dtype=cp.bool_)
+            if compare
+            else cp.empty(out_shape, dtype=a.dtype)
+        )
         n = int(out.size)
         if n == 0:
             return out
@@ -374,12 +420,27 @@ class _ElementwiseMixin:
         for i, (dim, step_a, step_b) in enumerate(groups):
             dims[i], sa[i], sb[i] = dim, step_a, step_b
 
+        # 坐标还原是这条内核的主要开销：全维都是 2 的幂时，主机侧把 log2
+        # 传下去，内核用掩码 + 右移代替 64 位 div/mod（shape 是运行期参数，
+        # 编译器自己推不出这一点）。任一维不是 2 的幂就整条退回通用形态。
+        pow2 = all(int(dim) & (int(dim) - 1) == 0 for dim in dims)
+        shifts = [int(dim).bit_length() - 1 for dim in dims] if pow2 else []
+
         dtype_key = self._kind(a)
-        kernel = self._kernel(
-            ("bcast", kind, dtype_key),
-            lambda: self.codegen.render(self.codegen.broadcast_binary_source(kind), a.dtype),
-            "ew_bcast",
-        )
+        if compare:
+            kernel = self._kernel(
+                ("cmp_bcast", kind, dtype_key, "pow2" if pow2 else "div"),
+                lambda: self.codegen.compare_source(kind, pow2=pow2, dtype=a.dtype),
+                "ew_cmp_bcast",
+            )
+        else:
+            kernel = self._kernel(
+                ("bcast", kind, dtype_key, "pow2" if pow2 else "div"),
+                lambda: self.codegen.render(
+                    self.codegen.broadcast_binary_source(kind, pow2=pow2), a.dtype
+                ),
+                "ew_bcast",
+            )
         block, grid = self._grid(kind, n)
         kernel(
             (grid,),
@@ -393,6 +454,7 @@ class _ElementwiseMixin:
                 *[np.int64(v) for v in dims],
                 *[np.int64(v) for v in sa],
                 *[np.int64(v) for v in sb],
+                *[np.int32(v) for v in shifts],
             ),
         )
         return out

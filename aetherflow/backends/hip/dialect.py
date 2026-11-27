@@ -12,7 +12,7 @@ from ...lower.cstyle import CStyleDialect
 from ..cuda import codegen as _cuda
 from . import codegen
 
-__all__ = ["HIP_DIALECT", "CAST_DIALECT"]
+__all__ = ["HIP_DIALECT", "CAST_DIALECT", "BOOL_DIALECT"]
 
 HIP_DIALECT = CStyleDialect(
     "hip",
@@ -38,6 +38,23 @@ CAST_DIALECT = CStyleDialect(
     helpers={
         DType.F32: _cuda._F32_HELPERS + codegen._HIP_F16_HELPERS,
         DType.F16: codegen._HIP_F16_HELPERS + _cuda._F32_HELPERS,
+    },
+    reduce_helpers=HIP_DIALECT.reduce_helpers,
+)
+
+# 比较内核同时需要源 dtype 的读取与 bool 的读出/写回（同 CUDA 侧）。
+_BOOL_HELPERS = _cuda._F32_HELPERS + codegen._HIP_F16_HELPERS + _cuda._BOOL_HELPERS
+
+BOOL_DIALECT = CStyleDialect(
+    "hip",
+    storage={**HIP_DIALECT.storage, DType.BOOL: "unsigned char"},
+    load={**HIP_DIALECT.load, DType.BOOL: "af_ld_q"},
+    store={**HIP_DIALECT.store, DType.BOOL: "af_st_q"},
+    atomic={**HIP_DIALECT.atomic, DType.BOOL: "af_add_q"},
+    helpers={
+        DType.F32: _BOOL_HELPERS,
+        DType.F16: _BOOL_HELPERS,
+        DType.BOOL: _BOOL_HELPERS,
     },
     reduce_helpers=HIP_DIALECT.reduce_helpers,
 )

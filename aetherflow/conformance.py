@@ -225,6 +225,26 @@ def _binary(op: str, shape_a: tuple, shape_b: tuple, offset_b: float = 0.0):
     return build
 
 
+def _cmp_case(op: str, shape_a: tuple, shape_b: tuple, offset_b: float = 0.0):
+    """比较用例：输入先取整。
+
+    连续随机数之间几乎不可能相等，``eq`` / ``ne`` 会退化成"恒 false / 恒
+    true"，掩盖真正的错误。取整之后两种结果都能覆盖到，广播用例还同时
+    检验坐标还原。
+    """
+
+    def build(rng):
+        g = Graph(op)
+        a = g.input("a", f32[shape_a])
+        b = g.input("b", f32[shape_b])
+        g.output(g.add_node(op, [a, b]), "y")
+        av = np.round(_f32(rng, shape_a) * 2.0).astype(np.float32)
+        bv = np.round(_f32(rng, shape_b) * 2.0 + offset_b).astype(np.float32)
+        return g, {"a": av, "b": bv}
+
+    return build
+
+
 def _unary(op: str, shape: tuple, scale: float = 1.0):
     def build(rng):
         g = Graph(op)
@@ -1240,6 +1260,16 @@ def default_cases() -> List[Case]:
         _case("mul_basic", _binary("mul", (4, 6), (4, 6))),
         _case("div_basic", _binary("div", (4, 6), (4, 6), offset_b=3.0),
               note="除数偏移 3，避免靠近 0"),
+        # 比较：输出 bool，是掩码的唯一产生端
+        _case("eq_same", _cmp_case("eq", (4, 6), (4, 6))),
+        _case("ne_same", _cmp_case("ne", (4, 6), (4, 6))),
+        _case("lt_same", _cmp_case("lt", (4, 6), (4, 6))),
+        _case("le_same", _cmp_case("le", (4, 6), (4, 6))),
+        _case("gt_same", _cmp_case("gt", (4, 6), (4, 6))),
+        _case("ge_same", _cmp_case("ge", (4, 6), (4, 6))),
+        _case("gt_broadcast_bias", _cmp_case("gt", (2, 3, 4), (4,)),
+              note="比较复用广播骨架，检验 strided 坐标还原"),
+        _case("lt_broadcast_scalar", _cmp_case("lt", (3, 5), (1,))),
         # 逐元素：广播（前端把 linear 降级成 matmul + add 后的真实形态）
         _case("add_broadcast_bias", _binary("add", (2, 3, 4), (4,)),
               note="尾部维广播，bias 的典型形态"),
@@ -1548,9 +1578,12 @@ def _compare(got: Mapping[str, np.ndarray], expected: Mapping[str, np.ndarray], 
             np.testing.assert_allclose(got_arr, exp_arr, rtol=case.rtol, atol=case.atol)
         except AssertionError:
             # 先在公共 dtype 上求差再取模：复数不能先转 float64，否则虚部被
-            # 静默丢弃，误差会算成 0。
-            diff = np.abs(got_arr - exp_arr)
-            peak = float(np.nanmax(diff)) if diff.size else 0.0
+            # 静默丢弃，误差会算成 0。bool 不能做减法，用不等元素个数。
+            if got_arr.dtype == np.bool_ or exp_arr.dtype == np.bool_:
+                peak = float(np.count_nonzero(got_arr != exp_arr))
+            else:
+                diff = np.abs(got_arr - exp_arr)
+                peak = float(np.nanmax(diff)) if diff.size else 0.0
             return (
                 False,
                 f"输出 {name} 与参考语义不一致（最大绝对误差 {peak:.3e}，"
@@ -1558,8 +1591,11 @@ def _compare(got: Mapping[str, np.ndarray], expected: Mapping[str, np.ndarray], 
                 peak,
             )
         if got_arr.size:
-            diff = np.abs(got_arr - exp_arr)
-            max_error = max(max_error, float(np.nanmax(diff)))
+            if got_arr.dtype == np.bool_ or exp_arr.dtype == np.bool_:
+                max_error = max(max_error, float(np.count_nonzero(got_arr != exp_arr)))
+            else:
+                diff = np.abs(got_arr - exp_arr)
+                max_error = max(max_error, float(np.nanmax(diff)))
     return True, "", max_error
 
 

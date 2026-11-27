@@ -62,6 +62,27 @@ def cast_fn(src, dst) -> str:
     return _cuda.cast_fn(src, dst, dialect=CAST_DIALECT)
 
 
+def compare_source(kind: str, *, scalar_a: bool = False, scalar_b: bool = False,
+                   pow2=None, dtype=None) -> str:
+    """比较内核源码：L2 与 CUDA 逐字共用，只换方言。
+
+    ``dtype`` 是输入的存储类型：bool 输入（``ne(mask, 0)``）要 HIP 侧的
+    ``BOOL_DIALECT``，其余仍是 ``HIP_DIALECT``（L2 与 CUDA 同一份）。
+    """
+    # 延迟导入：hip.dialect 顶层就 import 了本模块。
+    from .dialect import BOOL_DIALECT, HIP_DIALECT
+
+    is_bool = dtype is not None and _cuda._dtype_key(dtype) == "bool"
+    return _cuda.compare_source(
+        kind,
+        scalar_a=scalar_a,
+        scalar_b=scalar_b,
+        pow2=pow2,
+        dtype=dtype,
+        dialect=BOOL_DIALECT if is_bool else HIP_DIALECT,
+    )
+
+
 def __getattr__(name: str):
     """未定义的常量/函数一律来自 CUDA 侧的模板库（单一事实来源）。"""
     return getattr(_cuda, name)

@@ -7,6 +7,17 @@ from ..kernel import Axis, Bin, Cast, Expr, For, Let, Stmt, Var
 
 BINARY_OP = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 
+# 比较算符：与 BINARY_OP 分开，因为它们唯一的产出类型是 bool，设备端的存储
+# 与归一化（`af_st_q` 把任意非零写成 1）也和算术不同。
+COMPARE_OP = {
+    "eq": "==",
+    "ne": "!=",
+    "lt": "<",
+    "le": "<=",
+    "gt": ">",
+    "ge": ">=",
+}
+
 
 def grid_stride(limit: Expr, *body: Stmt) -> tuple:
     """一维网格步进的块内索引骨架，全部逐元素内核共用。

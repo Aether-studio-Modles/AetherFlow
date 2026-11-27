@@ -33,6 +33,12 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "sub",
         "mul",
         "div",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
         "relu",
         "silu",
         "exp",
@@ -127,6 +133,12 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
 # 整数下标允许的 dtype。与 ir/ops.py 的 infer 保持一致：i32 是前端导入的
 # 常态，i8 是压缩标签 / 量化权重的形态。
 _INDEX_DTYPES = ("int32", "int8")
+
+# 允许 bool 输入的算子。比较算子两侧都可以是 bool（``ne(mask, 0)`` 这类
+# "掩码再取反"的写法很常见），它们的设备存储是 1 字节 ``unsigned char``，
+# 走独立的 ``BOOL_DIALECT``。算术算子不在此列：true + true = 2 再归一成 1
+# 没有意义，IR 的 verifier 也已拒绝。
+_BOOL_OPS: FrozenSet[str] = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 # 带 ``layout`` 属性的算子。这些算子的自研内核只按 NCHW 寻址；NHWC 形态
 # 必须显式拒绝（DESIGN 5.246：布局传播由参考后端承接，设备端等待原生内核）。
@@ -337,6 +349,12 @@ _ELEMENTWISE_TUNABLE_OPS: FrozenSet[str] = frozenset(
         "sub",
         "mul",
         "div",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
         "relu",
         "silu",
         "exp",

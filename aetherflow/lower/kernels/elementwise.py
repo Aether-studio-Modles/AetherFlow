@@ -27,13 +27,25 @@ from ..kernel import (
     Tensor,
     Var,
 )
-from .common import BINARY_OP, grid_stride
+from .common import BINARY_OP, COMPARE_OP, grid_stride
 
 
-def ew_binary(kind: str, *, scalar_a: bool = False, scalar_b: bool = False) -> Kernel:
-    """逐元素二元内核（网格步进）。"""
-    if kind not in BINARY_OP:
-        raise ValueError(f"未知的二元运算 {kind!r}；已支持: {sorted(BINARY_OP)}")
+def ew_binary(
+    kind: str,
+    *,
+    scalar_a: bool = False,
+    scalar_b: bool = False,
+    compare: bool = False,
+) -> Kernel:
+    """逐元素二元内核（网格步进）。
+
+    ``compare`` 为真时是**比较**内核：算子从 ``COMPARE_OP`` 取，输出容器是
+    1 字节的 bool。算术与比较共用同一份循环骨架，差异只有这两处。
+    """
+    table = COMPARE_OP if compare else BINARY_OP
+    if kind not in table:
+        label = "比较" if compare else "二元"
+        raise ValueError(f"未知的{label}运算 {kind!r}；已支持: {sorted(table)}")
 
     # 标量一侧仍然收设备指针、在内核里取 [0]：传主机 float 会强制同步，
     # 也会让整张图无法被捕获。
@@ -41,22 +53,27 @@ def ew_binary(kind: str, *, scalar_a: bool = False, scalar_b: bool = False) -> K
     b_index = Num("0") if scalar_b else Var("i")
     # 括号显式写进 L2（模板原本是 "(A) op (B)"），打印器不推断优先级。
     value = Bin(
-        BINARY_OP[kind],
+        table[kind],
         Paren(Load("a", a_index)),
         Paren(Load("b", b_index)),
     )
 
+    out = Tensor("out", read_only=False, type_name="bool") if compare else Tensor(
+        "out", read_only=False
+    )
     return Kernel(
-        name="ew_bin",
+        name="ew_cmp" if compare else "ew_bin",
         params=(
             Tensor("a"),
             Tensor("b"),
-            Tensor("out", read_only=False),
+            out,
             Scalar("long long", "n"),
         ),
         body=grid_stride(
             Var("n"),
-            Store("out", Var("i"), value),
+            # 比较结果是 C 的 0/1，直接裸写进 1 字节容器；套 ``af_st_q``
+            # 只会多一次"非零归一"，而那一步在 0/1 上是恒等的。
+            Store("out", Var("i"), value, raw=compare),
         ),
     )
 
@@ -310,17 +327,25 @@ def silu_gate() -> Kernel:
     )
 
 
-def ew_broadcast(kind: str) -> Kernel:
+def ew_broadcast(kind: str, *, pow2: bool = False, compare: bool = False) -> Kernel:
     """支持 numpy 多维广播的逐元素二元内核。
 
     广播靠"对齐后的 stride"：被广播的维度 stride 为 0，同一个输入元素会被
     多个输出位置复用。维度上限 4，超过时由后端拒绝。
+
+    ``pow2`` 为真表示**所有维都是 2 的幂**（主机侧判定），于是坐标还原可以
+    用掩码 + 右移代替 64 位 div/mod：``rem % shape`` → ``rem & (shape-1)``、
+    ``rem / shape`` → ``rem >> log2(shape)``。``shape`` 是运行期参数、编译器
+    不知道它是不是 2 的幂，所以这个信息只能由主机侧多传一组 ``s0..s3`` 给
+    内核；两者都按"取模"语义成立，数值语义不变。
     """
-    if kind not in BINARY_OP:
-        raise ValueError(f"未知的二元运算 {kind!r}；已支持: {sorted(BINARY_OP)}")
+    table = COMPARE_OP if compare else BINARY_OP
+    if kind not in table:
+        label = "比较" if compare else "二元"
+        raise ValueError(f"未知的{label}运算 {kind!r}；已支持: {sorted(table)}")
 
     value = Bin(
-        BINARY_OP[kind],
+        table[kind],
         Paren(Load("a", Var("oa"))),
         Paren(Load("b", Var("ob"))),
     )
@@ -328,19 +353,51 @@ def ew_broadcast(kind: str) -> Kernel:
     def _dims(prefix: str) -> tuple:
         return tuple(Var(f"{prefix}{k}") for k in range(4))
 
-    params = [Tensor("a"), Tensor("b"), Tensor("out", read_only=False)]
+    out = Tensor("out", read_only=False, type_name="bool") if compare else Tensor(
+        "out", read_only=False
+    )
+    params = [Tensor("a"), Tensor("b"), out]
     params.append(Scalar("long long", "n"))
     params.append(Scalar("int", "ndim"))
     for prefix in ("d", "a", "b"):
         params.extend(Scalar("long long", v.name) for v in _dims(prefix))
+    if pow2:
+        # 尾部未用的维由主机传 dim=1 / shift=0：掩码为 0、右移 0 位，
+        # 正好把 c 还原成 0 且 rem 不动，不需要在内核里分支。
+        params.extend(Scalar("int", v.name) for v in _dims("s"))
+
+    if pow2:
+        decomp = (
+            Let(
+                "long long",
+                "c",
+                Bin(
+                    "&",
+                    Var("rem"),
+                    Paren(Bin("-", Index("shape", Var("d")), Num("1"))),
+                ),
+            ),
+            AugAssign(Var("rem"), ">>", Index("sh", Var("d"))),
+        )
+    else:
+        decomp = (
+            Let("long long", "c", Bin("%", Var("rem"), Index("shape", Var("d")))),
+            AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
+        )
+
+    decls = [
+        ArrayDecl("long long", "shape", 4, _dims("d")),
+        ArrayDecl("long long", "sa", 4, _dims("a")),
+        ArrayDecl("long long", "sb", 4, _dims("b")),
+    ]
+    if pow2:
+        decls.append(ArrayDecl("int", "sh", 4, _dims("s")))
 
     return Kernel(
-        name="ew_bcast",
+        name="ew_cmp_bcast" if compare else "ew_bcast",
         params=tuple(params),
         body=(
-            ArrayDecl("long long", "shape", 4, _dims("d")),
-            ArrayDecl("long long", "sa", 4, _dims("a")),
-            ArrayDecl("long long", "sb", 4, _dims("b")),
+            *decls,
             Let(
                 "long long",
                 "i",
@@ -375,16 +432,7 @@ def ew_broadcast(kind: str) -> Kernel:
                         Num("0"),
                         Num("1"),
                         (
-                            Let(
-                                "long long",
-                                "c",
-                                Bin(
-                                    "%",
-                                    Var("rem"),
-                                    Index("shape", Var("d")),
-                                ),
-                            ),
-                            AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
+                            *decomp,
                             AugAssign(
                                 Var("oa"),
                                 "+",
@@ -408,7 +456,7 @@ def ew_broadcast(kind: str) -> Kernel:
                         incr="--",
                         type_name="int",
                     ),
-                    Store("out", Var("i"), value),
+                    Store("out", Var("i"), value, raw=compare),
                 ),
             ),
         ),

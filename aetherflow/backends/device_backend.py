@@ -66,6 +66,7 @@ import numpy as np
 from .device_shared import (
     GPU_OPS as GPU_OPS,
     _ALL_TUNABLE_OPS as _ALL_TUNABLE_OPS,
+    _BOOL_OPS as _BOOL_OPS,
     _CONV_CB_OPTIONS as _CONV_CB_OPTIONS,
     _CONV_IMPLS as _CONV_IMPLS,
     _CONV_KNOBS as _CONV_KNOBS,
@@ -408,6 +409,12 @@ class DeviceBackend(
         r.register("sub", self._op_sub)
         r.register("mul", self._op_mul)
         r.register("div", self._op_div)
+        r.register("eq", self._op_eq)
+        r.register("ne", self._op_ne)
+        r.register("lt", self._op_lt)
+        r.register("le", self._op_le)
+        r.register("gt", self._op_gt)
+        r.register("ge", self._op_ge)
         r.register("relu", self._op_relu)
         r.register("silu", self._op_silu)
         r.register("exp", self._op_exp)
@@ -1065,6 +1072,8 @@ class DeviceBackend(
                         f"{self._LABEL}的 {name} 的整数下标必须是 i32/i8，收到 {a.dtype}"
                     )
                 continue
+            if a.dtype == self.cp.bool_ and name in _BOOL_OPS:
+                continue
             if a.dtype == self.cp.float32:
                 continue
             if a.dtype == self.cp.float16 and name in self._f16_ops:
@@ -1310,11 +1319,13 @@ class DeviceBackend(
         return groups
 
     def _kind(self, a) -> str:
-        """内核源码与缓存的 dtype 键（``f32`` / ``f16`` / ``bf16``）。
+        """内核源码与缓存的 dtype 键（``f32`` / ``f16`` / ``bf16`` / ``bool``）。
 
-        ``uint16`` 只可能是 bf16 的位模式容器（IR 没有 u16 类型）；其余
-        dtype 在 ``invoke`` 就已拒绝，走不到这里。
+        ``uint16`` 只可能是 bf16 的位模式容器（IR 没有 u16 类型）；``bool``
+        只出现在比较结果与 ``where`` 的 cond 上，由 ``_BOOL_OPS`` 放行。
         """
+        if a.dtype == self.cp.bool_:
+            return "bool"
         if a.dtype == self.cp.uint16:
             return "bf16"
         return "f16" if a.dtype == self.cp.float16 else "f32"

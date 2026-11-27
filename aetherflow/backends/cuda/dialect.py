@@ -11,7 +11,7 @@ from ...ir.types import DType
 from ...lower.cstyle import CStyleDialect
 from . import codegen
 
-__all__ = ["CUDA_DIALECT", "CAST_DIALECT"]
+__all__ = ["CUDA_DIALECT", "CAST_DIALECT", "BOOL_DIALECT"]
 
 CUDA_DIALECT = CStyleDialect(
     "cuda",
@@ -50,6 +50,26 @@ CAST_DIALECT = CStyleDialect(
         DType.F32: _CAST_HELPERS,
         DType.F16: _CAST_HELPERS,
         DType.BF16: _CAST_HELPERS,
+    },
+    reduce_helpers=CUDA_DIALECT.reduce_helpers,
+)
+
+# 比较这类"输入数值、输出 bool"的内核同时需要两套 helper：源 dtype 的读取
+# 与 bool 的读出/写回。与 CAST_DIALECT 同理，只给这一族内核用，不并进
+# CUDA_DIALECT——否则每个普通内核都会多带一份用不到的 bool 存取。
+_BOOL_HELPERS = _CAST_HELPERS + codegen._BOOL_HELPERS
+
+BOOL_DIALECT = CStyleDialect(
+    "cuda",
+    storage={**CUDA_DIALECT.storage, DType.BOOL: "unsigned char"},
+    load={**CUDA_DIALECT.load, DType.BOOL: "af_ld_q"},
+    store={**CUDA_DIALECT.store, DType.BOOL: "af_st_q"},
+    atomic={**CUDA_DIALECT.atomic, DType.BOOL: "af_add_q"},
+    helpers={
+        DType.F32: _BOOL_HELPERS,
+        DType.F16: _BOOL_HELPERS,
+        DType.BF16: _BOOL_HELPERS,
+        DType.BOOL: _BOOL_HELPERS,
     },
     reduce_helpers=CUDA_DIALECT.reduce_helpers,
 )
