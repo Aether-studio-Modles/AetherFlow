@@ -5,10 +5,10 @@
 
 - 物理存储是每层一份 ``(num_blocks, block_size, num_heads, head_dim)`` 的数组；
 - 每条序列只持有一张**块表**（逻辑页号 → 物理页号），页从一张空闲链上领；
-- 对外只有"追加 / 取回 / 回滚 / 回收 / 换出 / 换入"六个动作，取回时按块表
-  拼成连续张量。
+- 对外只有"追加 / 取回 / 回滚 / 回收 / 换出 / 换入 / 分叉"七个动作，取回时按
+  块表拼成连续张量。
 
-四条结构性事实（都是"不满足就必须显式报错"的那类）：
+五条结构性事实（都是"不满足就必须显式报错"的那类）：
 
 1. **追加是全有或全无的。** 一次追加需要的新页在写入前一次性领齐；空闲页不够
    就抛 :class:`PagedCacheFullError`，**不留下半条序列**。留下半段比直接失败更
@@ -20,9 +20,13 @@
 4. **换出只搬数据，不改长度。** ``swap_out`` 把整条序列的 K/V 拷一份到主机、
    释放物理页；``swap_in`` 重新领页并写回，页号可能与换出前不同，数值不变。
    换出期间块表为空，所以只允许查长度，读写一律显式要求先换入。
+5. **共享前缀是写时复制的。** ``fork`` 让子序列指向父序列的同一批物理页，每页
+   的引用计数加一；任何一方之后写到这些页时先**拆页**（领新页 + 整页拷贝），
+   所以追加 / 回滚不会穿透到另一方。页只在最后一个持有者放手时回到空闲链，
+   ``used_blocks`` 也只算一次。
 
 策略面由 :class:`PagedCacheManager` 提供：容量不足时按最近最少使用（LRU）自动
-换出**未被 pin 的**序列，被换出的序列再次被访问时自动换入。它不改变上面六条
+换出**未被 pin 的**序列，被换出的序列再次被访问时自动换入。它不改变上面这些
 存储语义，只决定"谁被换出、什么时候换入"。
 
 **这一层不负责数值算子的实现。** 它只提供"按块表取回一段连续 K/V"的存储语义，
@@ -101,6 +105,9 @@ class PagedKVCache:
         self._free: List[int] = list(range(self.num_blocks - 1, -1, -1))
         self._tables: Dict[int, List[int]] = {}
         self._lengths: Dict[int, int] = {}
+        # 物理页 → 持有它的序列数。只在 fork 后大于 1；归零才回空闲链。
+        self._refs: Dict[int, int] = {}
+        self._forks = 0
         # 每层懒分配：只用了 2 层就只占 2 层的显存。
         self._keys: Dict[int, np.ndarray] = {}
         self._values: Dict[int, np.ndarray] = {}
@@ -134,6 +141,21 @@ class PagedKVCache:
     @property
     def num_sequences(self) -> int:
         return len(self._tables)
+
+    @property
+    def shared_blocks(self) -> int:
+        """引用计数大于 1 的物理页数，即被多条序列共享的页。"""
+        return sum(1 for count in self._refs.values() if count > 1)
+
+    def exclusive_blocks(self, rid: int) -> int:
+        """只被 ``rid`` 引用的物理页数，即换出它最多能腾出的页数。
+
+        换出态返回 0（没有物理页）；未分配抛 ``KeyError``。
+        """
+        self.length(rid)
+        if rid in self._swapped:
+            return 0
+        return sum(1 for page in self._tables[rid] if self._refs[page] == 1)
 
     def __contains__(self, rid: object) -> bool:
         return rid in self._tables
@@ -174,9 +196,33 @@ class PagedKVCache:
             "free_blocks": self.free_blocks,
             "peak_blocks": self._peak_blocks,
             "sequences": self.num_sequences,
+            "shared_blocks": self.shared_blocks,
+            "forks": self._forks,
             "swapped_sequences": len(self._swapped),
             "swapped_tokens": self.swapped_tokens,
         }
+
+    # -- 页的引用计数 -------------------------------------------------
+
+    def _take_page(self) -> int:
+        """从空闲链领一页，引用计数置 1。调用方必须先确认空闲页够。"""
+        page = self._free.pop()
+        self._refs[page] = 1
+        return page
+
+    def _give_back(self, page: int) -> bool:
+        """放手一页：引用计数减 1，降到 0 才真正回到空闲链。
+
+        返回 ``True`` 表示这页确实腾出来了（可以再分给别人）；返回 ``False``
+        表示还有别的序列引用它，什么都没腾出。
+        """
+        count = self._refs[page] - 1
+        if count:
+            self._refs[page] = count
+            return False
+        del self._refs[page]
+        self._free.append(page)
+        return True
 
     # -- 生命周期 -----------------------------------------------------
 
@@ -200,28 +246,34 @@ class PagedKVCache:
         self._lengths.pop(rid, None)
         self._swapped.pop(rid, None)  # 换出态没有物理页，只丢弃主机副本
         for block in table:
-            self._free.append(block)
+            self._give_back(block)
         return True
 
     def reset(self, rid: int) -> int:
-        """把序列长度清零并回收其全部页，但保留分配；返回回收的页数。"""
+        """把序列长度清零并放手全部页，但保留分配；返回**实际腾出**的页数。
+
+        共享页只减引用，还有别的序列引用它时不算腾出。
+        """
         self.length(rid)  # 未分配时显式抛 KeyError
         if self._swapped.pop(rid, None) is not None:
             # 换出态：页已在换出时归还，这里只丢弃主机副本。
             self._lengths[rid] = 0
             return 0
         table = self._tables[rid]
-        freed = len(table)
-        self._free.extend(table)
+        released = 0
+        for block in table:
+            if self._give_back(block):
+                released += 1
         self._tables[rid] = []
         self._lengths[rid] = 0
-        return freed
+        return released
 
     def truncate(self, rid: int, length: int) -> int:
-        """把序列缩短到 ``length`` 个 token，返回释放的页数。
+        """把序列缩短到 ``length`` 个 token，返回**实际腾出**的页数。
 
         ``length`` 不能超过当前长度（伸长不是回滚，应该走 ``append``）。页内的
-        残留数据不清零：它一定落在新长度之外，``gather`` 不会返回。
+        残留数据不清零：它一定落在新长度之外，``gather`` 不会返回。被别的序列
+        共享的页只减引用，不算腾出。
         """
         current = self.length(rid)
         if isinstance(length, bool) or not isinstance(length, int):
@@ -249,19 +301,50 @@ class PagedKVCache:
         keep = _pages_for(length, self.block_size)
         freed = table[keep:]
         del table[keep:]
-        self._free.extend(freed)
+        released = 0
+        for block in freed:
+            if self._give_back(block):
+                released += 1
         self._lengths[rid] = length
-        return len(freed)
+        return released
+
+    def fork(self, parent: int, child: int) -> None:
+        """把 ``parent`` 当前的块表整份共享给 ``child``，走写时复制。
+
+        子序列与父序列指向同一批物理页，页的引用计数加一，``used_blocks`` 与
+        ``shared_blocks`` 都不增加页数（后者反而变大）。任何一方之后写这些页
+        时先拆页（新页 + 整页拷贝），所以追加 / 回滚不会穿透到另一方。
+
+        典型用法是"同一段前缀 + 多条后继"：多采样、束搜索、同一个系统提示下
+        的多条请求。只接受驻留序列——换出态没有物理页，先 ``swap_in``；
+        ``child`` 必须是一个没分配过的 id。
+        """
+        self.length(parent)  # 未分配时显式抛 KeyError
+        if parent in self._swapped:
+            raise ValueError(
+                f"序列 {parent} 已换出到主机；先 swap_in 再 fork"
+            )
+        if isinstance(child, bool) or not isinstance(child, int):
+            raise TypeError(f"child 必须是 int，得到 {type(child).__name__}")
+        if child in self._tables:
+            raise ValueError(f"序列 {child} 已经分配；fork 需要一个新的 id")
+        table = list(self._tables[parent])
+        for page in table:
+            self._refs[page] += 1
+        self._tables[child] = table
+        self._lengths[child] = self._lengths[parent]
+        self._forks += 1
 
     # -- 换出与换入 ---------------------------------------------------
 
     def swap_out(self, rid: int) -> int:
-        """把整条序列的 K/V 拷到主机暂存并释放物理页，返回释放的页数。
+        """把整条序列的 K/V 拷到主机暂存并放手物理页，返回**实际腾出**的页数。
 
         换出后长度不变、仍然是"已分配"，但块表为空：``append`` / ``gather``
         会显式要求先 :meth:`swap_in`，只有 ``length`` / ``is_swapped`` 可查。
         暂存的是副本，且只覆盖**已经分配过**的层——从没用过的层换出后仍然
-        不占空间。
+        不占空间。被别的序列共享的页只减引用：一条全共享的序列换出后一页也
+        腾不出（返回 0），但它的主机副本照样独立存在。
 
         这一层不做真正的 D2H：缓存本身就在主机内存，"搬到主机"是把页归还
         空闲链、把副本挂到序列上。真机上的显存换出由上层按同一语义执行。
@@ -277,11 +360,13 @@ class PagedKVCache:
             keys.append(key)
             values.append(value)
         table = self._tables[rid]
-        freed = len(table)
-        self._free.extend(table)
+        released = 0
+        for block in table:
+            if self._give_back(block):
+                released += 1
         self._tables[rid] = []
         self._swapped[rid] = (layers, keys, values, current)
-        return freed
+        return released
 
     def swap_in(self, rid: int) -> int:
         """把换出的序列换回物理页，返回本次领取的页数。
@@ -302,7 +387,7 @@ class PagedKVCache:
                 f"{len(self._free)}（block_size={self.block_size}）；"
                 "序列保持换出态，腾出页后可重试"
             )
-        table = [self._free.pop() for _ in range(need)]
+        table = [self._take_page() for _ in range(need)]
         for layer, key, value in zip(layers, keys, values):
             store_keys, store_values = self._layer_arrays(layer)
             for position in range(length):
@@ -388,17 +473,34 @@ class PagedKVCache:
                     f"{k.shape[0]}"
                 )
         need = _pages_for(current + tokens, self.block_size)
-        have = len(self._tables[rid])
+        table = self._tables[rid]
+        have = len(table)
         missing = need - have
-        if missing > len(self._free):
+        # 写时复制：这次会写到的**已有**页若仍被别的序列共享，必须先拆开。
+        first = current // self.block_size
+        last = (current + tokens - 1) // self.block_size
+        cow = [
+            page
+            for page in range(first, min(last, have - 1) + 1)
+            if self._refs[table[page]] > 1
+        ]
+        if missing + len(cow) > len(self._free):
+            extra = f"，另有 {len(cow)} 个共享页需要拆分" if cow else ""
             raise PagedCacheFullError(
-                f"追加 {tokens} 个 token 需要 {missing} 个新页，空闲页只有 "
+                f"追加 {tokens} 个 token 需要 {missing} 个新页{extra}，空闲页只有 "
                 f"{len(self._free)}（block_size={self.block_size}）；"
                 "缩短序列、回收其它会话，或调大 num_blocks"
             )
         for _ in range(missing):
-            self._tables[rid].append(self._free.pop())
-        table = self._tables[rid]
+            table.append(self._take_page())
+        for page in cow:
+            old = table[page]
+            fresh = self._take_page()
+            for stores in (self._keys, self._values):
+                for store in stores.values():
+                    store[fresh] = store[old]
+            table[page] = fresh
+            self._give_back(old)
         for layer, (keys_layer, values_layer) in enumerate(pairs):
             store_keys, store_values = self._layer_arrays(layer)
             for offset in range(tokens):
@@ -456,7 +558,8 @@ class PagedKVCache:
     def __repr__(self) -> str:
         return (
             f"PagedKVCache(blocks={self.num_blocks}, block_size={self.block_size}, "
-            f"used={self.used_blocks}, sequences={self.num_sequences})"
+            f"used={self.used_blocks}, shared={self.shared_blocks}, "
+            f"sequences={self.num_sequences})"
         )
 
 
@@ -468,9 +571,14 @@ class PagedCacheManager:
 
     - 每次 ``append`` / ``gather`` 都把该序列标成"最近使用"；
     - ``append`` / ``ensure_resident`` 遇到 :class:`PagedCacheFullError`，就从
-      **最久未使用**的一条开始换出（跳过自己、已换出的、pin 住的），再重试；
+      **最久未使用**的一条开始换出（跳过自己、已换出的、pin 住的，以及所有页都
+      被别的序列共享的——换出它也腾不出页），再重试；
     - 被换出的序列在下一次 ``append`` / ``gather`` 前自动换入，页不够时同样
       先换出别人再重试。
+
+    **共享前缀也按"两条序列"管理。** :meth:`fork` 转发给缓存层做块级共享，两条
+    序列各自进出 LRU 顺序；共享页在任一方换出时只减引用，所以"一条全共享的父
+    序列先被换出"不会腾出任何容量——这正是 `_evict_one` 要跳过它的原因。
 
     **pin 的语义是"自动换出时可以跳过"。** 正在解码的序列一旦被换出，下一步就得
     再换入，白白搬一遍数据；服务层应在请求进入解码槽位时 ``pin``、请求结束或
@@ -566,6 +674,17 @@ class PagedCacheManager:
         self._order.move_to_end(rid)
         return self.cache.truncate(rid, length)
 
+    def fork(self, parent: int, child: int) -> None:
+        """把 ``parent`` 的块表共享给新的 ``child``（写时复制）。
+
+        两条序列都进入 LRU 顺序，父序列顺手标成最近使用。共享页在换出时
+        只减引用：只要还有一条序列持有，页就不会被别的会话拿走。
+        """
+        self._require(parent)
+        self.cache.fork(parent, child)
+        self._order[child] = None
+        self._order.move_to_end(parent)
+
     # -- pin 与显式换出 -----------------------------------------------
 
     def pin(self, rid: int) -> None:
@@ -651,14 +770,17 @@ class PagedCacheManager:
     def _evict_one(self, *, exclude: int) -> bool:
         """按 LRU 换出**一条**序列；没有可换的返回 ``False``。
 
-        跳过 ``exclude``（正在等页的那条）、被 pin 的、已经换出的，以及长度为 0
-        的（换出它也腾不出页）。每调用一次至少推进一条，所以调用方的重试循环
-        最多迭代"序列数 + 1"次。
+        跳过 ``exclude``（正在等页的那条）、被 pin 的、已经换出的、长度为 0 的
+        （换出它也腾不出页），以及**所有页都被别的序列共享**的（换出是白搬，
+        页一页也腾不出）。每调用一次至少推进一条，所以调用方的重试循环最多
+        迭代"序列数 + 1"次。
         """
         for rid in list(self._order):
             if rid == exclude or rid in self._pinned:
                 continue
             if self.cache.is_swapped(rid) or self.cache.length(rid) == 0:
+                continue
+            if self.cache.exclusive_blocks(rid) == 0:
                 continue
             pages = self.cache.swap_out(rid)
             self._swaps_out += 1

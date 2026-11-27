@@ -562,5 +562,191 @@ class TestPagedCacheManager(unittest.TestCase):
             cache.swap_in(2)
 
 
+class TestSharedPrefix(unittest.TestCase):
+    """``fork`` 的写时复制语义：共享页只算一次，写前先拆页。"""
+
+    def _check_invariant(self, cache):
+        """每条序列持有的页数之和 == 全部引用计数之和。"""
+        pages = sum(len(table) for table in cache._tables.values())
+        self.assertEqual(sum(cache._refs.values()), pages)
+        self.assertEqual(len(cache._refs), cache.used_blocks)
+
+    def test_fork_shares_pages_and_reads_are_identical(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        keys, _ = _append(cache, 1, 3)
+        used = cache.used_blocks
+        cache.fork(1, 2)
+        self.assertEqual(cache.used_blocks, used)  # 分叉不多占页
+        self.assertEqual(cache.length(2), 3)
+        self.assertEqual(cache.shared_blocks, 2)
+        self.assertEqual(cache.stats()["forks"], 1)
+        self.assertEqual(cache.block_table(1), cache.block_table(2))
+        for layer in range(cache.num_layers):
+            k1, v1 = cache.gather(1, layer)
+            k2, v2 = cache.gather(2, layer)
+            np.testing.assert_array_equal(k1, k2)
+            np.testing.assert_array_equal(v1, v2)
+            np.testing.assert_array_equal(k1, keys[layer])
+        self._check_invariant(cache)
+
+    def test_child_append_cows_only_the_written_page(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        keys, _ = _append(cache, 1, 3)  # 2 页，第 2 页只用了 1 个 slot
+        cache.fork(1, 2)
+        shared_tail = cache.block_table(2)[1]
+        extra, _ = _append(cache, 2, 1, seed=99)
+        self.assertEqual(cache.length(1), 3)
+        self.assertEqual(cache.length(2), 4)
+        self.assertEqual(cache.used_blocks, 3)  # 拆尾页多占一页
+        self.assertEqual(cache.shared_blocks, 1)  # 只剩首页仍共享
+        self.assertNotEqual(cache.block_table(2)[1], shared_tail)
+        for layer in range(cache.num_layers):
+            k1, _ = cache.gather(1, layer)
+            k2, _ = cache.gather(2, layer)
+            np.testing.assert_array_equal(k1, keys[layer])
+            np.testing.assert_array_equal(k2[:3], k1)
+            np.testing.assert_array_equal(k2[3:], extra[layer])
+        self._check_invariant(cache)
+
+    def test_parent_append_does_not_reach_the_child(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        _append(cache, 1, 3)
+        cache.fork(1, 2)
+        child_keys, child_values = cache.gather(2, 0)
+        extra, _ = _append(cache, 1, 1, seed=7)
+        k1, v1 = cache.gather(1, 0)
+        k2, v2 = cache.gather(2, 0)
+        np.testing.assert_array_equal(k1[3:], extra[0])
+        np.testing.assert_array_equal(k2, child_keys)
+        np.testing.assert_array_equal(v2, child_values)
+        self.assertEqual(cache.length(2), 3)
+        self._check_invariant(cache)
+
+    def test_free_one_side_keeps_pages_for_the_other(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        keys, _ = _append(cache, 1, 4)
+        cache.fork(1, 2)
+        self.assertTrue(cache.free(2))
+        self.assertEqual(cache.used_blocks, 2)  # 一条放手，页还留着
+        self.assertEqual(cache.shared_blocks, 0)
+        k, _ = cache.gather(1, 0)
+        np.testing.assert_array_equal(k, keys[0])
+        self.assertTrue(cache.free(1))
+        self.assertEqual(cache.used_blocks, 0)
+        self.assertEqual(cache.free_blocks, cache.num_blocks)
+        self._check_invariant(cache)
+
+    def test_truncate_on_one_side_only_drops_references(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        keys, _ = _append(cache, 1, 4)
+        cache.fork(1, 2)
+        # 回滚掉的那页只减引用；首页仍被两条序列共享。
+        self.assertEqual(cache.truncate(1, 1), 0)
+        self.assertEqual(cache.used_blocks, 2)
+        self.assertEqual(cache.shared_blocks, 1)
+        k2, _ = cache.gather(2, 0)
+        np.testing.assert_array_equal(k2, keys[0])
+        self.assertTrue(cache.free(2))
+        self.assertEqual(cache.used_blocks, 1)  # 父序列还占着首页
+        self.assertTrue(cache.free(1))
+        self.assertEqual(cache.used_blocks, 0)
+        self._check_invariant(cache)
+
+    def test_cow_capacity_failure_keeps_state(self):
+        cache = _cache(num_blocks=3, block_size=2)
+        cache.allocate(1)
+        keys, _ = _append(cache, 1, 3)  # 2 页，最后 1 页只有 1 个 slot
+        cache.fork(1, 2)
+        self.assertEqual(cache.free_blocks, 1)
+        table_before = cache.block_table(2)
+        shared_before = cache.shared_blocks
+        # 拆尾页 1 个 + 新增 1 个 = 2 页，空闲只有 1 个。
+        with self.assertRaises(PagedCacheFullError):
+            _append(cache, 2, 2)
+        self.assertEqual(cache.length(2), 3)
+        self.assertEqual(cache.block_table(2), table_before)
+        self.assertEqual(cache.free_blocks, 1)
+        self.assertEqual(cache.shared_blocks, shared_before)
+        k, _ = cache.gather(1, 0)
+        np.testing.assert_array_equal(k, keys[0])
+        self._check_invariant(cache)
+
+    def test_swap_out_of_shared_sequence_frees_nothing(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        keys, _ = _append(cache, 1, 4)
+        cache.fork(1, 2)
+        self.assertEqual(cache.swap_out(1), 0)  # 全是共享页，一页也没腾出
+        self.assertEqual(cache.used_blocks, 2)
+        self.assertTrue(cache.is_swapped(1))
+        self.assertEqual(cache.exclusive_blocks(1), 0)
+        k2, _ = cache.gather(2, 0)
+        np.testing.assert_array_equal(k2, keys[0])
+        self.assertEqual(cache.swap_in(1), 2)  # 换入领新页，不再共享
+        self.assertEqual(cache.shared_blocks, 0)
+        k1, _ = cache.gather(1, 0)
+        np.testing.assert_array_equal(k1, keys[0])
+        self._check_invariant(cache)
+
+    def test_fork_chain_shares_a_single_set_of_pages(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        _append(cache, 1, 2)
+        cache.fork(1, 2)
+        cache.fork(2, 3)
+        self.assertEqual(cache.used_blocks, 1)
+        self.assertEqual(cache.shared_blocks, 1)
+        self.assertEqual(cache.stats()["forks"], 2)
+        _append(cache, 2, 2)  # 只有 2 追加到新页，不动共享页
+        self.assertEqual(cache.used_blocks, 2)
+        self.assertEqual(cache.length(1), 2)
+        self.assertEqual(cache.length(3), 2)
+        self._check_invariant(cache)
+
+    def test_fork_rejections(self):
+        cache = _cache()
+        cache.allocate(1)
+        with self.assertRaises(KeyError):
+            cache.fork(9, 2)
+        cache.allocate(3)
+        with self.assertRaisesRegex(ValueError, "已经分配"):
+            cache.fork(1, 3)
+        with self.assertRaises(TypeError):
+            cache.fork(1, True)
+        _append(cache, 1, 2)
+        cache.swap_out(1)
+        with self.assertRaisesRegex(ValueError, "先 swap_in"):
+            cache.fork(1, 2)
+
+
+class TestManagerFork(unittest.TestCase):
+    def test_manager_forwards_fork_and_evicts_for_cow(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 3)  # 父：2 页，尾页只有 1 个 slot
+        mgr.fork(1, 2)
+        mgr.allocate(3)
+        _append(mgr, 3, 4)  # 占满剩下的 2 页
+        self.assertEqual(cache.free_blocks, 0)
+        self.assertEqual(mgr.stats()["forks"], 1)
+        self.assertEqual(mgr.stats()["shared_blocks"], 2)
+        # 子序列写共享尾页需要 1 个新页：LRU 里父序列全是共享页（换出腾不出），
+        # 序列 3 独占两页，于是它被换出。
+        extra, _ = _append(mgr, 2, 1, seed=5)
+        self.assertEqual(mgr.length(2), 4)
+        self.assertTrue(cache.is_swapped(3))
+        self.assertEqual(mgr.stats()["swaps_out"], 1)
+        self.assertEqual(mgr.length(1), 3)
+        self.assertEqual(cache.shared_blocks, 1)
+        k2, _ = cache.gather(2, 0)
+        np.testing.assert_array_equal(k2[3:], extra[0])
+
+
 if __name__ == "__main__":
     unittest.main()
