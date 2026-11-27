@@ -1,8 +1,8 @@
 """int8 量化的构图与离线工具。
 
 这里没有任何新的数值语义：量化与反量化的定义都在 ``ir/ops.py``
-（``quantize_i8`` / ``dequantize_i8`` / ``linear_i8`` / ``linear_i8a8``），
-参考实现在同一处的 reference 函数里。本模块只做三件事：
+（``quantize_i8`` / ``dequantize_i8`` / ``fake_quantize_i8`` / ``linear_i8`` /
+``linear_i8a8``），参考实现在同一处的 reference 函数里。本模块只做三件事：
 
 1. **离线量化一份权重**（``quantize_weight``）：从 f32 的 ``(K, N)`` 权重算出
    逐输出通道的 scale 与 int8 权重。它直接调用算子的 reference 函数，

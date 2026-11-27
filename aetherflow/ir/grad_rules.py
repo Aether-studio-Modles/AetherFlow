@@ -579,6 +579,21 @@ def _linear_i8a8(ctx):
     return (None, None, None, None, db)
 
 
+@vjp("fake_quantize_i8")
+def _fake_quantize_i8(ctx):
+    """QAT 的直通估计器（STE）：梯度原样穿过假量化。
+
+    前向把 x 舍到 int8 格点上，``rint`` 与 ``clip`` 的解析梯度几乎处处为零，
+    照实写会让整条训练链学不到东西。QAT 的标准做法是**直通估计**：上游梯度
+    直接当作对 x 的梯度，量化误差只体现在前向数值里。饱和区也不额外截断——
+    这与 PyTorch ``fake_quantize_per_tensor_affine`` 的反向口径一致。
+
+    scale 是量化参数而不是连续变量，与 ``linear_i8`` / ``linear_i8a8``
+    同口径返回 ``None``；要学 scale（LSQ）需要另一条规则，不在这一版。
+    """
+    return (ctx.g, None)
+
+
 def _conv_attrs(attrs: dict) -> dict:
     return {k: attrs[k] for k in ("stride", "padding", "dilation", "groups") if k in attrs}
 

@@ -1220,7 +1220,11 @@ register(
 # - **W8A8 的累加在 int32 里**：``linear_i8a8`` 先做整数矩阵乘，再乘激活 /
 #   权重两个 scale。它才是 int8 tensor-core GEMM 的累加语义，因此另有两条
 #   约束：scale 必须沿压缩轴恒定（否则提不出求和号），且
-#   ``K * 127 * 127`` 不得超过 int32 上界（否则回绕）。设备内核尚未承接。
+#   ``K * 127 * 127`` 不得超过 int32 上界（否则回绕）。设备内核见 5.309。
+# - **QAT 的假量化（``fake_quantize_i8``）不产出 int8**：它把 f32 量化到
+#   int8 的格点上再原样放大回 f32，前向逐位等于
+#   ``dequantize_i8(quantize_i8(x, scale), scale)``；区别只在反向——整数
+#   中转没有可用的梯度，假量化用直通估计器（STE）把梯度送到连续权重上。
 
 _QUANT_MIN = -127
 _QUANT_MAX = 127
@@ -1309,6 +1313,49 @@ register(
         infer=_infer_dequantize_i8,
         reference=_ref_dequantize_i8,
         doc="反量化：f32(q) * scale（scale 广播到 q），输出与 q 同形状的 f32",
+    )
+)
+
+
+def _infer_fake_quantize_i8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(
+            f"fake_quantize_i8 需要 (x, scale) 两个输入，得到 {len(inputs)}"
+        )
+    x, scale = inputs
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"fake_quantize_i8 只接受 f32 输入，得到 {x.dtype.value}；"
+            "假量化与 quantize_i8 同源，语义只在 f32 上定义"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(f"fake_quantize_i8 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    if x.rank < 1:
+        raise ValueError("fake_quantize_i8 至少需要 1 维输入")
+    _check_scale_broadcast(x, scale, "fake_quantize_i8")
+    return TensorType(DType.F32, x.shape)
+
+
+def _ref_fake_quantize_i8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, scale = args
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"fake_quantize_i8 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    # 先真的落成 int8 再放大：这样前向与"量化算子 + 反量化算子"逐位同源，
+    # 而不是另一份"round 之后乘回去"的近似实现。
+    q = np.clip(np.rint(x / scale), _QUANT_MIN, _QUANT_MAX).astype(np.int8)
+    return q.astype(np.float32) * scale
+
+
+register(
+    Op(
+        name="fake_quantize_i8",
+        infer=_infer_fake_quantize_i8,
+        reference=_ref_fake_quantize_i8,
+        doc="量化感知训练（QAT）的假量化：f32 量化到 int8 格点再放大回 f32，"
+        "前向逐位等于 dequantize_i8(quantize_i8(x, scale), scale)；"
+        "反向是直通估计器（STE），scale 不接收梯度",
     )
 )
 

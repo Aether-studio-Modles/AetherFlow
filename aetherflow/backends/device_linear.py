@@ -187,6 +187,17 @@ class _LinearMixin:
         )
         return out
 
+    def _op_fake_quantize_i8(self, node, args, attrs):
+        """QAT 假量化：量化到 i8 再原样放大回 f32。
+
+        不新增内核——直接复用 ``_op_quantize_i8`` 与 ``_op_dequantize_i8``。
+        前向与"图上显式串联这两个算子"逐位相同（舍入与端点饱和只有一份
+        实现）；独立成算子的唯一理由在反向：IR 给它挂了一条直通估计器
+        （STE）规则，训练图才能穿过量化继续更新 f32 权重。
+        """
+        q = self._op_quantize_i8(node, [args[0], args[1]], attrs)
+        return self._op_dequantize_i8(node, [q, args[1]], attrs)
+
     def _op_linear_i8(self, node, args, attrs):
         """weight-only int8 线性层：反量化权重后走既有 f32 GEMM。
 

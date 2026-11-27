@@ -436,6 +436,7 @@ class DeviceBackend(
         r.register("matmul", self._op_matmul)
         r.register("quantize_i8", self._op_quantize_i8)
         r.register("dequantize_i8", self._op_dequantize_i8)
+        r.register("fake_quantize_i8", self._op_fake_quantize_i8)
         r.register("linear_i8", self._op_linear_i8)
         r.register("linear_i8a8", self._op_linear_i8a8)
         r.register("conv2d", self._op_conv2d)

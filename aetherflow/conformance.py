@@ -306,6 +306,18 @@ def _dequantize_i8(shape: tuple = (8, 6)):
     return build
 
 
+def _fake_quantize_i8(shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("fake_quantize_i8")
+        x = g.input("x", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        g.output(g.add_node("fake_quantize_i8", [x, s]), "y")
+        scale = (np.abs(_f32(rng, (shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {"x": _f32(rng, shape, scale=0.5), "s": scale}
+
+    return build
+
+
 def _linear_i8(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
     def build(rng):
         g = Graph("linear_i8")
@@ -1444,6 +1456,9 @@ def default_cases() -> List[Case]:
                    "不是近似对齐"),
         _case("dequantize_i8_channel", _dequantize_i8(),
               note="放大回 f32：权重驻留宽度从 4 字节降到 1 字节的唯一读出口"),
+        _case("fake_quantize_i8_channel", _fake_quantize_i8(),
+              note="QAT 的假量化：前向必须逐位等于 dequantize_i8(quantize_i8(x, s), s)，"
+                   "设备端由已有两个内核组合承接"),
         _case("linear_i8_bias", _linear_i8(),
               note="反量化 GEMM 的完整形态（含 bias）：数值必须等于先 dequantize "
                    "再 matmul"),

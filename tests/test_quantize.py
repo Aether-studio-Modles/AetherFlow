@@ -559,11 +559,136 @@ class TestLinearI8A8Gradient(unittest.TestCase):
                     backward(g, wrt=[g.find(name)])
 
 
+class TestFakeQuantizeI8(unittest.TestCase):
+    """QAT 的假量化：f32 进、f32 出，前向是"量化-反量化"的组合，反向是 STE。
+
+    与 ``quantize_i8`` 的差别只有两点：输出仍是 f32（因此能接进训练图），
+    以及反向有一条直通估计器规则。前向必须与显式串联两个算子逐位相同——
+    否则"假量化"和"真量化再反量化"就是两套语义。
+    """
+
+    def _graph(self, shape=(4, 3)):
+        g = Graph("fake_quantize_i8")
+        x = g.input("x", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        g.output(g.add_node("fake_quantize_i8", [x, s]), "y")
+        return g
+
+    def _two_op_graph(self, shape=(4, 3)):
+        g = Graph("quantize_then_dequantize")
+        x = g.input("x", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        q = g.add_node("quantize_i8", [x, s])
+        g.output(g.add_node("dequantize_i8", [q, s]), "y")
+        return g
+
+    def test_forward_matches_explicit_quantize_then_dequantize(self):
+        rng = np.random.default_rng(81)
+        shape = (5, 4)
+        feed = {
+            "x": (rng.standard_normal(shape) * 3).astype(np.float32),
+            "s": np.array([0.1, 0.05, 0.25, 0.5], np.float32),
+        }
+        got = _run(self._graph(shape), feed)["y"]
+        want = _run(self._two_op_graph(shape), feed)["y"]
+        np.testing.assert_array_equal(got, want)
+
+    def test_rounding_is_rne_and_saturates(self):
+        # scale=1 时格点就是整数：0.5→0、1.5→2、-0.5→0（半偶）；
+        # 127.6 与 -127.6 被夹到 ±127。
+        x = np.array([0.5, 1.5, 2.5, -0.5, -1.5, 127.6, -127.6], np.float32)
+        s = np.ones((1,), np.float32)
+        got = _run(self._graph((7, 1)), {"x": x.reshape(7, 1), "s": s})["y"]
+        np.testing.assert_array_equal(
+            got.reshape(-1), np.array([0.0, 2.0, 2.0, 0.0, -2.0, 127.0, -127.0], np.float32)
+        )
+
+    def test_zero_input_stays_zero_for_any_scale(self):
+        x = np.zeros((2, 3), np.float32)
+        s = np.array([0.1, 1.0, 7.0], np.float32)
+        got = _run(self._graph((2, 3)), {"x": x, "s": s})["y"]
+        np.testing.assert_array_equal(got, x)
+
+    def test_ste_gradient_is_identity(self):
+        """反向必须原样穿过量化：dw 与"没有假量化"时逐位相同。"""
+        rng = np.random.default_rng(82)
+        g = Graph("qat")
+        x = g.input("x", f32[2, 4])
+        w = g.input("w", f32[4, 3])
+        s = g.input("s", f32[3])
+        wq = g.add_node("fake_quantize_i8", [w, s])
+        g.output(g.matmul(x, wq), "y")
+
+        feed = {
+            "x": rng.standard_normal((2, 4)).astype(np.float32),
+            "w": (rng.standard_normal((4, 3)) * 2).astype(np.float32),
+            "s": np.array([0.1, 0.2, 0.3], np.float32),
+        }
+        dy = rng.standard_normal((2, 3)).astype(np.float32)
+        out = _run(backward(g, wrt=[g.find("w")]), {**feed, "dy": dy})
+        np.testing.assert_array_equal(out["dw"], feed["x"].T @ dy)
+
+    def test_quantization_scale_has_no_gradient(self):
+        g = self._graph((4, 3))
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[g.find("s")])
+
+    def test_rejections(self):
+        with self.subTest(case="non_f32_input"):
+            g = Graph("fake_quantize_i8")
+            x = g.input("x", f16[2, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("fake_quantize_i8", [x, s])
+        with self.subTest(case="non_f32_scale"):
+            g = Graph("fake_quantize_i8")
+            x = g.input("x", f32[2, 3])
+            s = g.input("s", f16[3])
+            with self.assertRaises(TypeError):
+                g.add_node("fake_quantize_i8", [x, s])
+        with self.subTest(case="scale_rank_exceeds_input"):
+            g = Graph("fake_quantize_i8")
+            x = g.input("x", f32[2, 3])
+            s = g.input("s", f32[1, 2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("fake_quantize_i8", [x, s])
+        with self.subTest(case="symbolic_scale_mismatch"):
+            g = Graph("fake_quantize_i8")
+            x = g.input("x", f32["B", 4])
+            s = g.input("s", f32["S"])
+            with self.assertRaises(ValueError):
+                g.add_node("fake_quantize_i8", [x, s])
+        with self.subTest(case="wrong_arity"):
+            g = Graph("fake_quantize_i8")
+            x = g.input("x", f32[2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("fake_quantize_i8", [x])
+        with self.subTest(case="non_positive_scale_at_runtime"):
+            g = self._graph((2, 3))
+            for bad in (0.0, -0.5):
+                with self.assertRaises(ValueError):
+                    _run(
+                        g,
+                        {"x": np.ones((2, 3), np.float32), "s": np.full(3, bad, np.float32)},
+                    )
+
+    def test_json_round_trip(self):
+        rng = np.random.default_rng(83)
+        g = self._graph((3, 2))
+        feed = {
+            "x": (rng.standard_normal((3, 2)) * 2).astype(np.float32),
+            "s": np.array([0.125, 0.5], np.float32),
+        }
+        again = loads(dumps(g))
+        np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
             "quantize_i8_channel",
             "dequantize_i8_channel",
+            "fake_quantize_i8_channel",
             "linear_i8_bias",
             "linear_i8a8_bias",
         }
