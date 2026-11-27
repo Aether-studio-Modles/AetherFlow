@@ -956,6 +956,87 @@ extern "C" __global__ void argmax_last(const %T%* __restrict__ x,
 )
 
 
+TOPK_SRC = (
+    PRELUDE
+    + r"""
+// topk over the last dim: k rounds of (block-wide max, then smallest index via
+// atomicMin). Ties resolve to the smaller index and NaN ranks as +inf, matching
+// the IR reference (torch.topk convention). `sel` is dynamic shared memory with
+// room for k ints; it doubles as the buffer for the chosen index and as the
+// already-taken list, so the kernel never allocates per-row scratch.
+// NOTE: NVRTC requires ASCII source -- keep every comment in this file ASCII.
+__device__ __forceinline__ void topk_select_row(const %T%* __restrict__ xr,
+                                                long long cols, int k, int mode,
+                                                %T%* __restrict__ vals,
+                                                int* __restrict__ ids,
+                                                float* smem, int* sel) {
+    for (int rank = 0; rank < k; ++rank) {
+        float best = __int_as_float(0xff800000);   // -inf
+        int best_i = 0x7fffffff;
+        for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+            int taken = 0;
+            for (int t = 0; t < rank; ++t) {
+                if (sel[t] == (int)j) { taken = 1; break; }
+            }
+            if (taken) { continue; }
+            float v = %LD%(xr[j]);
+            if (v != v) { v = __int_as_float(0x7f800000); }   // +inf
+            if (v > best || (v == best && (int)j < best_i)) {
+                best = v;
+                best_i = (int)j;
+            }
+        }
+        float m = block_reduce_max(best, smem);
+        if (threadIdx.x == 0) { sel[rank] = (int)cols; }
+        __syncthreads();
+        if (best == m) { atomicMin(&sel[rank], best_i); }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int at = sel[rank];
+            if (mode == 0) { vals[(long long)rank] = xr[at]; }
+            else if (mode == 1) { ids[(long long)rank] = at; }
+            else { vals[at] = %ST%(1.f); }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void topk_values(const %T%* __restrict__ x,
+                                      void* __restrict__ outp,
+                                      long long rows, long long cols, int k) {
+    long long row = blockIdx.x;
+    if (row >= rows) { return; }
+    extern __shared__ int sel_dyn[];
+    __shared__ float smem[1024];
+    topk_select_row(x + row * cols, cols, k, 0,
+                    (%T%*)outp + row * (long long)k, 0, smem, sel_dyn);
+}
+
+extern "C" __global__ void topk_indices(const %T%* __restrict__ x,
+                                       void* __restrict__ outp,
+                                       long long rows, long long cols, int k) {
+    long long row = blockIdx.x;
+    if (row >= rows) { return; }
+    extern __shared__ int sel_dyn[];
+    __shared__ float smem[1024];
+    topk_select_row(x + row * cols, cols, k, 1,
+                    0, (int*)outp + row * (long long)k, smem, sel_dyn);
+}
+
+extern "C" __global__ void topk_mask_select(const %T%* __restrict__ x,
+                                            void* __restrict__ outp,
+                                            long long rows, long long cols, int k) {
+    long long row = blockIdx.x;
+    if (row >= rows) { return; }
+    extern __shared__ int sel_dyn[];
+    __shared__ float smem[1024];
+    topk_select_row(x + row * cols, cols, k, 2,
+                    (%T%*)outp + row * cols, 0, smem, sel_dyn);
+}
+"""
+)
+
+
 IM2COL_SRC = (
     PRELUDE
     + r"""
@@ -2048,6 +2129,16 @@ def argmax_source() -> Kernel:
     输出参数是 ``int*``（i32），不随输入 dtype 变化——下标不是浮点激活值。
     """
     return argmax_last()
+
+
+def topk_source() -> str:
+    """末维 topk 的手写内核源码（values / indices / mask 三个入口共用）。
+
+    没有做成 L2 描述：每轮需要一段运行期长度（``k``）的动态共享内存，
+    而 L2 的 ``Shared`` 只能声明静态大小。选择规则与 ``argmax_last`` 一致
+    （最大值、并列取小下标），NaN 按 +inf 参与比较。
+    """
+    return TOPK_SRC
 
 
 def broadcast_binary_source(kind: str) -> Kernel:

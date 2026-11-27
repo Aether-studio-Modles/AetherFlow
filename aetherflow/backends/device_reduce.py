@@ -1,4 +1,4 @@
-"""归约：末维 / 非末维 / 多轴，以及 argmax。"""
+"""归约：末维 / 非末维 / 多轴，以及 argmax / topk。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import numpy as np
 
 
 class _ReduceMixin:
-    """归约：末维 / 非末维 / 多轴，以及 argmax。"""
+    """归约：末维 / 非末维 / 多轴，以及 argmax / topk。"""
 
     def _use_tiled_reduce(self, inner: int, total: int) -> bool:
         """非末维归约该不该走两维铺法（5.174）。
@@ -271,3 +271,118 @@ class _ReduceMixin:
         block = self._reduce_block("argmax", cols)
         kernel((rows,), (block,), (x, out, np.int64(rows), np.int64(cols)))
         return out.reshape(target)
+
+    # -- topk ---------------------------------------------------------
+    #
+    # 三个算子共用一份内核（``topk_source``）：一个 block 处理一行，``k`` 轮
+    # "块内最大值 + atomicMin 取小下标"。与 argmax 一样，非末轴先换到末维再
+    # 复用同一个内核，输出最后换回原轴序。
+
+    def _topk_axis_k(self, x, attrs, op: str):
+        """解析并防御性校验 ``axis`` / ``k``（IR 已验证过，这里守住后端入口）。"""
+        if x.ndim == 0:
+            raise BackendCapabilityError(f"{self._LABEL}的 {op} 需要至少一维")
+        axis = attrs.get("axis", -1)
+        if isinstance(axis, (tuple, list)):
+            if len(axis) != 1:
+                raise BackendCapabilityError(
+                    f"{self._LABEL}的 {op} 一次只支持一个轴，收到 {axis}"
+                )
+            axis = axis[0]
+        axis = int(axis) % x.ndim
+        k = attrs.get("k")
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的 k 必须是整数，收到 {k!r}"
+            )
+        if k < 1:
+            raise BackendCapabilityError(f"{self._LABEL}的 {op} 的 k 必须为正，收到 {k}")
+        cols = int(x.shape[axis])
+        if k > cols:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的 k={k} 超过轴 {axis} 的长度 {cols}"
+            )
+        return axis, k
+
+    def _topk_flatten(self, x, axis: int):
+        """把 ``axis`` 换到末维并转连续；返回 ``(flat, perm, perm_shape)``。
+
+        ``perm`` 为 ``None`` 表示本来就是末维（不拷贝）。
+        """
+        cp = self.cp
+        shape = tuple(int(d) for d in x.shape)
+        if axis == x.ndim - 1:
+            return self._contig(x), None, shape
+        perm = tuple(i for i in range(x.ndim) if i != axis) + (axis,)
+        flat = cp.ascontiguousarray(cp.transpose(self._contig(x), perm))
+        return flat, perm, tuple(shape[i] for i in perm)
+
+    def _topk_launch(self, op: str, flat, out, rows: int, cols: int, k: int, func: str):
+        dtype_key = self._kind(flat)
+        kernel = self._kernel(
+            (op, dtype_key),
+            lambda: self.codegen.render(self.codegen.topk_source(), flat.dtype),
+            func,
+        )
+        block = self._reduce_block(op, cols)
+        # 静态 smem 是 4 KiB（block_reduce_max 的 scratch），动态部分是 k 个 int。
+        sel_bytes = 4 * k
+        if 4096 + sel_bytes > 48 * 1024:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 需要 {sel_bytes} 字节动态共享内存，"
+                f"超过每块 48 KiB 的上限（k={k} 过大）"
+            )
+        kernel(
+            (rows,),
+            (block,),
+            (flat, out, np.int64(rows), np.int64(cols), np.int32(k)),
+            shared_mem=sel_bytes,
+        )
+
+    def _topk_result(self, out_perm, perm, target):
+        """把置换布局（末维是 k 或 cols）的输出换回原轴序。"""
+        if perm is None:
+            return out_perm.reshape(target)
+        inv = tuple(sorted(range(len(perm)), key=lambda i: perm[i]))
+        return self.cp.ascontiguousarray(out_perm.transpose(inv))
+
+    def _op_topk_values(self, node, args, attrs):
+        cp = self.cp
+        x = args[0]
+        axis, k = self._topk_axis_k(x, attrs, "topk_values")
+        flat, perm, perm_shape = self._topk_flatten(x, axis)
+        rows, cols = self._last_dim_2d(flat, "topk_values")
+        out = cp.empty(perm_shape[:-1] + (k,), dtype=flat.dtype)
+        if rows:
+            self._topk_launch(
+                "topk_values", flat, out, rows, cols, k, "topk_values"
+            )
+        target = tuple(k if i == axis else int(d) for i, d in enumerate(x.shape))
+        return self._topk_result(out, perm, target)
+
+    def _op_topk_indices(self, node, args, attrs):
+        cp = self.cp
+        x = args[0]
+        axis, k = self._topk_axis_k(x, attrs, "topk_indices")
+        flat, perm, perm_shape = self._topk_flatten(x, axis)
+        rows, cols = self._last_dim_2d(flat, "topk_indices")
+        out = cp.empty(perm_shape[:-1] + (k,), dtype=cp.int32)
+        if rows:
+            self._topk_launch(
+                "topk_indices", flat, out, rows, cols, k, "topk_indices"
+            )
+        target = tuple(k if i == axis else int(d) for i, d in enumerate(x.shape))
+        return self._topk_result(out, perm, target)
+
+    def _op_topk_mask(self, node, args, attrs):
+        cp = self.cp
+        x = args[0]
+        axis, k = self._topk_axis_k(x, attrs, "topk_mask")
+        flat, perm, perm_shape = self._topk_flatten(x, axis)
+        rows, cols = self._last_dim_2d(flat, "topk_mask")
+        out = cp.zeros(perm_shape, dtype=flat.dtype)
+        if rows:
+            self._topk_launch(
+                "topk_mask", flat, out, rows, cols, k, "topk_mask_select"
+            )
+        return self._topk_result(out, perm, tuple(int(d) for d in x.shape))

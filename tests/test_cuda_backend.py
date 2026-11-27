@@ -2671,6 +2671,109 @@ class TestCudaReductions(CudaTestCase):
         got = self.assert_backends_equal(g, {"x": self.rand(3, 4, 5)}, rtol=0, atol=0)
         self.assertEqual(got.shape, (3, 1, 5))
 
+    # -- topk ---------------------------------------------------------
+
+    @staticmethod
+    def _topk_graph(shape, k, axis, op, dtype=f32):
+        g = Graph()
+        x = g.input("x", dtype[shape])
+        g.output(g.add_node(op, [x], {"k": k, "axis": axis}), "y")
+        return g
+
+    def test_topk_values_and_indices_last_axis(self):
+        for op in ("topk_values", "topk_indices"):
+            with self.subTest(op=op):
+                g = self._topk_graph((4, 7), 3, -1, op)
+                got = self.assert_backends_equal(
+                    g, {"x": self.rand(4, 7)}, rtol=0, atol=0
+                )
+                self.assertEqual(got.shape, (4, 3))
+                if op == "topk_indices":
+                    self.assertEqual(got.dtype, np.int32)
+
+    def test_topk_non_last_axis(self):
+        """非末轴先换到末维：形状按原轴序返回，下标语义是该轴上的位置。"""
+        for shape, axis in (
+            ((4, 7), 0),
+            ((3, 4, 5), 0),
+            ((3, 4, 5), 1),
+            ((2, 3, 4, 5), 2),
+        ):
+            for op in ("topk_values", "topk_indices"):
+                with self.subTest(shape=shape, axis=axis, op=op):
+                    k = 2
+                    g = self._topk_graph(shape, k, axis, op)
+                    got = self.assert_backends_equal(
+                        g, {"x": self.rand(*shape)}, rtol=0, atol=0
+                    )
+                    target = list(shape)
+                    target[axis] = k
+                    self.assertEqual(got.shape, tuple(target))
+
+    def test_topk_ties_prefer_smaller_index(self):
+        """并列值按小下标优先，与参考实现的稳定降序一致。"""
+        x = np.array(
+            [[1.0, 5.0, 5.0, 0.0, 5.0], [2.0, 2.0, 2.0, 2.0, 2.0]],
+            dtype=np.float32,
+        )
+        g = self._topk_graph((2, 5), 3, -1, "topk_indices")
+        got = self.cuda.execute(g, {"x": x})["y"]
+        np.testing.assert_array_equal(
+            got, np.array([[1, 2, 4], [0, 1, 2]], dtype=np.int32)
+        )
+
+    def test_topk_nan_ranks_first(self):
+        """NaN 按 +inf 参与比较，排在最前，但输出的值仍是 NaN。"""
+        x = self.rand(3, 6)
+        x[0, 4] = np.nan
+        x[2, 1] = np.nan
+        for op in ("topk_values", "topk_indices"):
+            with self.subTest(op=op):
+                g = self._topk_graph((3, 6), 2, -1, op)
+                self.assert_backends_equal(g, {"x": x}, rtol=0, atol=0)
+        g = self._topk_graph((3, 6), 1, -1, "topk_indices")
+        ids = self.cuda.execute(g, {"x": x})["y"]
+        self.assertEqual(int(ids[0, 0]), 4)
+        self.assertEqual(int(ids[2, 0]), 1)
+
+    def test_topk_k_equals_axis_length(self):
+        """k 等于轴长时就是整行降序排列。"""
+        g = self._topk_graph((3, 5), 5, -1, "topk_values")
+        x = self.rand(3, 5)
+        got = self.assert_backends_equal(g, {"x": x}, rtol=0, atol=0)
+        np.testing.assert_array_equal(got, np.sort(x, axis=-1)[:, ::-1])
+
+    def test_topk_mask_selects_exactly_k(self):
+        for shape, axis, k in (((4, 7), -1, 3), ((3, 4, 5), 1, 2)):
+            with self.subTest(shape=shape, axis=axis):
+                g = self._topk_graph(shape, k, axis, "topk_mask")
+                got = self.assert_backends_equal(
+                    g, {"x": self.rand(*shape)}, rtol=0, atol=0
+                )
+                self.assertEqual(got.shape, shape)
+                counts = got.sum(axis=axis)
+                np.testing.assert_array_equal(
+                    counts, np.full(counts.shape, k, dtype=got.dtype)
+                )
+                self.assertTrue(np.all((got == 0) | (got == 1)))
+
+    def test_topk_f16(self):
+        x = self.rand(3, 9).astype(np.float16)
+        g = self._topk_graph((3, 9), 4, -1, "topk_values", dtype=f16)
+        got = self.assert_backends_equal(g, {"x": x}, rtol=0, atol=0)
+        self.assertEqual(got.dtype, np.float16)
+        g = self._topk_graph((3, 9), 4, -1, "topk_indices", dtype=f16)
+        got = self.assert_backends_equal(g, {"x": x}, rtol=0, atol=0)
+        self.assertEqual(got.dtype, np.int32)
+
+    def test_topk_rejects_int_input(self):
+        """i32 输入不在能力面内：明确报错，不把整型当 f32 读。"""
+        g = Graph()
+        x = g.input("x", i32[4, 6])
+        g.output(g.add_node("topk_values", [x], {"k": 2, "axis": -1}), "y")
+        with self.assertRaisesRegex(BackendCapabilityError, "topk_values"):
+            self.cuda.execute(g, {"x": np.arange(24, dtype=np.int32).reshape(4, 6)})
+
     def test_reduce_multi_axis(self):
         """多轴归约：先置换再合并成一个轴，结果与 numpy 相同。"""
         for op in ("reduce_sum", "reduce_max", "reduce_mean"):
