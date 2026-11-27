@@ -235,7 +235,7 @@ GPU 作业仍未接上真实 runner。
 | 动态形状 | 前端拒绝 SymInt；执行器支持一次构图多形状（5.217）；训练循环与分段重算要求静态 | PyTorch / JAX 原生支持（JAX 按形状重编译） | 我们是"多形状绑定"，不是"动态图" |
 | 控制流 | `Conditional` / `WhileLoop` 是子图关系，判定回主机；设备端循环每次读一次谓词（5.245） | PyTorch 用 TorchScript / Dynamo 表达分支；JAX 的 `lax.cond` / `lax.while_loop` 编译进设备端 | 我们的控制流不追求设备端无同步 |
 | 后端接入 | 两个必需方法 + 六个可选契约；新硬件写一个包即可（HIP 为证），IR / 前端 / 优化零改动 | PyTorch 需 PrivateUse1 / dispatch key；JAX 需 PJRT plugin；ONNX Runtime 需 Execution Provider；TVM 需 BYOC | 接入面更窄，代价是生态工具要自己写 |
-| 算子覆盖 | 71 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
+| 算子覆盖 | 74 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），但无 fp8、无非对称零点 |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
 | 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（解码器未接 `generate`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面，但没有 HF 权重 / BPE / GGUF |
