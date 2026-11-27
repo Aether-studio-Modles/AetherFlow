@@ -16,7 +16,7 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：72 个 IR 算子，CUDA / HIP 各自承接 69 个；
+- **一份语义 IR，多个硬件后端**：73 个 IR 算子，CUDA / HIP 各自承接 70 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
@@ -35,7 +35,8 @@
   roofline 式成本模型（用于排序，不做性能预测）、Chrome Trace 导出。
 - **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）与 W8A8
   （`linear_i8a8`：int32 累加后乘两个 scale，CUDA 走 `__dp4a`、HIP 标量乘加，
-  V100 真机与参考逐位相等）；
+  V100 真机与参考逐位相等）；QAT 的假量化算子 `fake_quantize_i8`（f32 进出，
+  前向等同量化-反量化，反向是直通估计器，5.311）；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 
 ### 安装
@@ -90,10 +91,10 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3026 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3033 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（128 executed / 2 refused / 0 failed，`linear_i8a8_bias` 误差 0）与 `verify_cuda.py`（含两条 W8A8 边界用例），全过；未跑全量 unittest |
+| CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（129 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
 
 ```bash
 # 本地全量
@@ -123,7 +124,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   累加，再乘激活 / 权重两个 scale）。CUDA / HIP **已有设备内核**（CUDA 走
   `__dp4a`，HIP 走标量乘加，V100 真机与参考逐位相等，5.309）；但它不是 int8
   tensor core（没有 IMMA / wmma 分块），**不要期待"int8 算得更快"的结论**；
-  无 fp8、无 QAT、无非对称零点，W8A8 也尚无反向（bias 除外）。
+  QAT 只到假量化算子（`fake_quantize_i8`，5.311）——scale 不可学（无 LSQ），
+  没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；此外无 fp8、
+  无非对称零点，W8A8 也尚无反向（bias 除外）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
   显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
@@ -577,6 +580,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **生成闭环要自己持有 token 历史**（5.310）：分页调度器只记长度，`fork` 的
   前缀一致性校验需要 token 本身；由此暴露"fork 后 prompt 必须比父长一个 token"
   这类边界，写进 API 与报错文案，不要靠调用方猜。
+- **"串联两个算子能算出来"不等于"能训练"**（5.311）：
+  `dequantize_i8(quantize_i8(x))` 的前向就是假量化，但中间类型是 i8、
+  `quantize_i8` 没有也不该有反向规则，训练图到这里就断了。前向等价时可以
+  接受组合路径，**反向不可导时必须补独立算子**；设备端仍可复用那两个内核。
+- **STE 不是数学导数，语义要钉在文档里**（5.311）：直通估计器让 `rint` /
+  `clip` 几乎处处为零的解析梯度不挡训练，这是训练时的选择而不是求导结果。
+  写清"梯度直通、饱和区不额外截断、scale 不接收梯度、学 scale 是另一条
+  规则（LSQ）"，否则读代码的人会以为反向写漏了。
 - **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
   移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
   账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100
