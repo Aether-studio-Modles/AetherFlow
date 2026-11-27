@@ -484,6 +484,19 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `LMRunner.generate_speculative` 只需要 `_check_draft_tokens` /
   `_speculative_loop`；把后者放在方法体内导入，模块图保持无环。
 
+- **换出必须同时释放页并清空块表**（5.304）：只拷副本不清块表，换出期间
+  那些页会被别的序列领走，换入前的任何 `gather` 都会读到别人的数据。
+  换入必须**重新领页**，不能沿用旧块表——页号只在块表里有意义。
+- **换入失败要保持换出态**（5.304）：先领齐全部页再写回；页不够就抛错并
+  原样保留主机副本，腾出页后可重试。半换入会同时占页与丢副本，是两种故障
+  里最难排查的一种。
+- **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
+  单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
+  `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
+  paramiko SFTP 上传 → `/root/afv2` 解压；`python3 -m unittest
+  tests.test_cuda_backend tests.test_cuda_train` 383 条 2.9 秒全过。
+  SSH 偶发 `banner` 被重置，连接要带 3–5 次重试，别把一次失败当环境坏了。
+
 ---
 
 ## 版本记录
