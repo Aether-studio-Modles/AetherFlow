@@ -43,6 +43,7 @@ __all__ = [
     "LoopbackWorld",
     "LoopbackCollective",
     "NcclHostCollective",
+    "NcclDeviceCollective",
 ]
 
 _META_KEY = "__meta__"
@@ -652,3 +653,45 @@ class NcclHostCollective:
             )
         target[...] = values
         return recv
+
+
+class NcclDeviceCollective:
+    """把 NCCL 包成"设备数组进、设备数组出"的集合通信（每个 rank 一个进程）。
+
+    与 :class:`NcclHostCollective` 的差别只在**往返**：后者的输入输出都是主机
+    numpy 数组，每次调用固定做 H2D → NCCL → 同步 → D2H；这里在输入本身就在
+    显存时跳过两端拷贝，把设备缓冲直接交给 NCCL，归约结果留在原地。主机数组
+    仍然接受（损失标量那条极小的路径），此时行为与 ``NcclHostCollective``
+    一致——同一个对象因此既能喂设备态梯度，也能喂主机态损失。
+
+    ``device_side = True`` 是给 ``DistributedDataParallel`` 看的声明：只有带
+    这个属性的 collective 才允许搭配设备态 Trainer；否则 DDP 在构造期就拒绝，
+    而不是静默退回主机中转、让调用方以为通信留在设备上。
+
+    ``op="mean"`` 在设备上补一次原地除法。理由与 :class:`NcclDeviceAllReduce`
+    相同：``train/nccl.py`` 只登记 sum / prod / max / min，平均在哪一侧除由
+    调用方决定。``device`` 缺省取 rank，与 ``NcclHostCollective`` 同一约定。
+    """
+
+    device_side = True
+    name = "nccl-device"
+
+    def __init__(self, comm: Any, *, device: Optional[int] = None) -> None:
+        self.comm = comm
+        self.rank = int(getattr(comm, "rank"))
+        self.world_size = int(getattr(comm, "world_size"))
+        self.device = int(self.rank if device is None else device)
+
+    def all_reduce(self, array: Any, *, op: str = "sum") -> Any:
+        if op not in ("sum", "mean"):
+            raise ValueError(f"op 必须是 sum / mean，收到 {op!r}")
+        import cupy as cp
+
+        on_device = hasattr(array, "__cuda_array_interface__")
+        with cp.cuda.Device(self.device):
+            buf = array if on_device else cp.asarray(array)
+            self.comm.all_reduce(buf, op="sum")
+            self.comm.synchronize()
+            if op == "mean" and self.world_size > 1:
+                buf /= self.world_size
+            return buf if on_device else cp.asnumpy(buf)

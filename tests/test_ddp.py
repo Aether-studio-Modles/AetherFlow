@@ -249,6 +249,34 @@ class _NoReduce:
     world_size = 1
 
 
+class _DeviceCollective:
+    """``device_side = True`` 的替身：数组就是 numpy，用它当"设备数组"。
+
+    只验证 DDP 在设备态下是否**绕过主机归约路径**（不转 ``np.asarray``、
+    不拼桶、``op`` 直接传 ``mean``），以及用户钩子是否仍看到归约后的梯度。
+    真正的 NCCL 行为由 ``NcclDeviceCollective`` 的测试覆盖。
+    """
+
+    device_side = True
+
+    def __init__(self, rank=0, world_size=2, inplace=False):
+        self.rank = rank
+        self.world_size = world_size
+        self.inplace = inplace
+        self.calls = []
+
+    def all_reduce(self, array, *, op="sum"):
+        self.calls.append((op, tuple(np.shape(array))))
+        if self.inplace:
+            if op == "mean" and self.world_size > 1:
+                array /= self.world_size
+            return array
+        out = np.array(array, copy=True)
+        if op == "mean" and self.world_size > 1:
+            out = out / self.world_size
+        return out
+
+
 def _build_ranks(world_size=2, batch_per_rank=4, hooks=None):
     """每个 rank 一份独立参数与 Trainer；初值相同（真实场景各自加载同一份权重）。"""
     world = LoopbackWorld(world_size)
@@ -468,6 +496,102 @@ class TestDistributedDataParallel(unittest.TestCase):
             DistributedDataParallel(object(), world.collective(0))
 
 
+class TestDeviceSideDistributed(unittest.TestCase):
+    """B1：设备态 Trainer + ``device_side`` collective，归约不再经主机中转。"""
+
+    def _trainer(self, hook=None):
+        store = _linear_store()
+        options = {"rng_rank": 0, "rng_world_size": 2}
+        if hook is not None:
+            options["grad_hook"] = hook
+        return store, Trainer(
+            _linear_graph(4),
+            store,
+            SGD(store.arrays(), lr=0.1),
+            backend=_CaptureBackend(),
+            device_state=True,
+            **options,
+        )
+
+    def _grads(self):
+        return {
+            "w": np.array([[1.0], [2.0]], np.float32),
+            "b": np.array([0.5], np.float32),
+        }
+
+    def test_requires_device_side_declaration(self):
+        _, trainer = self._trainer()
+        world = LoopbackWorld(2)
+        with self.assertRaises(ValueError) as raised:
+            DistributedDataParallel(trainer, world.collective(0))
+        self.assertIn("device_side", str(raised.exception))
+
+    def test_rejects_host_bucketing_and_threads(self):
+        _, trainer = self._trainer()
+        collective = _DeviceCollective(0, 2)
+        with self.assertRaises(ValueError):
+            DistributedDataParallel(trainer, collective, bucket_bytes=128)
+        with self.assertRaises(ValueError):
+            DistributedDataParallel(
+                trainer, collective, bucket_bytes=0, threads=2
+            )
+
+    def test_reduces_through_device_collective(self):
+        seen = []
+
+        def hook(grads):
+            seen.append(dict(grads))
+            return grads
+
+        _, trainer = self._trainer(hook=hook)
+        collective = _DeviceCollective(0, 2)
+        ddp = DistributedDataParallel(
+            trainer, collective, bucket_bytes=0, threads=1
+        )
+        reduced = trainer.grad_hook(self._grads())
+        # 两个张量各一次，直接传 mean（设备侧负责除），没有拼桶。
+        self.assertEqual(
+            collective.calls, [("mean", (2, 1)), ("mean", (1,))]
+        )
+        np.testing.assert_allclose(reduced["w"], [[0.5], [1.0]])
+        np.testing.assert_allclose(reduced["b"], [0.25])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(seen[0]), {"w", "b"})
+        np.testing.assert_allclose(seen[0]["w"], reduced["w"])
+
+    def test_inplace_reduction_returns_same_buffers(self):
+        _, trainer = self._trainer()
+        collective = _DeviceCollective(0, 2, inplace=True)
+        DistributedDataParallel(
+            trainer, collective, bucket_bytes=0, threads=1
+        )
+        grads = self._grads()
+        reduced = trainer.grad_hook(grads)
+        self.assertIs(reduced["w"], grads["w"])
+        np.testing.assert_allclose(grads["w"], [[0.5], [1.0]])
+
+    def test_rejects_non_floating_device_grads(self):
+        _, trainer = self._trainer()
+        DistributedDataParallel(
+            trainer, _DeviceCollective(0, 2), bucket_bytes=0, threads=1
+        )
+        grads = {"w": np.array([[1], [2]], np.int32)}
+        with self.assertRaises(TypeError):
+            trainer.grad_hook(grads)
+
+    def test_from_env_reads_rank_and_world_size(self):
+        _, trainer = self._trainer()
+        collective = _DeviceCollective(0, 2)
+        with mock.patch.dict(
+            os.environ, {"AF_RANK": "0", "AF_WORLD_SIZE": "2"}
+        ):
+            ddp = DistributedDataParallel.from_env(
+                trainer, collective=collective, bucket_bytes=0, threads=1
+            )
+        self.assertEqual(ddp.rank, 0)
+        self.assertEqual(ddp.world_size, 2)
+
+
 def _norm(grads):
     return float(
         np.sqrt(sum(float(np.sum(np.asarray(value) ** 2)) for value in grads.values()))
@@ -569,6 +693,94 @@ class TestGradientBuckets(unittest.TestCase):
         )
         ddp.step(batch)
         self.assertGreaterEqual(collective.peak, 2)
+
+
+class TestBucketOverlap(unittest.TestCase):
+    """B2：分桶反向 + 桶就绪即发，数值与整图反向 + 一次性归约逐位相同。"""
+
+    count = 6
+
+    def _build(self, overlap, bucket_bytes=128, collective=None, **trainer):
+        graph = _many_param_graph(self.count)
+        store = ParameterStore(
+            {
+                f"p{i}": np.full((4, 4), 0.1 * (i + 1), np.float32)
+                for i in range(self.count)
+            }
+        )
+        trainer_obj = Trainer(
+            graph, store, SGD(store.arrays(), lr=0.1), **trainer
+        )
+        ddp = DistributedDataParallel(
+            trainer_obj,
+            collective or LoopbackWorld(1).collective(0),
+            bucket_bytes=bucket_bytes,
+            threads=1,
+            overlap=overlap,
+        )
+        rng = np.random.default_rng(7)
+        batch = {
+            "x": rng.standard_normal((4, 4)).astype(np.float32),
+            "target": rng.standard_normal((4, 4)).astype(np.float32),
+        }
+        return store, ddp, batch
+
+    def test_matches_whole_graph_backward(self):
+        plain_store, plain, batch = self._build(overlap=False)
+        over_store, over, _ = self._build(overlap=True)
+        for _ in range(2):
+            self.assertAlmostEqual(plain.step(batch), over.step(batch), places=7)
+        for name in plain_store.names:
+            np.testing.assert_array_equal(over_store[name], plain_store[name])
+
+    def test_one_collective_call_per_bucket(self):
+        # 6 个 64 B 参数、128 B 的桶 → 3 个桶 + 损失一次 = 4 次集合调用。
+        collective = _CountingCollective(LoopbackWorld(1).collective(0))
+        _, ddp, batch = self._build(overlap=True, collective=collective)
+        ddp.step(batch)
+        self.assertEqual(collective.calls, 4)
+
+    def test_rejects_parallel_submission_and_tensor_buckets(self):
+        _, _, batch = self._build(overlap=False)
+        store = _linear_store()
+        trainer = Trainer(
+            _linear_graph(4), store, SGD(store.arrays(), lr=0.1)
+        )
+        collective = LoopbackWorld(1).collective(0)
+        with self.assertRaises(ValueError):
+            DistributedDataParallel(
+                trainer, collective, overlap=True, threads=2
+            )
+        with self.assertRaises(ValueError):
+            DistributedDataParallel(
+                trainer, collective, overlap=True, bucket_bytes=0
+            )
+
+    def test_bucket_plan_must_cover_every_parameter(self):
+        store = _linear_store()
+        trainer = Trainer(
+            _linear_graph(4), store, SGD(store.arrays(), lr=0.1)
+        )
+        names = list(store.names)
+        with self.assertRaises(ValueError):
+            trainer.enable_bucket_overlap([names[:1]], lambda *_: None)
+        with self.assertRaises(ValueError):
+            trainer.enable_bucket_overlap(
+                [names, names[:1]], lambda *_: None
+            )
+        with self.assertRaises(ValueError):
+            trainer.enable_bucket_overlap([names, []], lambda *_: None)
+
+    def test_requires_single_accumulation_window(self):
+        store = _linear_store()
+        trainer = Trainer(
+            _linear_graph(4),
+            store,
+            SGD(store.arrays(), lr=0.1),
+            accumulate_steps=2,
+        )
+        with self.assertRaises(ValueError):
+            trainer.enable_bucket_overlap([list(store.names)], lambda *_: None)
 
 
 class TestLaunch(unittest.TestCase):

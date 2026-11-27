@@ -506,9 +506,14 @@ class Trainer:
 
         self._outputs = list(zip(graph.outputs, outputs))
         self._seed_name = "d" + chosen
+        self._chosen = chosen
         self._loss_value = target
         self._params = [graph.find(name) for name in store.names]
         self.segments = segments
+        # 分桶反向：设置后每桶一张独立反向图，桶算完就回调（数据并行据此
+        # "桶就绪即发"地提交归约）。默认 None，单步行为逐位不变。
+        self._bucket_bwd: Optional[List[Any]] = None
+        self._on_bucket_ready: Optional[Callable[..., None]] = None
         if segments is None:
             # 只有 chosen 参与反向：其余输出在构图期就被剪掉，而不是喂零种子。
             # 零种子在导数链上碰上 0/x 这类项仍会算出 NaN，把对的梯度污染掉。
@@ -557,6 +562,64 @@ class Trainer:
             shapes[value.name] = shape
         return shapes
 
+    def enable_bucket_overlap(
+        self,
+        buckets: Sequence[Sequence[str]],
+        on_ready: Callable[[Sequence[str], Mapping[str, np.ndarray]], None],
+    ) -> None:
+        """把主机态反向拆成若干参数桶，桶算完立刻回调（数据并行归约用）。
+
+        ``buckets`` 必须不重不漏地覆盖 ``store`` 的全部参数。每个桶单独建一张
+        反向图并单独执行：数值与整图反向逐位相同（同样的 vjp、同样的顺序），
+        但**共同的链式路径会按桶数重算**——桶越多越慢。只在"通信占比高、
+        且桶很大（例如按层分块）"时才划算。
+
+        为什么不用执行器的逐节点回调：整图反向是一次 ``backend.execute``，
+        本层拿不到"某个参数的梯度已经算完"的时刻。把反向拆成桶，是最小、
+        且对后端零改动的做法。设备态不分桶（capture / replay 是整图），
+        梯度累积窗口未满时归约是白付通信，因此也只允许 ``accumulate_steps=1``。
+        """
+        if self.device_state:
+            raise ValueError("设备态不支持分桶反向：capture / replay 是整图")
+        if self._plan is not None:
+            raise ValueError("分桶反向与 checkpoint 分段反向不能同时开启")
+        if self._accumulator is not None:
+            raise ValueError(
+                "分桶反向要求 accumulate_steps=1：窗口未满时归约是白付通信"
+            )
+        if self.steps:
+            raise RuntimeError("分桶反向只能在训练开始前设置")
+        if not callable(on_ready):
+            raise TypeError("on_ready 必须可调用")
+        ordered: List[List[str]] = []
+        seen = set()
+        for bucket in buckets:
+            group = list(bucket)
+            if not group:
+                raise ValueError("桶不能为空")
+            for name in group:
+                if name not in self.store:
+                    raise KeyError(f"桶里的 {name!r} 不在参数表里")
+                if name in seen:
+                    raise ValueError(f"参数 {name!r} 出现在多个桶里")
+                seen.add(name)
+            ordered.append(group)
+        missing = [name for name in self.store.names if name not in seen]
+        if missing:
+            raise ValueError(f"这些参数没有被任何桶覆盖: {missing}")
+        self._bucket_bwd = [
+            (
+                group,
+                backward(
+                    self.graph,
+                    wrt=[self.graph.find(name) for name in group],
+                    active=[self._chosen],
+                ),
+            )
+            for group in ordered
+        ]
+        self._on_bucket_ready = on_ready
+
     def step(
         self,
         batch: Optional[Mapping[str, np.ndarray]] = None,
@@ -592,7 +655,16 @@ class Trainer:
         # 累积窗口未满或 AMP 溢出跳过更新时，batch 统计量照样要进 EMA。
         self._observe_bn(feed)
 
-        if self._plan is None:
+        if self._bucket_bwd is not None:
+            grads = {}
+            seed = {self._seed_name: self._seed(out.dtype)}
+            for group, graph in self._bucket_bwd:
+                result = self.backend.execute(graph, {**feed, **seed})
+                part = {name: result["d" + name] for name in group}
+                grads.update(part)
+                if self._on_bucket_ready is not None:
+                    self._on_bucket_ready(group, part)
+        elif self._plan is None:
             result = self.backend.execute(
                 self._bwd,
                 {**feed, self._seed_name: self._seed(out.dtype)},

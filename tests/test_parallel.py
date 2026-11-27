@@ -12,7 +12,10 @@ CPU 侧用 numpy 上的伪多设备后端（数组就是 numpy，"设备"只记�
 CUDA 真机侧用 3 × Tesla M40 的前两块卡对拍。
 """
 
+import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -192,6 +195,95 @@ class TestNcclDeviceCollective(unittest.TestCase):
             nccl.init_all([0])
         with self.assertRaises(nccl.NcclUnavailable):
             nccl_device_collective(_FakeDevices(1), [0])
+
+
+class _FakeCudaDevice:
+    """``with cp.cuda.Device(i):`` 的最小替身。"""
+
+    def __init__(self, index):
+        self.index = index
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_cupy():
+    """只实现 ``asarray`` / ``asnumpy`` / ``cuda.Device`` 的 cupy 替身。"""
+    return SimpleNamespace(
+        cuda=SimpleNamespace(Device=_FakeCudaDevice),
+        asarray=lambda value: np.array(value, copy=True),
+        asnumpy=lambda value: np.asarray(value),
+    )
+
+
+class _DeviceArray(np.ndarray):
+    """带 ``__cuda_array_interface__`` 的 numpy 视图：模拟"已在显存里"。"""
+
+    @property
+    def __cuda_array_interface__(self):
+        return {}
+
+
+class TestNcclPassThrough(unittest.TestCase):
+    """``NcclDeviceCollective``：主机数组往返 / 设备数组原地进原地出。"""
+
+    class _Comm:
+        def __init__(self, rank=0, world_size=2):
+            self.rank = rank
+            self.world_size = world_size
+            self.ops = []
+            self.syncs = 0
+            self.transform = None
+
+        def all_reduce(self, buf, *, op="sum", stream=None):
+            self.ops.append(op)
+            if self.transform is not None:
+                buf[...] = self.transform(buf)
+
+        def synchronize(self):
+            self.syncs += 1
+
+    def test_host_array_round_trip_applies_mean(self):
+        from aetherflow.train import NcclDeviceCollective
+
+        comm = self._Comm(rank=0, world_size=2)
+        comm.transform = lambda buf: buf * 2
+        collective = NcclDeviceCollective(comm)
+        with mock.patch.dict(sys.modules, {"cupy": _fake_cupy()}):
+            out = collective.all_reduce(
+                np.array([1.0, 2.0], np.float32), op="mean"
+            )
+        self.assertIsInstance(out, np.ndarray)
+        np.testing.assert_allclose(out, [1.0, 2.0])
+        self.assertEqual(comm.ops, ["sum"])
+        self.assertEqual(comm.syncs, 1)
+
+    def test_device_array_stays_in_place(self):
+        from aetherflow.train import NcclDeviceCollective
+
+        comm = self._Comm(rank=0, world_size=2)
+        comm.transform = lambda buf: buf * 3
+        collective = NcclDeviceCollective(comm)
+        value = np.array([1.0, 2.0], np.float32).view(_DeviceArray)
+        with mock.patch.dict(sys.modules, {"cupy": _fake_cupy()}):
+            out = collective.all_reduce(value, op="mean")
+        self.assertIs(out, value)
+        np.testing.assert_allclose(value, [1.5, 3.0])
+
+    def test_unknown_op_is_rejected_before_importing_cupy(self):
+        from aetherflow.train import NcclDeviceCollective
+
+        collective = NcclDeviceCollective(self._Comm())
+        with self.assertRaises(ValueError):
+            collective.all_reduce(np.zeros(2, np.float32), op="avg")
+
+    def test_device_side_is_declared(self):
+        from aetherflow.train import NcclDeviceCollective
+
+        self.assertTrue(NcclDeviceCollective.device_side)
 
 
 class TestAllreduce(unittest.TestCase):

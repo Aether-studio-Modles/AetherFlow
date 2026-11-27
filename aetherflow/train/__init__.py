@@ -63,7 +63,7 @@ from .tensor_parallel import (
     split_axis,
 )
 from .schedule import CosineDecay, ExponentialDecay, StepDecay, Warmup, apply_lr
-from .zero import LoopbackWorld, NcclHostCollective, ZeroRank
+from .zero import LoopbackWorld, NcclDeviceCollective, NcclHostCollective, ZeroRank
 from .zero2 import Zero2Rank
 from .zero3 import Zero3Rank
 
@@ -92,6 +92,7 @@ __all__ = [
     "Zero3Rank",
     "LoopbackWorld",
     "NcclHostCollective",
+    "NcclDeviceCollective",
     "Trainer",
     "TrainingState",
     "DataParallelTrainer",

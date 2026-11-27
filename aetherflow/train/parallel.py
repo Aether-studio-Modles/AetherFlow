@@ -47,8 +47,10 @@ devices)`` 提供（``ncclCommInitAll`` + 每卡原地 AllReduce），显式注�
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import queue
+import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -96,6 +98,60 @@ class DeviceCollectiveUnavailable(NotImplementedError):
     该做的是退回主机路径（显式改成 ``collective="host"``）或接入 NCCL / RCCL，
     而不是去改参数重试。
     """
+
+
+class _BucketReducer:
+    """后台单线程：按"桶就绪"的顺序逐个归约，与后续反向计算重叠。
+
+    为什么是单线程而不是线程池：集合调用必须**各 rank 同序**。桶的提交顺序
+    由反向图的执行顺序决定，各 rank 图相同，所以顺序一致；并发提交会让
+    发送顺序取决于调度，一侧先发 A 后发 B、另一侧反过来就会死锁。单线程
+    FIFO 把顺序钉死，同时仍然让"归约在网络上跑"与"主线程算下一个桶"重叠。
+
+    异常不吞：``finish()`` 重新抛出第一个失败；后台线程继续把已排队的桶
+    处理完，避免留下等不到对端的 rank（能做的只有继续按序调用）。
+    """
+
+    def __init__(self, reduce_bucket: Callable[..., Mapping[str, Any]]) -> None:
+        self._reduce_bucket = reduce_bucket
+        self._queue: "queue.Queue[Any]" = queue.Queue()
+        self._futures: List[Future] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(
+        self, names: Sequence[str], arrays: Mapping[str, Any]
+    ) -> None:
+        future: Future = Future()
+        self._futures.append(future)
+        self._queue.put((future, names, arrays))
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, names, arrays = item
+            try:
+                future.set_result(self._reduce_bucket(names, arrays))
+            except BaseException as exc:  # 交给 finish() 重新抛出
+                future.set_exception(exc)
+
+    def finish(self) -> Dict[str, np.ndarray]:
+        """等全部桶归约完，按提交顺序合并成一个字典。"""
+        self._queue.put(None)
+        self._thread.join()
+        merged: Dict[str, np.ndarray] = {}
+        for future in self._futures:
+            merged.update(future.result())
+        self._futures = []
+        return merged
+
+    def abort(self) -> None:
+        """异常路径：把已排队的桶做完，丢掉结果（避免下一轮错位）。"""
+        self._queue.put(None)
+        self._thread.join()
+        self._futures = []
 
 
 @dataclass(frozen=True)
@@ -699,14 +755,27 @@ class DistributedDataParallel:
     不需要把那些逻辑复制一遍。用户原有的钩子会被保存下来，在归约**之后**
     调用——它看到的必须是全局梯度，否则裁剪阈值在各 rank 上都不一样。
 
-    **只接受主机态。** 设备态训练的参数与梯度常驻显存，本层不做设备侧
-    集合通信（``nccl_device_collective`` 只服务于单进程多卡的
-    ``DataParallelTrainer``）；``GradScaler``
-    也不行：某个 rank 溢出就跳过更新，其余 rank 却在集合调用上等它，直接
-    挂死。ZeRO-3 自带 ReduceScatter，再接一层归约等于把梯度算两遍。
+    **支持设备态，但必须显式声明。** 主机态下梯度是主机数组，归约经
+    ``HostCollective``；设备态下梯度常驻显存，只有注入 ``device_side = True``
+    的 collective（如 :class:`NcclDeviceCollective`）才允许构造——归约直接把
+    设备缓冲交给 NCCL，不再经主机中转。缺少这个声明时**构造期就拒绝**，
+    不静默退回主机路径。设备态不支持主机侧拼桶（没有通用的设备拼接），
+    也不允许并发提交（同一个 NCCL communicator 不能被多线程同时调用），
+    因此要求 ``bucket_bytes=0`` 且 ``threads=1``。
+    ``GradScaler`` 仍不行：某个 rank 溢出就跳过更新，其余 rank 却在集合调用
+    上等它，直接挂死。ZeRO-3 自带 ReduceScatter，再接一层归约等于把梯度算
+    两遍。
 
     **每卡 batch 仍按图构图。** 与 ``DataParallelTrainer`` 同一条前提：
     ``graph`` 的第 0 维是分片后的大小，``step`` 收到的是 ``world_size`` 倍。
+
+    **``overlap=True``：反向按桶拆开，桶就绪即发。** 默认关。开启后
+    ``Trainer`` 为每个桶单独建一张反向图，桶算完立刻把这一桶交给后台线程
+    归约，主线程继续算下一个桶——通信与后续反向重叠。集合调用必须各 rank
+    同序，所以后台只有一个线程、按提交顺序发送，``threads`` 必须为 1。
+    代价是每桶反向都要重算从损失到该桶的共同链式路径：桶越多越慢，只有
+    "桶很少、通信占比高"时才划算。权重更新仍在 ``grad_hook`` 里等全部桶
+    归约完才发生，数值与整图反向 + 一次归约逐位相同。
     """
 
     def __init__(
@@ -717,6 +786,7 @@ class DistributedDataParallel:
         reduction: str = "mean",
         bucket_bytes: int = DEFAULT_BUCKET_BYTES,
         threads: int = 2,
+        overlap: bool = False,
     ) -> None:
         if not isinstance(trainer, Trainer):
             raise TypeError(f"trainer 必须是 Trainer，得到 {type(trainer).__name__}")
@@ -756,10 +826,24 @@ class DistributedDataParallel:
                 f"{rank}/{world} 不一致；构造 Trainer 时要传 rng_rank=rank、"
                 "rng_world_size=world，否则各 rank 的 dropout 掩码会重合"
             )
-        if trainer.device_state:
+        device_side = bool(getattr(collective, "device_side", False))
+        if trainer.device_state and not device_side:
             raise ValueError(
-                "DistributedDataParallel 只支持主机态 Trainer：设备态的参数与"
-                "梯度常驻显存，而本层只做主机侧集合通信（没有 NCCL 路径）"
+                "设备态 Trainer 的梯度常驻显存，DistributedDataParallel 只有"
+                "注入 device_side = True 的 collective（如 NcclDeviceCollective）"
+                "才能直接归约；"
+                f"{type(collective).__name__} 没有这个声明。要么换成主机态 "
+                "Trainer，要么接入 NCCL / RCCL"
+            )
+        if trainer.device_state and bucket_bytes:
+            raise ValueError(
+                "设备态下不支持主机侧拼桶（没有通用的设备拼接），"
+                f"请传 bucket_bytes=0，收到 {bucket_bytes}"
+            )
+        if trainer.device_state and threads != 1:
+            raise ValueError(
+                "设备态的集合调用必须串行：同一个 NCCL communicator 不能被"
+                f"多线程同时调用，请传 threads=1，收到 {threads}"
             )
         if trainer.scaler is not None:
             raise ValueError(
@@ -772,6 +856,23 @@ class DistributedDataParallel:
                 "DistributedDataParallel 不能叠加 ZeRO-3：后者每步自己做 "
                 "ReduceScatter，再经过本层会把梯度归约两次"
             )
+        if overlap:
+            if trainer.device_state:
+                raise ValueError(
+                    "overlap 只支持主机态：设备态的反向是整图 capture / replay，"
+                    "没有「桶就绪」的时刻"
+                )
+            if threads != 1:
+                raise ValueError(
+                    "overlap 用单线程按桶序提交（集合调用必须各 rank 同序），"
+                    f"请传 threads=1，收到 {threads}"
+                )
+            if not bucket_bytes:
+                raise ValueError(
+                    "overlap 需要合并成少量大桶才有收益：分桶反向会按桶数"
+                    "重算共同前缀，bucket_bytes=0（逐参数一桶）会把计算量放大"
+                    "到参数个数倍"
+                )
 
         self.trainer = trainer
         self.collective = collective
@@ -779,11 +880,54 @@ class DistributedDataParallel:
         # 0 表示不拼桶（逐参数归约，5.269 之前的行为）。
         self.bucket_bytes = bucket_bytes
         self.threads = threads
+        self.overlap = bool(overlap)
         self.steps = 0
+        self._device_state = bool(trainer.device_state)
         self._shapes = trainer.data_input_shapes()
         self._user_hook = trainer.grad_hook
+        self._pipeline: Optional[_BucketReducer] = None
         # 组合而不是覆盖：归约必须在用户钩子之前，裁剪 / 加噪才看到全局梯度。
         trainer.grad_hook = self._reduce_grads
+        if self.overlap:
+            buckets = self._bucket_plan(trainer.store.arrays())
+            trainer.enable_bucket_overlap(buckets, self._on_bucket_ready)
+
+    # -- 构造 ---------------------------------------------------------
+
+    @classmethod
+    def from_env(
+        cls,
+        trainer: Trainer,
+        *,
+        collective: Optional[Any] = None,
+        reduction: str = "mean",
+        bucket_bytes: int = DEFAULT_BUCKET_BYTES,
+        threads: int = 2,
+        overlap: bool = False,
+    ) -> "DistributedDataParallel":
+        """从 ``AF_RANK`` / ``AF_WORLD_SIZE`` 读 rank 与规模，配一个最小启动器。
+
+        环境变量与 :func:`train.distributed.spawn` / :func:`train.host_collective.launch`
+        同源：启动器负责注入，训练脚本只读。``collective`` 缺省是
+        ``HostCollective.from_env()``（连父进程的中转端口）；设备态要显式传入
+        ``NcclDeviceCollective(comm)``——每个 rank 的 communicator 必须由调用方
+        建立，本层不替你猜 ``init_rank`` 的参数。
+        """
+        from .distributed import env_rank, env_world_size
+        from .host_collective import HostCollective
+
+        rank = env_rank()
+        world = env_world_size()
+        if collective is None:
+            collective = HostCollective.from_env(rank=rank, world_size=world)
+        return cls(
+            trainer,
+            collective,
+            reduction=reduction,
+            bucket_bytes=bucket_bytes,
+            threads=threads,
+            overlap=overlap,
+        )
 
     # -- 只读面 -------------------------------------------------------
 
@@ -811,7 +955,14 @@ class DistributedDataParallel:
         **并发提交**：桶与桶之间没有依赖，交给线程池并发提交——拼下一个桶
         的主机时间与上一桶的传输重叠。前提是集合通信在等待网络时释放 GIL
         （socket / MPI 都是），否则线程只会轮流跑，不会更快。
+
+        设备态的梯度是设备数组：不拼桶、不转主机，逐个交给 ``device_side``
+        collective 原地归约。
         """
+        if self._device_state:
+            return self._reduce_device_grads(grads)
+        if self._pipeline is not None:
+            return self._finish_overlap(grads)
         arrays: Dict[str, np.ndarray] = {}
         for name, value in grads.items():
             array = np.asarray(value)
@@ -843,6 +994,97 @@ class DistributedDataParallel:
             if self.reduction == "mean":
                 # 显式 astype：`f4 / int` 在 NEP 50 下仍是 f4，但别依赖版本行为。
                 total = (total / self.world_size).astype(array.dtype, copy=False)
+            reduced[name] = total
+        if self._user_hook is None:
+            return reduced
+        return self._user_hook(reduced)
+
+    def _on_bucket_ready(
+        self, names: Sequence[str], arrays: Mapping[str, Any]
+    ) -> None:
+        """Trainer 的桶完成回调：把这一桶立刻交给后台归约。"""
+        if self._pipeline is None:
+            raise RuntimeError(
+                "桶回调发生在 step 之外：pipeline 已关闭（是不是直接调用了 "
+                "trainer.step 而不是 ddp.step？）"
+            )
+        self._pipeline.submit(
+            names, {name: np.asarray(value) for name, value in arrays.items()}
+        )
+
+    def _finish_overlap(
+        self, grads: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """等后台把全部桶归约完，再按与主机路径相同的规则取平均。"""
+        pipeline, self._pipeline = self._pipeline, None
+        merged = pipeline.finish()
+        reduced: Dict[str, np.ndarray] = {}
+        for name, value in grads.items():
+            array = np.asarray(value)
+            if not np.issubdtype(array.dtype, np.floating):
+                raise TypeError(
+                    f"梯度 {name!r} 的 dtype 是 {array.dtype}，"
+                    "集合通信只接受浮点"
+                )
+            total = merged[name]
+            if self.reduction == "mean":
+                total = (total / self.world_size).astype(
+                    array.dtype, copy=False
+                )
+            reduced[name] = total
+        if self._user_hook is None:
+            return reduced
+        return self._user_hook(reduced)
+
+    def _reduce_device_grads(
+        self, grads: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """设备态：逐个张量交给设备侧 collective 原地归约。
+
+        不做 ``np.asarray``——那会把显存里的梯度整份拉回主机，正是 B1 要
+        消除的往返。形状 / dtype 直接读数组元数据；``op`` 用 ``reduction``
+        本身（``sum`` / ``mean``），设备侧适配器负责在设备上补除法。
+
+        为什么不拼桶：拼接需要后端的 ``concatenate``，各厂商数组类型不同，
+        本层拿不到通用实现；``bucket_bytes`` 在构造期已被强制为 0。
+        """
+        device_side = bool(getattr(self.collective, "device_side", False))
+        if not device_side:
+            raise RuntimeError(
+                "设备态归约需要一个 device_side = True 的 collective；"
+                "构造期本应拒绝，说明 collective 的声明在构造后被改过"
+            )
+        reduced: Dict[str, Any] = {}
+        for name, value in grads.items():
+            shape = tuple(getattr(value, "shape", ()))
+            dtype = getattr(value, "dtype", None)
+            if dtype is None:
+                raise TypeError(
+                    f"梯度 {name!r} 没有 dtype 属性，不是设备数组"
+                )
+            try:
+                numpy_dtype = np.dtype(dtype)
+            except TypeError:
+                raise TypeError(
+                    f"梯度 {name!r} 的 dtype {dtype!r} 无法识别"
+                ) from None
+            if not np.issubdtype(numpy_dtype, np.floating):
+                raise TypeError(
+                    f"梯度 {name!r} 的 dtype 是 {numpy_dtype}，"
+                    "集合通信只接受浮点（bf16 以 uint16 位模式存放时请先转 f32）"
+                )
+            total = self.collective.all_reduce(value, op=self.reduction)
+            if tuple(getattr(total, "shape", ())) != shape:
+                raise ValueError(
+                    f"归约后的 {name!r} 形状是 "
+                    f"{tuple(getattr(total, 'shape', ()))}，"
+                    f"本 rank 的梯度是 {shape}"
+                )
+            if np.dtype(getattr(total, "dtype", numpy_dtype)) != numpy_dtype:
+                raise TypeError(
+                    f"归约后的 {name!r} dtype 是 {getattr(total, 'dtype', None)}，"
+                    f"本 rank 的梯度是 {numpy_dtype}"
+                )
             reduced[name] = total
         if self._user_hook is None:
             return reduced
@@ -967,7 +1209,18 @@ class DistributedDataParallel:
         local = {
             name: array[start : start + chunk] for name, array in data.items()
         }
-        loss = float(self.trainer.step(local, weight=weight))
+        if self.overlap:
+            self._pipeline = _BucketReducer(self._reduce_bucket)
+            try:
+                loss = float(self.trainer.step(local, weight=weight))
+            finally:
+                pipeline, self._pipeline = self._pipeline, None
+                if pipeline is not None:
+                    # 没走到 grad_hook（前向 / 反向抛错）：排空后台，别让
+                    # 已提交的桶在下一轮 step 里串到新的 pipeline 上。
+                    pipeline.abort()
+        else:
+            loss = float(self.trainer.step(local, weight=weight))
         # 各 rank 的损失是"本片均值"，等分样本下全局均值就是跨 rank 取平均。
         bucket = np.asarray([loss], dtype=np.float64)
         total_loss = np.asarray(self.collective.all_reduce(bucket, op="sum"))
