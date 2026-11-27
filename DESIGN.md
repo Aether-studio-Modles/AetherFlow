@@ -19067,3 +19067,87 @@ cc 112 段 0.359（6.4%）。
 **回归**：本轮无代码改动；标定脚本与静态普查脚本用完即删。本地与远端仓库
 均干净。
 
+### 5.301　对标清单核对与补齐路线（阶段 A / B）
+
+外部给了一份"对比 PyTorch / TVM / vLLM / TensorRT-LLM"的缺口清单。逐条对照
+代码后，先作废 4 条与现状不符的，再把剩下的按"挡不挡使用"分层。**清单不能
+直接当待办**：按它排期会把已经做完的东西再做一遍。
+
+**核对结果（作废项）**
+
+1. **训练配套不是空白**：`train/grads.py` 有 `clip_global_norm` 与
+   `GradientAccumulator`，`train/schedule.py` 有 `CosineDecay` / `StepDecay` /
+   `ExponentialDecay` / `Warmup`，`train/checkpoint.py` 有 `save_async` /
+   `load_checkpoint`，`train/shard_io.py` 有分片 ckpt，`train/amp.py` 有
+   `GradScaler` 且 `passes/autocast.py` 是独立 pass。这些是"上层要自己拼装"，
+   不是"没有"。
+2. **MoE / 投机解码 / 分页 KV 已有**：`models/moe.py` 用稠密参考语义把路由、
+   top-k 门控与负载均衡闭环表达完整（专家并行显式拒绝），
+   `models/speculative.py` 与 `models/paged_cache.py` 是组件级交付。准确表述是
+   "未接进 `LMRunner` 主干"，不是"没有实现"。
+3. **49 条 VJP 不是抽样白名单**：IR 一共 71 个算子，可微的那部分正好 49 个，
+   等于全覆盖。PyTorch 需要"海量算子兜底"是因为它有 2000+ 算子；算子桶小
+   就不存在兜底问题。真正的差距是**算子面窄**，不是反向规则缺兜底。
+4. **包发布已自动化**：`v*` tag 触发 PyPI trusted publishing，版本号单点来源
+   在 `aetherflow/__init__.py`。"只能源码 `pip install -e .`"已过时。
+
+**真缺口（按挡不挡使用排序）**
+
+| 序 | 缺口 | 挡的是什么 |
+| --- | --- | --- |
+| 1 | bool 张量没有算子产出、后端没有存储路径 | 任何带 mask 的模型都进不来 |
+| 2 | DDP 走主机中转、无反向重叠、无 P2P | 多卡扩展性 |
+| 3 | 量化只到 weight-only int8 | 推理性能上限 |
+| 4 | 无 loop IR / 调度搜索 / 原生 NHWC / GEMM epilogue | 峰值性能上限 |
+| 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率 |
+| 6 | 无国产卡后端 | 特定硬件市场 |
+
+第 4 项与"IR 语义简单、数值可验证"的设计约束正面冲突（等于换一套后端），
+排在最后且很可能永远不做；第 3、5 项取决于项目定位（卖推理才做）；第 6 项
+需要厂商联合优化，单机项目做了也是半成品。**只有第 1、2 项是无论定位如何都
+该补的。**
+
+**阶段 A：bool 与掩码算子面（本地可完整验证）**
+
+类型系统其实已经有 `DType.BOOL`（`ir/types.py`，numpy 侧映射为 `bool`），缺的是
+"谁能产出它"和"后端怎么存"：
+
+- **A1 比较算子**：`eq` / `ne` / `lt` / `le` / `gt` / `ge`。`infer` 复用现有广播
+  规则、输出 `bool`；`reference` 直接用 numpy 比较；`codegen` 增加 bool 存储键
+  （设备容器 `unsigned char`，存取 helper `af_ld_q` / `af_st_q` 把 0/1 与
+  float 互转），设备内核复用 `ew_bcast` 的坐标还原结构（含 5.300 的 pow2 形态）。
+  反向规则不注册——比较在数学上没有梯度，`vjp=None` 会让 `backward` 明确报错。
+- **A2 `where` 与 `masked_fill`**：`where(cond, a, b)` 三输入广播，设备内核在
+  `ew_bcast` 上多一路 stride；`masked_fill` 不新增算子，前端降成
+  `where(eq(mask, 0), x, full(value))`。`where` 的 vjp 是
+  `g_a = where(cond, g, 0)`、`g_b = where(cond, 0, g)`，不需要 bool→float 的 cast。
+- **A3 一元补齐**：`sign` / `round` / `floor` / `ceil`。`round` 必须是
+  half-to-even（`nearbyintf` / `rintf`），与 torch 的 `round` 一致；`floor` / `ceil`
+  用 `floorf` / `ceilf`。这四个都进 `UNARY_EXPR` 与前端白名单。
+- **A4 `topk`**：返回 values + indices，最后一维块内选择。它涉及多输出与 i32
+  索引输出，放在 A1~A3 稳定之后单独做；并列时按**下标升序**定序，写进语义。
+
+**验收**：IR verifier 拒绝 bool 参与算术；参考后端数值正确；参考↔CUDA 一致性
+套件覆盖新增算子；一个含比较 + `where` 的 `torch.export` 模型端到端跑通；
+`pytest` 全绿。
+
+**阶段 B：DDP 多进程与反向重叠（受机器限制）**
+
+- B1 `DistributedDataParallel` 在提供设备集合通信时走 NCCL，不再经主机中转；
+- B2 反向按参数分桶做 allreduce，并与计算重叠（桶就绪即发，不等全图结束）；
+- B3 rank / world 从环境变量读，配一个最小启动器。
+
+**限制先写清楚**：现只有单卡 A800 与两卡数值用例，`world > 1` 无法真机验证。
+因此 B 只做到"代码路径与两卡用例就位"，**不承诺规模数字**；要真数字得先有
+多卡机器。
+
+**明确不做**（写进边界，不再单独讨论）：auto-schedule 搜索、loop 级 IR、
+TVM 式分层 IR、通用自动微分兜底、国产卡后端、C++ runtime、K8s / 监控 / 熔断、
+CV / 语音专用算子（NMS / ROIAlign）。理由统一：要么与"语义简单、数值可验证"
+的核心约束冲突，要么需要团队与厂商资源，单人项目做了也是半成品。
+
+**风险**：bool 落地后必须钉死转换方向（只允许 bool→f32 / i32，反向拒绝），
+否则 `cast` 会把任意整数当布尔；常量折叠要能处理比较结果，但要避免把
+bool 常量写进属性时被当成整数；`topk` 的并列定序必须写进语义，否则参考端与
+设备端的下票顺序可能不同。
+
