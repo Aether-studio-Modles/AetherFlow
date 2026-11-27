@@ -7,6 +7,7 @@
 ``build_transformer`` 整段前向的对应位置一致。页宽只改分配粒度，不该改数值。
 """
 
+import math
 import unittest
 from dataclasses import replace
 
@@ -15,6 +16,7 @@ import numpy as np
 from aetherflow import Graph, ReferenceBackend
 from aetherflow.models import (
     PagedDecodeScheduler,
+    PagedGenerator,
     TransformerSpec,
     build_transformer,
     cached_forward,
@@ -349,6 +351,246 @@ class TestPagedDecodeScheduler(unittest.TestCase):
         self.assertNotIn(1, sched)
         sched.submit(1)  # 同一个 id 可以复用
         self.assertEqual(sched.length(1), 0)
+
+
+def _vocab_spec(**overrides):
+    base = dict(
+        d_model=8,
+        num_heads=2,
+        d_ff=16,
+        num_layers=2,
+        seq=12,
+        vocab=16,
+        batch=1,
+        dropout=0.0,
+    )
+    base.update(overrides)
+    return TransformerSpec(**base)
+
+
+def _vocab_params(spec, seed=0):
+    """在 ``_params`` 之上把位置编码改成非零：零位置表测不出位置真的用上了。"""
+    params = _params(spec, seed)
+    rng = np.random.default_rng(seed + 1000)
+    params["pos"] = (
+        rng.standard_normal(spec.param_shapes["pos"]) * 0.1
+    ).astype(np.float32)
+    return params
+
+
+def _dense_next(params, spec, tokens):
+    """稠密图参照：整段前向一遍，取最后位置的 argmax。"""
+    seq = len(tokens)
+    dense_spec = replace(spec, seq=seq)
+    g = Graph("dense_next")
+    inputs, logits = build_transformer(g, dense_spec)
+    g.output(logits, "logits")
+    feed = {
+        inputs["ids"].name: np.array([tokens], dtype=np.int32),
+        inputs["mask"].name: causal_mask_bias(seq),
+    }
+    for name in dense_spec.param_shapes:
+        feed[inputs[name].name] = (
+            params["pos"][:, :seq] if name == "pos" else params[name]
+        )
+    out = BACKEND.execute(g, feed)["logits"]
+    return int(np.argmax(out[0, -1]))
+
+
+def _dense_greedy(params, spec, prompt, max_new_tokens, eos_id=None):
+    tokens = list(prompt)
+    out = []
+    for _ in range(max_new_tokens):
+        nxt = _dense_next(params, spec, tokens)
+        out.append(nxt)
+        if eos_id is not None and nxt == eos_id:
+            break
+        tokens.append(nxt)
+    return out
+
+
+class TestPagedGenerator(unittest.TestCase):
+    """分页 KV 上的生成闭环：判据仍是"逐 token 等于稠密图"。
+
+    生成层只是补上 token → 嵌入 / 位置编码、隐状态 → 词表头、以及停止条件；
+    分页、换出换入与共享前缀都来自 :class:`PagedDecodeScheduler`，所以这里
+    重点验三件事：贪心 token 与稠密图一致、``fork`` 不额外占页且数值不变、
+    挂起换出之后续写的 token 不变。
+    """
+
+    def _generator(self, spec, params, **overrides):
+        # pad_to 是 max_steps，所以池容量（blocks × block_size）必须装得下它
+        options = dict(
+            num_blocks=max(8, math.ceil(spec.seq / 2)), block_size=2, max_steps=spec.seq
+        )
+        options.update(overrides)
+        return PagedGenerator(BACKEND, params, spec, **options)
+
+    def test_generate_matches_dense_greedy(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=2)
+        prompt = [1, 4, 7]
+        for block_size in (1, 2, 3):
+            with self.subTest(block_size=block_size):
+                gen = self._generator(
+                    spec,
+                    params,
+                    block_size=block_size,
+                    num_blocks=math.ceil(spec.seq / block_size),
+                )
+                got = gen.generate(prompt, max_new_tokens=5, rid=1)
+                self.assertEqual(
+                    got, _dense_greedy(params, spec, prompt, 5)
+                )
+                # 最后一个生成的 token 不必再喂回缓存：长度 = prompt + 4
+                self.assertEqual(gen.length(1), len(prompt) + 4)
+                self.assertEqual(gen.tokens(1), prompt + got[:-1])
+
+    def test_generate_stops_at_eos(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=4)
+        prompt = [3, 5]
+        want = _dense_greedy(params, spec, prompt, 5)
+        eos = None
+        for index in range(1, len(want)):
+            if want[index] not in want[:index]:
+                eos = want[index]
+                break
+        self.assertIsNotNone(eos, f"参照序列 {want} 全重复，换一组权重")
+        stop = want.index(eos) + 1
+        gen = self._generator(spec, params)
+        got = gen.generate(prompt, max_new_tokens=5, eos_id=eos, rid=1)
+        self.assertEqual(got, want[:stop])
+
+    def test_fork_shares_prefix_and_matches_independent(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=6)
+        prefix = [1, 4, 7]
+        parent = self._generator(spec, params)
+        parent.generate(prefix, max_new_tokens=0, rid=1)
+        used = parent.stats()["used_blocks"]
+        parent.fork(1, 2)
+        info = parent.stats()
+        self.assertEqual(info["used_blocks"], used)  # 分叉不额外占页
+        self.assertEqual(info["shared_blocks"], used)
+        self.assertEqual(info["forks"], 1)
+        self.assertEqual(parent.tokens(2), prefix)
+
+        # 子只喂多出来的一个 token，之后与独立实例逐 token 对拍
+        shared_tail = [2]
+        nxt = parent.prefill(2, shared_tail)
+        got = []
+        for _ in range(3):
+            got.append(nxt)
+            nxt = parent.feed(2, nxt)
+        other = self._generator(spec, params)
+        want = other.generate(prefix + shared_tail, max_new_tokens=3, rid=1)
+        self.assertEqual(got, want)
+        # 父仍然停在原来的前缀上，没被子序列写脏
+        self.assertEqual(parent.length(1), len(prefix))
+        self.assertEqual(parent.tokens(1), prefix)
+
+    def test_suspend_evict_and_resume_keep_tokens(self):
+        spec = _vocab_spec(seq=8)
+        params = _vocab_params(spec, seed=8)
+        prompt = [1, 6, 9]
+        gen = self._generator(spec, params, num_blocks=4, block_size=2, max_steps=8)
+        gen.submit(1)
+        got = []
+        nxt = gen.prefill(1, prompt)
+        for index in range(5):
+            got.append(nxt)
+            if index == 2:
+                gen.suspend(1, evict=True)
+                self.assertTrue(gen.is_swapped(1))
+                self.assertEqual(gen.stats()["swaps_out"], 1)
+                gen.resume(1)
+                self.assertFalse(gen.is_swapped(1))
+            if index < 4:
+                nxt = gen.feed(1, nxt)
+        # 中途整段换出再换入，续写的 token 必须与不换出时完全一致
+        self.assertEqual(got, _dense_greedy(params, spec, prompt, 5))
+        self.assertEqual(gen.stats()["swaps_in"], 1)
+
+    def test_prefill_feed_and_token_history(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=10)
+        gen = self._generator(spec, params)
+        gen.submit(1)
+        nxt = gen.prefill(1, [2, 3, 4])
+        self.assertEqual(nxt, _dense_greedy(params, spec, [2, 3, 4], 1)[0])
+        self.assertEqual(gen.tokens(1), [2, 3, 4])
+        history = gen.tokens(1)
+        history.append(99)
+        self.assertEqual(gen.tokens(1), [2, 3, 4])  # 返回的是副本
+
+        gen.finish(1)
+        self.assertNotIn(1, gen)
+        gen.submit(1)  # 同一个 id 可以复用
+        self.assertEqual(gen.length(1), 0)
+        self.assertEqual(gen.tokens(1), [])
+
+    def test_rejections(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=12)
+        with self.assertRaisesRegex(ValueError, "vocab>=1"):
+            self._generator(_vocab_spec(vocab=0), params)
+        with self.assertRaisesRegex(ValueError, "位置编码表长度"):
+            self._generator(spec, params, max_steps=spec.seq + 1)
+        bad_pos = dict(params)
+        bad_pos["pos"] = params["pos"][0]
+        with self.assertRaisesRegex(ValueError, "params\\['pos'\\]"):
+            self._generator(spec, bad_pos)
+        bad_emb = dict(params)
+        bad_emb["tok_emb"] = params["tok_emb"][:, :1]
+        with self.assertRaisesRegex(ValueError, "tok_emb"):
+            self._generator(spec, bad_emb)
+        missing = dict(params)
+        del missing["w_head"]
+        with self.assertRaisesRegex(KeyError, "w_head"):
+            self._generator(spec, missing)
+
+        gen = self._generator(spec, params)
+        with self.assertRaisesRegex(ValueError, "至少要有一个 token"):
+            gen.generate([], max_new_tokens=2)
+        with self.assertRaisesRegex(ValueError, "越界"):
+            gen.generate([spec.vocab], max_new_tokens=2)
+        with self.assertRaisesRegex(TypeError, "整数 token id"):
+            gen.generate([1.5], max_new_tokens=2)
+        with self.assertRaisesRegex(TypeError, "整数 token id"):
+            gen.generate([True], max_new_tokens=2)
+        with self.assertRaisesRegex(TypeError, "prompt 必须是 token id 序列"):
+            gen.generate("abc", max_new_tokens=2)
+        with self.assertRaisesRegex(TypeError, "max_new_tokens"):
+            gen.generate([1], max_new_tokens=True)
+        with self.assertRaisesRegex(ValueError, "max_new_tokens"):
+            gen.generate([1], max_new_tokens=-1)
+        with self.assertRaisesRegex(ValueError, "超过 max_steps"):
+            gen.generate([1, 2, 3, 4], max_new_tokens=9)
+        with self.assertRaisesRegex(ValueError, "越界"):
+            gen.generate([1], max_new_tokens=1, eos_id=spec.vocab)
+        with self.assertRaisesRegex(KeyError, "没有提交"):
+            gen.feed(9, 1)
+        with self.assertRaisesRegex(KeyError, "没有提交"):
+            gen.finish(9)
+        with self.assertRaisesRegex(KeyError, "没有提交"):
+            gen.generate([1], max_new_tokens=1, fork_from=9)
+
+        gen.submit(1)
+        gen.prefill(1, [1, 2])
+        with self.assertRaisesRegex(ValueError, "前缀不一致"):
+            gen.generate([1, 3], max_new_tokens=1, fork_from=1, rid=2)
+        with self.assertRaisesRegex(ValueError, "多至少一个 token"):
+            gen.generate([1, 2], max_new_tokens=1, fork_from=1, rid=2)
+        with self.assertRaisesRegex(ValueError, "已经提交"):
+            gen.submit(1)
+        with self.assertRaisesRegex(ValueError, "已经提交"):
+            gen.fork(1, 1)
+        with self.assertRaisesRegex(ValueError, "达到 max_steps"):
+            gen2 = self._generator(spec, params, max_steps=3)
+            gen2.submit(1)
+            gen2.prefill(1, [1, 2, 3])
+            gen2.feed(1, 4)
 
 
 if __name__ == "__main__":

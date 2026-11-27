@@ -25,7 +25,9 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+import operator
+from dataclasses import replace
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -36,6 +38,7 @@ from .transformer import TransformerSpec
 
 __all__ = [
     "PagedDecodeScheduler",
+    "PagedGenerator",
     "build_cached_decoder_step",
     "cached_forward",
 ]
@@ -538,4 +541,294 @@ class PagedDecodeScheduler:
             f"PagedDecodeScheduler({self.cache!r}, max_steps={self.max_steps}, "
             f"active={sum(1 for s in self._state.values() if s == 'active')}, "
             f"suspended={sum(1 for s in self._state.values() if s == 'suspended')})"
+        )
+
+
+def _token_id(token, vocab: int, label: str) -> int:
+    """把一个 token 规范成 ``int`` 并校验范围；bool 与浮点都显式拒绝。
+
+    用 ``operator.index`` 而不是 ``isinstance(int)``：numpy 整数、枚举与其他
+    实现 ``__index__`` 的整数类型都可以，浮点与字符串不行。
+    """
+    if isinstance(token, bool):
+        raise TypeError(f"{label} 必须是整数 token id，得到 bool")
+    try:
+        value = operator.index(token)
+    except TypeError:
+        raise TypeError(
+            f"{label} 必须是整数 token id，得到 {type(token).__name__}"
+        ) from None
+    if not 0 <= value < vocab:
+        raise ValueError(f"{label}={value} 越界：词表大小是 {vocab}")
+    return value
+
+
+def _token_ids(tokens, vocab: int, label: str) -> List[int]:
+    if isinstance(tokens, (str, bytes)):
+        raise TypeError(f"{label} 必须是 token id 序列，不能是 {type(tokens).__name__}")
+    return [_token_id(token, vocab, f"{label}[{i}]") for i, token in enumerate(tokens)]
+
+
+class PagedGenerator:
+    """分页 KV 池上的贪心生成闭环：``prompt`` 进、token 出。
+
+    :class:`PagedDecodeScheduler` 解的是隐状态；真实生成还缺三件东西：把
+    token 变成隐状态的嵌入与位置编码、把隐状态变成下一个 token 的词表头、
+    以及逐 token 的停止条件。本类只补这三件，分页 / 换出换入 / 共享前缀
+    全部复用调度器：
+
+    - :meth:`submit` / :meth:`fork` / :meth:`suspend` / :meth:`resume` /
+      :meth:`finish` 与调度器同名同义，另外维护每条序列的 token 历史
+      （``fork`` 需要它来校验前缀真的相同）；
+    - :meth:`feed` 喂一个 token，返回下一个 token 的贪心 id；
+    - :meth:`prefill` 连续喂一段，返回下一 token；
+    - :meth:`generate` 是 "prefill + 贪心续写 + 停止符" 的闭环。
+
+    嵌入与位置编码在主机侧相加（``tok_emb[token] + pos[t]``）：增量图的输入
+    本来就是隐状态，位置信息不必在设备上再算一遍。词表头是一张
+    ``(1, d) → (1, V)`` 的小图，语义等同 :func:`build_transformer` 的末层
+    ``x @ w_head``。
+
+    **边界**：缓存宽度与位置表都按 ``max_steps`` 固定，``prompt`` 长度加
+    ``max_new_tokens`` 超过它就显式报错——位置编码是有限表，越界没有定义。
+    池满且所有序列都 active 时 ``step`` 照旧抛 ``PagedCacheFullError``，此时
+    序列长度与 token 历史都不变，``suspend`` 别的请求后可以重试。
+    """
+
+    def __init__(
+        self,
+        backend,
+        params: Dict[str, np.ndarray],
+        spec: TransformerSpec,
+        *,
+        num_blocks: int,
+        max_steps: int,
+        block_size: int = 4,
+        on_swap_out=None,
+        on_swap_in=None,
+    ) -> None:
+        if isinstance(spec.vocab, bool) or not isinstance(spec.vocab, int):
+            raise TypeError(
+                f"PagedGenerator 需要整数 vocab，得到 {spec.vocab!r}"
+            )
+        if spec.vocab < 1:
+            raise ValueError(
+                f"PagedGenerator 需要 vocab>=1（词表头是生成闭环的一部分），"
+                f"得到 vocab={spec.vocab}；只解隐状态请用 PagedDecodeScheduler"
+            )
+        for name in ("tok_emb", "pos", "w_head"):
+            if name not in params:
+                raise KeyError(f"params 缺少权重 {name!r}")
+        pos = np.asarray(params["pos"], dtype=np.float32)
+        if pos.ndim != 3 or pos.shape[0] != 1 or pos.shape[2] != spec.d_model:
+            raise ValueError(
+                f"params['pos'] 形状必须是 (1, seq, {spec.d_model})，得到 {pos.shape}"
+            )
+        embed = np.asarray(params["tok_emb"], dtype=np.float32)
+        if embed.shape != (spec.vocab, spec.d_model):
+            raise ValueError(
+                f"params['tok_emb'] 形状必须是 {(spec.vocab, spec.d_model)}，"
+                f"得到 {embed.shape}"
+            )
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise TypeError(f"max_steps 必须是 int，得到 {type(max_steps).__name__}")
+        if max_steps < 1:
+            raise ValueError(f"max_steps 必须 >= 1，得到 {max_steps}")
+        if max_steps > pos.shape[1]:
+            raise ValueError(
+                f"max_steps={max_steps} 超过位置编码表长度 {pos.shape[1]}；"
+                "生成图与位置表必须等宽"
+            )
+
+        self.backend = backend
+        self.params = params
+        self.spec = spec
+        self.max_steps = max_steps
+        self.vocab = spec.vocab
+        self._embed = embed
+        self._pos = pos[0]  # (seq, d)
+        # 分页解码只解隐状态，词表头在下面的小图里；传一份 vocab=0 的 spec
+        # 给调度器，避免它去要 tok_emb / w_head 这两个不属于它的权重。
+        self._scheduler = PagedDecodeScheduler(
+            backend,
+            params,
+            replace(spec, vocab=0),
+            num_blocks=num_blocks,
+            max_steps=max_steps,
+            block_size=block_size,
+            on_swap_out=on_swap_out,
+            on_swap_in=on_swap_in,
+        )
+
+        g = Graph("paged_head")
+        y = g.input("y", f32[1, spec.d_model])
+        w_head = g.input("w_head", f32[spec.param_shapes["w_head"]])
+        g.output(g.matmul(y, w_head), "logits")
+        self._head_graph = g
+        self._head_feed = {w_head.name: np.asarray(params["w_head"], dtype=np.float32)}
+
+        self._tokens: Dict[int, List[int]] = {}
+
+    # -- 只读视图 -----------------------------------------------------
+
+    def __contains__(self, rid: object) -> bool:
+        return rid in self._tokens
+
+    def length(self, rid: int) -> int:
+        return self._scheduler.length(rid)
+
+    def is_swapped(self, rid: int) -> bool:
+        return self._scheduler.is_swapped(rid)
+
+    def stats(self) -> Dict[str, int]:
+        return self._scheduler.stats()
+
+    def tokens(self, rid: int) -> List[int]:
+        """这条序列已经解码过的 token（``fork`` 前缀校验用的就是它）。"""
+        if rid not in self._tokens:
+            raise KeyError(f"序列 {rid!r} 没有提交；先 submit(rid)")
+        return list(self._tokens[rid])
+
+    # -- 生命周期 -----------------------------------------------------
+
+    def submit(self, rid: int) -> None:
+        if rid in self._tokens:
+            raise ValueError(f"序列 {rid!r} 已经提交；先 finish(rid) 再复用这个 id")
+        self._scheduler.submit(rid)
+        self._tokens[rid] = []
+
+    def fork(self, parent: int, child: int) -> None:
+        if parent not in self._tokens:
+            raise KeyError(f"序列 {parent!r} 没有提交；先 submit(rid)")
+        if child in self._tokens:
+            raise ValueError(f"序列 {child!r} 已经提交；fork 需要一个新的 id")
+        self._scheduler.fork(parent, child)
+        self._tokens[child] = list(self._tokens[parent])
+
+    def suspend(self, rid: int, *, evict: bool = False) -> bool:
+        return self._scheduler.suspend(rid, evict=evict)
+
+    def resume(self, rid: int) -> int:
+        return self._scheduler.resume(rid)
+
+    def finish(self, rid: int) -> None:
+        if rid not in self._tokens:
+            raise KeyError(f"序列 {rid!r} 没有提交；先 submit(rid)")
+        self._scheduler.finish(rid)
+        del self._tokens[rid]
+
+    # -- 解码 ---------------------------------------------------------
+
+    def _logits(self, y: np.ndarray) -> np.ndarray:
+        feed = dict(self._head_feed)
+        feed["y"] = np.asarray(y, dtype=np.float32).reshape(1, self.spec.d_model)
+        out = self.backend.execute(self._head_graph, feed)
+        return _host(self.backend, out["logits"]).reshape(-1)
+
+    def feed(self, rid: int, token) -> int:
+        """喂一个 token，返回下一个位置上的贪心 token id。
+
+        位置取序列当前长度（即这个 token 的位置）；位置编码与嵌入在主机侧
+        相加后交给调度器。``PagedCacheFullError`` 时序列长度不变，可以挂起
+        别的序列后重试。
+        """
+        if rid not in self._tokens:
+            raise KeyError(f"序列 {rid!r} 没有提交；先 submit(rid)")
+        token = _token_id(token, self.vocab, "token")
+        position = self._scheduler.length(rid)
+        if position >= self.max_steps:
+            raise ValueError(
+                f"序列 {rid!r} 已达到 max_steps={self.max_steps}，不能再解码"
+            )
+        x = self._embed[token] + self._pos[position]
+        y = self._scheduler.step(rid, x)
+        self._tokens[rid].append(token)
+        return int(np.argmax(self._logits(y)))
+
+    def prefill(self, rid: int, tokens) -> int:
+        """连续喂一段 token，返回下一位置上的贪心 token id。"""
+        seq = _token_ids(tokens, self.vocab, "tokens")
+        if not seq:
+            raise ValueError("prefill 至少要有一个 token")
+        if self._scheduler.length(rid) + len(seq) > self.max_steps:
+            raise ValueError(
+                f"prefill 后长度 {self._scheduler.length(rid) + len(seq)} "
+                f"超过 max_steps={self.max_steps}"
+            )
+        next_id = 0
+        for token in seq:
+            next_id = self.feed(rid, token)
+        return next_id
+
+    def generate(
+        self,
+        prompt,
+        *,
+        max_new_tokens: int = 16,
+        eos_id=None,
+        rid: int = 0,
+        fork_from=None,
+    ) -> List[int]:
+        """贪心生成：返回新产生的 token（不含 ``prompt``）。
+
+        ``fork_from`` 给出时先共享父序列的前缀：``prompt`` 必须以父序列已解码
+        的全部 token 开头，只对多出来的部分做 prefill。生成结束后序列仍然
+        驻留（可以继续 :meth:`feed` 或 :meth:`stats`），回收请显式
+        :meth:`finish`。
+        """
+        ids = _token_ids(prompt, self.vocab, "prompt")
+        if not ids:
+            raise ValueError("prompt 至少要有一个 token：没有输入就算不出下一个")
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
+            raise TypeError(
+                f"max_new_tokens 必须是 int，得到 {type(max_new_tokens).__name__}"
+            )
+        if max_new_tokens < 0:
+            raise ValueError(f"max_new_tokens 必须 >= 0，得到 {max_new_tokens}")
+        if eos_id is not None:
+            eos_id = _token_id(eos_id, self.vocab, "eos_id")
+        if len(ids) + max_new_tokens > self.max_steps:
+            raise ValueError(
+                f"prompt({len(ids)}) + max_new_tokens({max_new_tokens}) = "
+                f"{len(ids) + max_new_tokens} 超过 max_steps={self.max_steps}"
+            )
+
+        if fork_from is None:
+            self.submit(rid)
+            consumed = 0
+        else:
+            if fork_from not in self._tokens:
+                raise KeyError(f"序列 {fork_from!r} 没有提交；先 submit(rid)")
+            shared = self._tokens[fork_from]
+            if len(ids) < len(shared) or ids[: len(shared)] != shared:
+                raise ValueError(
+                    f"fork_from={fork_from!r} 的前缀不一致：父序列已解码 "
+                    f"{len(shared)} 个 token，prompt 只有 {len(ids)} 个或开头不同"
+                )
+            if len(ids) == len(shared):
+                # 生成需要一个"尚未解码的位置"来取下一个 token。父序列最后一步
+                # 的 logits 当时没有保存，这里不回滚重算，直接要求多喂一个。
+                raise ValueError(
+                    "fork 之后 prompt 必须比父序列多至少一个 token："
+                    "父序列最后一步的 logits 没有保存，无法从同一位置续写"
+                )
+            consumed = len(shared)
+            self.fork(fork_from, rid)
+
+        next_id = self.prefill(rid, ids[consumed:])
+
+        out: List[int] = []
+        for _ in range(max_new_tokens):
+            out.append(next_id)
+            if eos_id is not None and next_id == eos_id:
+                break
+            if len(out) == max_new_tokens:
+                break
+            next_id = self.feed(rid, next_id)
+        return out
+
+    def __repr__(self) -> str:
+        return (
+            f"PagedGenerator({self._scheduler.cache!r}, vocab={self.vocab}, "
+            f"max_steps={self.max_steps}, sequences={len(self._tokens)})"
         )

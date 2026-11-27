@@ -20,6 +20,7 @@
 from .cnn import CNNSpec, bn_conv_block, bn_infer, build_cnn, conv_block, residual_block
 from .cached_attention import (
     PagedDecodeScheduler,
+    PagedGenerator,
     build_cached_decoder_step,
     cached_forward,
 )
@@ -166,6 +167,7 @@ __all__ = [
     "build_cached_decoder_step",
     "cached_forward",
     "PagedDecodeScheduler",
+    "PagedGenerator",
     "DraftModel",
     "SpeculativeDecoder",
     "greedy_draft",
