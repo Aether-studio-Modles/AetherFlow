@@ -87,7 +87,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3005 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3007 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 
@@ -140,9 +140,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   Mamba，没有随上下文增长的 KV。分页缓存已带换出 / 换入与 LRU 调度：`PagedCacheManager`
   在容量不足时换出最久未使用且未 pin 的序列、被访问时自动换回（`pin` 保护正在
   解码的请求）；`PagedDecodeScheduler` 把多序列交错解码接在同一张单步图上，
-  `suspend` / `resume` 对应解除保护与换入。`fork` 让多条序列共享同一批物理页、
-  写入时按页拆分（块级引用计数），适合同前缀多路采样 / 束搜索 / 同系统提示的
-  多请求；它是显式动作，不做前缀内容匹配。三者都是主机态组件，没有真机
+  `suspend` / `resume` 对应解除保护与换入，`fork` 让新序列共享父序列的前缀。
+  `fork` 在缓存层是多条序列共享同一批物理页、写入时按页拆分（块级引用计数），
+  适合同前缀多路采样 / 束搜索 / 同系统提示的多请求；它是显式动作，不做前缀
+  内容匹配。这些组件都是主机态，没有真机
   D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机只支持贪心
   验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
@@ -533,6 +534,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **自动换出要跳过全共享序列**（5.307）：LRU 先搬走一条 `exclusive_blocks == 0`
   的父序列，腾出零页、再搬下一条，白多一次换出还抬高 `swaps_out`。用
   `exclusive_blocks` 预筛，保证每次自动换出都真的腾出页。
+- **上层错误信息要指向本层的动作**（5.307）：缓存层说"先 swap_in"，但
+  `PagedDecodeScheduler` 的调用方只认识 `resume`。调度器层先判一次换出态，抛
+  "先 resume(rid) 再 fork"，比把底层术语透出去更好排查。
 - **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
   单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
   `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
