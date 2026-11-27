@@ -93,7 +93,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照
 ```
 
-当前基线：**3007 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3020 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
@@ -101,7 +101,7 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 | 面 | 已交付 |
 |---|---|
 | 前端 | `torch.export` 导入：卷积 / 池化 / linear / LayerNorm / softmax / SDPA / 归一化 / 索引与切片之外，P7 补上了逐元素数学、激活展开、clamp 与标量运算、dtype 转换、归约（mean / sum / amax / max.dim / argmax）、tril / triu / cumsum / pad、栈与切分、mm / mv / dot / addmm、常量构造（zeros / ones / full / arange 等）；不能精确表达的算子显式拒绝（见第 6 节） |
-| 算子 | IR 里 71 个算子；CUDA / HIP 各自承接 68 个（67 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
+| 算子 | IR 里 72 个算子；CUDA / HIP 各自承接 68 个（67 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8`），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部（含只有参考语义、设备端显式拒绝的 W8A8 `linear_i8a8`） |
 | 精度 | f32 全覆盖；f16 覆盖 64 个（68 个设备端算子去掉 3 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
 | 自动微分 | 49 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环接不进这套形态——判定在主机采样之后（5.278），但 decode 的**状态**可以常驻（5.279） |
@@ -242,8 +242,11 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   融合是规则表而非通用策略；
 - **布局**：有 NHWC 传播 pass（conv / pool 的 `layout` 属性 + 区域边界转置）与后端布局声明，
   但只有参考后端承接 NHWC，设备后端显式拒绝（无原生 NHWC 内核），也没有 GEMM epilogue；
-- **量化推理**：只有 weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
-  权重驻留 1 字节、GEMM 仍走 f32 反量化），无 int8 张量核累加、无 fp8、无 QAT、无非对称零点；
+- **量化推理**：weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
+  权重驻留 1 字节、GEMM 仍走 f32 反量化）与 W8A8 的**参考语义**
+  （`linear_i8a8`：int8 激活 × int8 权重在 int32 里累加后再乘两个 scale，
+  `quantize_activation` 按 token 量化激活）；W8A8 没有设备内核，CUDA / HIP
+  显式拒绝；此外无 fp8、无 QAT、无非对称零点；
 - **动态性**：主机态的执行与训练支持符号批维（一次构图跑不同 batch，归约反向的计数在
   运行期按实际形状算）；设备态的捕获计划、分段重算与需要合并维度的广播反向仍要求静态形状；
   控制流每次判定回主机；`DeviceWhileLoop` / `DeviceConditional` 只是把条件、分支
@@ -293,7 +296,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3007 个用例
+tests/                3020 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```

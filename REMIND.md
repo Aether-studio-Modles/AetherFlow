@@ -32,7 +32,8 @@
   `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
   roofline 式成本模型（用于排序，不做性能预测）、Chrome Trace 导出。
-- **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）；
+- **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）与 W8A8 的
+  参考语义（`linear_i8a8`：int32 累加后乘两个 scale；设备端未承接）；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 
 ### 安装
@@ -87,7 +88,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3007 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3020 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 
@@ -114,8 +115,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   机器、未执行。ZeRO-1/2/3 与流水部分参见 DESIGN §7。
 - **张量并行**：只有前向（列 / 行并行 + attention 头切分）。行并行返回**部分和**，
   需调用方归约；反向通信与优化器分片未接。
-- **量化**：weight-only int8。权重驻留 1 字节，GEMM 仍走 f32 反量化；
-  无 int8 累加、无 fp8、无 QAT、无非对称零点——**不要期待"int8 算得更快"**。
+- **量化**：weight-only int8（权重驻留 1 字节，GEMM 仍走 f32 反量化）与 W8A8 的
+  **参考语义**（`linear_i8a8` + `quantize_activation`：int8 激活 × int8 权重先在
+  int32 里累加，再乘激活 / 权重两个 scale）。W8A8 **没有设备内核**，CUDA / HIP
+  对它显式拒绝（conformance 记为 refused），所以仍然**不要期待"int8 算得更快"**；
+  无 fp8、无 QAT、无非对称零点，W8A8 也尚无反向（bias 除外）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
   显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
@@ -537,6 +541,16 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **上层错误信息要指向本层的动作**（5.307）：缓存层说"先 swap_in"，但
   `PagedDecodeScheduler` 的调用方只认识 `resume`。调度器层先判一次换出态，抛
   "先 resume(rid) 再 fork"，比把底层术语透出去更好排查。
+- **能广播 ≠ 能提出求和号**（5.308）：W8A8 的 `(int32(x) @ int32(w)) * sx * sw`
+  要求激活 scale 沿 K 维恒定、权重 scale 沿 K 维恒定。`sx` 形状 `(B, K)` 虽然
+  能广播到 `(B, K)`，但每列不同，乘到累加结果上就不再等于原来的点积——必须
+  在 infer 处显式拒绝"沿压缩轴不是 1"的 scale，而不是静默当 per-token。
+- **整数累加的溢出要当语义问题**（5.308）：`K * 127 * 127 > 2**31 - 1` 时
+  int32 会回绕，而回绕结果依赖溢出行为，不能跨后端对拍。构图期（K 静态）与
+  执行期各查一次，宁可拒绝也不"让它绕一圈"。
+- **只有参考实现的新算子也要有 conformance 形态**（5.308）：`covered_ops`
+  必须覆盖全部 IR 算子；设备端没有内核时，形态会被记成 refused，这是**显式
+  拒绝**的正常路径，不要为了凑 executed 数量而在设备上退回 f32 累加。
 - **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
   单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
   `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
