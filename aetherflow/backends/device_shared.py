@@ -61,6 +61,7 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "quantize_i8",
         "dequantize_i8",
         "linear_i8",
+        "linear_i8a8",
         "conv2d",
         "maxpool2d",
         "maxpool2d_indices",
@@ -134,6 +135,8 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     # 量化：i8 是**数据**而不是下标，但它同样不能走"只支持浮点"的默认检查。
     "dequantize_i8": frozenset({0}),
     "linear_i8": frozenset({1}),
+    # W8A8：激活与权重都是 i8 数据，scale / bias 仍是 f32。
+    "linear_i8a8": frozenset({0, 2}),
     # 整数取模：两侧都是**整数数据**，不是下标。
     "mod": frozenset({0, 1}),
 }
@@ -183,6 +186,68 @@ extern "C" __global__ void af_dequantize_i8(
   if (i >= n) return;
   float sv = per_row ? s[i % cols] : s[i];
   out[i] = (float)q[i] * sv;
+}
+"""
+
+# W8A8 的矩阵乘：i8 输入、int32 累加、按行 / 按列缩放。累加必须留在整数域，
+# 这正是它和 ``linear_i8``（反量化后走 f32 GEMM）的区别——后者的累加在浮点。
+# 两份源码只差“怎么算 4 路点积”：CUDA 走 ``__dp4a``（sm_61+，V100 是 70），
+# HIP 走标量乘加。两者都是精确整数运算，结果逐位相同，所以跨后端对拍成立。
+_LINEAR_I8A8_SRC = r"""
+extern "C" __global__ void af_linear_i8a8(
+    const signed char* __restrict__ x,
+    const float* __restrict__ xs,
+    const signed char* __restrict__ w,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    long long m, long long k, long long n) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  long long total = m * n;
+  if (idx >= total) return;
+  long long row = idx / n;
+  long long col = idx - row * n;
+  const signed char* xr = x + row * k;
+  const signed char* wc = w + col;
+  int acc = 0;
+  for (long long kk = 0; kk < k; ++kk) {
+    acc += (int)xr[kk] * (int)wc[kk * n];
+  }
+  out[idx] = (float)acc * xs[row] * ws[col];
+}
+"""
+
+_LINEAR_I8A8_DP4A_SRC = r"""
+extern "C" __global__ void af_linear_i8a8(
+    const signed char* __restrict__ x,
+    const float* __restrict__ xs,
+    const signed char* __restrict__ w,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    long long m, long long k, long long n) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  long long total = m * n;
+  if (idx >= total) return;
+  long long row = idx / n;
+  long long col = idx - row * n;
+  const signed char* xr = x + row * k;
+  const signed char* wc = w + col;
+  int acc = 0;
+  long long kk = 0;
+  for (; kk + 4 <= k; kk += 4) {
+    const signed char* xp = xr + kk;
+    const signed char* wp = wc + kk * n;
+    int xv = (int)((unsigned int)(unsigned char)xp[0]
+                 | ((unsigned int)(unsigned char)xp[1] << 8)
+                 | ((unsigned int)(unsigned char)xp[2] << 16)
+                 | ((unsigned int)(unsigned char)xp[3] << 24));
+    int wv = (int)((unsigned int)(unsigned char)wp[0]
+                 | ((unsigned int)(unsigned char)wp[n] << 8)
+                 | ((unsigned int)(unsigned char)wp[2 * n] << 16)
+                 | ((unsigned int)(unsigned char)wp[3 * n] << 24));
+    acc = __dp4a(xv, wv, acc);
+  }
+  for (; kk < k; ++kk) acc += (int)xr[kk] * (int)wc[kk * n];
+  out[idx] = (float)acc * xs[row] * ws[col];
 }
 """
 

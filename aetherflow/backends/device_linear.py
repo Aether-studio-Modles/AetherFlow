@@ -1,14 +1,24 @@
-"""线性代数与量化：matmul、int8 量化 / 反量化、weight-only 线性层。"""
+"""线性代数与量化：matmul、int8 量化 / 反量化、weight-only 与 W8A8 线性层。"""
 
 from __future__ import annotations
 
 from .base import BackendCapabilityError
 import numpy as np
-from .device_shared import _DEQUANTIZE_I8_SRC, _QUANTIZE_I8_SRC
+from .device_shared import (
+    _DEQUANTIZE_I8_SRC,
+    _LINEAR_I8A8_DP4A_SRC,
+    _LINEAR_I8A8_SRC,
+    _QUANTIZE_I8_SRC,
+)
 
 
 class _LinearMixin:
-    """线性代数与量化：matmul、int8 量化 / 反量化、weight-only 线性层。"""
+    """线性代数与量化：matmul、int8 量化 / 反量化、weight-only 与 W8A8 线性层。"""
+
+    #: W8A8 的点积是否走 ``__dp4a``（sm_61+ 的 4 路 int8 点积指令）。CUDA 侧
+    #: 覆盖成 True；HIP 的 hipRTC 不带 ``hip_runtime.h``，走标量乘加。两条路
+    #: 都是精确整数运算，累加结果逐位相同，只是指令条数不同。
+    _I8A8_DOT4 = False
 
     # ------------------------------------------------------------------
     # 矩阵
@@ -198,3 +208,90 @@ class _LinearMixin:
         if len(args) > 3:
             out = self._binary("add", [out, args[3]])
         return out
+
+    def _op_linear_i8a8(self, node, args, attrs):
+        """W8A8 线性层：i8 输入、**int32 累加**，最后才乘两路 scale。
+
+        与 ``linear_i8`` 的分界：那边把权重反量化成 f32 再交给 cuBLAS，累加
+        在浮点；这里累加全程 int32，只有缩放落到 f32。代价是 scale 必须提到
+        求和号外面——``x_scale`` 每个 token 一个、``w_scale`` 每个输出通道
+        一个，IR 已拒绝沿压缩轴变化的形态，所以设备端只需按行 / 按列取。
+
+        逐位口径与参考实现一致：``(float)acc * xs * ws + bias`` 的乘加顺序
+        与 numpy 的 ``acc.astype(f32) * row * ws (+ bias)`` 相同。int32 不会
+        溢出，因为 IR 把 K 限制在 ``(2**31 - 1) / 127**2`` 以内。
+        """
+        cp = self.cp
+        xq, xs, wq, ws = args[0], args[1], args[2], args[3]
+        if xq.dtype != cp.int8 or wq.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8 要求激活与权重都是 i8，"
+                f"收到 {xq.dtype} 与 {wq.dtype}"
+            )
+        if xs.dtype != cp.float32 or ws.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8 的 scale 必须是 f32，"
+                f"收到 {xs.dtype} 与 {ws.dtype}"
+            )
+        if xq.ndim < 2 or wq.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8 要求激活秩 >= 2、权重秩 2，"
+                f"收到 {xq.shape} 与 {wq.shape}"
+            )
+        if (
+            xs.ndim != xq.ndim
+            or int(xs.shape[-1]) != 1
+            or tuple(xs.shape[:-1]) != tuple(xq.shape[:-1])
+        ):
+            raise BackendCapabilityError(
+                f"linear_i8a8 的激活 scale 形状必须是激活的前导维加 1，"
+                f"收到 {xs.shape} 对 {xq.shape}"
+            )
+        k = int(xq.shape[-1])
+        n = int(wq.shape[-1])
+        if int(wq.shape[0]) != k:
+            raise BackendCapabilityError(
+                f"linear_i8a8 的内维不匹配：{xq.shape} @ {wq.shape}"
+            )
+        if int(ws.size) != n:
+            raise BackendCapabilityError(
+                f"linear_i8a8 的权重 scale 长度必须是 {n}，收到 {ws.shape}"
+            )
+        if len(args) > 4:
+            bias = args[4]
+            if bias.dtype != cp.float32 or int(bias.size) != n:
+                raise BackendCapabilityError(
+                    f"linear_i8a8 的 bias 必须是长度 {n} 的 f32，收到 "
+                    f"{bias.dtype} {bias.shape}"
+                )
+
+        m = int(np.prod(xq.shape[:-1]))
+        out = cp.empty((m, n), cp.float32)
+        if out.size:
+            x = self._contig(xq).reshape(m, k)
+            w = self._contig(wq)
+            sxa = self._contig(xs).reshape(m)
+            swa = self._contig(ws).reshape(n)
+            dot4 = self._I8A8_DOT4
+            src = _LINEAR_I8A8_DP4A_SRC if dot4 else _LINEAR_I8A8_SRC
+            kernel = self._kernel(("linear_i8a8", dot4), src, "af_linear_i8a8")
+            block, grid = self._grid("linear_i8a8", m * n)
+            kernel(
+                (grid,),
+                (block,),
+                (
+                    x,
+                    sxa,
+                    w,
+                    swa,
+                    out,
+                    np.int64(m),
+                    np.int64(k),
+                    np.int64(n),
+                ),
+            )
+        out = out.reshape(xq.shape[:-1] + (n,))
+        if len(args) > 4:
+            out = self._binary("add", [out, args[4]])
+        return out
+

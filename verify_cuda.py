@@ -455,6 +455,38 @@ def _extra_cases() -> list:
             ),
         }
 
+    def linear_i8a8_tail():
+        """W8A8：K=13 不是 4 的倍数，``__dp4a`` 之后必须收尾；激活秩 3。"""
+        g = Graph("w8a8_tail")
+        xq = g.input("xq", i8[2, 3, 13])
+        xs = g.input("xs", f32[2, 3, 1])
+        wq = g.input("wq", i8[13, 5])
+        ws = g.input("ws", f32[5])
+        b = g.input("b", f32[5])
+        g.output(g.add_node("linear_i8a8", [xq, xs, wq, ws, b]), "y")
+        return g, {
+            "xq": rng.integers(-127, 128, (2, 3, 13), dtype=np.int8),
+            "xs": np.abs(_rand(rng, 2, 3, 1)) + 0.02,
+            "wq": rng.integers(-127, 128, (13, 5), dtype=np.int8),
+            "ws": np.abs(_rand(rng, 5)) + 0.05,
+            "b": _rand(rng, 5),
+        }
+
+    def linear_i8a8_no_bias():
+        """W8A8 的无 bias 形态 + K 恰为 4 的倍数：走纯 dp4a 主循环。"""
+        g = Graph("w8a8_nobias")
+        xq = g.input("xq", i8[9, 512])
+        xs = g.input("xs", f32[9, 1])
+        wq = g.input("wq", i8[512, 32])
+        ws = g.input("ws", f32[32])
+        g.output(g.add_node("linear_i8a8", [xq, xs, wq, ws]), "y")
+        return g, {
+            "xq": rng.integers(-127, 128, (9, 512), dtype=np.int8),
+            "xs": np.abs(_rand(rng, 9, 1)) + 0.005,
+            "wq": rng.integers(-127, 128, (512, 32), dtype=np.int8),
+            "ws": np.abs(_rand(rng, 32)) + 0.01,
+        }
+
     return [
         ("gelu_saturation", gelu),
         ("rmsnorm_rank3", rmsnorm),
@@ -489,6 +521,8 @@ def _extra_cases() -> list:
         ("rounding_boundaries", rounding_boundaries),
         ("sign_special", sign_special),
         ("mod_negative_floor", mod_negative_floor),
+        ("linear_i8a8_tail_rank3", linear_i8a8_tail),
+        ("linear_i8a8_no_bias", linear_i8a8_no_bias),
         ("silu_gate_odd_length", silu_gate_odd),
         ("layernorm_residual_odd_cols", layernorm_residual_odd),
     ]

@@ -82,6 +82,10 @@ class CudaBackend(DeviceBackend):
     # 0.133～0.136 ms，同形状 im2col 0.16～0.31 ms（5.255）。判据在
     # ``plan.conv_winograd_preferred``。
     CONV_AUTO_WINOGRAD = True
+    # W8A8 的点积走 ``__dp4a``：sm_61+ 的 4 路 int8 乘加指令，V100（sm_70）
+    # 与 A800（sm_80）都支持。HIP 的 hipRTC 不带 ``hip_runtime.h``，保持
+    # 标量乘加；两条路都是精确整数运算，累加结果逐位相同。
+    _I8A8_DOT4 = True
 
     def __init__(
         self,
