@@ -18,6 +18,7 @@ import unittest
 from aetherflow import ReferenceBackend
 from aetherflow.models import (
     LMSpec,
+    LMRunner,
     SpeculativeDecoder,
     generate,
     greedy_draft,
@@ -256,6 +257,160 @@ class TestSpeculativeMatchesGreedy(unittest.TestCase):
                 )
         self.assertEqual(outputs[0], want)
         self.assertEqual(outputs[1], want)
+
+
+class TestRunnerSpeculative(unittest.TestCase):
+    """``LMRunner.generate_speculative``：与 ``generate`` 逐位一致且共用会话。
+
+    判据与 ``SpeculativeDecoder`` 相同（草稿改不了结果），额外三条是会话
+    语义：图缓存跨调用复用、``resident=True`` 时权重不重复上传、
+    ``prime`` 的前缀可以作为起点且生成后清空。
+    """
+
+    def _setup(self, **overrides):
+        spec = _small(**overrides)
+        return spec, spec.init_params(seed=21)
+
+    def test_matches_generate_and_reuses_graphs(self):
+        spec, params = self._setup()
+        prompt = [3, 4]
+        want = list(generate(BACKEND, params, prompt, spec, max_new_tokens=4))
+        with LMRunner(BACKEND, params, spec) as runner:
+            draft = greedy_draft(BACKEND, params, spec, chunk_size=spec.steps)
+            first = runner.generate_speculative(
+                prompt, draft, max_new_tokens=4, draft_tokens=3
+            )
+            graphs = runner.graph_count
+            second = runner.generate_speculative(
+                prompt, draft, max_new_tokens=4, draft_tokens=3
+            )
+            self.assertEqual(runner.graph_count, graphs)
+            if spec.eos_id not in want:
+                self.assertEqual(
+                    runner.last_speculative_stats["accepted"],
+                    runner.last_speculative_stats["proposed"],
+                )
+        self.assertEqual(first, want)
+        self.assertEqual(second, want)
+
+    def test_matches_standalone_decoder(self):
+        spec, params = self._setup()
+        prompt = [5, 6]
+        draft = greedy_draft(BACKEND, params, spec, chunk_size=spec.steps)
+        with SpeculativeDecoder(BACKEND, params, spec) as decoder:
+            want = decoder.generate(
+                prompt, draft, max_new_tokens=5, draft_tokens=3
+            )
+        with LMRunner(BACKEND, params, spec) as runner:
+            got = runner.generate_speculative(
+                prompt, draft, max_new_tokens=5, draft_tokens=3
+            )
+        self.assertEqual(got, want)
+
+    def test_bad_draft_cannot_change_result(self):
+        spec, params = self._setup()
+        prompt = [3]
+        want = list(generate(BACKEND, params, prompt, spec, max_new_tokens=5))
+        for draft in (
+            lambda h, k: [],
+            lambda h, k: [0] * k,
+            lambda h, k: [spec.eos_id] * k,
+            lambda h, k: [h[-1]],
+        ):
+            with self.subTest(draft=draft):
+                with LMRunner(BACKEND, params, spec) as runner:
+                    got = runner.generate_speculative(
+                        prompt, draft, max_new_tokens=5, draft_tokens=2
+                    )
+                self.assertEqual(got, want)
+
+    def test_prime_prefix_is_used_then_cleared(self):
+        spec, params = self._setup()
+        prompt = [3, 4, 5]
+        want = list(generate(BACKEND, params, prompt, spec, max_new_tokens=4))
+        draft = greedy_draft(BACKEND, params, spec, chunk_size=spec.steps)
+        with LMRunner(BACKEND, params, spec) as runner:
+            runner.prime([3, 4])
+            got = runner.generate_speculative(
+                prompt, draft, max_new_tokens=4, draft_tokens=2
+            )
+            self.assertEqual(got, want)
+            # 前缀必须已经失效：下一次用完全不同开头的 prompt 也能跑
+            other = list(
+                generate(BACKEND, params, [9], spec, max_new_tokens=3)
+            )
+            self.assertEqual(
+                runner.generate_speculative(
+                    [9], draft, max_new_tokens=3, draft_tokens=2
+                ),
+                other,
+            )
+
+    def test_resident_uploads_weights_once(self):
+        spec, params = self._setup()
+        prompt = [3, 4]
+        want = list(generate(BACKEND, params, prompt, spec, max_new_tokens=3))
+        recorder = _ResidentRecorder(BACKEND)
+        runner = LMRunner(recorder, params, spec, resident=True)
+        # 草稿走裸后端：``recorder.fed`` 只应记录会话自己的 execute，
+        # 否则草稿的整份 feed（含权重）会混淆"驻留是否生效"的判据。
+        draft = greedy_draft(BACKEND, params, spec, chunk_size=spec.steps)
+        got = runner.generate_speculative(
+            prompt, draft, max_new_tokens=3, draft_tokens=2
+        )
+        self.assertEqual(got, want)
+        self.assertNotEqual(recorder.resident, {})
+        self.assertTrue(recorder.fed)
+        for fed in recorder.fed:
+            self.assertEqual(set(fed) & set(params), set())
+        runner.close()
+        self.assertEqual(recorder.resident, {})
+
+    def test_zero_tokens_builds_no_graph(self):
+        spec, params = self._setup()
+        with LMRunner(BACKEND, params, spec) as runner:
+            self.assertEqual(
+                runner.generate_speculative(
+                    [3], lambda h, k: [0], max_new_tokens=0
+                ),
+                [],
+            )
+            self.assertEqual(runner.graph_count, 0)
+
+    def test_rejections(self):
+        spec, params = self._setup()
+        with LMRunner(BACKEND, params, _small(batch=2)) as runner:
+            with self.assertRaisesRegex(ValueError, "batch=1"):
+                runner.generate_speculative([3], lambda h, k: [0])
+
+        with LMRunner(BACKEND, params, spec) as runner:
+            with self.assertRaisesRegex(TypeError, "draft"):
+                runner.generate_speculative([3], object())
+            with self.assertRaisesRegex(ValueError, "draft_tokens"):
+                runner.generate_speculative(
+                    [3], lambda h, k: [0], draft_tokens=0
+                )
+            with self.assertRaisesRegex(TypeError, "draft_tokens"):
+                runner.generate_speculative(
+                    [3], lambda h, k: [0], draft_tokens=True
+                )
+            with self.assertRaisesRegex(ValueError, "超过要求"):
+                runner.generate_speculative(
+                    [3], lambda h, k: [0] * (k + 1), draft_tokens=2
+                )
+            with self.assertRaisesRegex(ValueError, "越界"):
+                runner.generate_speculative(
+                    [3], lambda h, k: [spec.vocab_size]
+                )
+            with self.assertRaisesRegex(ValueError, "chunk_size"):
+                runner.generate_speculative(
+                    [3], lambda h, k: [0], chunk_size=0
+                )
+
+        runner = LMRunner(BACKEND, params, spec)
+        runner.close()
+        with self.assertRaisesRegex(ValueError, "已关闭"):
+            runner.generate_speculative([3], lambda h, k: [0])
 
 
 if __name__ == "__main__":

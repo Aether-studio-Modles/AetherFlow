@@ -1623,6 +1623,12 @@ class LMRunner:
         self._prefix: List[int] = []
         self._state = None
         self._logits = None
+        # 最近一次 generate_speculative 的验收统计（只用于观测）
+        self.last_speculative_stats: Dict[str, int] = {
+            "rounds": 0,
+            "proposed": 0,
+            "accepted": 0,
+        }
 
     # -- 图与驻留 -----------------------------------------------------
 
@@ -1903,6 +1909,73 @@ class LMRunner:
             graph_for=self._graph_for,
             device_step=self._device_step if self.device_state else None,
         )[0]
+
+    def generate_speculative(
+        self,
+        prompt: Sequence[int],
+        draft,
+        *,
+        max_new_tokens: int = 16,
+        draft_tokens: int = 4,
+        eos_id: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+    ) -> Sequence[int]:
+        """贪心投机解码，复用本会话的图缓存、驻留权重与 ``prime`` 前缀。
+
+        与 :class:`aetherflow.models.SpeculativeDecoder` 的区别只在生命周期：
+        草稿验收用的 ``(长度, head="all")`` 图与单条生成共用同一份缓存，
+        ``resident=True`` 时权重一份，``prime`` 的前缀状态直接作为起点。
+        数值路径与 :meth:`generate`（``temperature=0``）逐位相同——草稿再差
+        也不会改变输出，只影响"一次前向确认几个"。
+
+        只支持 ``batch == 1`` 的会话（每行接受长度不同，状态回滚无法整批
+        共享）；与 :meth:`generate` 一样，生成结束后前缀与状态一并丢弃。
+        ``device_state=True`` 时仍走普通执行：验收一次要喂 ``k`` 个 token，
+        捕获图只覆盖单步 decode，混用不会更快。验收统计写在
+        ``last_speculative_stats``。
+        """
+        if self._closed:
+            raise ValueError("LMRunner 已关闭，请新建一个会话")
+        if self.spec.batch != 1:
+            raise ValueError(
+                f"这个会话按 batch={self.spec.batch} 构建；"
+                "投机解码需要 batch=1 的会话"
+            )
+        # 延迟导入：speculative 依赖本模块，模块级导入会成环。
+        from .speculative import _check_draft_tokens, _speculative_loop
+
+        if not callable(draft):
+            raise TypeError(f"draft 必须是可调用对象，得到 {draft!r}")
+        wanted = _check_draft_tokens(draft_tokens)
+        prompt, chunk, limit, stop = _check_request(
+            self.spec, prompt, chunk_size, max_new_tokens, eos_id, None
+        )
+        self.last_speculative_stats = {
+            "rounds": 0,
+            "proposed": 0,
+            "accepted": 0,
+        }
+        if limit == 0:
+            return []
+        state, logits = self._advance(prompt, chunk)
+        # 与 generate 同口径：decode 已把状态推进过，前缀不能再复用。
+        self._clear_prefix()
+        return _speculative_loop(
+            self.backend,
+            self.params,
+            self.spec,
+            prompt,
+            draft,
+            chunk=chunk,
+            limit=limit,
+            stop=stop,
+            draft_tokens=wanted,
+            resident=self.resident,
+            graph_for=self._graph_for,
+            state=state,
+            logits=logits,
+            stats=self.last_speculative_stats,
+        )
 
     def generate_batch(
         self,
