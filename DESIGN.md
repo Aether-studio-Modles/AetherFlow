@@ -19224,9 +19224,10 @@ torch 逐位相等。
   形状静态，因为 `x_shape` 要写进反向节点）；`topk_indices` 与 `topk_mask`
   返回 `None`。反向重算下标而不是前向保存，代价是排序跑两次，换来反向图不
   依赖前向中间量。
-- **设备端仍然没有内核**，与 `topk_mask` 同一状态：CUDA/HIP 上会抛
+- **设备端仍然没有内核**（当时），与 `topk_mask` 同一状态：CUDA/HIP 上会抛
   `BackendCapabilityError`，不静默降级。补它需要"k 轮块内选择 + 跳过已选
   下标"的专用内核（O(k²n)，`Shared("int", "sel", k)`，cache key 含 k）。
+  **已在 5.305 补齐**（三个算子共用一份内核）。
 - conformance 新增 4 条（values / indices × 末轴 / 首轴），参考后端
   **84/84 个声明算子**全部至少成功执行一次；回归 **2943 tests OK**。
 
@@ -19368,4 +19369,51 @@ chunk_size）。全量 `2965 tests, OK`（skipped 452）。
 （skipped 452）。GPU 侧顺带复跑 `tests.test_cuda_backend` +
 `tests.test_cuda_train`：**383 条 OK**（V100 32GB、python3.10.12 +
 cupy 14.2.0，2.9 s），确认阶段 A 的比较 / where / 取整内核在当前快照上无回归。
+
+### 5.305　topk 的设备内核：k 轮块内选择
+
+5.301 把 `topk_values` / `topk_indices` 落进了 IR 与参考后端，`topk_mask` 更早
+就有，但三者都没有设备内核——CUDA/HIP 上会抛 `BackendCapabilityError`。
+这一节补齐：三个算子共用一份手写内核，注册进能力面与调优面。
+
+**算法。** 一个 block 处理一行，做 `k` 轮"块内最大值 + 并发取最小下标"：
+每轮先让每个线程扫描自己那份列（跳过已选下标），得到局部最大值；`block_reduce_max`
+归约出全局最大；胜出线程再用 `atomicMin` 把下标压到最小。这轮的赢家写进
+`sel[rank]`，下一轮扫描时跳过它。并列口径与 `argmax_last` 完全一致（值相等时
+小下标优先），因此 `k=1` 的结果就是 `argmax`；NaN 按 `+inf` 参与比较（
+`torch.topk` 口径），但输出仍是原值（values 是 NaN，indices 指向该位置）。
+
+复杂度是朴素的 O(rows · k · (cols + k))：每轮每线程扫一遍列，再检查 `rank` 个
+已选下标。选择"简单可验证"而非"并行前缀和 + 分桶"是因为 k 在 MoE 路由里通常是
+4～8，k 轮的块内归约已经远小于一次 GEMM；真要优化应先做"一次扫描出 k 大"
+的分桶版，而不是把这个版本改复杂。
+
+**动态共享内存放已选下标。** 最初的写法是用 `bool used[cols]` 标记已选位置，但那
+把每行长度钉死在 48 KiB / 1 B = 49152 列；改成 `extern __shared__ int sel_dyn[]`
+只存 `k` 个下标，每轮 O(k) 线性检查，长度不再受列数限制，只受 `4·k + 4 KiB`
+（静态归约 scratch）≤ 48 KiB 约束。`k` 因此有上限（约 11k），超过时显式报错
+而不是凑合跑。
+
+**三个入口，一种输出参数。** values 输出 `%T%*`、indices 输出 `int*`、mask 输出
+`%T%*` 的同形矩阵，签名无法统一；内核内部改成 `void* outp`，三个
+`extern "C"` 入口各自做一次类型转换再调共用的 `topk_select_row`，省掉了三份
+几乎相同的 device 代码。mask 模式不需要额外清零：输出缓冲在算子层用
+`cp.zeros` 分配，内核只写 1。
+
+**非末轴。** 与 `argmax` 同一套路：先 `transpose + ascontiguousarray` 把目标轴换到
+末维，算完再按逆置换搬回来。代价是一次显存拷贝，换来一份内核覆盖所有单轴情形。
+
+**能力面。** `GPU_OPS` 与 `_REDUCE_TUNABLE_OPS` 同时加入三个名字：f32 直接支持，
+f16 由 `_F16_OPS = None` 自动放行，bf16 不加（与 `argmax` 一致，bf16 子集不含
+比较类归约）。非浮点输入在 `invoke` 的 dtype 面就被拒绝，不会把 i32 当 f32 读。
+
+**验证。** 本地全量 `2980 tests, OK`（skipped 460，新增 8 条 topk 用例在无 GPU
+时整组跳过）。V100 真机（32GB、python3.10.12 + cupy 14.2.0）：
+`tests.test_cuda_backend` **382 条 OK**（skipped 2），conformance 的 6 条 topk
+（values / indices / mask × 末轴 / 首轴）从 `refused` 变为 **`executed` 且无误差**。
+新增用例覆盖：末轴与非末轴四组形状、并列小下标优先、NaN 排最前、
+`k == 轴长`、mask 每行恰 k 个 1、f16、i32 输入被拒。
+
+**未声称**：任何 topk 吞吐数字。k 轮的块内归约在这个形状下不是瓶颈，但
+O(k²) 的朴素结构在大 k 时一定不是最优；真要给数字得先把分桶版写出来再测。
 

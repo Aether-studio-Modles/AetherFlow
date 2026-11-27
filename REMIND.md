@@ -155,8 +155,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `softplus.threshold` 一律拒绝；常量构造（zeros / ones / full / arange 等）
   落成图属性，单个常量上限 65536 元素；`padding_idx` / `sparse` /
   `scale_grad_by_freq` 显式拒绝。
-- **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_mask` 只有
-  参考实现；`spike_linear` 的 `dspikes` 必须稠密；卷积的差距按稳态口径读
+- **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_values` /
+  `topk_indices` / `topk_mask` 的设备内核是**朴素 k 轮块内选择**（f32 / f16，
+  bf16 与 `argmax` 一样不支持，k 受 48 KiB 动态共享内存约束）；`spike_linear` 的
+  `dspikes` 必须稠密；卷积的差距按稳态口径读
   （DESIGN 5.253）：低 GFLOP 形状与 cuDNN 同量级（1x1_c32 是 0.72×），真实差距
   只在宽通道 3x3/5x5 的内核结构——im2col 稳态为 cuDNN 的 1.4～3.7×，tiled 与
   implicit 落后 11～18×。隐式核的空间寄存器分块试过并回退（5.254）：A800 上
@@ -418,9 +420,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   内核（`Shared("int","sel",k)`，cache key 含 k），不能像 `where` 那样只加
   一路 stride。**已按拆两个算子落地**：`topk_values` / `topk_indices`，前端
   `getitem` 的两个槽位各映射一个节点，DCE 之后只留用到的那一个；`topk_values`
-  的反向重算下标后用 `gather_backward` 散射回原位置（`x_shape` 要求静态形状），
-  设备内核仍缺（与 `topk_mask` 同状态，抛 `BackendCapabilityError` 而不是
-  静默降级）。
+  的反向重算下标后用 `gather_backward` 散射回原位置（`x_shape` 要求静态形状）。
+  设备内核已在 5.305 补齐（k 轮块内选择、动态共享内存放已选下标），三个算子
+  在 CUDA/HIP 上真实执行，不再抛 `BackendCapabilityError`。
 - **`np.argsort` 的 NaN 位置与 torch 相反**（5.301）：numpy 升序把 NaN 放到
   末尾，取负做"降序"时 NaN 仍留在末尾，等于被 topk 排除；`torch.topk` 把 NaN
   当最大值排最前。跨框架对齐排序语义时必须显式
@@ -490,6 +492,16 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **换入失败要保持换出态**（5.304）：先领齐全部页再写回；页不够就抛错并
   原样保留主机副本，腾出页后可重试。半换入会同时占页与丢副本，是两种故障
   里最难排查的一种。
+- **topk 的最大值初值要用 -inf 的位模式**（5.305）：`-3.4e38f` 作哨兵时，整行
+  全是 `-inf` 的输入会同时不满足 `v > best` 与 `v == best`，一个元素都选不出来。
+  用 `__int_as_float(0xff800000)`，配合 `v == best && j < best_i` 与
+  `best_i = 0x7fffffff` 初值，`-inf` 行也能按小下标次序正常选出。
+- **topk 的"已选"标记放动态共享内存，不要 `used[cols]` 字节表**（5.305）：
+  一个 bool 数组把行宽钉死在 48 KiB 内；改成 `extern __shared__ int sel[k]`
+  存 k 个下标后，行宽不再受限，只受 `4k + 4 KiB ≤ 48 KiB` 约束。
+- **三个 topk 入口统一用 `void* outp`**（5.305）：values / mask 输出 `%T%*`、
+  indices 输出 `int*`，签名无法一致；在 `extern "C"` 入口内各自转一次类型，
+  device 函数保持一份，避免三份几乎相同的 k 轮选择逻辑各自漂移。
 - **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
   单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
   `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→

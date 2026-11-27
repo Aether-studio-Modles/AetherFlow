@@ -264,8 +264,9 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   工具调用显式 400），静态单密钥 Bearer 认证与进程内滑动窗口限流（5.285），
   `stop` 命中后取消请求并腾出槽位；没有多副本与按密钥计量的集群配额；
 - **生态**：只吃 `torch.export` 的 aten 子集，无 define-by-run，无采样 profiler（只有把已有遥测导成 Chrome Trace 的离线路径）；
-  前端覆盖算子 `torch.export` 的常用面（逐元素数学 / 激活 / 归约 / 形状 / 常量构造），
-  但 `where` / `masked_fill` / 比较算子（IR 没有 bool 张量）、`topk`、`sign` / `round` / `floor` / `ceil`、
+  前端覆盖算子 `torch.export` 的常用面（逐元素数学 / 激活 / 归约 / 形状 / 常量构造 /
+  比较 / `where` / 取整 / `topk`），
+  但 `masked_fill`、
   `copy_`、图内 `clamp` 边界、非零或 reflect 的 `pad`、非整数 `pow` 指数都**显式拒绝**，
   不会退化成近似实现；
 - **硬件**：NVIDIA sm_75 与 AMD gfx1100 / gfx1102 各一张卡，无 Intel / Apple / 移动端。
