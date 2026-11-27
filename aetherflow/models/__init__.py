@@ -18,7 +18,11 @@
 """
 
 from .cnn import CNNSpec, bn_conv_block, bn_infer, build_cnn, conv_block, residual_block
-from .cached_attention import build_cached_decoder_step, cached_forward
+from .cached_attention import (
+    PagedDecodeScheduler,
+    build_cached_decoder_step,
+    cached_forward,
+)
 from .lm import (
     LMSpec,
     LMRunner,
@@ -157,6 +161,7 @@ __all__ = [
     "parse_tool_call",
     "build_cached_decoder_step",
     "cached_forward",
+    "PagedDecodeScheduler",
     "DraftModel",
     "SpeculativeDecoder",
     "greedy_draft",

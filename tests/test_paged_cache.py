@@ -13,7 +13,11 @@ import unittest
 
 import numpy as np
 
-from aetherflow.runtime import PagedCacheFullError, PagedKVCache
+from aetherflow.runtime import (
+    PagedCacheFullError,
+    PagedCacheManager,
+    PagedKVCache,
+)
 
 
 def _cache(num_blocks=4, block_size=2, layers=2, heads=2, dim=3):
@@ -34,11 +38,16 @@ def _kv(tokens, heads=2, dim=3, seed=0):
 
 
 def _append(cache, rid, tokens, seed=0):
-    """按层追加同一批 token，返回 ``(keys, values)`` 两份按层列表。"""
+    """按层追加同一批 token，返回 ``(keys, values)`` 两份按层列表。
+
+    ``cache`` 可以是 ``PagedKVCache`` 或 ``PagedCacheManager``——后者的
+    ``append`` 才会演练换出 / 换入策略。
+    """
+    store = getattr(cache, "cache", cache)
     keys = []
     values = []
-    for layer in range(cache.num_layers):
-        k, v = _kv(tokens, cache.num_heads, cache.head_dim, seed=seed + layer)
+    for layer in range(store.num_layers):
+        k, v = _kv(tokens, store.num_heads, store.head_dim, seed=seed + layer)
         keys.append(k)
         values.append(v)
     cache.append(rid, keys, values)
@@ -360,6 +369,197 @@ class TestSwap(unittest.TestCase):
         got_k, got_v = cache.gather(1, 0)
         np.testing.assert_array_equal(got_k, keys[0])
         np.testing.assert_array_equal(got_v, values[0])
+
+
+class TestPagedCacheManager(unittest.TestCase):
+    """调度策略：容量不足按 LRU 换出、访问自动换入、pin 保护、失败不丢数据。
+
+    判据是三条可执行的等式：
+
+    1. 换出 / 换入后的 ``gather`` 与换出前逐位相同；
+    2. 换出顺序严格是"最久未使用优先"，``touch`` 能改变受害者；
+    3. 换不进去时抛 ``PagedCacheFullError``，所有序列的长度与数据保持不变。
+    """
+
+    def test_append_evicts_lru_then_reload_is_bitwise(self):
+        cache = _cache(num_blocks=3, block_size=2, layers=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 4, seed=1)
+        before = [cache.gather(1, layer) for layer in range(cache.num_layers)]
+
+        mgr.allocate(2)
+        _append(mgr, 2, 4, seed=2)  # 空闲页为 0 → 换出最久未使用的序列 1
+        self.assertTrue(cache.is_swapped(1))
+        self.assertFalse(cache.is_swapped(2))
+        self.assertEqual(cache.length(1), 4)
+        self.assertEqual(mgr.stats()["swaps_out"], 1)
+        self.assertEqual(mgr.stats()["swaps_in"], 0)
+
+        # 访问仍在页上的序列不产生换入
+        mgr.gather(2, 0)
+        self.assertEqual(mgr.stats()["swaps_in"], 0)
+
+        # 访问被换出的序列：先换出 2，再换入 1，数值逐位不变
+        for layer, (want_k, want_v) in enumerate(before):
+            got_k, got_v = mgr.gather(1, layer)
+            np.testing.assert_array_equal(got_k, want_k)
+            np.testing.assert_array_equal(got_v, want_v)
+        self.assertEqual(mgr.stats()["swaps_in"], 1)
+        self.assertTrue(cache.is_swapped(2))
+
+    def test_touch_changes_the_victim(self):
+        cache = _cache(num_blocks=3, block_size=2)
+        mgr = PagedCacheManager(cache)
+        for rid in (1, 2, 3):
+            mgr.allocate(rid)
+            _append(mgr, rid, 2, seed=rid)  # 各占 1 页，池满
+        mgr.touch(1)  # 使用顺序变成 2, 3, 1
+        mgr.allocate(4)
+        _append(mgr, 4, 2, seed=4)
+        self.assertTrue(cache.is_swapped(2))
+        self.assertFalse(cache.is_swapped(3))
+        self.assertFalse(cache.is_swapped(1))
+
+    def test_pinned_sequences_are_skipped(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 4, seed=1)
+        mgr.pin(1)
+        mgr.allocate(2)
+        _append(mgr, 2, 4, seed=2)
+        self.assertFalse(cache.is_swapped(1))
+        self.assertFalse(cache.is_swapped(2))
+
+        mgr.allocate(3)
+        _append(mgr, 3, 2, seed=3)  # 只能换出 2
+        self.assertTrue(cache.is_swapped(2))
+        self.assertFalse(cache.is_swapped(1))
+        self.assertFalse(cache.is_swapped(3))
+        self.assertTrue(mgr.is_pinned(1))
+        self.assertTrue(mgr.unpin(1))
+        self.assertFalse(mgr.unpin(1))
+        self.assertFalse(mgr.unpin(2))  # 2 没被 pin
+
+    def test_all_pinned_raises_and_keeps_every_state(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        mgr = PagedCacheManager(cache)
+        for rid in (1, 2):
+            mgr.allocate(rid)
+            _append(mgr, rid, 4, seed=rid)
+            mgr.pin(rid)
+        before = cache.gather(1, 0)[0]
+        mgr.allocate(3)
+        with self.assertRaises(PagedCacheFullError):
+            _append(mgr, 3, 2, seed=3)
+        self.assertEqual(cache.length(3), 0)
+        self.assertEqual(cache.used_blocks, 4)
+        self.assertFalse(cache.is_swapped(1))
+        self.assertFalse(cache.is_swapped(2))
+        np.testing.assert_array_equal(cache.gather(1, 0)[0], before)
+
+    def test_single_sequence_cannot_evict_itself(self):
+        cache = _cache(num_blocks=2, block_size=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 4, seed=1)
+        before = cache.gather(1, 0)[0]
+        with self.assertRaises(PagedCacheFullError):
+            _append(mgr, 1, 2, seed=2)
+        self.assertEqual(cache.length(1), 4)
+        np.testing.assert_array_equal(cache.gather(1, 0)[0], before)
+
+    def test_swap_in_failure_keeps_swapped_state_then_retries(self):
+        cache = _cache(num_blocks=2, block_size=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 4, seed=1)
+        want = cache.gather(1, 0)[0]
+        mgr.evict(1)
+
+        mgr.allocate(2)
+        _append(mgr, 2, 4, seed=9)
+        mgr.pin(2)
+        with self.assertRaises(PagedCacheFullError):
+            mgr.gather(1, 0)
+        self.assertTrue(cache.is_swapped(1))
+        self.assertEqual(cache.length(1), 4)
+
+        mgr.free(2)
+        np.testing.assert_array_equal(mgr.gather(1, 0)[0], want)
+
+    def test_hooks_report_pages(self):
+        cache = _cache(num_blocks=2, block_size=2)
+        events = []
+        mgr = PagedCacheManager(
+            cache,
+            on_swap_out=lambda rid, pages: events.append(("out", rid, pages)),
+            on_swap_in=lambda rid, pages: events.append(("in", rid, pages)),
+        )
+        mgr.allocate(1)
+        _append(mgr, 1, 4, seed=1)
+        mgr.allocate(2)
+        _append(mgr, 2, 4, seed=2)  # 换出 1
+        mgr.gather(1, 0)  # 换出 2，再换入 1
+        self.assertEqual(
+            events, [("out", 1, 2), ("out", 2, 2), ("in", 1, 2)]
+        )
+
+    def test_explicit_evict_ignores_pin(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 4, seed=1)
+        mgr.pin(1)
+        self.assertEqual(mgr.evict(1), 2)
+        self.assertTrue(cache.is_swapped(1))
+        self.assertTrue(mgr.is_pinned(1))
+        self.assertEqual(mgr.ensure_resident(1), 2)
+        self.assertEqual(mgr.ensure_resident(1), 0)
+        self.assertEqual(mgr.stats()["swaps_in"], 1)
+
+    def test_truncate_and_reset_forwarding(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        keys, _ = _append(mgr, 1, 5, seed=4)
+        mgr.evict(1)
+        self.assertEqual(mgr.truncate(1, 3), 0)
+        self.assertEqual(mgr.length(1), 3)
+        np.testing.assert_array_equal(mgr.gather(1, 0)[0], keys[0][:3])
+        self.assertEqual(mgr.reset(1), 2)
+        self.assertEqual(mgr.length(1), 0)
+        self.assertFalse(cache.is_swapped(1))
+
+    def test_rejections_and_idempotent_free(self):
+        cache = _cache()
+        with self.assertRaises(TypeError):
+            PagedCacheManager("not a cache")
+        with self.assertRaises(TypeError):
+            PagedCacheManager(cache, on_swap_out=1)
+        mgr = PagedCacheManager(cache)
+        with self.assertRaises(KeyError):
+            mgr.pin(9)
+        with self.assertRaises(KeyError):
+            mgr.unpin(9)
+        with self.assertRaises(KeyError):
+            mgr.evict(9)
+        with self.assertRaises(KeyError):
+            mgr.length(9)
+        self.assertFalse(mgr.free(9))
+
+        mgr.allocate(1)
+        mgr.pin(1)
+        self.assertTrue(mgr.unpin(1))
+        self.assertFalse(mgr.unpin(1))
+        _append(mgr, 1, 2, seed=1)
+        mgr.evict(1)
+        with self.assertRaisesRegex(ValueError, "已经换出"):
+            mgr.evict(1)
+        mgr.allocate(2)
+        with self.assertRaisesRegex(ValueError, "没有换出"):
+            cache.swap_in(2)
 
 
 if __name__ == "__main__":

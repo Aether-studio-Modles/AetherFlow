@@ -31,10 +31,11 @@ import numpy as np
 
 from ..ir.graph import Graph, Value
 from ..ir.types import f32
-from ..runtime.paged_cache import PagedKVCache
+from ..runtime.paged_cache import PagedCacheManager, PagedKVCache
 from .transformer import TransformerSpec
 
 __all__ = [
+    "PagedDecodeScheduler",
     "build_cached_decoder_step",
     "cached_forward",
 ]
@@ -54,6 +55,15 @@ def _layer_weight_names() -> Tuple[str, ...]:
         "w1",
         "w2",
     )
+
+
+def _all_param_names(spec: TransformerSpec) -> Tuple[str, ...]:
+    """增量图需要的全部权重名（逐层十项 + 末端两个）。"""
+    return tuple(
+        f"l{layer}_{base}"
+        for layer in range(spec.num_layers)
+        for base in _layer_weight_names()
+    ) + ("final_g", "final_b")
 
 
 def _check_spec(spec: TransformerSpec) -> None:
@@ -263,11 +273,7 @@ def cached_forward(
     for name, value in new_kv.items():
         g.output(value, name)
 
-    layer_names = tuple(
-        f"l{layer}_{base}"
-        for layer in range(spec.num_layers)
-        for base in _layer_weight_names()
-    ) + ("final_g", "final_b")
+    layer_names = _all_param_names(spec)
 
     outs = []
     for step in range(steps):
@@ -294,3 +300,219 @@ def cached_forward(
         ]
         cache.append(rid, keys_out, values_out)
     return np.stack(outs, axis=1)
+
+
+class PagedDecodeScheduler:
+    """多序列共享一个分页 KV 池的交错增量解码。
+
+    :func:`cached_forward` 是"一条序列、一次跑完"；服务里是"多条序列、每步
+    轮转"，而池子装不下所有序列。这一层把两者接起来：
+
+    - 构造时建一张固定形状的单步图（缓存宽度 ``max_steps``），权重只喂一次；
+    - :meth:`submit` 分配序列并 **pin**——正在解码的请求不被自动换出；
+    - :meth:`step` 只算一个 token：缓存里的 K/V 由 :class:`PagedCacheManager`
+      自动换入，新 K/V 自动写回；页不够时它先换出**已挂起**的序列（LRU），
+      所以所有已提交序列的总长度可以超过池容量；
+    - :meth:`suspend` 解除 pin，让这条序列成为换出候选；:meth:`resume` 先换入
+      再 pin 回来。挂起期间数据留在主机副本里，恢复后逐位继续；
+    - :meth:`finish` 回收序列与页。
+
+    **失败面**：所有序列都 active（pinned）且池满时，``step`` / ``resume`` 抛
+    ``PagedCacheFullError``。此时本步的 y 已算出但没有写回缓存，序列的长度与
+    数据不变；调用方可以 ``suspend`` 一条低优先级请求后重试同一步，stub 不会
+    重复计数。
+
+    数值判据与 :func:`cached_forward` 相同：交错执行的每步隐状态与
+    ``build_transformer`` 整段前向的对应位置逐位一致——池的大小与换出次数都
+    不该改数值。
+    """
+
+    def __init__(
+        self,
+        backend,
+        params: Dict[str, np.ndarray],
+        spec: TransformerSpec,
+        *,
+        num_blocks: int,
+        max_steps: int,
+        block_size: int = 4,
+        on_swap_out=None,
+        on_swap_in=None,
+    ) -> None:
+        _check_spec(spec)
+        if isinstance(spec.batch, bool) or not isinstance(spec.batch, int):
+            raise TypeError(
+                f"分页解码需要静态的整数 batch，得到 {spec.batch!r}"
+            )
+        if spec.batch != 1:
+            raise ValueError(
+                f"分页解码目前只支持 batch=1，得到 {spec.batch}；多序列请各用各的 rid"
+            )
+        for name, value in (
+            ("num_blocks", num_blocks),
+            ("block_size", block_size),
+            ("max_steps", max_steps),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} 必须是 int，得到 {type(value).__name__}")
+            if value < 1:
+                raise ValueError(f"{name} 必须 >= 1，得到 {value}")
+
+        self.backend = backend
+        self.params = params
+        self.spec = spec
+        self.max_steps = max_steps
+        self.cache = PagedCacheManager(
+            PagedKVCache(
+                num_blocks=num_blocks,
+                block_size=block_size,
+                num_layers=spec.num_layers,
+                num_heads=spec.num_heads,
+                head_dim=spec.head_dim,
+            ),
+            on_swap_out=on_swap_out,
+            on_swap_in=on_swap_in,
+        )
+        self._state: Dict[int, str] = {}
+
+        g = Graph("paged_decode_step")
+        self._inputs, self._y, self._new_kv = build_cached_decoder_step(
+            g, spec, cache_steps=max_steps
+        )
+        g.output(self._y, "y")
+        for name, value in self._new_kv.items():
+            g.output(value, name)
+        self._graph = g
+
+        self._weight_feed: Dict[str, np.ndarray] = {}
+        for name in _all_param_names(spec):
+            if name not in params:
+                raise KeyError(f"params 缺少权重 {name!r}")
+            self._weight_feed[self._inputs[name].name] = np.asarray(
+                params[name], dtype=np.float32
+            )
+
+    # -- 只读视图 -----------------------------------------------------
+
+    def __contains__(self, rid: object) -> bool:
+        return rid in self._state
+
+    def _require(self, rid: int) -> str:
+        if rid not in self._state:
+            raise KeyError(f"序列 {rid!r} 没有提交；先 submit(rid)")
+        return self._state[rid]
+
+    def length(self, rid: int) -> int:
+        self._require(rid)
+        return self.cache.length(rid)
+
+    def is_swapped(self, rid: int) -> bool:
+        self._require(rid)
+        return self.cache.is_swapped(rid)
+
+    def stats(self) -> Dict[str, int]:
+        info = self.cache.stats()
+        info["active_sequences"] = sum(
+            1 for state in self._state.values() if state == "active"
+        )
+        info["suspended_sequences"] = sum(
+            1 for state in self._state.values() if state == "suspended"
+        )
+        return info
+
+    # -- 生命周期 -----------------------------------------------------
+
+    def submit(self, rid: int) -> None:
+        """接入一条新序列：分配空缓存并 pin。"""
+        if rid in self._state:
+            raise ValueError(f"序列 {rid!r} 已经提交；先 finish(rid) 再复用这个 id")
+        self.cache.allocate(rid)
+        self.cache.pin(rid)
+        self._state[rid] = "active"
+
+    def step(self, rid: int, x) -> np.ndarray:
+        """解一个 token，返回长度为 ``d_model`` 的隐状态。
+
+        ``x`` 取 ``(d,)`` 或 ``(1, 1, d)``；位置编码由调用方加好。返回的数组
+        是主机态，设备后端会自动回传这一个向量。
+        """
+        state = self._require(rid)
+        if state != "active":
+            raise ValueError(f"序列 {rid!r} 处于挂起状态；先 resume(rid) 再解码")
+        width = self.spec.d_model
+        values = np.asarray(x, dtype=np.float32)
+        if values.shape == (width,):
+            values = values.reshape(1, 1, width)
+        elif values.shape != (1, 1, width):
+            raise ValueError(
+                f"x 形状必须是 ({width},) 或 (1, 1, {width})，得到 {values.shape}"
+            )
+        valid = self.cache.length(rid)
+        if valid >= self.max_steps:
+            raise ValueError(
+                f"序列 {rid!r} 已达到 max_steps={self.max_steps}，不能再解码"
+            )
+
+        feed = dict(self._weight_feed)
+        feed[self._inputs["x"].name] = values
+        feed[self._inputs["mask"].name] = _causal_step_mask(self.max_steps, valid)
+        for layer in range(self.spec.num_layers):
+            keys, vals = self.cache.gather(rid, layer, pad_to=self.max_steps)
+            feed[self._inputs[f"l{layer}_k"].name] = keys[None]
+            feed[self._inputs[f"l{layer}_v"].name] = vals[None]
+
+        out = self.backend.execute(self._graph, feed)
+        y = _host(self.backend, out["y"]).reshape(width)
+        keys_out = [
+            _host(self.backend, out[f"l{layer}_k_out"])[0]
+            for layer in range(self.spec.num_layers)
+        ]
+        values_out = [
+            _host(self.backend, out[f"l{layer}_v_out"])[0]
+            for layer in range(self.spec.num_layers)
+        ]
+        # 页不够且都 pin 住时这里抛 PagedCacheFullError；append 是全有或全无，
+        # 所以序列长度不变，重试同一步不会丢 token。
+        self.cache.append(rid, keys_out, values_out)
+        return y
+
+    def suspend(self, rid: int, *, evict: bool = False) -> bool:
+        """解除 pin，使 ``rid`` 成为换出候选；重复挂起返回 ``False``。
+
+        ``evict=True`` 时立即换出（页马上归还），适合"这条请求要等很久"的
+        调度决策；默认只解除保护，等别人需要页时再按 LRU 换出。
+        """
+        state = self._require(rid)
+        if state == "suspended":
+            return False
+        self.cache.unpin(rid)
+        self._state[rid] = "suspended"
+        if evict and not self.cache.is_swapped(rid):
+            self.cache.evict(rid)
+        return True
+
+    def resume(self, rid: int) -> int:
+        """换入并按回 active；返回本次换入的页数（已在页上则为 0）。
+
+        页不够且无可换出的序列时抛 ``PagedCacheFullError``，``rid`` 保持挂起态。
+        """
+        state = self._require(rid)
+        if state == "active":
+            return self.cache.ensure_resident(rid)
+        pages = self.cache.ensure_resident(rid)
+        self.cache.pin(rid)
+        self._state[rid] = "active"
+        return pages
+
+    def finish(self, rid: int) -> None:
+        """结束请求：解 pin、回收页，之后这个 id 可以重新 ``submit``。"""
+        self._require(rid)
+        self.cache.free(rid)
+        del self._state[rid]
+
+    def __repr__(self) -> str:
+        return (
+            f"PagedDecodeScheduler({self.cache!r}, max_steps={self.max_steps}, "
+            f"active={sum(1 for s in self._state.values() if s == 'active')}, "
+            f"suspended={sum(1 for s in self._state.values() if s == 'suspended')})"
+        )

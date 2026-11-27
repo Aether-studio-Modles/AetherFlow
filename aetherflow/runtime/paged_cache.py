@@ -21,6 +21,10 @@
    释放物理页；``swap_in`` 重新领页并写回，页号可能与换出前不同，数值不变。
    换出期间块表为空，所以只允许查长度，读写一律显式要求先换入。
 
+策略面由 :class:`PagedCacheManager` 提供：容量不足时按最近最少使用（LRU）自动
+换出**未被 pin 的**序列，被换出的序列再次被访问时自动换入。它不改变上面六条
+存储语义，只决定"谁被换出、什么时候换入"。
+
 **这一层不负责数值算子的实现。** 它只提供"按块表取回一段连续 K/V"的存储语义，
 真正的 attention 由 :mod:`aetherflow.models.cached_attention` 用 IR 表达。当前
 语言模型主干是 Mamba（固定大小的递归状态，没有随上下文增长的 KV），所以这里
@@ -33,12 +37,14 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 __all__ = [
     "PagedCacheFullError",
+    "PagedCacheManager",
     "PagedKVCache",
 ]
 
@@ -451,4 +457,218 @@ class PagedKVCache:
         return (
             f"PagedKVCache(blocks={self.num_blocks}, block_size={self.block_size}, "
             f"used={self.used_blocks}, sequences={self.num_sequences})"
+        )
+
+
+class PagedCacheManager:
+    """在 :class:`PagedKVCache` 之上决定"谁被换出、什么时候换入"。
+
+    这一层回答的是服务控制面的问题：多条序列共享固定容量的 KV 池，**容量不足时
+    怎么办**。它只有一条策略——按最近最少使用（LRU）换出，访问时自动换入：
+
+    - 每次 ``append`` / ``gather`` 都把该序列标成"最近使用"；
+    - ``append`` / ``ensure_resident`` 遇到 :class:`PagedCacheFullError`，就从
+      **最久未使用**的一条开始换出（跳过自己、已换出的、pin 住的），再重试；
+    - 被换出的序列在下一次 ``append`` / ``gather`` 前自动换入，页不够时同样
+      先换出别人再重试。
+
+    **pin 的语义是"自动换出时可以跳过"。** 正在解码的序列一旦被换出，下一步就得
+    再换入，白白搬一遍数据；服务层应在请求进入解码槽位时 ``pin``、请求结束或
+    被挂起时 ``unpin``。显式 :meth:`evict` 不受 pin 约束——那是调用方明确要求。
+
+    **换出是"有损但可恢复"的。** 换出后主机副本仍在缓存里，失败（例如能换的都
+    换完仍不够）不会丢数据，只会把 :class:`PagedCacheFullError` 原样抛出；那些
+    已被换出的序列保持换出态，等页腾出来可以再换入。这条与 ``append`` 的"全有
+    或全无"一致：宁可失败，也不留下半条序列。
+
+    **这一层同样不做真正的 D2H。** 真机上的显存搬运由 ``on_swap_out`` /
+    ``on_swap_in`` 两个钩子接上：它们在页已归还 / 已重新领到时被调用，参数是
+    ``(rid, pages)``，适合用来释放或重建设备侧数组。钩子抛出的异常会向上传播。
+    """
+
+    def __init__(
+        self,
+        cache: PagedKVCache,
+        *,
+        on_swap_out: Optional[Callable[[int, int], None]] = None,
+        on_swap_in: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        if not isinstance(cache, PagedKVCache):
+            raise TypeError(
+                f"cache 必须是 PagedKVCache，得到 {type(cache).__name__}"
+            )
+        for name, hook in (("on_swap_out", on_swap_out), ("on_swap_in", on_swap_in)):
+            if hook is not None and not callable(hook):
+                raise TypeError(f"{name} 必须是可调用对象或 None，得到 {hook!r}")
+        self.cache = cache
+        self._on_swap_out = on_swap_out
+        self._on_swap_in = on_swap_in
+        # 迭代顺序就是最近使用顺序：最早使用在最前，touch 把它移到末尾。
+        self._order: "OrderedDict[int, None]" = OrderedDict()
+        self._pinned: Set[int] = set()
+        self._swaps_out = 0
+        self._swaps_in = 0
+
+    # -- 只读视图 -----------------------------------------------------
+
+    def __contains__(self, rid: object) -> bool:
+        return rid in self.cache
+
+    def length(self, rid: int) -> int:
+        return self.cache.length(rid)
+
+    def is_swapped(self, rid: int) -> bool:
+        return self.cache.is_swapped(rid)
+
+    @property
+    def pinned(self) -> int:
+        return len(self._pinned)
+
+    def is_pinned(self, rid: int) -> bool:
+        self._require(rid)
+        return rid in self._pinned
+
+    def stats(self) -> Dict[str, int]:
+        """存储面的统计（同 :meth:`PagedKVCache.stats`）加管理面计数。"""
+        info = self.cache.stats()
+        info.update(
+            {
+                "swaps_out": self._swaps_out,
+                "swaps_in": self._swaps_in,
+                "pinned_sequences": len(self._pinned),
+            }
+        )
+        return info
+
+    # -- 生命周期 -----------------------------------------------------
+
+    def _require(self, rid: int) -> None:
+        if rid not in self._order:
+            raise KeyError(f"序列 {rid!r} 没有分配页；先 allocate(rid)")
+
+    def allocate(self, rid: int) -> None:
+        self.cache.allocate(rid)
+        self._order[rid] = None
+
+    def free(self, rid: int) -> bool:
+        """回收序列；未分配的 id 返回 ``False``（幂等，与 ``PagedKVCache`` 一致）。"""
+        freed = self.cache.free(rid)
+        self._order.pop(rid, None)
+        self._pinned.discard(rid)
+        return freed
+
+    def reset(self, rid: int) -> int:
+        self._require(rid)
+        return self.cache.reset(rid)
+
+    def truncate(self, rid: int, length: int) -> int:
+        self._require(rid)
+        self._order.move_to_end(rid)
+        return self.cache.truncate(rid, length)
+
+    # -- pin 与显式换出 -----------------------------------------------
+
+    def pin(self, rid: int) -> None:
+        """标记 ``rid`` 不被**自动**换出；重复 pin 不是错误。"""
+        self._require(rid)
+        self._pinned.add(rid)
+
+    def unpin(self, rid: int) -> bool:
+        """解除 pin；返回 ``True`` 表示这次确实解除了（重复调用返回 ``False``）。"""
+        self._require(rid)
+        if rid in self._pinned:
+            self._pinned.discard(rid)
+            return True
+        return False
+
+    def touch(self, rid: int) -> None:
+        """把 ``rid`` 标成最近使用；``append`` / ``gather`` 会自动做。"""
+        self._require(rid)
+        self._order.move_to_end(rid)
+
+    def evict(self, rid: int) -> int:
+        """显式换出 ``rid``，返回释放的页数；不受 pin 约束。
+
+        已换出的序列由 :class:`PagedKVCache` 抛 ``ValueError``（重复换出会覆盖
+        主机副本），未分配的 id 抛 ``KeyError``。
+        """
+        self._require(rid)
+        pages = self.cache.swap_out(rid)
+        self._swaps_out += 1
+        if self._on_swap_out is not None:
+            self._on_swap_out(rid, pages)
+        return pages
+
+    def ensure_resident(self, rid: int) -> int:
+        """确保 ``rid`` 有物理页；必要时先换出别人。返回本次换入的页数。
+
+        已经在物理页上的序列返回 0（不产生任何拷贝）；换不进去时抛
+        :class:`PagedCacheFullError`，``rid`` 保持换出态。
+        """
+        self._require(rid)
+        self._order.move_to_end(rid)
+        if not self.cache.is_swapped(rid):
+            return 0
+        while True:
+            try:
+                pages = self.cache.swap_in(rid)
+            except PagedCacheFullError:
+                if not self._evict_one(exclude=rid):
+                    raise
+                continue
+            self._swaps_in += 1
+            if self._on_swap_in is not None:
+                self._on_swap_in(rid, pages)
+            return pages
+
+    # -- 读写：换出后自动换入，容量不足自动换出 -----------------------
+
+    def append(self, rid: int, keys, values) -> int:
+        """追加 token；序列被换出时先换入，页不够时按 LRU 换出别的序列再重试。"""
+        self._require(rid)
+        self._order.move_to_end(rid)
+        if self.cache.is_swapped(rid):
+            self.ensure_resident(rid)
+        while True:
+            try:
+                return self.cache.append(rid, keys, values)
+            except PagedCacheFullError:
+                if not self._evict_one(exclude=rid):
+                    raise
+
+    def gather(
+        self, rid: int, layer: int, *, pad_to: Optional[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """取回第 ``layer`` 层的 K/V；序列被换出时先换入。"""
+        self._require(rid)
+        self._order.move_to_end(rid)
+        if self.cache.is_swapped(rid):
+            self.ensure_resident(rid)
+        return self.cache.gather(rid, layer, pad_to=pad_to)
+
+    # -- 换出选择 -----------------------------------------------------
+
+    def _evict_one(self, *, exclude: int) -> bool:
+        """按 LRU 换出**一条**序列；没有可换的返回 ``False``。
+
+        跳过 ``exclude``（正在等页的那条）、被 pin 的、已经换出的，以及长度为 0
+        的（换出它也腾不出页）。每调用一次至少推进一条，所以调用方的重试循环
+        最多迭代"序列数 + 1"次。
+        """
+        for rid in list(self._order):
+            if rid == exclude or rid in self._pinned:
+                continue
+            if self.cache.is_swapped(rid) or self.cache.length(rid) == 0:
+                continue
+            pages = self.cache.swap_out(rid)
+            self._swaps_out += 1
+            if self._on_swap_out is not None:
+                self._on_swap_out(rid, pages)
+            return True
+        return False
+
+    def __repr__(self) -> str:
+        return (
+            f"PagedCacheManager({self.cache!r}, pinned={len(self._pinned)}, "
+            f"swaps_out={self._swaps_out}, swaps_in={self._swaps_in})"
         )
