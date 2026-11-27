@@ -430,6 +430,19 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   .run(g)` 不原地改 `g`，`GraphRewriter.finish()` 给出的是新图；把返回值丢掉
   再检查 `g.nodes`，会看到"该删的节点还在"，很容易误判成 pass 失效。测试里
   断言 pass 效果一律写成 `pruned = Pass().run(g)`，之后只读 `pruned`。
+- **GPU 上的次正规数比不出"逐位一致"**（5.301 上机验证）：V100 + CUDA 12.4 +
+  cupy 14.2 上，`cp.sign(1e-38)` / `cp.greater(1e-38, 0)` 全给 0，即 FTZ
+  生效；numpy 参考不冲刷。把 `1e-38` 写进一致性用例必然报一个与代码无关的
+  失败（本次 `sign_special` 就是这么红的）。判据：设备用例的输入取正常数域
+  （`1e-30` 即可），subnormal 的差异当环境限制记录，不要试图在参考后端里
+  模拟 FTZ 去"凑一致"。
+- **远端验证环境的三件坑**（5.301）：① 共享机（`/root/afv` 独立目录，
+  勿动共用机的 `/root/AetherFlow`）只装了 python3.10 + 无 pip/numpy，apt 源
+  索引过期时要先 `apt-get update`，cupy 用
+  `pip install cupy-cuda12x -i 清华源`；② paramiko `exec_command` 的命令里
+  **不能用双引号**（本地 PowerShell 5 会吞掉，反而让远端把 `grep -E a|b`
+  当管道拆开）；③ SSH 连接关闭不会杀掉远端进程，`apt-get` 之类的长任务会在
+  后台继续持锁，重试前先 `ps` 看有没有自己的残留。
 
 ---
 

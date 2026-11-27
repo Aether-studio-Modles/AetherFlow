@@ -19216,12 +19216,33 @@ torch 逐位相等。
   依赖前向中间量。
 - **设备端仍然没有内核**，与 `topk_mask` 同一状态：CUDA/HIP 上会抛
   `BackendCapabilityError`，不静默降级。补它需要"k 轮块内选择 + 跳过已选
-  下标"的专用内核（O(k²n)，`Shared("int", "sel", k)`，cache key 含 k），等
-  比较 / `where` / 取整这批先上机验完再做。
+  下标"的专用内核（O(k²n)，`Shared("int", "sel", k)`，cache key 含 k）。
 - conformance 新增 4 条（values / indices × 末轴 / 首轴），参考后端
   **84/84 个声明算子**全部至少成功执行一次；回归 **2943 tests OK**。
 
 **验收核对**：IR 拒绝 bool 算术 ✅；参考后端数值 ✅（`conformance.py` 新增
 8 条比较、2 条 `where`、4 条取整）；`torch.export` 端到端 ✅；测试全绿 ✅；
-参考↔CUDA 一致性 ⏳（内核已就绪，等机器空闲）。
+参考↔CUDA 一致性 ✅（见下）。
+
+**A1–A3 的 GPU 上机验证（2026-11-27）**
+
+机器：Tesla PG503-216（V100 32GB，sm_70），CUDA 12.4，驱动 535，Python 3.10
++ cupy 14.2；代码上传到 `/root/afv`（独立目录，未碰共用机的 `/root/AetherFlow`），
+跑 `verify_cuda.py`：
+
+- conformance：**81 个声明算子 / 121 executed / 8 refused / 0 failed，PASS**。
+  比较（eq/ne/lt/le/gt/ge）、`where`、`sign`、`round`、`floor`、`ceil` 全部
+  `executed` 且 `err=0`；`topk_mask` / `topk_values` / `topk_indices` 共 6 条
+  按契约 `refused`（未声明，符合预期）。
+- `verify_cuda.py` 的边界用例新增 5 条：`where_bcast_pow2`（折叠后每维都是 2
+  的幂，走掩码 + 右移内核）、`where_bcast_odd_rank3`（非 2 的幂，走 div 余数
+  路径）、`compare_feeds_where`（比较结果直接当条件，bool 数据流端到端）、
+  `rounding_boundaries`（`.5` 取偶 / 负数 / `-0`）、`sign_special`（`±0` /
+  `±inf` / NaN）。原脚本的 tuning 回环用 `rounds=1`，已被 `search()`
+  "至少 2 轮" 的约束拒绝，一并修成 2。
+- **已知限制（环境级，不是代码问题）**：这台机器上 GPU 对次正规数
+  （subnormal，如 `1e-38`）的比较一律为 false——`cp.sign(1e-38)` 自己返回 0、
+  `cp.maximum(1e-38, 0)` 返回 0，即 FTZ 生效。参考后端是 numpy，语义不冲刷。
+  因此所有一致性用例的输入都避开次正规数，否则会得到一个与代码无关的假失败；
+  真实模型里出现次正规数的概率可忽略。此事记入 REMIND。
 
