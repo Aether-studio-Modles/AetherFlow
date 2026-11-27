@@ -2050,17 +2050,17 @@ def argmax_source() -> Kernel:
     return argmax_last()
 
 
-def broadcast_binary_source(kind: str, *, pow2: bool = False) -> Kernel:
+def broadcast_binary_source(kind: str) -> Kernel:
     """支持 numpy 多维广播的逐元素二元内核的 L2 描述（生产路径）。
 
     广播通过"对齐后的 stride"实现：被广播的维度 stride 置 0，
     于是同一份输入元素会被多个输出位置复用。维度上限 4，
     超过时由后端拒绝（而不是悄悄换实现）。
 
-    ``pow2`` 交给主机侧按实际维度决定：全为 2 的幂时用掩码/右移还原坐标，
-    否则退回 div/mod。两种形态是两份源码，内核缓存键必须区分。
+    ``pow2`` 的掩码/右移变体已删除：V100 上实测反而更慢，理由见
+    ``ew_broadcast`` 与 DESIGN 5.300。
     """
-    return ew_broadcast(kind, pow2=pow2)
+    return ew_broadcast(kind)
 
 
 def compare_source(
@@ -2068,22 +2068,22 @@ def compare_source(
     *,
     scalar_a: bool = False,
     scalar_b: bool = False,
-    pow2: bool | None = None,
+    broadcast: bool = False,
     dtype=None,
     dialect=None,
 ) -> str:
     """比较内核源码：输出容器固定是 1 字节 bool。
 
-    ``pow2 is None`` 表示两侧同形（扁平网格），否则是广播版且由主机告知
-    维度是否为 2 的幂。``dtype`` 是**输入**的存储类型：参数声明、读取 helper
+    ``broadcast`` 为假表示两侧同形（扁平网格），为真表示走多维广播版。
+    ``dtype`` 是**输入**的存储类型：参数声明、读取 helper
     与 prelude 都由它决定，输出则钉死成 bool 并裸写（比较结果本身就是 0/1）。
     bool 输入（``ne(mask, 0)``）需要 1 字节容器的方言，因此单独走
     ``BOOL_DIALECT``。
     """
-    if pow2 is None:
+    if not broadcast:
         template = ew_binary(kind, scalar_a=scalar_a, scalar_b=scalar_b, compare=True)
     else:
-        template = ew_broadcast(kind, pow2=pow2, compare=True)
+        template = ew_broadcast(kind, compare=True)
     ir_dtype = _ir_dtype(np.dtype("float32") if dtype is None else dtype)
     if dialect is None:
         if ir_dtype is DType.BOOL:
@@ -2097,20 +2097,20 @@ def compare_source(
     return emit(template, dialect, ir_dtype)
 
 
-def where_source(*, pow2: bool | None = None, dtype=None, dialect=None) -> str:
+def where_source(*, broadcast: bool = False, dtype=None, dialect=None) -> str:
     """``where(cond, a, b)`` 源码。
 
-    ``pow2 is None`` 表示三者同形（扁平网格），否则是三输入广播版。``dtype``
+    ``broadcast`` 为假表示三者同形（扁平网格），为真表示三输入广播版。``dtype``
     是 a / b 的存储类型，**输出跟随它**：浮点时正常走 ``af_st_*``；两侧本身
     就是 bool（掩码之间选择）时输出也是 1 字节，此时裸写并换用
     ``BOOL_DIALECT``。``cond`` 无论如何都是 1 字节 bool，裸索引读取。
     """
     ir_dtype = _ir_dtype(np.dtype("float32") if dtype is None else dtype)
     is_bool = ir_dtype is DType.BOOL
-    if pow2 is None:
+    if not broadcast:
         template = ew_where_same(raw_store=is_bool)
     else:
-        template = ew_where_bcast(pow2=pow2, raw_store=is_bool)
+        template = ew_where_bcast(raw_store=is_bool)
     if dialect is None:
         if is_bool:
             from .dialect import BOOL_DIALECT

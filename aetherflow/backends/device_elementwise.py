@@ -102,13 +102,10 @@ class _ElementwiseMixin:
         for i, (dim, step_c, step_a, step_b) in enumerate(groups):
             dims[i], sc[i], sa[i], sb[i] = dim, step_c, step_a, step_b
 
-        pow2 = all(int(dim) & (int(dim) - 1) == 0 for dim in dims)
-        shifts = [int(dim).bit_length() - 1 for dim in dims] if pow2 else []
-
         dtype_key = self._kind(a)
         kernel = self._kernel(
-            ("where_bcast", dtype_key, "pow2" if pow2 else "div"),
-            lambda: self.codegen.where_source(pow2=pow2, dtype=a.dtype),
+            ("where_bcast", dtype_key),
+            lambda: self.codegen.where_source(broadcast=True, dtype=a.dtype),
             "ew_where_bcast",
         )
         block, grid = self._grid("where", n)
@@ -126,7 +123,6 @@ class _ElementwiseMixin:
                 *[np.int64(v) for v in sc],
                 *[np.int64(v) for v in sa],
                 *[np.int64(v) for v in sb],
-                *[np.int32(v) for v in shifts],
             ),
         )
         return out
@@ -516,24 +512,20 @@ class _ElementwiseMixin:
         for i, (dim, step_a, step_b) in enumerate(groups):
             dims[i], sa[i], sb[i] = dim, step_a, step_b
 
-        # 坐标还原是这条内核的主要开销：全维都是 2 的幂时，主机侧把 log2
-        # 传下去，内核用掩码 + 右移代替 64 位 div/mod（shape 是运行期参数，
-        # 编译器自己推不出这一点）。任一维不是 2 的幂就整条退回通用形态。
-        pow2 = all(int(dim) & (int(dim) - 1) == 0 for dim in dims)
-        shifts = [int(dim).bit_length() - 1 for dim in dims] if pow2 else []
-
         dtype_key = self._kind(a)
         if compare:
             kernel = self._kernel(
-                ("cmp_bcast", kind, dtype_key, "pow2" if pow2 else "div"),
-                lambda: self.codegen.compare_source(kind, pow2=pow2, dtype=a.dtype),
+                ("cmp_bcast", kind, dtype_key),
+                lambda: self.codegen.compare_source(
+                    kind, broadcast=True, dtype=a.dtype
+                ),
                 "ew_cmp_bcast",
             )
         else:
             kernel = self._kernel(
-                ("bcast", kind, dtype_key, "pow2" if pow2 else "div"),
+                ("bcast", kind, dtype_key),
                 lambda: self.codegen.render(
-                    self.codegen.broadcast_binary_source(kind, pow2=pow2), a.dtype
+                    self.codegen.broadcast_binary_source(kind), a.dtype
                 ),
                 "ew_bcast",
             )
@@ -550,7 +542,6 @@ class _ElementwiseMixin:
                 *[np.int64(v) for v in dims],
                 *[np.int64(v) for v in sa],
                 *[np.int64(v) for v in sb],
-                *[np.int32(v) for v in shifts],
             ),
         )
         return out

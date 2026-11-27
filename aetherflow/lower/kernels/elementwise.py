@@ -371,7 +371,7 @@ def ew_where_same(*, raw_store: bool = False) -> Kernel:
     )
 
 
-def ew_where_bcast(*, pow2: bool = False, raw_store: bool = False) -> Kernel:
+def ew_where_bcast(*, raw_store: bool = False) -> Kernel:
     """``where(cond, a, b)`` 的三输入广播内核。
 
     骨架与 ``ew_broadcast`` 相同，只是多一组 ``oc`` 坐标：cond 被广播的
@@ -396,27 +396,11 @@ def ew_where_bcast(*, pow2: bool = False, raw_store: bool = False) -> Kernel:
     ]
     for prefix in ("d", "c", "a", "b"):
         params.extend(Scalar("long long", v.name) for v in _dims(prefix))
-    if pow2:
-        params.extend(Scalar("int", v.name) for v in _dims("s"))
 
-    if pow2:
-        decomp = (
-            Let(
-                "long long",
-                "r",
-                Bin(
-                    "&",
-                    Var("rem"),
-                    Paren(Bin("-", Index("shape", Var("d")), Num("1"))),
-                ),
-            ),
-            AugAssign(Var("rem"), ">>", Index("sh", Var("d"))),
-        )
-    else:
-        decomp = (
-            Let("long long", "r", Bin("%", Var("rem"), Index("shape", Var("d")))),
-            AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
-        )
+    decomp = (
+        Let("long long", "r", Bin("%", Var("rem"), Index("shape", Var("d")))),
+        AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
+    )
 
     decls = [
         ArrayDecl("long long", "shape", 4, _dims("d")),
@@ -424,8 +408,6 @@ def ew_where_bcast(*, pow2: bool = False, raw_store: bool = False) -> Kernel:
         ArrayDecl("long long", "sa", 4, _dims("a")),
         ArrayDecl("long long", "sb", 4, _dims("b")),
     ]
-    if pow2:
-        decls.append(ArrayDecl("int", "sh", 4, _dims("s")))
 
     return Kernel(
         name="ew_where_bcast",
@@ -489,17 +471,16 @@ def ew_where_bcast(*, pow2: bool = False, raw_store: bool = False) -> Kernel:
     )
 
 
-def ew_broadcast(kind: str, *, pow2: bool = False, compare: bool = False) -> Kernel:
+def ew_broadcast(kind: str, *, compare: bool = False) -> Kernel:
     """支持 numpy 多维广播的逐元素二元内核。
 
     广播靠"对齐后的 stride"：被广播的维度 stride 为 0，同一个输入元素会被
     多个输出位置复用。维度上限 4，超过时由后端拒绝。
 
-    ``pow2`` 为真表示**所有维都是 2 的幂**（主机侧判定），于是坐标还原可以
-    用掩码 + 右移代替 64 位 div/mod：``rem % shape`` → ``rem & (shape-1)``、
-    ``rem / shape`` → ``rem >> log2(shape)``。``shape`` 是运行期参数、编译器
-    不知道它是不是 2 的幂，所以这个信息只能由主机侧多传一组 ``s0..s3`` 给
-    内核；两者都按"取模"语义成立，数值语义不变。
+    坐标还原用 64 位 ``%`` / ``/``。曾经尝试过"全维是 2 的幂时改用掩码 +
+    右移"的形态，实测在 V100 上反而慢 14~15%（多传的 ``sh`` 局部数组被
+    动态下标寻址，落到 local memory），去掉数组改用 ``__clz`` 只追平，
+    所以那条路径已经删除，见 DESIGN 5.300。
     """
     table = COMPARE_OP if compare else BINARY_OP
     if kind not in table:
@@ -523,37 +504,17 @@ def ew_broadcast(kind: str, *, pow2: bool = False, compare: bool = False) -> Ker
     params.append(Scalar("int", "ndim"))
     for prefix in ("d", "a", "b"):
         params.extend(Scalar("long long", v.name) for v in _dims(prefix))
-    if pow2:
-        # 尾部未用的维由主机传 dim=1 / shift=0：掩码为 0、右移 0 位，
-        # 正好把 c 还原成 0 且 rem 不动，不需要在内核里分支。
-        params.extend(Scalar("int", v.name) for v in _dims("s"))
 
-    if pow2:
-        decomp = (
-            Let(
-                "long long",
-                "c",
-                Bin(
-                    "&",
-                    Var("rem"),
-                    Paren(Bin("-", Index("shape", Var("d")), Num("1"))),
-                ),
-            ),
-            AugAssign(Var("rem"), ">>", Index("sh", Var("d"))),
-        )
-    else:
-        decomp = (
-            Let("long long", "c", Bin("%", Var("rem"), Index("shape", Var("d")))),
-            AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
-        )
+    decomp = (
+        Let("long long", "c", Bin("%", Var("rem"), Index("shape", Var("d")))),
+        AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
+    )
 
     decls = [
         ArrayDecl("long long", "shape", 4, _dims("d")),
         ArrayDecl("long long", "sa", 4, _dims("a")),
         ArrayDecl("long long", "sb", 4, _dims("b")),
     ]
-    if pow2:
-        decls.append(ArrayDecl("int", "sh", 4, _dims("s")))
 
     return Kernel(
         name="ew_cmp_bcast" if compare else "ew_bcast",

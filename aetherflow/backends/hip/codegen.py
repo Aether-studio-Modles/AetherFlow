@@ -63,7 +63,7 @@ def cast_fn(src, dst) -> str:
 
 
 def compare_source(kind: str, *, scalar_a: bool = False, scalar_b: bool = False,
-                   pow2=None, dtype=None) -> str:
+                   broadcast: bool = False, dtype=None) -> str:
     """比较内核源码：L2 与 CUDA 逐字共用，只换方言。
 
     ``dtype`` 是输入的存储类型：bool 输入（``ne(mask, 0)``）要 HIP 侧的
@@ -77,13 +77,13 @@ def compare_source(kind: str, *, scalar_a: bool = False, scalar_b: bool = False,
         kind,
         scalar_a=scalar_a,
         scalar_b=scalar_b,
-        pow2=pow2,
+        broadcast=broadcast,
         dtype=dtype,
         dialect=BOOL_DIALECT if is_bool else HIP_DIALECT,
     )
 
 
-def where_source(*, pow2=None, dtype=None) -> str:
+def where_source(*, broadcast: bool = False, dtype=None) -> str:
     """``where`` 源码：L2 与 CUDA 逐字共用，只换方言。
 
     ``dtype`` 是 a / b（也是输出）的存储类型；bool 两侧（掩码选掩码）需要
@@ -94,7 +94,7 @@ def where_source(*, pow2=None, dtype=None) -> str:
 
     is_bool = dtype is not None and _cuda._dtype_key(dtype) == "bool"
     return _cuda.where_source(
-        pow2=pow2,
+        broadcast=broadcast,
         dtype=dtype,
         dialect=BOOL_DIALECT if is_bool else HIP_DIALECT,
     )

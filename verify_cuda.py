@@ -360,12 +360,13 @@ def _extra_cases() -> list:
         g.output(g.add_node("clamp", [x], {"min": -0.5, "max": 0.5}), "y")
         return g, {"x": _rand(rng, 4, 6, scale=2.0)}
 
-    def where_bcast_pow2():
-        """折叠后每维都是 2 的幂：走掩码 + 右移的 pow2 内核。
+    def where_bcast_pow2_shape():
+        """折叠后每维都是 2 的幂的规则形状。
 
-        与 ``where_bcast``（div 路径）不是同一份代码，两个分支都必须有真机证据。
+        曾经有掩码 + 右移的 pow2 专用内核，实测比 div/mod 慢已删除
+        （DESIGN 5.300）；用例保留原形状，作为规则形状的回归证据。
         """
-        g = Graph("where_pow2")
+        g = Graph("where_pow2_shape")
         c = g.input("c", boolean[8, 1, 8])
         a = g.input("a", f32[8, 4, 8])
         b = g.input("b", f32[8])
@@ -482,7 +483,7 @@ def _extra_cases() -> list:
         ("cumsum_mid_axis", cumsum_mid_axis),
         ("tril_negative_diagonal", tril_negative_diagonal),
         ("clamp_two_sided", clamp_two_sided),
-        ("where_bcast_pow2", where_bcast_pow2),
+        ("where_bcast_pow2_shape", where_bcast_pow2_shape),
         ("where_bcast_odd_rank3", where_bcast_odd_rank3),
         ("compare_feeds_where", compare_feeds_where),
         ("rounding_boundaries", rounding_boundaries),
