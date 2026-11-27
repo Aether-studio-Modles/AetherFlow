@@ -19302,3 +19302,41 @@ communicator 的 `init_rank` 参数本层不猜。
 （skipped 452，全部需要 GPU）。新增 15 条：DDP 设备态 6 条、分桶重叠 5 条、
 `NcclDeviceCollective` 4 条。
 
+### 5.303　投机解码接入 LMRunner 主干：复用图缓存、驻留与前缀
+
+5.301 把"prefix caching / KV swap / 投机解码"列为组件级交付、尚未接进主路径。
+这一节补上投机解码的主干入口：`LMRunner.generate_speculative`。
+
+**一份循环，两个入口。** `speculative.py` 的草稿 → 验收 → 提交循环抽成模块级
+`_speculative_loop`（连同 `_snapshot_state` / `_feed_state` / `_verify_tokens`
+三个状态工具），`SpeculativeDecoder.generate` 与
+`LMRunner.generate_speculative` 都调用它。抽出来的动机不是复用几行代码，而是
+**避免两条数值路径**：验收只认目标模型的 argmax，任何一处口径分叉（停止符、
+奖励 token、提交块长）都会让"投机 = 贪心"的等式在其中一个入口失效。
+
+**会话里真正被复用的三样东西。**
+
+1. 图缓存：验收用的 `(长度, head="all")` 图与 `generate` 的 `(长度, "last")`
+   共用同一个 `OrderedDict`，LRU 上限 `max_graphs` 不变；
+2. 驻留权重：`resident=True` 时验收与提交的 feed 都不含参数，权重只登记一次；
+3. `prime` 前缀：`_advance(prompt, chunk)` 从缓存状态起步，投机循环直接以
+   `state` / `logits` 为起点，不再全量预填充。
+
+生成结束后的口径与 `generate` 一致：`_clear_prefix()`，前缀与状态一并丢弃。
+
+**边界照旧，不加新旋钮。** 只支持 `batch == 1`（每行接受长度不同，递归状态
+无法整批回滚）；`device_state=True` 时仍走普通执行——验收一次要喂 `k` 个
+token，捕获图只覆盖单步 decode，混用不会更快；采样参数一概不提供（投机只对
+贪心成立）。`greedy_draft` 仍标注为正确性参照，不是性能方案。
+
+**验证**：`tests.test_speculative` 18 条全过，新增 7 条——与
+`generate(temperature=0)` 逐位一致且第二次调用图数不增长、与独立
+`SpeculativeDecoder` 逐位一致、四类坏草稿改不了结果、`prime` 前缀可用且
+生成后清空、`resident=True` 时 feed 不含权重且关闭后释放、`max_new_tokens=0`
+不建图、七类拒绝面（batch、关闭、draft 类型、draft_tokens 零 / 布尔、越界、
+chunk_size）。全量 `2965 tests, OK`（skipped 452）。
+
+**未验证 / 不声称**：任何吞吐或显存数字。投机解码的收益取决于草稿命中率与
+验收窗口，参考后端上的"一次前向确认几个"不能外推到真机；`world > 1`、设备态
+捕获图与投机混用都未上机。GPU 上的验收仍待空闲机器。
+

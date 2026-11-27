@@ -468,6 +468,22 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `__cuda_array_interface__`；用 `np.asarray` 会把整份梯度拉回主机，正好
   抵消设备侧归约的收益。设备态 DDP 只读 `.shape` / `.dtype` 元数据。
 
+- **投机循环要与会话生命周期解耦**（5.303）：把草稿 → 验收 → 提交抽成模块级
+  `_speculative_loop`，让 `SpeculativeDecoder` 与
+  `LMRunner.generate_speculative` 共用一份实现。分开写一定会分叉（停止符、
+  奖励 token、提交块长的口径），而"投机 = 贪心"的等式只在两份口径完全相同时
+  成立。
+- **测试驻留时，草稿的 feed 不算数**（5.303）：`greedy_draft` 如果也走被记录
+  的 backend，`fed` 里就会出现含权重的 feed，误判"驻留没生效"。草稿用裸
+  backend，recorder 只记录会话自己的 execute。
+- **`prime` 前缀可以做投机起点，但生成后必须清空**（5.303）：验收与提交都
+  推进会话状态，`_advance` 返回的 state 已越过前缀；再保留 `_prefix` 会让
+  下一次 `prime` 的错误不报或续接错位。
+- **`lm` 与 `speculative` 的循环依赖用函数内导入打破**（5.303）：
+  `speculative` 顶层依赖 `lm` 的 `_check_request` / `_prefill` 等，而
+  `LMRunner.generate_speculative` 只需要 `_check_draft_tokens` /
+  `_speculative_loop`；把后者放在方法体内导入，模块图保持无环。
+
 ---
 
 ## 版本记录
