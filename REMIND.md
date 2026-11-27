@@ -416,7 +416,20 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `reference` 返回单个数组，values + indices 必须拆成两个算子，或在前端用
   `argmax + eq/where` 组合。设备端还需要"k 轮块内选择 + 跳过已选下标"的专用
   内核（`Shared("int","sel",k)`，cache key 含 k），不能像 `where` 那样只加
-  一路 stride。
+  一路 stride。**已按拆两个算子落地**：`topk_values` / `topk_indices`，前端
+  `getitem` 的两个槽位各映射一个节点，DCE 之后只留用到的那一个；`topk_values`
+  的反向重算下标后用 `gather_backward` 散射回原位置（`x_shape` 要求静态形状），
+  设备内核仍缺（与 `topk_mask` 同状态，抛 `BackendCapabilityError` 而不是
+  静默降级）。
+- **`np.argsort` 的 NaN 位置与 torch 相反**（5.301）：numpy 升序把 NaN 放到
+  末尾，取负做"降序"时 NaN 仍留在末尾，等于被 topk 排除；`torch.topk` 把 NaN
+  当最大值排最前。跨框架对齐排序语义时必须显式
+  `np.where(np.isnan(x), np.inf, x)` 再排序，否则含 NaN 的输入两边选出的下标
+  完全不同——而且普通随机用例永远测不出来。
+- **pass 的 `run()` 返回新图，返回值必须接住**（5.301）：`DeadCodeElimination()
+  .run(g)` 不原地改 `g`，`GraphRewriter.finish()` 给出的是新图；把返回值丢掉
+  再检查 `g.nodes`，会看到"该删的节点还在"，很容易误判成 pass 失效。测试里
+  断言 pass 效果一律写成 `pruned = Pass().run(g)`，之后只读 `pruned`。
 
 ---
 

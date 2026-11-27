@@ -19188,22 +19188,38 @@ A3（一元补齐）已完成。`sign` / `round` / `floor` / `ceil` 进 `UNARY_E
 `torch.where(x > y, x - y, y - x)`、bool 输入直通 `where`，参考后端输出与
 torch 逐位相等。
 
-**规模与回归**：算子表 71 → **82**（+6 比较、+`where`、+4 取整），VJP 规则
-49 → **54**（`where` 一条 + 四取整各一条 `None`；可微算子仍是 49 个）。
-`python -m unittest discover -s tests` → **2934 tests, OK**（skipped 452，全部
+**规模与回归**：算子表 71 → **84**（+6 比较、+`where`、+4 取整、+`topk_values`
+/`topk_indices`），VJP 规则 49 → **56**（`where`、`topk_values`、`topk_indices`
+各一条，四取整各一条 `None`；可微算子仍是 49 个）。
+`python -m unittest discover -s tests` → **2943 tests, OK**（skipped 452，全部
 是需要 GPU 的用例）。
 
-**A4（`topk`）暂缓，理由是三件独立的事叠在一起**：
+**A4（`topk`）已落地：拆成两个单输出算子，设备内核仍缺**
 
-1. IR 节点是单输出——`Op.infer` 返回一个 `TensorType`、`reference` 返回一个
-   数组。要返回 values + indices，只能拆成 `topk_values` / `topk_indices` 两个
-   算子各算一遍，或在前端用 `argmax + eq/where` 组合出来；
-2. 设备端不能复用逐元素骨架：需要"k 轮块内选择 + 跳过已选下标"的专用内核
-   （O(k²n)，要 `Shared("int", "sel", k)`，cache key 得含 k），这是新内核族，
-   不是加一路 stride 能解决的；
-3. 远端 GPU 与另一个 agent 共用，本轮新增的比较 / `where` / 取整内核还没上机
-   跑参考↔CUDA↔HIP 一致性。**先上机把这批验掉，再决定 `topk` 走拆算子还是
-   前端组合**——否则等于在一个还没验证过的设备栈上再叠一层。
+- `topk_values` / `topk_indices` 的属性只有 `("k", "axis")`，语义是**前 k 大、
+  按值降序、并列时小下标优先**：`np.argsort(..., kind="stable")` 的稳定序正好
+  给出"并列保持原下标顺序"。NaN 先替换成 `+inf` 再排序，于是被当作最大值——
+  这是 `torch.topk` 的口径；numpy 原生 argsort 会把 NaN 丢到末尾，两边结果
+  会完全相反。三个算子（含既有的 `topk_mask`）共用一份 `_topk_axis_k_shape`
+  校验，避免"mask 拒绝 k=0 而 values 接受"这种边界分叉。
+- 前端 `aten.topk.default` 的两个槽位各映射一个节点。export 图里 `getitem`
+  是独立节点，所以只取 values 的模型在 DCE 之后不会残留 `topk_indices`——
+  这正是"拆成两个单输出算子"相对"一个双输出算子"的收益（IR 的 `Op.infer`
+  本来就只能返回一个 `TensorType`）。
+- `largest=False` 明确拒绝（提示先 `neg`、跑完再 `neg` 回来），`sorted=False`
+  接受（返回有序结果是"顺序不保证"的合法子集），`k` 必须是静态整数（动态 k
+  会让输出形状随输入变化，IR 的形状推断表达不了）。
+- 梯度：`topk_values` 有完整反向——重算一遍 `topk_indices`，再用
+  `gather_backward` 把 dy 散射回被选位置（与 `gather` 同一条约束：要求 x 的
+  形状静态，因为 `x_shape` 要写进反向节点）；`topk_indices` 与 `topk_mask`
+  返回 `None`。反向重算下标而不是前向保存，代价是排序跑两次，换来反向图不
+  依赖前向中间量。
+- **设备端仍然没有内核**，与 `topk_mask` 同一状态：CUDA/HIP 上会抛
+  `BackendCapabilityError`，不静默降级。补它需要"k 轮块内选择 + 跳过已选
+  下标"的专用内核（O(k²n)，`Shared("int", "sel", k)`，cache key 含 k），等
+  比较 / `where` / 取整这批先上机验完再做。
+- conformance 新增 4 条（values / indices × 末轴 / 首轴），参考后端
+  **84/84 个声明算子**全部至少成功执行一次；回归 **2943 tests OK**。
 
 **验收核对**：IR 拒绝 bool 算术 ✅；参考后端数值 ✅（`conformance.py` 新增
 8 条比较、2 条 `where`、4 条取整）；`torch.export` 端到端 ✅；测试全绿 ✅；
