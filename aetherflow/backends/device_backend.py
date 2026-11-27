@@ -415,6 +415,7 @@ class DeviceBackend(
         r.register("le", self._op_le)
         r.register("gt", self._op_gt)
         r.register("ge", self._op_ge)
+        r.register("where", self._op_where)
         r.register("relu", self._op_relu)
         r.register("silu", self._op_silu)
         r.register("exp", self._op_exp)
@@ -1300,21 +1301,25 @@ class DeviceBackend(
         return [0 if dim == 1 else raw[d] for d, dim in enumerate(padded)]
 
     @staticmethod
-    def _collapse_dims(shape: tuple, sa: List[int], sb: List[int]) -> List[tuple]:
-        """把相邻且两侧都连续的维度合并，返回 [(dim, stride_a, stride_b)]（由外到内）。
+    def _collapse_dims(shape: tuple, *strides: List[int]) -> List[tuple]:
+        """把相邻且每个输入都连续的维度合并，返回 ``[(dim, stride...)]``（由外到内）。
 
-        合并的前提是两侧的 stride 都恰好等于"内层总长度"，否则合并会改变索引。
+        合并的前提是每个输入的 stride 都恰好等于"内层总长度"，否则合并会改变索引。
+        二元算子是两组 stride，``where`` 是三组。
         """
         groups: List[tuple] = []
         for d in range(len(shape) - 1, -1, -1):
             if shape[d] == 1:
                 continue
             if groups:
-                inner_dim, inner_a, inner_b = groups[-1]
-                if sa[d] == inner_a * inner_dim and sb[d] == inner_b * inner_dim:
-                    groups[-1] = (inner_dim * shape[d], inner_a, inner_b)
+                inner = groups[-1]
+                inner_dim = inner[0]
+                if all(
+                    s[d] == inner[k + 1] * inner_dim for k, s in enumerate(strides)
+                ):
+                    groups[-1] = (inner_dim * shape[d],) + inner[1:]
                     continue
-            groups.append((shape[d], sa[d], sb[d]))
+            groups.append((shape[d],) + tuple(s[d] for s in strides))
         groups.reverse()
         return groups
 

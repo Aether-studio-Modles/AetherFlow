@@ -44,6 +44,8 @@ from ...lower.kernels import (
     ew_mod_int,
     ew_step,
     ew_unary,
+    ew_where_bcast,
+    ew_where_same,
     im2col,
     layernorm_last,
     layernorm_residual_last,
@@ -2080,6 +2082,32 @@ def compare_source(
     ir_dtype = _ir_dtype(np.dtype("float32") if dtype is None else dtype)
     if dialect is None:
         if ir_dtype is DType.BOOL:
+            from .dialect import BOOL_DIALECT
+
+            dialect = BOOL_DIALECT
+        else:
+            from .dialect import CUDA_DIALECT
+
+            dialect = CUDA_DIALECT
+    return emit(template, dialect, ir_dtype)
+
+
+def where_source(*, pow2: bool | None = None, dtype=None, dialect=None) -> str:
+    """``where(cond, a, b)`` 源码。
+
+    ``pow2 is None`` 表示三者同形（扁平网格），否则是三输入广播版。``dtype``
+    是 a / b 的存储类型，**输出跟随它**：浮点时正常走 ``af_st_*``；两侧本身
+    就是 bool（掩码之间选择）时输出也是 1 字节，此时裸写并换用
+    ``BOOL_DIALECT``。``cond`` 无论如何都是 1 字节 bool，裸索引读取。
+    """
+    ir_dtype = _ir_dtype(np.dtype("float32") if dtype is None else dtype)
+    is_bool = ir_dtype is DType.BOOL
+    if pow2 is None:
+        template = ew_where_same(raw_store=is_bool)
+    else:
+        template = ew_where_bcast(pow2=pow2, raw_store=is_bool)
+    if dialect is None:
+        if is_bool:
             from .dialect import BOOL_DIALECT
 
             dialect = BOOL_DIALECT

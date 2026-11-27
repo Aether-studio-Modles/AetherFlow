@@ -327,6 +327,156 @@ def silu_gate() -> Kernel:
     )
 
 
+def ew_where_same(*, raw_store: bool = False) -> Kernel:
+    """``where(cond, a, b)`` 同形扁平内核。
+
+    ``cond`` 是 1 字节 bool，裸索引即可（不需要 load helper）。输出跟随
+    a / b 的存储类型：浮点时走 ``af_st_*`` 舍入，bool 时（两侧都是掩码）
+    ``raw_store`` 为真，直接写 0/1。
+    """
+    return Kernel(
+        name="ew_where",
+        params=(
+            Tensor("cond", type_name="bool"),
+            Tensor("a"),
+            Tensor("b"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "n"),
+        ),
+        body=grid_stride(
+            Var("n"),
+            Store(
+                "out",
+                Var("i"),
+                Cond(
+                    Index("cond", Var("i")),
+                    Load("a", Var("i")),
+                    Load("b", Var("i")),
+                ),
+                raw=raw_store,
+            ),
+        ),
+    )
+
+
+def ew_where_bcast(*, pow2: bool = False, raw_store: bool = False) -> Kernel:
+    """``where(cond, a, b)`` 的三输入广播内核。
+
+    骨架与 ``ew_broadcast`` 相同，只是多一组 ``oc`` 坐标：cond 被广播的
+    维度 stride 为 0，因此同一个条件可以覆盖多个输出位置。
+    """
+    value = Cond(
+        Index("cond", Var("oc")),
+        Load("a", Var("oa")),
+        Load("b", Var("ob")),
+    )
+
+    def _dims(prefix: str) -> tuple:
+        return tuple(Var(f"{prefix}{k}") for k in range(4))
+
+    params = [
+        Tensor("cond", type_name="bool"),
+        Tensor("a"),
+        Tensor("b"),
+        Tensor("out", read_only=False),
+        Scalar("long long", "n"),
+        Scalar("int", "ndim"),
+    ]
+    for prefix in ("d", "c", "a", "b"):
+        params.extend(Scalar("long long", v.name) for v in _dims(prefix))
+    if pow2:
+        params.extend(Scalar("int", v.name) for v in _dims("s"))
+
+    if pow2:
+        decomp = (
+            Let(
+                "long long",
+                "r",
+                Bin(
+                    "&",
+                    Var("rem"),
+                    Paren(Bin("-", Index("shape", Var("d")), Num("1"))),
+                ),
+            ),
+            AugAssign(Var("rem"), ">>", Index("sh", Var("d"))),
+        )
+    else:
+        decomp = (
+            Let("long long", "r", Bin("%", Var("rem"), Index("shape", Var("d")))),
+            AugAssign(Var("rem"), "/", Index("shape", Var("d"))),
+        )
+
+    decls = [
+        ArrayDecl("long long", "shape", 4, _dims("d")),
+        ArrayDecl("long long", "sc", 4, _dims("c")),
+        ArrayDecl("long long", "sa", 4, _dims("a")),
+        ArrayDecl("long long", "sb", 4, _dims("b")),
+    ]
+    if pow2:
+        decls.append(ArrayDecl("int", "sh", 4, _dims("s")))
+
+    return Kernel(
+        name="ew_where_bcast",
+        params=tuple(params),
+        body=(
+            *decls,
+            Let(
+                "long long",
+                "i",
+                Bin(
+                    "+",
+                    Bin("*", Cast("long long", Axis("bid")), Axis("bdim")),
+                    Axis("tid"),
+                ),
+            ),
+            Let(
+                "long long",
+                "step",
+                Bin("*", Cast("long long", Axis("gdim")), Axis("bdim")),
+            ),
+            For(
+                "i",
+                None,
+                Var("n"),
+                Var("step"),
+                (
+                    LetMulti(
+                        "long long",
+                        (
+                            ("rem", Var("i")),
+                            ("oc", Num("0")),
+                            ("oa", Num("0")),
+                            ("ob", Num("0")),
+                        ),
+                    ),
+                    For(
+                        "d",
+                        Bin("-", Var("ndim"), Num("1")),
+                        Num("0"),
+                        Num("1"),
+                        (
+                            *decomp,
+                            AugAssign(
+                                Var("oc"), "+", Bin("*", Var("r"), Index("sc", Var("d")))
+                            ),
+                            AugAssign(
+                                Var("oa"), "+", Bin("*", Var("r"), Index("sa", Var("d")))
+                            ),
+                            AugAssign(
+                                Var("ob"), "+", Bin("*", Var("r"), Index("sb", Var("d")))
+                            ),
+                        ),
+                        cmp=">=",
+                        incr="--",
+                        type_name="int",
+                    ),
+                    Store("out", Var("i"), value, raw=raw_store),
+                ),
+            ),
+        ),
+    )
+
+
 def ew_broadcast(kind: str, *, pow2: bool = False, compare: bool = False) -> Kernel:
     """支持 numpy 多维广播的逐元素二元内核。
 

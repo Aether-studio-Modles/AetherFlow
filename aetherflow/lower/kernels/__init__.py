@@ -24,6 +24,8 @@ from .elementwise import (
     ew_mod_int as ew_mod_int,
     silu_gate,
     ew_broadcast,
+    ew_where_same as ew_where_same,
+    ew_where_bcast as ew_where_bcast,
     UNARY_EXPR as UNARY_EXPR,
 )
 from .reduce import (
@@ -179,6 +181,8 @@ __all__ = [
     "ew_unary",
     "ew_step",
     "ew_broadcast",
+    "ew_where_same",
+    "ew_where_bcast",
     "reduce_sum_last",
     "reduce_max_last",
     "reduce_mean_last",

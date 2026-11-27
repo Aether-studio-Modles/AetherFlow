@@ -39,6 +39,7 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "le",
         "gt",
         "ge",
+        "where",
         "relu",
         "silu",
         "exp",
@@ -138,7 +139,9 @@ _INDEX_DTYPES = ("int32", "int8")
 # "掩码再取反"的写法很常见），它们的设备存储是 1 字节 ``unsigned char``，
 # 走独立的 ``BOOL_DIALECT``。算术算子不在此列：true + true = 2 再归一成 1
 # 没有意义，IR 的 verifier 也已拒绝。
-_BOOL_OPS: FrozenSet[str] = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
+_BOOL_OPS: FrozenSet[str] = frozenset(
+    {"eq", "ne", "lt", "le", "gt", "ge", "where"}
+)
 
 # 带 ``layout`` 属性的算子。这些算子的自研内核只按 NCHW 寻址；NHWC 形态
 # 必须显式拒绝（DESIGN 5.246：布局传播由参考后端承接，设备端等待原生内核）。
@@ -355,6 +358,7 @@ _ELEMENTWISE_TUNABLE_OPS: FrozenSet[str] = frozenset(
         "le",
         "gt",
         "ge",
+        "where",
         "relu",
         "silu",
         "exp",

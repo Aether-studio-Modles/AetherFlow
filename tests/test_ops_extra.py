@@ -1020,5 +1020,98 @@ class TestCompare(unittest.TestCase):
             backward(g)
 
 
+class TestWhere(unittest.TestCase):
+    """``where(cond, a, b)``：bool 条件的三输入选择，支持三方广播。"""
+
+    def test_same_shape_matches_numpy(self):
+        from aetherflow import boolean
+
+        rng = np.random.default_rng(11)
+        cv = rng.integers(0, 2, (3, 4)).astype(bool)
+        av = rng.standard_normal((3, 4)).astype(np.float32)
+        bv = rng.standard_normal((3, 4)).astype(np.float32)
+        g = Graph("where_same")
+        c = g.input("c", boolean[3, 4])
+        a = g.input("a", f32[3, 4])
+        b = g.input("b", f32[3, 4])
+        g.output(g.where(c, a, b), "y")
+        out = _run(g, {"c": cv, "a": av, "b": bv})["y"]
+        self.assertEqual(out.dtype, np.float32)
+        np.testing.assert_array_equal(out, np.where(cv, av, bv))
+
+    def test_three_way_broadcast(self):
+        from aetherflow import boolean
+
+        rng = np.random.default_rng(12)
+        cv = rng.integers(0, 2, (2, 1, 4)).astype(bool)
+        av = rng.standard_normal((2, 3, 4)).astype(np.float32)
+        bv = rng.standard_normal((4,)).astype(np.float32)
+        g = Graph("where_bcast")
+        c = g.input("c", boolean[2, 1, 4])
+        a = g.input("a", f32[2, 3, 4])
+        b = g.input("b", f32[4])
+        g.output(g.where(c, a, b), "y")
+        out = _run(g, {"c": cv, "a": av, "b": bv})["y"]
+        self.assertEqual(out.shape, (2, 3, 4))
+        np.testing.assert_array_equal(out, np.where(cv, av, bv))
+
+    def test_bool_branches_select_masks(self):
+        from aetherflow import boolean
+
+        rng = np.random.default_rng(13)
+        cv = rng.integers(0, 2, (2, 3)).astype(bool)
+        mv = rng.integers(0, 2, (2, 3)).astype(bool)
+        nv = rng.integers(0, 2, (2, 3)).astype(bool)
+        g = Graph("where_mask")
+        c = g.input("c", boolean[2, 3])
+        m = g.input("m", boolean[2, 3])
+        n = g.input("n", boolean[2, 3])
+        g.output(g.where(c, m, n), "y")
+        self.assertEqual(g.outputs[0].type, boolean[2, 3])
+        out = _run(g, {"c": cv, "m": mv, "n": nv})["y"]
+        self.assertEqual(out.dtype, np.bool_)
+        np.testing.assert_array_equal(out, np.where(cv, mv, nv))
+
+    def test_gradient_routes_by_mask(self):
+        from aetherflow import boolean
+
+        rng = np.random.default_rng(14)
+        cv = rng.integers(0, 2, (4, 5)).astype(bool)
+        g = Graph("where_grad")
+        c = g.input("c", boolean[4, 5])
+        x = g.input("x", f64[4, 5])
+        z = g.input("z", f64[4, 5])
+        g.output(g.where(c, x, z), "y")
+        dx, dz = _analytic_grad(
+            g,
+            {
+                "c": cv,
+                "x": np.ones((4, 5), np.float64),
+                "z": np.ones((4, 5), np.float64),
+            },
+            ["x", "z"],
+        )
+        np.testing.assert_array_equal(dx, cv.astype(np.float64))
+        np.testing.assert_array_equal(dz, (~cv).astype(np.float64))
+
+    def test_cond_must_be_bool(self):
+        g = Graph("where_bad_cond")
+        c = g.input("c", f32[2, 3])
+        a = g.input("a", f32[2, 3])
+        b = g.input("b", f32[2, 3])
+        with self.assertRaises(TypeError):
+            g.add_node("where", [c, a, b])
+
+    def test_branch_dtypes_must_match(self):
+        from aetherflow import boolean
+
+        g = Graph("where_bad_dtype")
+        c = g.input("c", boolean[2, 3])
+        a = g.input("a", f32[2, 3])
+        b = g.input("b", f64[2, 3])
+        with self.assertRaises(TypeError):
+            g.add_node("where", [c, a, b])
+
+
 if __name__ == "__main__":
     unittest.main()

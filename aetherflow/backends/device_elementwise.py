@@ -47,6 +47,90 @@ class _ElementwiseMixin:
     def _op_ge(self, node, args, attrs):
         return self._binary("ge", args, compare=True)
 
+    def _op_where(self, node, args, attrs):
+        """``where(cond, a, b)``：cond 是 bool，a / b 同 dtype（输出跟随它）。"""
+        cond, a, b = args
+        out_shape = tuple(np.broadcast_shapes(cond.shape, a.shape, b.shape))
+        if cond.shape == a.shape == b.shape:
+            return self._where_kernel(cond, a, b)
+        return self._where_broadcast(cond, a, b, out_shape)
+
+    def _where_kernel(self, cond, a, b):
+        cp = self.cp
+        out = cp.empty(a.shape, dtype=a.dtype)
+        n = int(a.size)
+        if n == 0:
+            return out
+        tensor = a
+        dtype_key = self._kind(tensor)
+        kernel = self._kernel(
+            ("where", dtype_key),
+            lambda: self.codegen.where_source(dtype=tensor.dtype),
+            "ew_where",
+        )
+        block, grid = self._grid("where", n)
+        kernel((grid,), (block,), (cond, a, b, out, np.int64(n)))
+        return out
+
+    def _where_broadcast(self, cond, a, b, out_shape: tuple):
+        cp = self.cp
+        cond = self._contig(cond)
+        a = self._contig(a)
+        b = self._contig(b)
+        out = cp.empty(out_shape, dtype=a.dtype)
+        n = int(out.size)
+        if n == 0:
+            return out
+
+        groups = self._collapse_dims(
+            out_shape,
+            self._elem_strides(cond.shape, out_shape),
+            self._elem_strides(a.shape, out_shape),
+            self._elem_strides(b.shape, out_shape),
+        )
+        if len(groups) > 4:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的广播最多支持 4 个不可折叠维度，"
+                f"where 收到 {cond.shape} / {a.shape} / {b.shape}"
+                f"（折叠后 {len(groups)} 维）"
+            )
+
+        dims = [1, 1, 1, 1]
+        sc = [0, 0, 0, 0]
+        sa = [0, 0, 0, 0]
+        sb = [0, 0, 0, 0]
+        for i, (dim, step_c, step_a, step_b) in enumerate(groups):
+            dims[i], sc[i], sa[i], sb[i] = dim, step_c, step_a, step_b
+
+        pow2 = all(int(dim) & (int(dim) - 1) == 0 for dim in dims)
+        shifts = [int(dim).bit_length() - 1 for dim in dims] if pow2 else []
+
+        dtype_key = self._kind(a)
+        kernel = self._kernel(
+            ("where_bcast", dtype_key, "pow2" if pow2 else "div"),
+            lambda: self.codegen.where_source(pow2=pow2, dtype=a.dtype),
+            "ew_where_bcast",
+        )
+        block, grid = self._grid("where", n)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                cond,
+                a,
+                b,
+                out,
+                np.int64(n),
+                np.int32(len(groups)),
+                *[np.int64(v) for v in dims],
+                *[np.int64(v) for v in sc],
+                *[np.int64(v) for v in sa],
+                *[np.int64(v) for v in sb],
+                *[np.int32(v) for v in shifts],
+            ),
+        )
+        return out
+
     def _op_clamp(self, node, args, attrs):
         """按属性里的标量上下界截断；缺省的一侧由 ``has_lo`` / ``has_hi`` 关掉。
 

@@ -264,6 +264,34 @@ def _compare_ref(np_fn):
     return ref
 
 
+def _where_infer(inputs, attrs):
+    """``where(cond, a, b)``：cond 必须是 bool，a / b 同 dtype，三者广播。
+
+    bool 的 ``a`` / ``b`` 也允许（掩码之间选择），但浮点条件必须由上游
+    显式比较产生——这样可以保证"0.5 算真吗"这类歧义不会进入 IR。
+    """
+    cond, a, b = inputs
+    if cond.dtype is not DType.BOOL:
+        raise TypeError(
+            f"where 的 cond 必须是 bool，得到 {cond.dtype.value}；"
+            "浮点条件请先插入比较算子"
+        )
+    if a.dtype != b.dtype:
+        raise TypeError(
+            f"where 的两侧 dtype 必须一致，得到 {a.dtype.value} 与 {b.dtype.value}；"
+            "请显式插入 cast"
+        )
+    return TensorType(
+        a.dtype, _broadcast_shape(_broadcast_shape(cond.shape, a.shape), b.shape)
+    )
+
+
+def _where_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    cond, a, b = args
+    with np.errstate(all="ignore"):
+        return np.where(np.asarray(cond, dtype=np.bool_), a, b)
+
+
 def _binary_ref(np_fn):
     """二元逐元素：溢出 / 无效值按 IEEE 返回，且不在宿主上打警告。
 
@@ -317,6 +345,16 @@ for _name, _np_fn in (
             doc=f"逐元素比较 {_name}，输出 bool，支持 numpy 广播",
         )
     )
+
+
+register(
+    Op(
+        name="where",
+        infer=_where_infer,
+        reference=_where_ref,
+        doc="按 bool 条件逐元素选择，支持三方 numpy 广播",
+    )
+)
 
 
 def _div_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:

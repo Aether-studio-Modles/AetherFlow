@@ -21,6 +21,7 @@ from dataclasses import replace
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .ops import OPS, NoGradientError
+from .types import DType
 
 RULES: Dict[str, Any] = {}
 
@@ -183,6 +184,25 @@ def _sub(ctx):
         sum_to(b, g, ctx.input(0).type.shape),
         sum_to(b, b.add_node("neg", [g]), ctx.input(1).type.shape),
     )
+
+
+@vjp("where")
+def _where(ctx):
+    """d/dx = where(cond, g, 0)，d/dy = where(cond, 0, g)。
+
+    广播由 where 自己负责：标量零与 (1,) 常量都能直接参与，不需要先
+    expand。bool 的两侧本来不可导（掩码之间选择），返回 None 让自动微分
+    给出"不在可导路径上"的明确结论。
+    """
+    b, g = ctx.b, ctx.g
+    cond = ctx.input(0)
+    x, y = ctx.input(1), ctx.input(2)
+    dx = dy = None
+    if x.type.dtype is not DType.BOOL:
+        zero = _const(b, 0.0, x.type.dtype)
+        dx = sum_to(b, b.add_node("where", [cond, g, zero]), x.type.shape)
+        dy = sum_to(b, b.add_node("where", [cond, zero, g]), y.type.shape)
+    return (None, dx, dy)
 
 
 @vjp("mul")

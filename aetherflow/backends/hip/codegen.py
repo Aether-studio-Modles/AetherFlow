@@ -83,6 +83,23 @@ def compare_source(kind: str, *, scalar_a: bool = False, scalar_b: bool = False,
     )
 
 
+def where_source(*, pow2=None, dtype=None) -> str:
+    """``where`` 源码：L2 与 CUDA 逐字共用，只换方言。
+
+    ``dtype`` 是 a / b（也是输出）的存储类型；bool 两侧（掩码选掩码）需要
+    1 字节容器的 ``BOOL_DIALECT``，其余走 ``HIP_DIALECT``。
+    """
+    # 延迟导入：hip.dialect 顶层就 import 了本模块。
+    from .dialect import BOOL_DIALECT, HIP_DIALECT
+
+    is_bool = dtype is not None and _cuda._dtype_key(dtype) == "bool"
+    return _cuda.where_source(
+        pow2=pow2,
+        dtype=dtype,
+        dialect=BOOL_DIALECT if is_bool else HIP_DIALECT,
+    )
+
+
 def __getattr__(name: str):
     """未定义的常量/函数一律来自 CUDA 侧的模板库（单一事实来源）。"""
     return getattr(_cuda, name)

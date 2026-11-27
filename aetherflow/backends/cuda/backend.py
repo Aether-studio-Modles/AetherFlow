@@ -41,7 +41,7 @@ CUDA_OPS: FrozenSet[str] = GPU_OPS
 # 布局与分块假设，bf16 版本要逐个验证数值，不能只靠模板替换就宣布支持。
 # 不在表里的 bf16 算子会被 ``invoke`` 明确拒绝（不做隐式降级）。
 BF16_OPS: FrozenSet[str] = frozenset({
-    "add", "sub", "mul", "div", "eq", "ne", "lt", "le", "gt", "ge",
+    "add", "sub", "mul", "div", "eq", "ne", "lt", "le", "gt", "ge", "where",
     "relu", "silu", "exp", "log", "sqrt", "neg",
     "tanh", "sigmoid", "erf", "gelu", "clamp", "step", "spike",
     "constant", "cast", "broadcast_to", "reshape", "transpose", "slice",
