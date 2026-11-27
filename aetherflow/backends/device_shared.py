@@ -61,6 +61,7 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "quantize_i8",
         "dequantize_i8",
         "fake_quantize_i8",
+        "fake_quantize_i8_lsq",
         "linear_i8",
         "linear_i8a8",
         "conv2d",

@@ -683,12 +683,162 @@ class TestFakeQuantizeI8(unittest.TestCase):
         np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
 
 
+class TestFakeQuantizeI8LSQ(unittest.TestCase):
+    """LSQ：前向与 STE 版逐位相同，反向换成"非饱和区直通 + 可学步长"。
+
+    这个算子存在的唯一理由是 ``scale`` 能训练。判据因此不是"梯度形状对不对"，
+    而是三件事：前向不能与 ``fake_quantize_i8`` 分叉；``dx`` 必须把被夹到端点
+    的元素置零；``ds`` 的符号与大小要能把步长推向"量化误差更小"的方向。
+    """
+
+    def _graph(self, shape=(4, 3)):
+        g = Graph("fake_quantize_i8_lsq")
+        x = g.input("x", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        g.output(g.add_node("fake_quantize_i8_lsq", [x, s]), "y")
+        return g
+
+    def test_forward_is_bit_identical_to_ste_version(self):
+        """两个算子的前向必须共用一份舍入：否则 QAT 与 LSQ 会给出两套数值。"""
+        rng = np.random.default_rng(91)
+        shape = (5, 4)
+        feed = {
+            # 量级刻意跨过饱和端点：前向差异最容易在夹取处暴露。
+            "x": (rng.standard_normal(shape) * 20).astype(np.float32),
+            "s": np.array([0.1, 0.05, 0.25, 0.5], np.float32),
+        }
+        g_ste = Graph("fake_quantize_i8")
+        sx = g_ste.input("x", f32[shape])
+        ss = g_ste.input("s", f32[(shape[-1],)])
+        g_ste.output(g_ste.add_node("fake_quantize_i8", [sx, ss]), "y")
+        np.testing.assert_array_equal(
+            _run(self._graph(shape), feed)["y"], _run(g_ste, feed)["y"]
+        )
+
+    def test_dx_masks_saturated_elements(self):
+        """饱和列的输入梯度为 0，非饱和列与 STE 一样原样穿过（逐位）。"""
+        rng = np.random.default_rng(92)
+        g = Graph("qat_lsq")
+        x = g.input("x", f32[2, 3])
+        w = g.input("w", f32[3, 2])
+        s = g.input("s", f32[2])
+        wq = g.add_node("fake_quantize_i8_lsq", [w, s])
+        g.output(g.matmul(x, wq), "y")
+
+        feed = {
+            "x": rng.standard_normal((2, 3)).astype(np.float32),
+            # w[0, 0] = 100 配 s=0.1 → v = 1000，被夹到 127：该位置不接收梯度。
+            "w": np.array([[100.0, 0.4], [0.5, 0.6], [0.7, 0.8]], np.float32),
+            "s": np.array([0.1, 0.1], np.float32),
+            "dy": np.ones((2, 2), np.float32),
+        }
+        got = _run(backward(g, wrt=[g.find("w")]), feed)["dw"]
+        want = feed["x"].T @ feed["dy"]
+        want[0, 0] = 0.0
+        np.testing.assert_array_equal(got, want)
+
+    def test_scale_gradient_matches_lsq_formula(self):
+        """``ds = sum(g * (v_hat - v))``：逐通道归约，按公式手算对拍。"""
+        rng = np.random.default_rng(93)
+        g = self._graph((4, 3))
+        x = np.array(
+            [
+                [0.31, 2.7, -300.0],  # -300 / 1.0 → 下饱和
+                [-0.52, 0.13, 0.9],
+                [1.05, -3.2, 0.0],
+                [0.47, 0.66, 5.5],
+            ],
+            np.float32,
+        )
+        s = np.array([0.1, 0.25, 1.0], np.float32)
+        dy = rng.standard_normal((4, 3)).astype(np.float32)
+        got = _run(backward(g, wrt=[g.find("s")]), {"x": x, "s": s, "dy": dy})["ds"]
+
+        v = (x / s).astype(np.float32)
+        vq = np.clip(np.rint(v), -127.0, 127.0).astype(np.float32)
+        want = (dy * (vq - v)).sum(axis=0)
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+
+    def test_one_gradient_step_reduces_quantization_error(self):
+        """沿负梯度走一步，量化误差必须下降——这是"步长真的能学"的最小证据。"""
+        g = self._graph((4, 1))
+        x = np.array([[100.0], [-100.0], [80.0], [-60.0]], np.float32)
+        s0 = np.array([0.1], np.float32)
+        dy = np.ones((4, 1), np.float32)
+        ds = _run(backward(g, wrt=[g.find("s")]), {"x": x, "s": s0, "dy": dy})["ds"]
+        s1 = (s0 - 0.001 * ds).astype(np.float32)
+        err0 = np.abs(x - _run(g, {"x": x, "s": s0})["y"]).mean()
+        err1 = np.abs(x - _run(g, {"x": x, "s": s1})["y"]).mean()
+        self.assertLess(float(err1), float(err0))
+
+    def test_backward_graph_uses_only_device_ops(self):
+        """反向图必须整体落在设备算子面内，否则"设备上能训练"只是口号。"""
+        from aetherflow.backends.device_shared import GPU_OPS
+
+        g = Graph("qat_lsq")
+        x = g.input("x", f32[2, 4])
+        w = g.input("w", f32[4, 3])
+        s = g.input("s", f32[3])
+        wq = g.add_node("fake_quantize_i8_lsq", [w, s])
+        g.output(g.matmul(x, wq), "y")
+        bwd = backward(g, wrt=[g.find("w"), g.find("s")])
+        used = {node.op.name for node in bwd.nodes}
+        self.assertLessEqual(used, set(GPU_OPS), used - set(GPU_OPS))
+
+    def test_rejections(self):
+        with self.subTest(case="non_f32_input"):
+            g = Graph("fake_quantize_i8_lsq")
+            x = g.input("x", f16[2, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("fake_quantize_i8_lsq", [x, s])
+        with self.subTest(case="non_f32_scale"):
+            g = Graph("fake_quantize_i8_lsq")
+            x = g.input("x", f32[2, 3])
+            s = g.input("s", f16[3])
+            with self.assertRaises(TypeError):
+                g.add_node("fake_quantize_i8_lsq", [x, s])
+        with self.subTest(case="scale_rank_exceeds_input"):
+            g = Graph("fake_quantize_i8_lsq")
+            x = g.input("x", f32[2, 3])
+            s = g.input("s", f32[1, 2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("fake_quantize_i8_lsq", [x, s])
+        with self.subTest(case="wrong_arity"):
+            g = Graph("fake_quantize_i8_lsq")
+            x = g.input("x", f32[2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("fake_quantize_i8_lsq", [x])
+        with self.subTest(case="non_positive_scale_at_runtime"):
+            g = self._graph((2, 3))
+            for bad in (0.0, -0.5):
+                with self.assertRaises(ValueError):
+                    _run(
+                        g,
+                        {
+                            "x": np.ones((2, 3), np.float32),
+                            "s": np.full(3, bad, np.float32),
+                        },
+                    )
+
+    def test_json_round_trip(self):
+        rng = np.random.default_rng(94)
+        g = self._graph((3, 2))
+        feed = {
+            "x": (rng.standard_normal((3, 2)) * 2).astype(np.float32),
+            "s": np.array([0.125, 0.5], np.float32),
+        }
+        again = loads(dumps(g))
+        np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
             "quantize_i8_channel",
             "dequantize_i8_channel",
             "fake_quantize_i8_channel",
+            "fake_quantize_i8_lsq_channel",
             "linear_i8_bias",
             "linear_i8a8_bias",
         }

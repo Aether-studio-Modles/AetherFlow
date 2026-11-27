@@ -318,6 +318,25 @@ def _fake_quantize_i8(shape: tuple = (8, 6)):
     return build
 
 
+def _fake_quantize_i8_lsq(shape: tuple = (8, 6)):
+    """LSQ 的前向与 STE 版逐位相同，因此这里只校验"同一个出口"。
+
+    反向规则不参与 conformance（套件只跑前向）；把形态放进来是为了让
+    设备端"声明承接"与"真的能算"对得上——LSQ 在设备上跑训练时，前向走的
+    仍是同一对量化 / 反量化内核。
+    """
+
+    def build(rng):
+        g = Graph("fake_quantize_i8_lsq")
+        x = g.input("x", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        g.output(g.add_node("fake_quantize_i8_lsq", [x, s]), "y")
+        scale = (np.abs(_f32(rng, (shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {"x": _f32(rng, shape, scale=0.5), "s": scale}
+
+    return build
+
+
 def _linear_i8(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
     def build(rng):
         g = Graph("linear_i8")
@@ -1459,6 +1478,9 @@ def default_cases() -> List[Case]:
         _case("fake_quantize_i8_channel", _fake_quantize_i8(),
               note="QAT 的假量化：前向必须逐位等于 dequantize_i8(quantize_i8(x, s), s)，"
                    "设备端由已有两个内核组合承接"),
+        _case("fake_quantize_i8_lsq_channel", _fake_quantize_i8_lsq(),
+              note="LSQ 版前向与上一形态逐位相同；差异只在反向（dx 带非饱和掩码、"
+                   "scale 接收梯度），设备端仍复用同一对内核"),
         _case("linear_i8_bias", _linear_i8(),
               note="反量化 GEMM 的完整形态（含 bias）：数值必须等于先 dequantize "
                    "再 matmul"),

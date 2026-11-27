@@ -1225,6 +1225,11 @@ register(
 #   int8 的格点上再原样放大回 f32，前向逐位等于
 #   ``dequantize_i8(quantize_i8(x, scale), scale)``；区别只在反向——整数
 #   中转没有可用的梯度，假量化用直通估计器（STE）把梯度送到连续权重上。
+# - **LSQ 版本（``fake_quantize_i8_lsq``）前向与上一行完全相同**，只有反向
+#   不同：梯度不再无条件穿过量化，而是按"是否被夹到端点"分两段，并把
+#   ``scale`` 当作可学参数给出梯度（Esser et al. 2020）。拆成两个算子而不是
+#   给一个算子加开关：STE 与 LSQ 对 ``scale`` 的语义不同（一是不接收梯度，
+#   一是必须接收），写成属性会让"这个 scale 到底更不更新"藏在 attrs 里。
 
 _QUANT_MIN = -127
 _QUANT_MAX = 127
@@ -1356,6 +1361,43 @@ register(
         doc="量化感知训练（QAT）的假量化：f32 量化到 int8 格点再放大回 f32，"
         "前向逐位等于 dequantize_i8(quantize_i8(x, scale), scale)；"
         "反向是直通估计器（STE），scale 不接收梯度",
+    )
+)
+
+
+def _infer_fake_quantize_i8_lsq(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(
+            f"fake_quantize_i8_lsq 需要 (x, scale) 两个输入，得到 {len(inputs)}"
+        )
+    x, scale = inputs
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"fake_quantize_i8_lsq 只接受 f32 输入，得到 {x.dtype.value}；"
+            "它的前向与 fake_quantize_i8 逐位相同，语义只在 f32 上定义"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"fake_quantize_i8_lsq 的 scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+    if x.rank < 1:
+        raise ValueError("fake_quantize_i8_lsq 至少需要 1 维输入")
+    _check_scale_broadcast(x, scale, "fake_quantize_i8_lsq")
+    return TensorType(DType.F32, x.shape)
+
+
+register(
+    Op(
+        name="fake_quantize_i8_lsq",
+        infer=_infer_fake_quantize_i8_lsq,
+        # 前向与 fake_quantize_i8 共用同一份参考实现：LSQ 只是反向不同，
+        # 若另写一份舍入就迟早会在端点 / 半偶舍入上分叉。
+        reference=_ref_fake_quantize_i8,
+        doc="LSQ（Esser et al. 2020）的假量化：前向与 fake_quantize_i8 逐位"
+        "相同，反向按非饱和区直通、并把量化误差 v_hat - v 的归约和送给"
+        "scale，使量化步长本身可学（scale 必须是图输入，不能是 constant）",
     )
 )
 

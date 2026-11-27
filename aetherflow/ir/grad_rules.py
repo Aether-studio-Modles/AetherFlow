@@ -589,9 +589,42 @@ def _fake_quantize_i8(ctx):
     这与 PyTorch ``fake_quantize_per_tensor_affine`` 的反向口径一致。
 
     scale 是量化参数而不是连续变量，与 ``linear_i8`` / ``linear_i8a8``
-    同口径返回 ``None``；要学 scale（LSQ）需要另一条规则，不在这一版。
+    同口径返回 ``None``；要学 scale 用 ``fake_quantize_i8_lsq``。
     """
     return (ctx.g, None)
+
+
+@vjp("fake_quantize_i8_lsq")
+def _fake_quantize_i8_lsq(ctx):
+    """LSQ 的可学步长口径：前向同 STE 版，反向承认饱和区并给 scale 梯度。
+
+    记 ``v = x / s``、``v̂ = clamp(round(v), -127, 127)``、``x̂ = v̂ * s``。
+    LSQ（Esser et al. 2020）用两条与 STE 不同的规则：
+
+    - ``dx = g * 1[-127 <= v <= 127]``：舍入处仍直通（解析梯度为零），但被夹到
+      端点的元素不再接收梯度——它们的输入再怎么变也跨不出量化格点。
+    - ``ds = sum(g * (v̂ - v))``：这是 ``∂x̂/∂s`` 的 LSQ 值。非饱和区把
+      ``∂v̂/∂s`` 记为零，于是 ``v̂ - v`` 就是"量化误差把步长往哪边推"；
+      饱和区 ``v̂`` 就是端点，同一式子仍然成立。
+
+    ``scale`` 必须是图输入（可训练参数）。若接成 ``constant``，梯度会在常量
+    节点处按"没有输入"被丢掉：前向仍是假量化，但训练不会更新它——这是
+    LSQ 与 STE 版在接口上的唯一约束，写在这里免得被当成 bug。
+    """
+    b, g = ctx.b, ctx.g
+    x, s = ctx.input(0), ctx.input(1)
+    v = b.add_node("div", [x, s])
+    bounds = {"min": -127.0, "max": 127.0}
+    vr = b.add_node("round", [v])
+    vq = b.add_node("clamp", [vr], bounds)
+    # 非饱和判定用 ``v == clamp(v)``：闭区间内原样返回，越界才被改动。
+    # 比 ``v̂ == round(v)`` 精确——后者在 (-127.5, -127) 这类半格点上会
+    # 把已经饱和的元素误判成可导。
+    inside = b.add_node("eq", [v, b.add_node("clamp", [v], bounds)])
+    mask = b.add_node("cast", [inside], {"dtype": DType.F32.value})
+    dx = sum_to(b, b.add_node("mul", [g, mask]), x.type.shape)
+    ds_elem = b.add_node("mul", [g, b.add_node("sub", [vq, v])])
+    return (dx, sum_to(b, ds_elem, s.type.shape))
 
 
 def _conv_attrs(attrs: dict) -> dict:

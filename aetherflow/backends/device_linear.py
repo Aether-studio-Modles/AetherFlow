@@ -198,6 +198,15 @@ class _LinearMixin:
         q = self._op_quantize_i8(node, [args[0], args[1]], attrs)
         return self._op_dequantize_i8(node, [q, args[1]], attrs)
 
+    def _op_fake_quantize_i8_lsq(self, node, args, attrs):
+        """LSQ 版前向：与 STE 版逐位相同，只有反向规则不同。
+
+        保留独立方法而不是在注册表里指同一个函数，是为了让"声明即实现"的
+        反射检查（内核方法名 ↔ ``CUDA_OPS``）继续成立；也把"设备端没有为
+        可学步长新增内核"这件事写在代码里。
+        """
+        return self._op_fake_quantize_i8(node, args, attrs)
+
     def _op_linear_i8(self, node, args, attrs):
         """weight-only int8 线性层：反量化权重后走既有 f32 GEMM。
 
