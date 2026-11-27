@@ -27,7 +27,8 @@
   **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
   decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
-  分页 KV cache（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制）与贪心投机
+  分页 KV cache（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制，以及
+  token→token 的贪心生成闭环 `PagedGenerator`）与贪心投机
   解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：
   `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
@@ -89,7 +90,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3020 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3026 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（128 executed / 2 refused / 0 failed，`linear_i8a8_bias` 误差 0）与 `verify_cuda.py`（含两条 W8A8 边界用例），全过；未跑全量 unittest |
@@ -143,16 +144,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
   捕获计划、分段重算、需要把若干维合并成二维的广播反向（`sum_axes`）以及 torch
   导入的 SymInt 仍要求静态形状，入口显式拒绝（契约表见 DESIGN 5.217 / 5.275）。
-- **推理**：分页 KV cache 与投机解码是组件级交付，**未接进 `LMRunner`**——主干是
-  Mamba，没有随上下文增长的 KV。分页缓存已带换出 / 换入与 LRU 调度：`PagedCacheManager`
+- **推理**：`LMRunner` 主干是 Mamba，没有随上下文增长的 KV，所以分页 KV 不在它的
+  主路径上。分页缓存已带换出 / 换入与 LRU 调度：`PagedCacheManager`
   在容量不足时换出最久未使用且未 pin 的序列、被访问时自动换回（`pin` 保护正在
   解码的请求）；`PagedDecodeScheduler` 把多序列交错解码接在同一张单步图上，
   `suspend` / `resume` 对应解除保护与换入，`fork` 让新序列共享父序列的前缀。
   `fork` 在缓存层是多条序列共享同一批物理页、写入时按页拆分（块级引用计数），
   适合同前缀多路采样 / 束搜索 / 同系统提示的多请求；它是显式动作，不做前缀
-  内容匹配。这些组件都是主机态，没有真机
-  D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机只支持贪心
-  验收与 `batch=1`。
+  内容匹配。`PagedGenerator`（5.310）在调度器之上补了 token→token 的贪心生成闭环
+  （主机侧嵌入 + 位置编码、一层词表头、EOS 停止）。这些组件都是主机态，没有真机
+  D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机解码走
+  `LMRunner.generate_speculative`（5.303），只支持贪心验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
   `response_format` / 非 0 penalty 显式 400。认证是**静态单密钥** Bearer
   （`api_key=...`，`/healthz` 免认证，`hmac.compare_digest` 比较），限流是
@@ -565,6 +567,16 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   让错误报成语义错误而不是越界读。
 - **整次 `execute` 的墙钟不能当内核吞吐**（5.309）：512³ 的中位 1.14 ms 包含
   图查找、传输与启动；文档里必须写清口径，否则就成了没有依据的"加速"。
+- **"未接主干"有时是分类错误，不是欠债**（5.310）：`LMRunner` 的主干是 Mamba，
+  没有 K/V，"把分页 KV 接进 `LMRunner`"本身就不成立。接主路径之前先确认主干
+  有没有这个对象；没有就补在真正的主路径上（Transformer 增量解码），而不是硬塞。
+- **新增一层不要改被复用函数的返回值面**（5.310）：`build_cached_decoder_step`
+  的 `(inputs, y, new_kv)` 被多处解包，为词表头改元数会牵动所有调用方。给生成器
+  单独一张 `(1,d)→(1,V)` 的小图、多一次 `execute`，换来零侵入——正确性优先时
+  这笔交易划算。
+- **生成闭环要自己持有 token 历史**（5.310）：分页调度器只记长度，`fork` 的
+  前缀一致性校验需要 token 本身；由此暴露"fork 后 prompt 必须比父长一个 token"
+  这类边界，写进 API 与报错文案，不要靠调用方猜。
 - **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
   移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
   账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100
