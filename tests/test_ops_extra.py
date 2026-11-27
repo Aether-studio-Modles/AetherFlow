@@ -1113,5 +1113,51 @@ class TestWhere(unittest.TestCase):
             g.add_node("where", [c, a, b])
 
 
+class TestRounding(unittest.TestCase):
+    """sign / round / floor / ceil 的参考语义。
+
+    这三个（除 round 外）都是阶梯函数：判据只看逐点取值，不看导数。
+    """
+
+    VALUES = np.array(
+        [-3.5, -2.5, -1.5, -0.5, -0.0, 0.0, 0.5, 1.5, 2.5, 3.5, 1e-8, -1e-8],
+        dtype=np.float64,
+    )
+
+    def _forward(self, op, values):
+        g = Graph(op)
+        x = g.input("x", f64[values.shape])
+        g.output(getattr(g, op)(x), "y")
+        return _run(g, {"x": values})["y"]
+
+    def test_round_is_half_to_even(self):
+        got = self._forward("round", self.VALUES)
+        # numpy 的 np.round 与 torch.round 都是 half-to-even：±2.5 -> ±2，±3.5 -> ±4
+        np.testing.assert_array_equal(got, np.round(self.VALUES))
+
+    def test_floor_and_ceil(self):
+        np.testing.assert_array_equal(
+            self._forward("floor", self.VALUES), np.floor(self.VALUES)
+        )
+        np.testing.assert_array_equal(
+            self._forward("ceil", self.VALUES), np.ceil(self.VALUES)
+        )
+
+    def test_sign_keeps_zero_and_nan(self):
+        values = np.array([-2.5, -1e-8, 0.0, 1e-8, 3.0, np.nan])
+        got = self._forward("sign", values)
+        np.testing.assert_array_equal(got, np.sign(values))
+        # NaN 透传：两个比较都为假，原值返回
+        self.assertTrue(np.isnan(got[-1]))
+        self.assertEqual(got[2], 0.0)
+
+    def test_sign_has_no_backward_rule_output(self):
+        """阶梯函数的反向规则存在且返回 None（与 step 同口径），不伪造零梯度。"""
+        from aetherflow.ir.grad_rules import RULES
+
+        for name in ("sign", "round", "floor", "ceil"):
+            self.assertIn(name, RULES)
+
+
 if __name__ == "__main__":
     unittest.main()

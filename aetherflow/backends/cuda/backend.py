@@ -44,6 +44,7 @@ BF16_OPS: FrozenSet[str] = frozenset({
     "add", "sub", "mul", "div", "eq", "ne", "lt", "le", "gt", "ge", "where",
     "relu", "silu", "exp", "log", "sqrt", "neg",
     "tanh", "sigmoid", "erf", "gelu", "clamp", "step", "spike",
+    "sign", "round", "floor", "ceil",
     "constant", "cast", "broadcast_to", "reshape", "transpose", "slice",
     "concat", "pad",
     "matmul",

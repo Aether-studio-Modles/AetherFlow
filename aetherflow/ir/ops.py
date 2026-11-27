@@ -573,6 +573,13 @@ for _name, _ref, _doc in (
     ("tanh", lambda a, at: np.tanh(a[0]), "双曲正切"),
     ("sigmoid", _sigmoid_ref, "logistic 函数 1/(1+e^-x)"),
     ("erf", _erf_ref, "误差函数 erf(x)"),
+    # 取整与符号。``round`` 用 numpy 的 half-to-even，与 ``torch.round`` 一致；
+    # 设备端对应 ``nearbyintf``（默认舍入模式是 round-half-to-even），不能用
+    # ``roundf``（那是 half-away-from-zero）。
+    ("sign", lambda a, at: np.sign(a[0]), "符号函数：正 1 / 负 -1 / 零 0，NaN 透传"),
+    ("round", lambda a, at: np.round(a[0]), "四舍六入五取偶（与 torch.round 一致）"),
+    ("floor", lambda a, at: np.floor(a[0]), "向下取整"),
+    ("ceil", lambda a, at: np.ceil(a[0]), "向上取整"),
 ):
     register(Op(name=_name, infer=_elementwise_unary_infer, reference=_ref, doc=_doc))
 

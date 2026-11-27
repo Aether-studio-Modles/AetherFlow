@@ -451,6 +451,11 @@ UNARY_EXPR = {
     "tanh": "tanhf(x)",
     "sigmoid": "1.f / (1.f + expf(-x))",
     "erf": "erff(x)",
+    # 嵌套三目与 L2 的 Cond 逐个 token 对齐；0 → 0、NaN 两个比较都为假 → 原样透传。
+    "sign": "x > 0.f ? 1.f : x < 0.f ? -1.f : x",
+    "round": "nearbyintf(x)",
+    "floor": "floorf(x)",
+    "ceil": "ceilf(x)",
 }
 
 # step 比其他一元算子多一个 kernel 参数（阈值），因此不进 UNARY_EXPR 模板。

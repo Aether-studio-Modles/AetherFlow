@@ -133,9 +133,9 @@ class TestTorchExport(unittest.TestCase):
 
         class M(nn.Module):
             def forward(self, x):
-                # sign 需要比较/选择语义（IR 没有 bool 张量），必须显式拒绝；
-                # tanh 等一元数学族在 P7 已接上，不再适合当反例。
-                return torch.sign(x)
+                # trunc 不在映射表里（floor/ceil/round/sign 已接上），必须显式
+                # 拒绝而不是猜一个近邻语义。
+                return torch.trunc(x)
 
         ep = torch.export.export(M().eval(), (torch.randn(4),))
         with self.assertRaises(UnsupportedOperatorError):
@@ -628,12 +628,29 @@ class TestTorchExport(unittest.TestCase):
 
         self._roundtrip(M().eval(), torch.randn(3) * 10, atol=0.0)
 
-    def test_floor_is_rejected(self):
+    def test_rounding_unary_ops(self):
+        """sign / round / floor / ceil 与 torch 逐位一致（round 是 half-to-even）。"""
+        cases = {
+            "sign": lambda x: torch.sign(x),
+            "round": lambda x: torch.round(x),
+            "floor": lambda x: torch.floor(x),
+            "ceil": lambda x: torch.ceil(x),
+        }
+        # 取 .5 附近的点专门检验舍入方向：2.5 -> 2、3.5 -> 4
+        x = torch.tensor([-3.5, -2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5, 3.5])
+        for name, fn in cases.items():
+            class M(nn.Module):
+                def forward(self, t):
+                    return fn(t)
+
+            self._roundtrip(M().eval(), x.clone(), atol=0.0)
+
+    def test_trunc_is_rejected(self):
         from aetherflow.frontend import UnsupportedOperatorError
 
         class M(nn.Module):
             def forward(self, x):
-                return torch.floor(x)
+                return torch.trunc(x)
 
         with self.assertRaises(UnsupportedOperatorError):
             self.import_exported(torch.export.export(M().eval(), (torch.randn(3),)))

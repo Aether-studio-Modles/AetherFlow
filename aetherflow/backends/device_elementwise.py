@@ -251,6 +251,18 @@ class _ElementwiseMixin:
     def _op_neg(self, node, args, attrs):
         return self._unary("neg", args)
 
+    def _op_sign(self, node, args, attrs):
+        return self._unary("sign", args)
+
+    def _op_round(self, node, args, attrs):
+        return self._unary("round", args)
+
+    def _op_floor(self, node, args, attrs):
+        return self._unary("floor", args)
+
+    def _op_ceil(self, node, args, attrs):
+        return self._unary("ceil", args)
+
     def _op_tanh(self, node, args, attrs):
         return self._unary("tanh", args)
 

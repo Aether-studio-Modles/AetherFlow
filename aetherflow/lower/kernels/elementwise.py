@@ -138,6 +138,18 @@ UNARY_EXPR = {
         Paren(Bin("+", Num("1.f"), Call("expf", (Neg(x),)))),
     ),
     "erf": lambda x: Call("erff", (x,)),
+    # 符号：三路选择。用嵌套 Cond 而不是 Copysign/Sign 函数，是因为语义
+    # 在 0 与 NaN 上都要精确：0 → 0，NaN 两个比较都为假 → 原样透传。
+    "sign": lambda x: Cond(
+        Bin(">", x, Num("0.f")),
+        Num("1.f"),
+        Cond(Bin("<", x, Num("0.f")), Num("-1.f"), x),
+    ),
+    # nearbyintf 默认按当前舍入模式（round-half-to-even），与 np.round /
+    # torch.round 一致；roundf 是 half-away-from-zero，会差一。
+    "round": lambda x: Call("nearbyintf", (x,)),
+    "floor": lambda x: Call("floorf", (x,)),
+    "ceil": lambda x: Call("ceilf", (x,)),
 }
 
 

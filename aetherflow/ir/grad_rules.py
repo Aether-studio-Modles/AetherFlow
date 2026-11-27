@@ -381,6 +381,29 @@ def _step(ctx):
     return (None,)
 
 
+@vjp("sign")
+def _sign(ctx):
+    # 几乎处处导数为 0（0 点不可导）。与 step 同口径：返回 None 表示该输入
+    # 不接收梯度，而不是伪造一个零梯度节点。
+    return (None,)
+
+
+@vjp("round")
+def _round(ctx):
+    # 阶梯函数，几乎处处导数为 0；PyTorch 同样把梯度定义为 0。
+    return (None,)
+
+
+@vjp("floor")
+def _floor(ctx):
+    return (None,)
+
+
+@vjp("ceil")
+def _ceil(ctx):
+    return (None,)
+
+
 @vjp("spike")
 def _spike(ctx):
     """替代梯度（surrogate gradient）。

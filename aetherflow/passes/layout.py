@@ -66,6 +66,10 @@ _ELEMENTWISE_OPS: FrozenSet[str] = frozenset(
         "erf",
         "step",
         "spike",
+        "sign",
+        "round",
+        "floor",
+        "ceil",
     }
 )
 

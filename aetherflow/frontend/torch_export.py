@@ -1055,7 +1055,8 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
     # ------------------------------------------------------------------
     if target in ("aten.tanh.default", "aten.exp.default", "aten.log.default",
                   "aten.neg.default", "aten.neg_.default", "aten.sqrt.default",
-                  "aten.erf.default"):
+                  "aten.erf.default", "aten.sign.default", "aten.round.default",
+                  "aten.floor.default", "aten.ceil.default"):
         return g.add_node(target.split(".")[1].rstrip("_"), [a(0)])
 
     if target in ("aten.abs.default", "aten.abs_.default"):
