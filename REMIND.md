@@ -16,7 +16,7 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：73 个 IR 算子，CUDA / HIP 各自承接 70 个；
+- **一份语义 IR，多个硬件后端**：74 个 IR 算子，CUDA / HIP 各自承接 71 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
@@ -36,7 +36,9 @@
 - **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）与 W8A8
   （`linear_i8a8`：int32 累加后乘两个 scale，CUDA 走 `__dp4a`、HIP 标量乘加，
   V100 真机与参考逐位相等）；QAT 的假量化算子 `fake_quantize_i8`（f32 进出，
-  前向等同量化-反量化，反向是直通估计器，5.311）；
+  前向等同量化-反量化，反向是直通估计器，5.311）与可学步长的 LSQ 版本
+  `fake_quantize_i8_lsq`（前向逐位相同，反向按非饱和区直通并给 scale 梯度，
+  5.312）；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 
 ### 安装
@@ -91,10 +93,10 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3033 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3040 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（129 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
+| CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
 
 ```bash
 # 本地全量
@@ -124,7 +126,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   累加，再乘激活 / 权重两个 scale）。CUDA / HIP **已有设备内核**（CUDA 走
   `__dp4a`，HIP 走标量乘加，V100 真机与参考逐位相等，5.309）；但它不是 int8
   tensor core（没有 IMMA / wmma 分块），**不要期待"int8 算得更快"的结论**；
-  QAT 只到假量化算子（`fake_quantize_i8`，5.311）——scale 不可学（无 LSQ），
+  QAT 到假量化算子（`fake_quantize_i8`，5.311）与 LSQ 的可学步长版本
+  （`fake_quantize_i8_lsq`，5.312）——后者要求 scale 作为图输入才能收到梯度，
   没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；此外无 fp8、
   无非对称零点，W8A8 也尚无反向（bias 除外）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
@@ -588,6 +591,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `clip` 几乎处处为零的解析梯度不挡训练，这是训练时的选择而不是求导结果。
   写清"梯度直通、饱和区不额外截断、scale 不接收梯度、学 scale 是另一条
   规则（LSQ）"，否则读代码的人会以为反向写漏了。
+- **可学参数必须是图输入，不能是 `constant`**（5.312）：vjp 返回非 `None` 的
+  梯度会写成对应输入的 cotangent；若那个输入是 `constant` 节点，cotangent
+  到常量处按"零输入"被静默丢弃——不报错，训练就是不更新。给"参数"发梯度
+  前先确认它是 placeholder，并把这条约束写进算子 doc 与测试。
+- **前向相同、反向不同时，拆成两个算子而不是加属性**（5.312）：`fake_quantize_i8`
+  与 `fake_quantize_i8_lsq` 的前向逐位相同，只差 vjp。用 `learnable_scale`
+  之类的 attrs 也能实现，但"这个 scale 到底会不会被训练"就藏进了属性；
+  两个算子名让 `backward(wrt=[s])` 从报错变返回梯度的差异直接写在图上。
 - **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
   移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
   账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100

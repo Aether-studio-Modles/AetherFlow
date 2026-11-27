@@ -93,7 +93,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照
 ```
 
-当前基线：**3033 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3040 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
@@ -101,8 +101,8 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 | 面 | 已交付 |
 |---|---|
 | 前端 | `torch.export` 导入：卷积 / 池化 / linear / LayerNorm / softmax / SDPA / 归一化 / 索引与切片之外，P7 补上了逐元素数学、激活展开、clamp 与标量运算、dtype 转换、归约（mean / sum / amax / max.dim / argmax）、tril / triu / cumsum / pad、栈与切分、mm / mv / dot / addmm、常量构造（zeros / ones / full / arange 等）；不能精确表达的算子显式拒绝（见第 6 节） |
-| 算子 | IR 里 73 个算子；CUDA / HIP 各自承接 70 个（68 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8` + 1 个由量化与反量化组合的 `fake_quantize_i8`，其中 W8A8 的 `linear_i8a8` 是 int8 读入、int32 累加的专用内核，5.309；QAT 假量化见 5.311），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
-| 精度 | f32 全覆盖；f16 覆盖 65 个（70 个设备端算子去掉 4 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` / `fake_quantize_i8` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
+| 算子 | IR 里 74 个算子；CUDA / HIP 各自承接 71 个（68 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8` + 1 个由量化与反量化组合的 `fake_quantize_i8` + 1 个前向同源、反向为 LSQ 的 `fake_quantize_i8_lsq`，其中 W8A8 的 `linear_i8a8` 是 int8 读入、int32 累加的专用内核，5.309；QAT 假量化见 5.311，LSQ 见 5.312），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
+| 精度 | f32 全覆盖；f16 覆盖 65 个（71 个设备端算子去掉 5 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` / `fake_quantize_i8` / `fake_quantize_i8_lsq` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
 | 自动微分 | 49 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环接不进这套形态——判定在主机采样之后（5.278），但 decode 的**状态**可以常驻（5.279） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast）、数据并行（默认主机中转归约；单进程多卡可显式接设备侧归约，`nccl_device_collective(backend, devices)`，见下）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
@@ -247,8 +247,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   int8 权重在 int32 里累加后再乘两个 scale，CUDA 的内核走 `__dp4a`、HIP 走标量
   乘加，两者累加逐位相同；`quantize_activation` 按 token 量化激活）；
   QAT 到假量化算子（`fake_quantize_i8`：f32 进出，前向等同量化-反量化，
-  反向是直通估计器，5.311），但没有可学 scale（无 LSQ）、无 fp8、
-  无非对称零点，也没有 int8 tensor core 级的矩阵乘；
+  反向是直通估计器，5.311）与可学步长的 LSQ 版本（`fake_quantize_i8_lsq`：
+  前向逐位相同，反向按非饱和区直通、并把 `sum(g * (v_hat - v))` 送给
+  scale，5.312），但没有 fp8、无非对称零点、也没有 int8 tensor core
+  级的矩阵乘；
 - **动态性**：主机态的执行与训练支持符号批维（一次构图跑不同 batch，归约反向的计数在
   运行期按实际形状算）；设备态的捕获计划、分段重算与需要合并维度的广播反向仍要求静态形状；
   控制流每次判定回主机；`DeviceWhileLoop` / `DeviceConditional` 只是把条件、分支
@@ -299,7 +301,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3033 个用例
+tests/                3040 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
