@@ -19055,10 +19055,19 @@ cc 112 段 0.359（6.4%）。
 
 **下一步**（按收益/风险排序）：
 
-1. **2 的幂维用移位/掩码替代 div/mod**（最小侵入）。本模型所有广播维度都是
-   2 的幂，主机侧多传一组 `log2(shape)` 与标志，内核把 `rem % shape` 换成
-   `rem & (shape-1)`、`rem / shape` 换成 `rem >> log2`。预计大形状降 2~3×，
-   **省 0.4~0.6 ms（4~6% step）**。
+1. **2 的幂维用移位/掩码替代 div/mod**（曾预计大形状降 2~3×、省 0.4~0.6 ms）。
+   已实现并**上机实测否决、方案撤回**（2026-11-27，Tesla PG503-216 / V100 32GB、
+   CUDA 12.4、cupy 14.2）：131072 元素广播上 pow2+`sh` 形态比 div/mod **慢
+   14~15%**（20.60 vs 17.70 μs、18.40 vs 15.72 μs；where 27.12 vs 23.62 μs；
+   两次独立测量：两点法与交替 400 次 × 5 轮取最小）。手写三内核对照
+   （同形状、同 block/grid）定位到真凶：多传的 `int sh[4]` 局部数组被循环变量
+   `d` 动态下标寻址，落到 local memory —— `div` 7.85 μs / `pow2+sh` 10.87 μs
+   （1.38×）/ `pow2+clz`（`rem >> (31-__clz(shape))`，去掉 sh 数组）7.88 μs
+   （1.00×）。即去掉数组只能**追平**，`&`/`>>` 的收益被 `__clz` 抵消，没有
+   净收益。因此 `ew_broadcast` / `ew_where_bcast` 的 pow2 分支、`sh` 参数与
+   后端缓存键里的 pow2 维度全部删除，回到单一 div/mod 形态（本地 2943 用例
+   全过；V100 复跑 conformance 121 executed / 8 refused / 0 failed，81/81 覆盖）。
+   继续提速只能靠第 2 条（把广播乘融进邻近内核的 epilogue），而不是改寻址。
 2. **广播乘法融进 `scan_linear` / `reduce_sum` 的 epilogue**。`A*delta`、
    `B*x` 这类输入本来就是 scan 的入参，整段可消掉 0.87 ms，但要改 scan
    内核，风险高，排在 1 之后。
@@ -19115,7 +19124,8 @@ cc 112 段 0.359（6.4%）。
 - **A1 比较算子**：`eq` / `ne` / `lt` / `le` / `gt` / `ge`。`infer` 复用现有广播
   规则、输出 `bool`；`reference` 直接用 numpy 比较；`codegen` 增加 bool 存储键
   （设备容器 `unsigned char`，存取 helper `af_ld_q` / `af_st_q` 把 0/1 与
-  float 互转），设备内核复用 `ew_bcast` 的坐标还原结构（含 5.300 的 pow2 形态）。
+  float 互转），设备内核复用 `ew_bcast` 的坐标还原结构（div/mod 单一形态，
+  5.300 的 pow2 变体已实测否决并删除）。
   反向规则不注册——比较在数学上没有梯度，`vjp=None` 会让 `backward` 明确报错。
 - **A2 `where` 与 `masked_fill`**：`where(cond, a, b)` 三输入广播，设备内核在
   `ew_bcast` 上多一路 stride；`masked_fill` 不新增算子，前端降成
@@ -19234,8 +19244,9 @@ torch 逐位相等。
   比较（eq/ne/lt/le/gt/ge）、`where`、`sign`、`round`、`floor`、`ceil` 全部
   `executed` 且 `err=0`；`topk_mask` / `topk_values` / `topk_indices` 共 6 条
   按契约 `refused`（未声明，符合预期）。
-- `verify_cuda.py` 的边界用例新增 5 条：`where_bcast_pow2`（折叠后每维都是 2
-  的幂，走掩码 + 右移内核）、`where_bcast_odd_rank3`（非 2 的幂，走 div 余数
+- `verify_cuda.py` 的边界用例新增 5 条：`where_bcast_pow2_shape`（折叠后每维
+  都是 2 的幂的规则形状；曾经专走掩码 + 右移内核，该形态已于 5.300 删除，
+  现在走 div/mod 路径）、`where_bcast_odd_rank3`（非 2 的幂，走 div 余数
   路径）、`compare_feeds_where`（比较结果直接当条件，bool 数据流端到端）、
   `rounding_boundaries`（`.5` 取偶 / 负数 / `-0`）、`sign_special`（`±0` /
   `±inf` / NaN）。原脚本的 tuning 回环用 `rounds=1`，已被 `search()`
