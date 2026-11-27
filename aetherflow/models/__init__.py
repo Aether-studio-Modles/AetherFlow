@@ -62,7 +62,9 @@ from .mlp import MLPSpec, build_mlp
 from .quantize import (
     QUANT_MAX,
     build_int8_linear,
+    build_int8a8_linear,
     dequantize_weight,
+    quantize_activation,
     quantize_weight,
 )
 from .moe import (
@@ -102,7 +104,9 @@ __all__ = [
     "build_mlp",
     "QUANT_MAX",
     "build_int8_linear",
+    "build_int8a8_linear",
     "dequantize_weight",
+    "quantize_activation",
     "quantize_weight",
     "MoESpec",
     "build_moe",

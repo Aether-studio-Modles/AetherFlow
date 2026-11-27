@@ -1,11 +1,11 @@
-"""weight-only int8 量化：语义、反向与入口验收。
+"""int8 量化：weight-only 与 W8A8 的语义、反向与入口验收。
 
 三条判据，与项目的其它算子一致：
 
 1. 参考语义是**手写公式**，不是拿自己给自己打分：RNE 舍入、[-127,127]
-   饱和、逐通道 scale 广播。
-2. 反向只对连续量（激活 / bias）给梯度；量化权重与 scale 是冻结常量，
-   对它们求导必须显式报错，而不是返回零。
+   饱和、逐通道 scale 广播；W8A8 还要额外钉住"累加发生在 int32 里"。
+2. 反向只对连续量（激活 / bias）给梯度；量化权重、int8 输入与 scale 是
+   冻结常量，对它们求导必须显式报错，而不是返回零。
 3. 图能走通完整链路：构图 → 执行 → JSON 往返 → 再执行，结果逐位相同。
 """
 
@@ -28,7 +28,9 @@ from aetherflow.conformance import default_cases, run_conformance
 from aetherflow.models.quantize import (
     QUANT_MAX,
     build_int8_linear,
+    build_int8a8_linear,
     dequantize_weight,
+    quantize_activation,
     quantize_weight,
 )
 
@@ -299,9 +301,272 @@ class TestQuantizedLinearBuilder(unittest.TestCase):
             build_int8_linear(g, 0, 4)
 
 
+class TestLinearI8A8(unittest.TestCase):
+    """W8A8：int8 激活 × int8 权重先在 int32 里累加，再乘两个 scale。
+
+    这一组要钉住的不是"和 f32 差不多"，而是**累加发生在整数域**：
+    手写公式逐位相等，并且与"先反量化再 f32 matmul"确实不同。
+    """
+
+    def _graph(self, x_shape, w_shape, bias=True, x_scale_shape=None):
+        g = Graph("linear_i8a8")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input(
+            "x_scale",
+            f32[x_scale_shape if x_scale_shape is not None else x_shape[:-1] + (1,)],
+        )
+        wq = g.input("w_q", i8[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        args = [q, sx, wq, sw]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_i8a8", args), "y")
+        return g
+
+    def test_matches_hand_written_int32_accumulation(self):
+        rng = np.random.default_rng(41)
+        x_shape, w_shape = (2, 4, 8), (8, 6)
+        xq = rng.integers(-127, 128, size=x_shape, dtype=np.int8)
+        wq = rng.integers(-127, 128, size=w_shape, dtype=np.int8)
+        sx = (rng.random(x_shape[:-1] + (1,)).astype(np.float32) + 0.02)
+        sw = (rng.random(w_shape[-1]).astype(np.float32) + 0.05)
+        b = rng.standard_normal(w_shape[-1]).astype(np.float32)
+
+        got = _run(
+            self._graph(x_shape, w_shape),
+            {"x_q": xq, "x_scale": sx, "w_q": wq, "w_scale": sw, "b": b},
+        )["y"]
+        acc = np.matmul(xq.astype(np.int32), wq.astype(np.int32)).astype(np.float32)
+        want = acc * sx * sw + b
+        # 整数累加 + 三次浮点运算，没有理由不是逐位相同。
+        np.testing.assert_array_equal(got, want)
+
+    def test_accumulation_is_not_f32_dequantize_then_matmul(self):
+        """K 足够大时，f32 逐项累加与整数累加的舍入不同。
+
+        若这个算子只是 ``matmul(dequantize(x), dequantize(w))`` 的别名，
+        这条会失败——那说明新增的语义没有存在价值。
+        """
+        shapes = ((3, 512), (512, 7))
+        xq = np.random.default_rng(42).integers(-127, 128, size=shapes[0], dtype=np.int8)
+        wq = np.random.default_rng(43).integers(-127, 128, size=shapes[1], dtype=np.int8)
+        sx = np.full((shapes[0][0], 1), 0.013, np.float32)
+        sw = np.full(shapes[1][1], 0.011, np.float32)
+        got = _run(
+            self._graph(shapes[0], shapes[1], bias=False),
+            {"x_q": xq, "x_scale": sx, "w_q": wq, "w_scale": sw},
+        )["y"]
+        dequant = np.matmul(
+            xq.astype(np.float32) * sx, wq.astype(np.float32) * sw
+        )
+        self.assertGreater(float(np.max(np.abs(got - dequant))), 0.0)
+
+    def test_per_tensor_activation_scale(self):
+        rng = np.random.default_rng(44)
+        x_shape, w_shape = (2, 3, 5), (5, 4)
+        feed = {
+            "x_q": rng.integers(-127, 128, size=x_shape, dtype=np.int8),
+            "x_scale": np.array([0.05], np.float32),
+            "w_q": rng.integers(-127, 128, size=w_shape, dtype=np.int8),
+            "w_scale": np.array([0.1, 0.2, 0.3, 0.4], np.float32),
+            "b": np.zeros(4, np.float32),
+        }
+        got = _run(self._graph(x_shape, w_shape, x_scale_shape=(1,)), feed)["y"]
+        acc = np.matmul(
+            feed["x_q"].astype(np.int32), feed["w_q"].astype(np.int32)
+        ).astype(np.float32)
+        np.testing.assert_array_equal(got, acc * 0.05 * feed["w_scale"])
+
+    def test_rejects_wrong_dtypes_ranks_and_scales(self):
+        good = dict(x_shape=(2, 4), w_shape=(4, 3))
+        cases = [
+            ("xq", f32[2, 4], "x_scale", f32[2, 1]),
+            ("xq", i8[2, 4], "x_scale", f16[2, 1]),
+        ]
+        for qn, qt, sn, st in cases:
+            with self.subTest(x=qt, scale=st):
+                g = Graph("linear_i8a8")
+                q = g.input(qn, qt)
+                sx = g.input(sn, st)
+                wq = g.input("w_q", i8[good["w_shape"]])
+                sw = g.input("w_scale", f32[3])
+                with self.assertRaises((TypeError, ValueError)):
+                    g.add_node("linear_i8a8", [q, sx, wq, sw])
+
+        bad_builds = [
+            ("权重不是 i8", lambda: self._graph_bad(w_dtype=f32)),
+            ("激活只有 1 维", lambda: self._graph_bad(x_shape=(4,))),
+            ("权重不是 2 维", lambda: self._graph_bad(w_shape=(2, 2, 3))),
+            ("内维不匹配", lambda: self._graph_bad(x_shape=(2, 5))),
+            (
+                "激活 scale 沿 K 维变化",
+                lambda: self._graph_bad(x_scale_shape=(2, 4)),
+            ),
+            ("权重 scale 是 2 维", lambda: self._graph_bad(w_scale_shape=(4, 3))),
+            ("权重 scale 长度不匹配", lambda: self._graph_bad(w_scale_shape=(2,))),
+            ("bias 长度不匹配", lambda: self._graph_bad(bias_len=2)),
+            ("输入个数不足", lambda: self._graph_bad(drop=("w_scale",))),
+            ("K 超过 int32 累加上界", lambda: self._graph_bad(x_shape=(2, 200000))),
+        ]
+        for label, build in bad_builds:
+            with self.subTest(case=label):
+                with self.assertRaises((TypeError, ValueError)):
+                    build()
+
+    def _graph_bad(
+        self,
+        x_shape=(2, 4),
+        w_shape=(4, 3),
+        x_scale_shape=None,
+        w_scale_shape=None,
+        w_dtype=i8,
+        bias_len=None,
+        drop=(),
+    ):
+        g = Graph("linear_i8a8")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input(
+            "x_scale",
+            f32[x_scale_shape if x_scale_shape is not None else x_shape[:-1] + (1,)],
+        )
+        wq = g.input("w_q", w_dtype[w_shape])
+        sw = g.input(
+            "w_scale",
+            f32[w_scale_shape if w_scale_shape is not None else (w_shape[-1],)],
+        )
+        args = [q, sx, wq, sw]
+        if bias_len is not None:
+            args.append(g.input("b", f32[bias_len]))
+        named = dict(zip(("x_q", "x_scale", "w_q", "w_scale", "b"), args))
+        args = [v for name, v in named.items() if name not in drop]
+        g.add_node("linear_i8a8", args)
+
+    def test_non_positive_scale_fails_at_execution(self):
+        rng = np.random.default_rng(45)
+        feed = {
+            "x_q": rng.integers(-127, 128, size=(2, 4), dtype=np.int8),
+            "x_scale": np.array([[0.1], [0.0]], np.float32),
+            "w_q": rng.integers(-127, 128, size=(4, 3), dtype=np.int8),
+            "w_scale": np.array([0.1, 0.2, 0.3], np.float32),
+        }
+        with self.assertRaises(ValueError):
+            _run(self._graph((2, 4), (4, 3), bias=False), feed)
+
+        feed["x_scale"] = np.full((2, 1), 0.1, np.float32)
+        feed["w_scale"] = np.array([0.1, -0.2, 0.3], np.float32)
+        with self.assertRaises(ValueError):
+            _run(self._graph((2, 4), (4, 3), bias=False), feed)
+
+    def test_graph_survives_json_roundtrip(self):
+        rng = np.random.default_rng(46)
+        feed = {
+            "x_q": rng.integers(-127, 128, size=(2, 4), dtype=np.int8),
+            "x_scale": np.array([[0.1], [0.2]], np.float32),
+            "w_q": rng.integers(-127, 128, size=(4, 3), dtype=np.int8),
+            "w_scale": np.array([0.1, 0.2, 0.3], np.float32),
+            "b": np.zeros(3, np.float32),
+        }
+        g = self._graph((2, 4), (4, 3))
+        want = _run(g, feed)["y"]
+        again = _run(loads(dumps(g)), feed)["y"]
+        np.testing.assert_array_equal(want, again)
+
+
+class TestQuantizeActivation(unittest.TestCase):
+    def test_per_token_scale_shape_and_error_bound(self):
+        rng = np.random.default_rng(51)
+        x = (rng.standard_normal((2, 3, 16)) * 2).astype(np.float32)
+        q, scale = quantize_activation(x)
+        self.assertEqual(q.dtype, np.int8)
+        self.assertEqual(q.shape, x.shape)
+        self.assertEqual(scale.shape, (2, 3, 1))
+        err = np.max(np.abs(q.astype(np.float32) * scale - x), axis=-1)
+        self.assertTrue(np.all(err <= scale[..., 0] / 2 + 1e-5), (err, scale))
+
+    def test_zero_token_gets_unit_scale(self):
+        x = np.zeros((2, 4), dtype=np.float32)
+        x[0, 1] = 3.0
+        q, scale = quantize_activation(x)
+        np.testing.assert_array_equal(q[1], np.zeros(4, np.int8))
+        np.testing.assert_array_equal(q[0], np.array([0, 127, 0, 0], np.int8))
+        self.assertEqual(float(scale[1, 0]), 1.0)
+        self.assertGreater(float(scale[0, 0]), 0.0)
+
+    def test_rejects_bad_activations(self):
+        with self.assertRaises(ValueError):
+            quantize_activation(np.zeros((4,), np.float32))
+        with self.assertRaises(TypeError):
+            quantize_activation(np.zeros((2, 4), np.int32))
+        with self.assertRaises(ValueError):
+            quantize_activation(np.array([[1.0, np.inf]], np.float32))
+
+
+class TestQuantizedW8A8Builder(unittest.TestCase):
+    def test_builder_matches_f32_within_quantization_error(self):
+        rng = np.random.default_rng(61)
+        w = (rng.standard_normal((16, 5)) * 0.5).astype(np.float32)
+        b = rng.standard_normal(5).astype(np.float32)
+        x = (rng.standard_normal((3, 16)) * 0.5).astype(np.float32)
+
+        xq, xs = quantize_activation(x)
+        wq, ws = quantize_weight(w)
+        g = Graph("int8a8_linear")
+        inputs, y = build_int8a8_linear(g, 16, 5)
+        g.output(y, "y")
+        got = _run(g, {"x_q": xq, "x_scale": xs, "w_q": wq, "w_scale": ws, "bias": b})[
+            "y"
+        ]
+        # 激活与权重各多一份 scale/2 的舍入，K=16 的点积把它放大到 1e-2 量级。
+        np.testing.assert_allclose(got, x @ w + b, rtol=5e-2, atol=5e-2)
+
+    def test_builder_rejects_non_positive_features(self):
+        g = Graph("int8a8_linear")
+        with self.assertRaises(ValueError):
+            build_int8a8_linear(g, 0, 4)
+
+
+class TestLinearI8A8Gradient(unittest.TestCase):
+    def _graph(self):
+        g = Graph("linear_i8a8")
+        q = g.input("x_q", i8[2, 4])
+        sx = g.input("x_scale", f32[2, 1])
+        wq = g.input("w_q", i8[4, 3])
+        sw = g.input("w_scale", f32[3])
+        b = g.input("b", f32[3])
+        g.output(g.add_node("linear_i8a8", [q, sx, wq, sw, b]), "y")
+        return g
+
+    def test_only_bias_receives_gradient(self):
+        rng = np.random.default_rng(71)
+        feed = {
+            "x_q": rng.integers(-127, 128, size=(2, 4), dtype=np.int8),
+            "x_scale": np.array([[0.1], [0.2]], np.float32),
+            "w_q": rng.integers(-127, 128, size=(4, 3), dtype=np.int8),
+            "w_scale": np.array([0.1, 0.2, 0.3], np.float32),
+            "b": np.zeros(3, np.float32),
+        }
+        g = self._graph()
+        bwd = backward(g, wrt=[g.find("b")])
+        dy = rng.standard_normal((2, 3)).astype(np.float32)
+        out = _run(bwd, {**feed, "dy": dy})
+        np.testing.assert_allclose(out["db"], dy.sum(axis=0), rtol=1e-6, atol=1e-6)
+
+    def test_int8_inputs_and_scales_have_no_gradient(self):
+        g = self._graph()
+        for name in ("x_q", "x_scale", "w_q", "w_scale"):
+            with self.subTest(wrt=name):
+                with self.assertRaises(NoGradientError):
+                    backward(g, wrt=[g.find(name)])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
-        names = {"quantize_i8_channel", "dequantize_i8_channel", "linear_i8_bias"}
+        names = {
+            "quantize_i8_channel",
+            "dequantize_i8_channel",
+            "linear_i8_bias",
+            "linear_i8a8_bias",
+        }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)
         report = run_conformance(BACKEND, cases=cases)

@@ -564,6 +564,21 @@ def _linear_i8(ctx):
     return (sum_to(b, dx, x.type.shape), None, None, db)
 
 
+@vjp("linear_i8a8")
+def _linear_i8a8(ctx):
+    """W8A8 线性层的反向：只有 bias 是连续量。
+
+    激活与权重都是 int8，scale 是量化参数：在 int8 桶上求导没有连续变量，
+    与 ``linear_i8`` 同口径返回 ``None``（该输入不接收梯度），而不是造一张
+    零张量。要与训练接上需要量化感知训练，不在这一版。
+    """
+    b, g = ctx.b, ctx.g
+    if len(ctx.node.inputs) < 5:
+        return (None, None, None, None)
+    db = sum_axes(b, g, tuple(range(g.type.rank - 1)))
+    return (None, None, None, None, db)
+
+
 def _conv_attrs(attrs: dict) -> dict:
     return {k: attrs[k] for k in ("stride", "padding", "dilation", "groups") if k in attrs}
 

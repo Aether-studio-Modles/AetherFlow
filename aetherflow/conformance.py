@@ -325,6 +325,30 @@ def _linear_i8(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
     return build
 
 
+def _linear_i8a8(x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("linear_i8a8")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input("x_scale", f32[x_shape[:-1] + (1,)])
+        wq = g.input("w_q", i8[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_i8a8", [q, sx, wq, sw, b]), "y")
+        return g, {
+            "x_q": rng.integers(-127, 128, size=x_shape, dtype=np.int8),
+            "x_scale": (
+                np.abs(_f32(rng, x_shape[:-1] + (1,), scale=0.1)) + 0.02
+            ).astype(np.float32),
+            "w_q": rng.integers(-127, 128, size=w_shape, dtype=np.int8),
+            "w_scale": (
+                np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05
+            ).astype(np.float32),
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
 def _softmax(axis: int = -1, scaled: bool = False, shape: tuple = (6, 11)):
     def build(rng):
         g = Graph("softmax")
@@ -1423,6 +1447,10 @@ def default_cases() -> List[Case]:
         _case("linear_i8_bias", _linear_i8(),
               note="反量化 GEMM 的完整形态（含 bias）：数值必须等于先 dequantize "
                    "再 matmul"),
+        # W8A8 int8
+        _case("linear_i8a8_bias", _linear_i8a8(),
+              note="int8 激活 × int8 权重先在 int32 里累加，再乘两个 scale；"
+                   "尚未承接 int8 矩阵乘的后端必须显式拒绝，而不是退回 f32 累加"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

@@ -1203,7 +1203,7 @@ register(
 
 
 # --------------------------------------------------------------------------
-# 量化（weight-only int8）
+# 量化（weight-only int8 与 W8A8）
 # --------------------------------------------------------------------------
 #
 # 语义边界写在这里，因为它是"能不能对外说支持量化"的分界线：
@@ -1215,9 +1215,12 @@ register(
 #   四舍五入（half-away-from-zero）会在 .5 处产生系统性偏差。
 # - 缩放系数必须严格为正。``scale <= 0`` 不是"退化成另一种量化"，而是
 #   语义未定义（除零 / 符号翻转），因此参考实现与设备实现都显式拒绝。
-# - **权重驻留是 i8，计算仍是 f32**：``linear_i8`` 先反量化再走普通 GEMM。
-#   它省的是权重占用与读带宽，不是算力；int8 tensor-core GEMM 会改变累加
-#   精度，必须另立语义（舍入 / 饱和 / 累加器宽度），不在这一版里。
+# - **weight-only 的权重驻留是 i8，计算仍是 f32**：``linear_i8`` 先反量化再走
+#   普通 GEMM。它省的是权重占用与读带宽，不是算力。
+# - **W8A8 的累加在 int32 里**：``linear_i8a8`` 先做整数矩阵乘，再乘激活 /
+#   权重两个 scale。它才是 int8 tensor-core GEMM 的累加语义，因此另有两条
+#   约束：scale 必须沿压缩轴恒定（否则提不出求和号），且
+#   ``K * 127 * 127`` 不得超过 int32 上界（否则回绕）。设备内核尚未承接。
 
 _QUANT_MIN = -127
 _QUANT_MAX = 127
@@ -1310,6 +1313,14 @@ register(
 )
 
 
+#: int32 累加器的安全上界：``K * 127 * 127`` 不得超过 ``2**31 - 1``。
+#:
+#: 超过这个 K 时，即使每个元素都取 int8 端点，int32 累加也会回绕；而回绕
+#: 依赖溢出行为，不是能跨后端对拍的语义。构图期（K 静态时）与执行期都
+#: 显式拒绝，而不是"让它绕一圈"。
+_I32_ACC_LIMIT = (2**31 - 1) // (_QUANT_MAX * _QUANT_MAX)
+
+
 def _infer_linear_i8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (3, 4):
         raise ValueError(
@@ -1374,6 +1385,112 @@ register(
         "权重按 scale 反量化后在 f32 上做 GEMM，因此数值等于"
         "``matmul(x, dequantize_i8(qweight, scale)) [+ bias]``；"
         "省的是权重占用与读带宽，不是算力",
+    )
+)
+
+
+def _infer_linear_i8a8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) not in (4, 5):
+        raise ValueError(
+            "linear_i8a8 需要 (x_q, x_scale, w_q, w_scale[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    xq, xs, wq, ws = inputs[0], inputs[1], inputs[2], inputs[3]
+    if xq.dtype != DType.I8:
+        raise TypeError(
+            f"linear_i8a8 的激活必须是 i8，得到 {xq.dtype.value}；"
+            "浮点激活请先走 quantize_i8，或改用 linear_i8"
+        )
+    if wq.dtype != DType.I8:
+        raise TypeError(f"linear_i8a8 的权重必须是 i8，得到 {wq.dtype.value}")
+    if xs.dtype != DType.F32:
+        raise TypeError(f"linear_i8a8 的激活 scale 必须是 f32，得到 {xs.dtype.value}")
+    if ws.dtype != DType.F32:
+        raise TypeError(f"linear_i8a8 的权重 scale 必须是 f32，得到 {ws.dtype.value}")
+    if xq.rank < 2:
+        raise ValueError(f"linear_i8a8 的激活至少是 2 维，得到秩 {xq.rank}")
+    if wq.rank != 2:
+        raise ValueError(f"linear_i8a8 的量化权重必须是 2 维 (K, N)，得到 {wq.shape}")
+
+    k, n = wq.shape
+    kx = xq.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_i8a8 的内维不匹配：激活的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_i8a8 的内维符号不一致：激活 {kx} 与权重 K={k}")
+
+    _check_scale_broadcast(xq, xs, "linear_i8a8 的激活 scale")
+    # int32 累加的前提是 scale 能提到求和之外：激活 scale 必须沿 K 维恒定
+    # （每个 token 一个），权重 scale 必须沿 K 维恒定（每个输出通道一个）。
+    # 沿压缩轴逐元素变化的 scale 让累加不再成立，直接拒绝而不是静默近似。
+    if xs.rank > 0 and xs.shape[-1] != 1:
+        raise ValueError(
+            f"linear_i8a8 的激活 scale 形状 {xs.shape} 沿 K 维不是 1："
+            "int32 累加要求每个 token 一个 scale（如 (B, T, 1) 或标量）"
+        )
+    if ws.rank > 1:
+        raise ValueError(
+            f"linear_i8a8 的权重 scale 必须是逐输出通道 (N,) 或逐张量标量，"
+            f"得到秩 {ws.rank} 形状 {ws.shape}；沿 K 维逐元素变化的 scale "
+            "无法用 int32 累加表达"
+        )
+    if ws.rank == 1 and ws.shape[0] != 1 and ws.shape[0] != n:
+        raise ValueError(f"linear_i8a8 的权重 scale 长度 {ws.shape[0]} 与 N={n} 不一致")
+    if isinstance(k, int) and k > _I32_ACC_LIMIT:
+        raise ValueError(
+            f"linear_i8a8 的 K={k} 超过 int32 累加上限 {_I32_ACC_LIMIT}："
+            "K * 127 * 127 会溢出 int32，累加结果不再确定；请分段累加"
+        )
+
+    if len(inputs) == 5:
+        bias = inputs[4]
+        if bias.dtype != DType.F32:
+            raise TypeError(f"linear_i8a8 的 bias 必须是 f32，得到 {bias.dtype.value}")
+        if bias.rank != 1:
+            raise ValueError(f"linear_i8a8 的 bias 必须是秩 1，得到秩 {bias.rank}")
+        if isinstance(bias.shape[0], int) and isinstance(n, int) and bias.shape[0] != n:
+            raise ValueError(f"linear_i8a8 的 bias 长度 {bias.shape[0]} 与 N={n} 不一致")
+    return TensorType(DType.F32, xq.shape[:-1] + (n,))
+
+
+def _ref_linear_i8a8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    xq, xs, wq, ws = args[0], args[1], args[2], args[3]
+    if float(np.min(xs)) <= 0.0:
+        raise ValueError(
+            f"linear_i8a8 的激活 scale 必须严格为正，得到最小值 {float(np.min(xs))}"
+        )
+    if float(np.min(ws)) <= 0.0:
+        raise ValueError(
+            f"linear_i8a8 的权重 scale 必须严格为正，得到最小值 {float(np.min(ws))}"
+        )
+    k = int(xq.shape[-1])
+    if k > _I32_ACC_LIMIT:
+        raise ValueError(
+            f"linear_i8a8 的 K={k} 超过 int32 累加上限 {_I32_ACC_LIMIT}："
+            "K * 127 * 127 会溢出 int32，累加结果不再确定；请分段累加"
+        )
+    # int32 累加是这一版与 weight-only 的唯一数值差别：先整数求和，再乘两个
+    # scale 的积，而不是先反量化再在 f32 上逐项累加。
+    acc = np.matmul(xq.astype(np.int32), wq.astype(np.int32))
+    row = np.broadcast_to(xs, xq.shape)[..., :1].astype(np.float32)
+    out = acc.astype(np.float32) * row * ws
+    if len(args) > 4:
+        out = out + args[4]
+    return out
+
+
+register(
+    Op(
+        name="linear_i8a8",
+        infer=_infer_linear_i8a8,
+        reference=_ref_linear_i8a8,
+        doc="W8A8 线性层：(..., K) i8 激活与 (K, N) i8 权重先在 int32 里累加，"
+        "再乘激活 scale（每个 token 一个）与权重 scale（每个输出通道一个），"
+        "最后加 bias。语义是 ``(int32(x_q) @ int32(w_q)).f32() * xs * ws [+ b]``；"
+        "K * 127 * 127 超过 int32 上界时显式拒绝，不做回绕",
     )
 )
 
