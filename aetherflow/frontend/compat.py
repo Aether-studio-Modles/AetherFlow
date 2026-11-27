@@ -69,7 +69,7 @@ TORCH_MATRIX: Tuple[TorchCompatibility, ...] = (
     TorchCompatibility(
         min_version=(2, 9),
         max_version=(2, 13),
-        dtypes=("float16", "float32", "float64", "bfloat16", "int32", "int64"),
+        dtypes=("float16", "float32", "float64", "bfloat16", "int32", "int64", "bool"),
         verified=("2.13.0",),
         notes=(
             "verified 列出的版本由 tests/test_frontend.py 实跑；"

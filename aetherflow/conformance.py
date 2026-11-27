@@ -51,7 +51,7 @@ from .backends.reference_backend import ReferenceBackend
 from .ir.graph import Graph
 from .ir.ops import OPS
 from .ir.serialize import dumps, loads, to_dict
-from .ir.types import c64, f32, f64, i8, i32
+from .ir.types import boolean, c64, f32, f64, i8, i32
 from .ir.verifier import verify_portable_only
 from .models.transformer import BlockSpec, build_transformer_block
 
@@ -241,6 +241,21 @@ def _cmp_case(op: str, shape_a: tuple, shape_b: tuple, offset_b: float = 0.0):
         av = np.round(_f32(rng, shape_a) * 2.0).astype(np.float32)
         bv = np.round(_f32(rng, shape_b) * 2.0 + offset_b).astype(np.float32)
         return g, {"a": av, "b": bv}
+
+    return build
+
+
+def _where_case(shape_c: tuple, shape_a: tuple, shape_b: tuple):
+    """``where`` 用例：条件是真 bool 输入，两个分支支持三方广播。"""
+
+    def build(rng):
+        g = Graph("where")
+        c = g.input("c", boolean[shape_c])
+        a = g.input("a", f32[shape_a])
+        b = g.input("b", f32[shape_b])
+        g.output(g.where(c, a, b), "y")
+        cv = rng.integers(0, 2, size=shape_c).astype(bool)
+        return g, {"c": cv, "a": _f32(rng, shape_a), "b": _f32(rng, shape_b)}
 
     return build
 
@@ -1270,6 +1285,10 @@ def default_cases() -> List[Case]:
         _case("gt_broadcast_bias", _cmp_case("gt", (2, 3, 4), (4,)),
               note="比较复用广播骨架，检验 strided 坐标还原"),
         _case("lt_broadcast_scalar", _cmp_case("lt", (3, 5), (1,))),
+        # 掩码消费端：条件与两个分支三方广播
+        _case("where_same", _where_case((4, 6), (4, 6), (4, 6))),
+        _case("where_broadcast", _where_case((2, 1, 4), (2, 3, 4), (4,)),
+              note="条件 / 分支各自广播，检验三组 stride 的坐标还原"),
         # 逐元素：广播（前端把 linear 降级成 matmul + add 后的真实形态）
         _case("add_broadcast_bias", _binary("add", (2, 3, 4), (4,)),
               note="尾部维广播，bias 的典型形态"),

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ..ir.graph import Graph, Value
-from ..ir.types import DType, TensorType, bf16, f16, f32, f64, i32
+from ..ir.types import DType, TensorType, bf16, boolean, f16, f32, f64, i32
 from .compat import TorchCompatibility, check_torch
 
 try:  # 可选依赖：没有 torch 的机器上内核仍可用
@@ -46,6 +46,8 @@ _TORCH_DTYPE = {
     # 越界值在入口就报错（见 5.181）。
     "int32": i32,
     "int64": i32,
+    # bool 只用于掩码：比较 / where / masked_fill 的条件，不参与算术。
+    "bool": boolean,
 }
 
 #: 导入时允许落成 ``constant`` 节点的最大元素数。与常量折叠的上限同量级：
@@ -61,6 +63,7 @@ _IR_TO_TORCH = {
     "f32": "float32",
     "f64": "float64",
     "i32": "int32",
+    "bool": "bool",
 }
 
 
@@ -108,7 +111,7 @@ def _to_dtype(dtype: Any, row: Optional[TorchCompatibility] = None) -> DType:
         supported = "、".join(sorted(_TORCH_DTYPE))
         raise UnsupportedOperatorError(
             f"不支持的 dtype: {dtype}；矩阵内的 dtype 是 {supported}"
-            "（bool 没有对应的张量语义；int64 会按 i32 承载，越界值在入口拒绝）"
+            "（int64 会按 i32 承载，越界值在入口拒绝）"
         )
     if row is not None and not row.accepts_dtype(key):
         raise UnsupportedOperatorError(
@@ -1631,6 +1634,91 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
         if hasattr(raw, "name"):
             return a(i)
         return _const_like(g, ref, raw, node, what)
+
+    def branch(raw, ref: Value, what: str) -> Value:
+        """where 的某个分支：图内值原样取，Python 标量折成与另一分支同 dtype。
+
+        与 ``operand`` 的差别是分支本身可能就是标量（``torch.where(c, x, 0.0)``），
+        此时 dtype 参照物只能是另一个分支，而不是被选中的那个张量。
+        """
+        if hasattr(raw, "name"):
+            return env[raw.name]
+        return _const_like(g, ref, raw, node, what)
+
+    compare_kind = {
+        "aten.eq": "eq",
+        "aten.ne": "ne",
+        "aten.lt": "lt",
+        "aten.le": "le",
+        "aten.gt": "gt",
+        "aten.ge": "ge",
+    }.get(target.rsplit(".", 1)[0])
+
+    if compare_kind is not None:
+        _reject_unknown_kwargs(node, kwargs, set())
+        x = a(0)
+        y = operand(1, x, "比较的右操作数")
+        if x.type.dtype is not y.type.dtype:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 {compare_kind} 两侧 dtype 不同"
+                f"（{x.type.dtype.value} vs {y.type.dtype.value}）；"
+                "IR 的比较要求同 dtype，请在模型里显式 cast"
+            )
+        return getattr(g, compare_kind)(x, y)
+
+    if target.startswith("aten.where."):
+        _reject_unknown_kwargs(node, kwargs, {"condition", "input", "other"})
+        cond = t(0, "condition")
+        if cond is None:
+            raise UnsupportedOperatorError(f"节点 {node.name} 的 where 缺少 condition")
+        if cond.type.dtype is not DType.BOOL:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 where 条件 dtype 是 {cond.type.dtype.value}；"
+                "IR 的 where 只接受 bool 条件（浮点条件请先显式比较）"
+            )
+        def raw_branch(index: int, key: str):
+            if len(args) > index:
+                return args[index]
+            return kwargs.get(key)
+
+        raw_x = raw_branch(1, "input")
+        raw_y = raw_branch(2, "other")
+        if raw_x is None or raw_y is None:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 where 缺少 input / other 分支"
+            )
+        # 标量分支的 dtype 参照物只能取另一个（张量）分支。
+        if hasattr(raw_x, "name"):
+            x = env[raw_x.name]
+            y = branch(raw_y, x, "where 的 other 分支")
+        else:
+            if not hasattr(raw_y, "name"):
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 where 两个分支都是 Python 标量，"
+                    "推不出 dtype；请把其中一个写成张量"
+                )
+            y = env[raw_y.name]
+            x = _const_like(g, y, raw_x, node, "where 的 input 分支")
+        return g.where(cond, x, y)
+
+    if target in (
+        "aten.masked_fill.Scalar",
+        "aten.masked_fill_.Scalar",
+        "aten.masked_fill.Tensor",
+        "aten.masked_fill_.Tensor",
+    ):
+        # masked_fill(x, mask, v) 的语义是"mask 为真的位置填 v"，即
+        # where(mask, v, x)。没有独立的 masked_fill 内核：掩码选择本来就是
+        # where 的本义，多一个算子只会多一套需要校验的形状规则。
+        x = a(0)
+        mask = a(1)
+        if mask.type.dtype is not DType.BOOL:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 masked_fill 掩码 dtype 是 "
+                f"{mask.type.dtype.value}；IR 只接受 bool 掩码"
+            )
+        value = branch(args[2], x, "masked_fill 的填充值")
+        return g.where(mask, value, x)
 
     if target in ("aten.add.Tensor", "aten.add_.Tensor"):
         # ``add_`` 同理：export 的图是 SSA 的，残差的 ``out += identity`` 只需按

@@ -1214,6 +1214,68 @@ class TestTorchExport(unittest.TestCase):
             self.ref.execute(imported.graph, feed)
 
 
+    # ------------------------------------------------------------------
+    # bool 掩码链路：比较 / where / masked_fill
+    # ------------------------------------------------------------------
+
+    def _roundtrip_args(self, model, args):
+        """多输入版本：按位置喂 numpy，逐位与 eager 比对。"""
+        ep = torch.export.export(model, args)
+        imported = self.import_exported(ep)
+        feed = imported.feed(
+            **{name: arg.detach().numpy() for name, arg in zip(imported.user_inputs, args)}
+        )
+        with torch.no_grad():
+            expected = model(*args).numpy()
+        got = list(self.ref.execute(imported.graph, feed).values())[0]
+        np.testing.assert_array_equal(got, expected)
+        return imported
+
+    def test_masked_fill_lowers_to_where(self):
+        class M(nn.Module):
+            def forward(self, x, mask):
+                return torch.masked_fill(x, mask, 7.5)
+
+        imported = self._roundtrip_args(
+            M().eval(), (torch.randn(3, 4), torch.rand(3, 4) > 0.5)
+        )
+        names = [n.op.name for n in imported.graph.nodes]
+        self.assertIn("where", names)
+        self.assertNotIn("masked_fill", names)
+
+    def test_compare_then_where(self):
+        class M(nn.Module):
+            def forward(self, x, y):
+                return torch.where(x > y, x - y, y - x)
+
+        imported = self._roundtrip_args(M().eval(), (torch.randn(3, 4), torch.randn(3, 4)))
+        names = [n.op.name for n in imported.graph.nodes]
+        self.assertIn("gt", names)
+        self.assertIn("where", names)
+
+    def test_bool_input_flows_through_where(self):
+        class M(nn.Module):
+            def forward(self, x, mask):
+                return torch.where(mask, x, torch.zeros_like(x))
+
+        imported = self._roundtrip_args(
+            M().eval(), (torch.randn(2, 3), torch.rand(2, 3) > 0.5)
+        )
+        # 掩码是用户输入，导出的图里应保留 bool 声明的 placeholder
+        mask = imported.graph.find("mask")
+        self.assertEqual(mask.type.dtype.value, "bool")
+
+    def test_where_requires_bool_condition(self):
+        class M(nn.Module):
+            def forward(self, c, x, y):
+                return torch.where(c > 0, x, y)
+
+        self._roundtrip_args(
+            M().eval(),
+            (torch.randn(2, 3), torch.randn(2, 3), torch.randn(2, 3)),
+        )
+
+
 @unittest.skipUnless(TORCH_AVAILABLE and CUDA_AVAILABLE, "需要 torch 与 GPU")
 class TestTorchExportOnCuda(unittest.TestCase):
     def test_block_matches_on_gpu(self):
@@ -1338,14 +1400,14 @@ class TestTorchCompatMatrix(unittest.TestCase):
 
     @unittest.skipUnless(TORCH_AVAILABLE, "需要 torch")
     def test_dtype_coverage_matches_matrix(self):
-        """bfloat16 与 int64 在矩阵内 → 能导出；bool 不在 → 显式拒绝。"""
+        """矩阵内的 dtype（含 bool 掩码）能导出；矩阵外显式拒绝。"""
         from aetherflow.frontend import TORCH_MATRIX
         from aetherflow.frontend.torch_export import (
             UnsupportedOperatorError,
             _require_torch,
             _to_dtype,
         )
-        from aetherflow.ir.types import bf16, i32
+        from aetherflow.ir.types import bf16, boolean, i32
 
         row = _require_torch()
         self.assertIn(row.span, "、".join(r.span for r in TORCH_MATRIX))
@@ -1353,8 +1415,10 @@ class TestTorchCompatMatrix(unittest.TestCase):
         # IR 只有 i32：int32 无损、int64 收窄（越界值在入口拒绝）
         self.assertIs(_to_dtype(torch.int32), i32)
         self.assertIs(_to_dtype(torch.int64), i32)
+        # bool 只作掩码载体（比较 / where / masked_fill 的条件）
+        self.assertIs(_to_dtype(torch.bool), boolean)
         with self.assertRaisesRegex(UnsupportedOperatorError, "dtype"):
-            _to_dtype(torch.bool)
+            _to_dtype(torch.complex64)
 
 
 if __name__ == "__main__":
