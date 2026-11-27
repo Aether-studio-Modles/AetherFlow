@@ -27,9 +27,9 @@
   **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
   decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
-  分页 KV cache（含换出 / 换入与 LRU 调度）与贪心投机解码（组件级，
-  见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：`/v1/completions`、
-  `/v1/chat/completions`、SSE 流式）。
+  分页 KV cache（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制）与贪心投机
+  解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：
+  `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
   roofline 式成本模型（用于排序，不做性能预测）、Chrome Trace 导出。
 - **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）；
@@ -87,7 +87,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 2995 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3005 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 
@@ -140,9 +140,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   Mamba，没有随上下文增长的 KV。分页缓存已带换出 / 换入与 LRU 调度：`PagedCacheManager`
   在容量不足时换出最久未使用且未 pin 的序列、被访问时自动换回（`pin` 保护正在
   解码的请求）；`PagedDecodeScheduler` 把多序列交错解码接在同一张单步图上，
-  `suspend` / `resume` 对应解除保护与换入。两者都是主机态组件，没有真机
-  D2H 开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机只支持贪心验收与
-  `batch=1`。
+  `suspend` / `resume` 对应解除保护与换入。`fork` 让多条序列共享同一批物理页、
+  写入时按页拆分（块级引用计数），适合同前缀多路采样 / 束搜索 / 同系统提示的
+  多请求；它是显式动作，不做前缀内容匹配。三者都是主机态组件，没有真机
+  D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机只支持贪心
+  验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
   `response_format` / 非 0 penalty 显式 400。认证是**静态单密钥** Bearer
   （`api_key=...`，`/healthz` 免认证，`hmac.compare_digest` 比较），限流是
@@ -519,6 +521,18 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   会在页不足时留下半条序列。
 - **`free` 要同时清 `_order` 与 `_pinned`**（5.306）：id 复用是常态，残留的
   使用顺序会让新序列"一出生就是最久未使用"，残留 pin 则让它永远不被换出。
+- **"放手"和"腾出"必须分开算**（5.307）：页被多条序列共享时，`truncate` /
+  `reset` / `swap_out` 返回"块表里放手了几页"会骗人。统一改成返回**实际回到
+  空闲链**的页数（共享页只减引用），一条全共享的序列换出后返回 0。想让换出
+  腾出容量就直接读这个返回值，别拿块表长度当容量。
+- **拆页只拆被写到的页**（5.307）：追加落到全新页时不需要拆；落回共享的尾页
+  才拆。整条 `fork` 时全拆等于没共享，而"写前不查引用"会让两条序列互相覆盖。
+- **拆页的页数要进容量检查**（5.307）：`append` 必须把"新增页 + 要拆的共享页"
+  一起和空闲页比，拆到一半失败会留下引用计数与块表不一致的缓存，比直接抛
+  `PagedCacheFullError` 难查得多。
+- **自动换出要跳过全共享序列**（5.307）：LRU 先搬走一条 `exclusive_blocks == 0`
+  的父序列，腾出零页、再搬下一条，白多一次换出还抬高 `swaps_out`。用
+  `exclusive_blocks` 预筛，保证每次自动换出都真的腾出页。
 - **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
   单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
   `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
