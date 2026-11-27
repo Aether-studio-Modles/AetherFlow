@@ -315,6 +315,8 @@ class PagedDecodeScheduler:
       所以所有已提交序列的总长度可以超过池容量；
     - :meth:`suspend` 解除 pin，让这条序列成为换出候选；:meth:`resume` 先换入
       再 pin 回来。挂起期间数据留在主机副本里，恢复后逐位继续；
+    - :meth:`fork` 让一条新序列共享父序列的前缀（块级写时复制），同提示的多路
+      采样 / 束搜索不必各存一份 K/V；
     - :meth:`finish` 回收序列与页。
 
     **失败面**：所有序列都 active（pinned）且池满时，``step`` / ``resume`` 抛
@@ -429,6 +431,27 @@ class PagedDecodeScheduler:
         self.cache.allocate(rid)
         self.cache.pin(rid)
         self._state[rid] = "active"
+
+    def fork(self, parent: int, child: int) -> None:
+        """把 ``parent`` 已解码的前缀共享给新的 ``child``，之后各自解码。
+
+        两条序列指向同一批物理页（块级写时复制），不额外占页；任一方之后
+        ``step`` 都会先拆开被写的尾页，所以各自的 K/V 不会互相覆盖。子序列
+        同样是 active（会被 pin），也要自己 ``suspend`` / ``finish``。
+
+        ``parent`` 必须已提交且驻留：换出态请先 :meth:`resume`。``child`` 必须
+        是没提交过的 id。典型用法是同一提示下的多路采样与束搜索。
+        """
+        self._require(parent)
+        if child in self._state:
+            raise ValueError(f"序列 {child!r} 已经提交；fork 需要一个新的 id")
+        if self.cache.is_swapped(parent):
+            raise ValueError(
+                f"序列 {parent!r} 已换出；先 resume({parent}) 再 fork"
+            )
+        self.cache.fork(parent, child)
+        self.cache.pin(child)
+        self._state[child] = "active"
 
     def step(self, rid: int, x) -> np.ndarray:
         """解一个 token，返回长度为 ``d_model`` 的隐状态。

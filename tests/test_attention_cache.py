@@ -244,6 +244,62 @@ class TestPagedDecodeScheduler(unittest.TestCase):
             np.stack(got), _dense(xs, params, spec)[0], rtol=1e-4, atol=1e-5
         )
 
+    def test_fork_shares_prefix_then_diverges(self):
+        spec = _spec()
+        params = _params(spec, seed=17)
+        rng = np.random.default_rng(41)
+        prefix = rng.standard_normal((2, spec.d_model)).astype(np.float32) * 0.5
+        tail_a = rng.standard_normal((3, spec.d_model)).astype(np.float32) * 0.5
+        tail_b = rng.standard_normal((3, spec.d_model)).astype(np.float32) * 0.5
+        xs_a = np.concatenate([prefix, tail_a])
+        xs_b = np.concatenate([prefix, tail_b])
+        sched = self._scheduler(spec, params, num_blocks=8, block_size=2, max_steps=5)
+        sched.submit(1)
+        got_prefix = self._stream(sched, 1, prefix)
+        used = sched.stats()["used_blocks"]
+        sched.fork(1, 2)
+        info = sched.stats()
+        self.assertEqual(info["used_blocks"], used)  # 分叉不额外占页
+        self.assertEqual(info["shared_blocks"], used)
+        self.assertEqual(info["forks"], 1)
+        self.assertEqual(info["active_sequences"], 2)
+        self.assertEqual(sched.length(2), 2)
+        got_a, got_b = [], []
+        for t in range(3):
+            got_a.append(sched.step(1, tail_a[t]))
+            got_b.append(sched.step(2, tail_b[t]))
+        np.testing.assert_allclose(
+            np.concatenate([got_prefix, np.stack(got_a)]),
+            _dense(xs_a, params, spec)[0],
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.concatenate([got_prefix, np.stack(got_b)]),
+            _dense(xs_b, params, spec)[0],
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        self.assertEqual(sched.length(1), 5)
+        self.assertEqual(sched.length(2), 5)
+
+    def test_fork_rejections(self):
+        spec = _spec()
+        params = _params(spec)
+        sched = self._scheduler(spec, params, num_blocks=4, block_size=2, max_steps=4)
+        with self.assertRaises(KeyError):
+            sched.fork(9, 1)
+        sched.submit(1)
+        sched.submit(3)
+        with self.assertRaisesRegex(ValueError, "已经提交"):
+            sched.fork(1, 3)
+        rng = np.random.default_rng(3)
+        xs = rng.standard_normal((2, spec.d_model)).astype(np.float32) * 0.5
+        self._stream(sched, 1, xs)
+        sched.suspend(1, evict=True)
+        with self.assertRaisesRegex(ValueError, "resume"):
+            sched.fork(1, 2)
+
     def test_rejections_and_id_reuse(self):
         spec = _spec()
         params = _params(spec)
