@@ -244,5 +244,123 @@ class TestPagedKVCache(unittest.TestCase):
             )
 
 
+class TestSwap(unittest.TestCase):
+    """换出 / 换入：释放物理页、保留主机副本，换回后逐位一致。
+
+    判据只有一条是数值的（换入后的 ``gather`` 必须与换出前相同），其余都是
+    容量语义：换出的页能被别的序列拿走、换入页不够时保持换出态、换出期间
+    读写被显式拒绝。
+    """
+
+    def test_swap_out_and_back_preserves_values(self):
+        cache = _cache(num_blocks=6, block_size=2, layers=2)
+        cache.allocate(1)
+        _append(cache, 1, 5, seed=3)
+        before = [cache.gather(1, layer) for layer in range(cache.num_layers)]
+        self.assertEqual(cache.swap_out(1), 3)
+        self.assertEqual(cache.used_blocks, 0)
+        self.assertEqual(cache.free_blocks, 6)
+        self.assertEqual(cache.length(1), 5)
+        self.assertTrue(cache.is_swapped(1))
+        self.assertEqual(cache.swapped_tokens, 5)
+        self.assertEqual(cache.block_table(1), ())
+        self.assertEqual(cache.stats()["swapped_sequences"], 1)
+        self.assertEqual(cache.swap_in(1), 3)
+        self.assertFalse(cache.is_swapped(1))
+        self.assertEqual(cache.used_blocks, 3)
+        self.assertEqual(cache.swapped_tokens, 0)
+        for layer, (want_k, want_v) in enumerate(before):
+            got_k, got_v = cache.gather(1, layer)
+            np.testing.assert_array_equal(got_k, want_k)
+            np.testing.assert_array_equal(got_v, want_v)
+
+    def test_swapped_pages_are_reusable_and_swap_in_keeps_state(self):
+        cache = _cache(num_blocks=2, block_size=2)
+        cache.allocate(1)
+        _append(cache, 1, 4, seed=1)
+        want = cache.gather(1, 0)[0]
+        cache.swap_out(1)
+
+        cache.allocate(2)
+        _append(cache, 2, 4, seed=9)
+        self.assertEqual(cache.free_blocks, 0)
+        with self.assertRaises(PagedCacheFullError):
+            cache.swap_in(1)
+        # 失败必须原样保留：仍然是换出态，长度与主机副本都在
+        self.assertTrue(cache.is_swapped(1))
+        self.assertEqual(cache.length(1), 4)
+        self.assertEqual(cache.used_blocks, 2)
+
+        cache.free(2)
+        self.assertEqual(cache.swap_in(1), 2)
+        np.testing.assert_array_equal(cache.gather(1, 0)[0], want)
+
+    def test_swapped_sequence_rejects_reads_and_writes(self):
+        cache = _cache()
+        cache.allocate(1)
+        _append(cache, 1, 3, seed=2)
+        cache.swap_out(1)
+        with self.assertRaisesRegex(ValueError, "已换出"):
+            cache.gather(1, 0)
+        with self.assertRaisesRegex(ValueError, "已换出"):
+            _append(cache, 1, 1)
+        self.assertEqual(cache.length(1), 3)
+
+    def test_truncate_swapped_copy_then_swap_in(self):
+        cache = _cache(num_blocks=4, block_size=2)
+        cache.allocate(1)
+        keys, values = _append(cache, 1, 5, seed=4)
+        cache.swap_out(1)
+        self.assertEqual(cache.truncate(1, 3), 0)
+        self.assertEqual(cache.length(1), 3)
+        self.assertEqual(cache.swapped_tokens, 3)
+        self.assertEqual(cache.swap_in(1), 2)
+        np.testing.assert_array_equal(cache.gather(1, 0)[0], keys[0][:3])
+        np.testing.assert_array_equal(cache.gather(1, 1)[1], values[1][:3])
+        # 换入后可以继续追加，长度接着走
+        _append(cache, 1, 2, seed=7)
+        self.assertEqual(cache.length(1), 5)
+
+    def test_reset_and_free_drop_swapped_copy(self):
+        cache = _cache()
+        cache.allocate(1)
+        _append(cache, 1, 3, seed=5)
+        cache.swap_out(1)
+        self.assertEqual(cache.reset(1), 0)
+        self.assertFalse(cache.is_swapped(1))
+        self.assertEqual(cache.length(1), 0)
+        self.assertEqual(cache.swapped_tokens, 0)
+        _append(cache, 1, 2, seed=6)
+        self.assertEqual(cache.length(1), 2)
+
+        cache.swap_out(1)
+        self.assertTrue(cache.free(1))
+        self.assertNotIn(1, cache)
+        self.assertEqual(cache.swapped_tokens, 0)
+        self.assertEqual(cache.free_blocks, 4)
+
+    def test_swap_rejections(self):
+        cache = _cache()
+        with self.assertRaises(KeyError):
+            cache.swap_out(9)
+        cache.allocate(1)
+        with self.assertRaisesRegex(ValueError, "没有换出"):
+            cache.swap_in(1)
+        _append(cache, 1, 1)
+        cache.swap_out(1)
+        with self.assertRaisesRegex(ValueError, "已经换出"):
+            cache.swap_out(1)
+
+    def test_single_layer_swap(self):
+        cache = _cache(num_blocks=4, block_size=2, layers=1)
+        cache.allocate(1)
+        keys, values = _append(cache, 1, 3, seed=8)
+        cache.swap_out(1)
+        self.assertEqual(cache.swap_in(1), 2)
+        got_k, got_v = cache.gather(1, 0)
+        np.testing.assert_array_equal(got_k, keys[0])
+        np.testing.assert_array_equal(got_v, values[0])
+
+
 if __name__ == "__main__":
     unittest.main()

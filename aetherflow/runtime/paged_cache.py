@@ -5,9 +5,10 @@
 
 - 物理存储是每层一份 ``(num_blocks, block_size, num_heads, head_dim)`` 的数组；
 - 每条序列只持有一张**块表**（逻辑页号 → 物理页号），页从一张空闲链上领；
-- 对外只有"追加 / 取回 / 回滚 / 回收"四个动作，取回时按块表拼成连续张量。
+- 对外只有"追加 / 取回 / 回滚 / 回收 / 换出 / 换入"六个动作，取回时按块表
+  拼成连续张量。
 
-三条结构性事实（都是"不满足就必须显式报错"的那类）：
+四条结构性事实（都是"不满足就必须显式报错"的那类）：
 
 1. **追加是全有或全无的。** 一次追加需要的新页在写入前一次性领齐；空闲页不够
    就抛 :class:`PagedCacheFullError`，**不留下半条序列**。留下半段比直接失败更
@@ -16,6 +17,9 @@
    不能缓存 ``gather`` 之外的东西；``gather`` 返回的是**副本**，不是视图。
 3. **回滚按页对齐回收。** ``truncate`` 只释放长度之外的整页，页内残留数据不
    清零——它永远在 ``length`` 之外，``gather`` 不会返回。清零是纯浪费。
+4. **换出只搬数据，不改长度。** ``swap_out`` 把整条序列的 K/V 拷一份到主机、
+   释放物理页；``swap_in`` 重新领页并写回，页号可能与换出前不同，数值不变。
+   换出期间块表为空，所以只允许查长度，读写一律显式要求先换入。
 
 **这一层不负责数值算子的实现。** 它只提供"按块表取回一段连续 K/V"的存储语义，
 真正的 attention 由 :mod:`aetherflow.models.cached_attention` 用 IR 表达。当前
@@ -94,6 +98,11 @@ class PagedKVCache:
         # 每层懒分配：只用了 2 层就只占 2 层的显存。
         self._keys: Dict[int, np.ndarray] = {}
         self._values: Dict[int, np.ndarray] = {}
+        # 换出到主机的 K/V：rid → (层号表, 每层 keys, 每层 values, 长度)。
+        # 只记录**已经分配过**的层，未用过的层换出后仍然不占空间。
+        self._swapped: Dict[
+            int, Tuple[List[int], List[np.ndarray], List[np.ndarray], int]
+        ] = {}
         self._peak_blocks = 0
 
     # -- 只读视图 -----------------------------------------------------
@@ -137,6 +146,19 @@ class PagedKVCache:
         except KeyError:
             raise KeyError(f"序列 {rid!r} 没有分配页；先 allocate(rid)") from None
 
+    def is_swapped(self, rid: int) -> bool:
+        """``rid`` 是否处于换出状态（没有物理页，只有主机副本）。
+
+        换出态仍然是"已分配"（``rid in cache`` 为真、长度可查），但
+        ``append`` / ``gather`` 会显式要求先 :meth:`swap_in`。
+        """
+        return rid in self._swapped
+
+    @property
+    def swapped_tokens(self) -> int:
+        """换出到主机的 token 总数（按序列长度累加，不是页数）。"""
+        return sum(item[3] for item in self._swapped.values())
+
     def stats(self) -> Dict[str, int]:
         """一眼看清占用：页数、空闲页、页大小、序列数、历史峰值。"""
         return {
@@ -146,6 +168,8 @@ class PagedKVCache:
             "free_blocks": self.free_blocks,
             "peak_blocks": self._peak_blocks,
             "sequences": self.num_sequences,
+            "swapped_sequences": len(self._swapped),
+            "swapped_tokens": self.swapped_tokens,
         }
 
     # -- 生命周期 -----------------------------------------------------
@@ -168,6 +192,7 @@ class PagedKVCache:
         if table is None:
             return False
         self._lengths.pop(rid, None)
+        self._swapped.pop(rid, None)  # 换出态没有物理页，只丢弃主机副本
         for block in table:
             self._free.append(block)
         return True
@@ -175,6 +200,10 @@ class PagedKVCache:
     def reset(self, rid: int) -> int:
         """把序列长度清零并回收其全部页，但保留分配；返回回收的页数。"""
         self.length(rid)  # 未分配时显式抛 KeyError
+        if self._swapped.pop(rid, None) is not None:
+            # 换出态：页已在换出时归还，这里只丢弃主机副本。
+            self._lengths[rid] = 0
+            return 0
         table = self._tables[rid]
         freed = len(table)
         self._free.extend(table)
@@ -198,6 +227,18 @@ class PagedKVCache:
                 f"truncate 只能缩短：当前 {current}，要求 {length}；"
                 "要追加请用 append"
             )
+        if rid in self._swapped:
+            # 换出态没有物理页；直接裁剪主机副本，不涉及页回收。
+            if length < current:
+                layers, keys, values, _ = self._swapped[rid]
+                self._swapped[rid] = (
+                    layers,
+                    [item[:length].copy() for item in keys],
+                    [item[:length].copy() for item in values],
+                    length,
+                )
+                self._lengths[rid] = length
+            return 0
         table = self._tables[rid]
         keep = _pages_for(length, self.block_size)
         freed = table[keep:]
@@ -205,6 +246,68 @@ class PagedKVCache:
         self._free.extend(freed)
         self._lengths[rid] = length
         return len(freed)
+
+    # -- 换出与换入 ---------------------------------------------------
+
+    def swap_out(self, rid: int) -> int:
+        """把整条序列的 K/V 拷到主机暂存并释放物理页，返回释放的页数。
+
+        换出后长度不变、仍然是"已分配"，但块表为空：``append`` / ``gather``
+        会显式要求先 :meth:`swap_in`，只有 ``length`` / ``is_swapped`` 可查。
+        暂存的是副本，且只覆盖**已经分配过**的层——从没用过的层换出后仍然
+        不占空间。
+
+        这一层不做真正的 D2H：缓存本身就在主机内存，"搬到主机"是把页归还
+        空闲链、把副本挂到序列上。真机上的显存换出由上层按同一语义执行。
+        """
+        current = self.length(rid)
+        if rid in self._swapped:
+            raise ValueError(f"序列 {rid} 已经换出；重复换出会覆盖主机副本")
+        layers = [layer for layer in range(self.num_layers) if layer in self._keys]
+        keys: List[np.ndarray] = []
+        values: List[np.ndarray] = []
+        for layer in layers:
+            key, value = self.gather(rid, layer)
+            keys.append(key)
+            values.append(value)
+        table = self._tables[rid]
+        freed = len(table)
+        self._free.extend(table)
+        self._tables[rid] = []
+        self._swapped[rid] = (layers, keys, values, current)
+        return freed
+
+    def swap_in(self, rid: int) -> int:
+        """把换出的序列换回物理页，返回本次领取的页数。
+
+        页不够时抛 :class:`PagedCacheFullError`，序列保持换出态（主机副本
+        原样保留，腾出页后可以再试）。换入的页号与换出前无关：块表按当前
+        空闲链重新分配。
+        """
+        self.length(rid)  # 未分配时显式抛 KeyError
+        item = self._swapped.get(rid)
+        if item is None:
+            raise ValueError(f"序列 {rid} 没有换出；swap_in 只接受换出态")
+        layers, keys, values, length = item
+        need = _pages_for(length, self.block_size)
+        if need > len(self._free):
+            raise PagedCacheFullError(
+                f"换入序列 {rid} 需要 {need} 个页，空闲页只有 "
+                f"{len(self._free)}（block_size={self.block_size}）；"
+                "序列保持换出态，腾出页后可重试"
+            )
+        table = [self._free.pop() for _ in range(need)]
+        for layer, key, value in zip(layers, keys, values):
+            store_keys, store_values = self._layer_arrays(layer)
+            for position in range(length):
+                page, slot = divmod(position, self.block_size)
+                physical = table[page]
+                store_keys[physical, slot] = key[position]
+                store_values[physical, slot] = value[position]
+        self._tables[rid] = table
+        del self._swapped[rid]
+        self._peak_blocks = max(self._peak_blocks, self.used_blocks)
+        return need
 
     # -- 写入与读取 ---------------------------------------------------
 
@@ -247,6 +350,10 @@ class PagedKVCache:
         ``num_layers=1`` 时也接受单个 ``(T, H, D)`` 数组，省掉一层列表。
         """
         current = self.length(rid)
+        if rid in self._swapped:
+            raise ValueError(
+                f"序列 {rid} 已换出到主机；先 swap_in 再追加"
+            )
         if self.num_layers == 1 and isinstance(keys, np.ndarray):
             key_list: List[object] = [keys]
             value_list: List[object] = [values]
@@ -311,6 +418,10 @@ class PagedKVCache:
         返回的数组是**副本**：页随时可能被别的序列拿走。
         """
         length = self.length(rid)
+        if rid in self._swapped:
+            raise ValueError(
+                f"序列 {rid} 已换出到主机；先 swap_in 再取回"
+            )
         if pad_to is None:
             width = length
         else:
