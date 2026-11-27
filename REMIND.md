@@ -27,7 +27,7 @@
   **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
   decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
-  分页 KV cache 与贪心投机解码（组件级，
+  分页 KV cache（含换出 / 换入与 LRU 调度）与贪心投机解码（组件级，
   见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：`/v1/completions`、
   `/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
@@ -87,7 +87,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 2865 个用例，444 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 2995 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 
@@ -137,7 +137,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   捕获计划、分段重算、需要把若干维合并成二维的广播反向（`sum_axes`）以及 torch
   导入的 SymInt 仍要求静态形状，入口显式拒绝（契约表见 DESIGN 5.217 / 5.275）。
 - **推理**：分页 KV cache 与投机解码是组件级交付，**未接进 `LMRunner`**——主干是
-  Mamba，没有随上下文增长的 KV。投机只支持贪心验收与 `batch=1`。
+  Mamba，没有随上下文增长的 KV。分页缓存已带换出 / 换入与 LRU 调度：`PagedCacheManager`
+  在容量不足时换出最久未使用且未 pin 的序列、被访问时自动换回（`pin` 保护正在
+  解码的请求）；`PagedDecodeScheduler` 把多序列交错解码接在同一张单步图上，
+  `suspend` / `resume` 对应解除保护与换入。两者都是主机态组件，没有真机
+  D2H 开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机只支持贪心验收与
+  `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
   `response_format` / 非 0 penalty 显式 400。认证是**静态单密钥** Bearer
   （`api_key=...`，`/healthz` 免认证，`hmac.compare_digest` 比较），限流是
@@ -502,6 +507,18 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **三个 topk 入口统一用 `void* outp`**（5.305）：values / mask 输出 `%T%*`、
   indices 输出 `int*`，签名无法一致；在 `extern "C"` 入口内各自转一次类型，
   device 函数保持一份，避免三份几乎相同的 k 轮选择逻辑各自漂移。
+- **换出候选要跳过"已换出"和"长度 0"**（5.306）：LRU 循环里不跳过这两类，
+  `_evict_one` 会返回"换出了一条"却没腾出任何页，外层重试循环看起来在推进、
+  实际原地打转。管理器保证每轮至少换出一条真正占页的序列，重试次数才有
+  "序列数 + 1"的上界。
+- **pin 只约束自动换出，不约束显式 `evict`**（5.306）：服务层的约定是
+  active 序列 pin、挂起序列 unpin；调用方明确要求换出时（`suspend(evict=True)`）
+  越过 pin 是预期行为。把两者混成一个"不可换出"标志会让挂起与回收互相挡住。
+- **解码步要"先算后写"**（5.306）：`step` 先执行单步图、再 `append` 写回，
+  失败时序列长度与 K/V 都不变，重试同一步不会重复计数。写成"先写占位再算"
+  会在页不足时留下半条序列。
+- **`free` 要同时清 `_order` 与 `_pinned`**（5.306）：id 复用是常态，残留的
+  使用顺序会让新序列"一出生就是最久未使用"，残留 pin 则让它永远不被换出。
 - **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
   单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
   `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
