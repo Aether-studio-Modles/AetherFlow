@@ -16,7 +16,7 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：71 个 IR 算子，CUDA / HIP 各自承接 68 个；
+- **一份语义 IR，多个硬件后端**：72 个 IR 算子，CUDA / HIP 各自承接 69 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
@@ -32,8 +32,9 @@
   `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
   roofline 式成本模型（用于排序，不做性能预测）、Chrome Trace 导出。
-- **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）与 W8A8 的
-  参考语义（`linear_i8a8`：int32 累加后乘两个 scale；设备端未承接）；
+- **量化与布局**：weight-only int8（权重驻留 1 字节，计算仍在 f32）与 W8A8
+  （`linear_i8a8`：int32 累加后乘两个 scale，CUDA 走 `__dp4a`、HIP 标量乘加，
+  V100 真机与参考逐位相等）；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 
 ### 安装
@@ -91,6 +92,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 | 参考 | Windows / Python 3.14 | 3020 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
+| CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（128 executed / 2 refused / 0 failed，`linear_i8a8_bias` 误差 0）与 `verify_cuda.py`（含两条 W8A8 边界用例），全过；未跑全量 unittest |
 
 ```bash
 # 本地全量
@@ -115,10 +117,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   机器、未执行。ZeRO-1/2/3 与流水部分参见 DESIGN §7。
 - **张量并行**：只有前向（列 / 行并行 + attention 头切分）。行并行返回**部分和**，
   需调用方归约；反向通信与优化器分片未接。
-- **量化**：weight-only int8（权重驻留 1 字节，GEMM 仍走 f32 反量化）与 W8A8 的
-  **参考语义**（`linear_i8a8` + `quantize_activation`：int8 激活 × int8 权重先在
-  int32 里累加，再乘激活 / 权重两个 scale）。W8A8 **没有设备内核**，CUDA / HIP
-  对它显式拒绝（conformance 记为 refused），所以仍然**不要期待"int8 算得更快"**；
+- **量化**：weight-only int8（权重驻留 1 字节，GEMM 仍走 f32 反量化）与 W8A8
+  （`linear_i8a8` + `quantize_activation`：int8 激活 × int8 权重先在 int32 里
+  累加，再乘激活 / 权重两个 scale）。CUDA / HIP **已有设备内核**（CUDA 走
+  `__dp4a`，HIP 走标量乘加，V100 真机与参考逐位相等，5.309）；但它不是 int8
+  tensor core（没有 IMMA / wmma 分块），**不要期待"int8 算得更快"的结论**；
   无 fp8、无 QAT、无非对称零点，W8A8 也尚无反向（bias 除外）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
   显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
@@ -551,11 +554,27 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **只有参考实现的新算子也要有 conformance 形态**（5.308）：`covered_ops`
   必须覆盖全部 IR 算子；设备端没有内核时，形态会被记成 refused，这是**显式
   拒绝**的正常路径，不要为了凑 executed 数量而在设备上退回 f32 累加。
-- **远端 V100 的现状**（5.304）：`223.109.239.32:20824`（root，凭证见会话），
-  单卡 V100 32GB；python3.10.12 + cupy 14.2.0 + numpy 2.2.6。同步方式是本地
+- **同名相近的两套累加语义要分开立形态**（5.309）：`linear_i8` 是"读 i8 权重、
+  反量化后走 f32 GEMM"，`linear_i8a8` 是"i8 输入、int32 累加"。K=512 的用例已
+  证明两者数值不同，conformance 不能用一个覆盖另一个。
+- **共享签名、分叉实现是跨厂商 int8 的正确姿势**（5.309）：CUDA 直接用
+  `__dp4a`（sm_61+，V100 实测编译通过），HIP 的 hipRTC 不带 `hip_runtime.h`，
+  用标量乘加。两条路都是精确整数运算，累加逐位相同——分叉的只是指令，不是语义。
+- **设备端的形状校验不能省**（5.309）：IR 已保证 `x_scale` 是"前导维 + 1"，
+  但设备执行也可能来自手工构图或旧序列化图；把 dtype / 形状 / 长度再查一遍，
+  让错误报成语义错误而不是越界读。
+- **整次 `execute` 的墙钟不能当内核吞吐**（5.309）：512³ 的中位 1.14 ms 包含
+  图查找、传输与启动；文档里必须写清口径，否则就成了没有依据的"加速"。
+- **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
+  移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
+  账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100
+  32GB / compute_cap 7.0 / sm_70，CUDA 12.9）；python3.10.12 + cupy 14.2.0 +
+  numpy 2.2.6。同步方式是本地
   `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
   paramiko SFTP 上传 → `/root/afv2` 解压；`python3 -m unittest
   tests.test_cuda_backend tests.test_cuda_train` 383 条 2.9 秒全过。
+  5.309 的 W8A8 验证用同一套同步，跑 `python3 verify_cuda.py`（完整
+  conformance + 边界用例）与一段临时对拍脚本（7 种形态逐位比对，跑完删除）。
   SSH 偶发 `banner` 被重置，连接要带 3–5 次重试，别把一次失败当环境坏了。
 
 ---
