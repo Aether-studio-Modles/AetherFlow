@@ -1366,6 +1366,37 @@ def _topk_mask(ctx):
     return (None,) * len(ctx.node.inputs)
 
 
+@vjp("topk_values")
+def _topk_values(ctx):
+    """``topk_values`` 对 x 求导：把 dy 散射回被选中的位置。
+
+    下标是离散比较的结果，不能对 x 求导，但"哪个位置被选中"本身是常量，
+    所以 values 这条路径上的梯度是良定义的——与 ``gather`` 同一个形状：
+    ``gather_backward`` 用重复下标累加。反向重算一遍 ``topk_indices`` 而不是
+    在前向保存下标，代价是排序算两次，换来的是反向图不依赖前向中间量。
+
+    ``x`` 的形状必须静态（``x_shape`` 要写进反向节点的属性），与 ``gather``
+    的 ``x_shape`` 同一条理由；含符号维时明确报"没有定义梯度"。
+    """
+    shape = _static(ctx.input(0), "topk_values")
+    axis = int(ctx.attrs.get("axis", -1))
+    if axis < 0:
+        axis += len(shape)
+    k = int(ctx.attrs["k"])
+    idx = ctx.b.add_node("topk_indices", [ctx.input(0)], {"k": k, "axis": axis})
+    return (
+        ctx.b.add_node(
+            "gather_backward", [ctx.g, idx], {"x_shape": list(shape), "dim": axis}
+        ),
+    )
+
+
+@vjp("topk_indices")
+def _topk_indices(ctx):
+    """下标是离散结果，不可导；输出 i32，本来也不会进浮点反传。"""
+    return (None,) * len(ctx.node.inputs)
+
+
 # --------------------------------------------------------------------------
 # 安装
 # --------------------------------------------------------------------------

@@ -15,7 +15,16 @@ import unittest
 
 import numpy as np
 
-from aetherflow import Graph, NoGradientError, ReferenceBackend, backward, f32, f64, i32
+from aetherflow import (
+    Graph,
+    NoGradientError,
+    ReferenceBackend,
+    backward,
+    boolean,
+    f32,
+    f64,
+    i32,
+)
 
 
 BACKEND = ReferenceBackend()
@@ -1157,6 +1166,82 @@ class TestRounding(unittest.TestCase):
 
         for name in ("sign", "round", "floor", "ceil"):
             self.assertIn(name, RULES)
+
+
+class TestTopK(unittest.TestCase):
+    """topk_values / topk_indices 的参考语义。
+
+    三条判据：值降序、并列时小下标优先（稳定排序）、NaN 当作最大值
+    （``torch.topk`` 的口径）。三者分别写在独立用例里，因为设备端将来
+    实现时最容易在并列与 NaN 上分叉。
+    """
+
+    def _run_pair(self, values, k, axis=-1):
+        values = np.asarray(values, dtype=np.float64)
+        g = Graph("topk")
+        x = g.input("x", f64[values.shape])
+        attrs = {"k": k, "axis": axis}
+        g.output(g.add_node("topk_values", [x], dict(attrs)), "v")
+        g.output(g.add_node("topk_indices", [x], dict(attrs)), "i")
+        out = _run(g, {"x": values})
+        return out["v"], out["i"]
+
+    def test_descending_with_indices(self):
+        xs = np.array([[1.0, 3.0, 5.0, 2.0], [9.0, 0.0, 7.0, 4.0]])
+        v, i = self._run_pair(xs, 2)
+        np.testing.assert_array_equal(v, np.array([[5.0, 3.0], [9.0, 7.0]]))
+        np.testing.assert_array_equal(i, np.array([[2, 1], [0, 2]]))
+        self.assertEqual(i.dtype, np.int32)
+
+    def test_ties_prefer_smaller_index(self):
+        v, i = self._run_pair([2.0, 2.0, 1.0], 2)
+        np.testing.assert_array_equal(v, [2.0, 2.0])
+        np.testing.assert_array_equal(i, [0, 1])
+
+    def test_axis0_and_full_k(self):
+        xs = np.array([[1.0, 4.0], [3.0, 2.0]])
+        v, i = self._run_pair(xs, 2, axis=0)
+        np.testing.assert_array_equal(v, np.array([[3.0, 4.0], [1.0, 2.0]]))
+        np.testing.assert_array_equal(i, np.array([[1, 0], [0, 1]]))
+        # k 等于轴长时退化成一次全排序
+        v2, i2 = self._run_pair(xs, 2, axis=1)
+        np.testing.assert_array_equal(v2, np.array([[4.0, 1.0], [3.0, 2.0]]))
+        np.testing.assert_array_equal(i2, np.array([[1, 0], [0, 1]]))
+
+    def test_nan_counts_as_largest(self):
+        _, i = self._run_pair([1.0, np.nan, 3.0], 2)
+        np.testing.assert_array_equal(i, [1, 2])
+
+    def test_gradient_scatters_back_to_picked_positions(self):
+        xs = np.array([[1.0, 5.0, 3.0, 9.0]])
+        g = Graph("topk_grad")
+        x = g.input("x", f64[xs.shape])
+        g.output(g.add_node("topk_values", [x], {"k": 2, "axis": 1}), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_array_equal(dx, np.array([[0.0, 1.0, 0.0, 1.0]]))
+
+    def test_indices_are_not_differentiable(self):
+        g = Graph("topk_indices_grad")
+        x = g.input("x", f64[4])
+        g.output(g.add_node("topk_indices", [x], {"k": 2}), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[g.find("x")])
+
+    def test_rejects_bad_attrs(self):
+        g = Graph("topk_bad")
+        x = g.input("x", f64[3])
+        for attrs, exc in (
+            ({"k": 0}, ValueError),
+            ({"k": 4}, ValueError),
+            ({"k": 1.5}, TypeError),
+            ({"k": 1, "axis": (0, 1)}, ValueError),
+        ):
+            with self.subTest(attrs=attrs):
+                with self.assertRaises(exc):
+                    g.add_node("topk_values", [x], dict(attrs))
+        mask = g.input("m", boolean[3])
+        with self.assertRaises(TypeError):
+            g.add_node("topk_indices", [mask], {"k": 1})
 
 
 if __name__ == "__main__":

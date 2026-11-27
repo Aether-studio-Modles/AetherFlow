@@ -446,6 +446,26 @@ def _topk_mask(k: int = 2, axis: int = -1, shape: tuple = (3, 5)):
     return build
 
 
+def _topk_values(k: int = 2, axis: int = -1, shape: tuple = (3, 5)):
+    def build(rng):
+        g = Graph("topk_values")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("topk_values", [x], {"k": k, "axis": axis}), "y")
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
+def _topk_indices(k: int = 2, axis: int = -1, shape: tuple = (3, 5)):
+    def build(rng):
+        g = Graph("topk_indices")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("topk_indices", [x], {"k": k, "axis": axis}), "y")
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
 def _reshape():
     def build(rng):
         g = Graph("reshape")
@@ -1468,6 +1488,13 @@ def default_cases() -> List[Case]:
         _case("topk_mask_last", _topk_mask(), rtol=0.0, atol=0.0,
               note="路由掩码：输出 0/1，必须精确相等；同值按下标小者优先（稳定排序）"),
         _case("topk_mask_axis0", _topk_mask(k=1, axis=0, shape=(4, 3)),
+              rtol=0.0, atol=0.0),
+        _case("topk_values_last", _topk_values(),
+              note="前 k 大的值：降序，并列时小下标优先（稳定排序）"),
+        _case("topk_values_axis0", _topk_values(k=3, axis=0, shape=(4, 3))),
+        _case("topk_indices_last", _topk_indices(), rtol=0.0, atol=0.0,
+              note="输出 i32 下标：必须精确相等，顺序与 topk_values 一致"),
+        _case("topk_indices_axis0", _topk_indices(k=1, axis=0, shape=(4, 3)),
               rtol=0.0, atol=0.0),
         _case("reduce_sum_multi_axis", _reduce_sum(axis=(0, 2), shape=(3, 4, 5)),
               note="多轴归约：置换到 [keep..., reduce...] 再合并成一个轴"),

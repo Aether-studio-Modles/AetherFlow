@@ -1268,6 +1268,32 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
         indices = g.argmax(x, axis=dim, keepdims=keepdim)
         return (values, indices)
 
+    if target == "aten.topk.default":
+        # (values, indices) 拆成两个 IR 节点：IR 的节点是单输出，一个算子
+        # 只返回一个张量；拆开之后两者都能被 DCE 单独剪掉（只取 values 的
+        # 模型不会白算一遍下标）。
+        x = a(0)
+        _reject_unknown_kwargs(node, kwargs, {"k", "dim", "largest", "sorted"})
+        k = _aten_arg(args, kwargs, 1, "k", None)
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 topk 需要静态整数 k，得到 {k!r}；"
+                "动态 k 会让输出形状随输入变化，IR 的形状推断无法表达"
+            )
+        dim = _norm_dim(int(_aten_arg(args, kwargs, 2, "dim", -1)), x.type.rank)
+        if not bool(_aten_arg(args, kwargs, 3, "largest", True)):
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 topk 只支持 largest=True；"
+                "取最小的 k 个请先 neg、跑完 topk 再 neg 回来"
+            )
+        # sorted=False 只是允许"顺序不保证"，返回有序结果是合法子集，
+        # 所以照常落到稳定降序的实现上。
+        attrs = {"k": int(k), "axis": dim}
+        return (
+            g.topk_values(x, **attrs),
+            g.topk_indices(x, **attrs),
+        )
+
     if target == "aten.argmax.default":
         x = a(0)
         _reject_unknown_kwargs(node, kwargs, {"dim", "keepdim"})

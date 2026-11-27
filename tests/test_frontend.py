@@ -698,6 +698,50 @@ class TestTorchExport(unittest.TestCase):
         _, expected, got = self._import_and_run(M().eval(), (example,))
         self.assertEqual(int(got), int(expected))
 
+    def test_topk_values_and_indices(self):
+        """topk 的两个槽位各映射成一个 IR 节点，另一个不会残留。
+
+        ``getitem`` 在导出图里是独立节点，所以只取 values 的模型跑一遍 DCE
+        之后不该留下 ``topk_indices``——反过来也一样。这条判据同时钉住了
+        "双输出算子被拆成两个单输出算子"的取舍：拆开之后两者才可能被单独剪掉。
+        """
+        from aetherflow.passes import DeadCodeElimination
+
+        class Values(nn.Module):
+            def forward(self, x):
+                return torch.topk(x, 2, dim=-1).values
+
+        class Indices(nn.Module):
+            def forward(self, x):
+                return torch.topk(x, 2, dim=-1).indices
+
+        example = torch.randn(3, 5)
+        imported, expected, got = self._import_and_run(Values().eval(), (example,))
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-6)
+        pruned = DeadCodeElimination().run(imported.graph)
+        names = [n.op.name for n in pruned.nodes]
+        self.assertIn("topk_values", names)
+        self.assertNotIn("topk_indices", names)
+
+        imported, expected, got = self._import_and_run(Indices().eval(), (example,))
+        np.testing.assert_array_equal(got, expected)
+        pruned = DeadCodeElimination().run(imported.graph)
+        names = [n.op.name for n in pruned.nodes]
+        self.assertIn("topk_indices", names)
+        self.assertNotIn("topk_values", names)
+
+    def test_topk_smallest_is_rejected(self):
+        from aetherflow.frontend.torch_export import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x):
+                return torch.topk(x, 2, dim=1, largest=False).values
+
+        with self.assertRaises(UnsupportedOperatorError):
+            self.import_exported(
+                torch.export.export(M().eval(), (torch.randn(2, 4),))
+            )
+
     def test_tril_triu_cumsum(self):
         class M(nn.Module):
             def forward(self, x):

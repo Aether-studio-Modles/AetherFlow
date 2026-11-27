@@ -2502,20 +2502,56 @@ register(
 # --------------------------------------------------------------------------
 
 
-def _infer_topk_mask(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
-    t = inputs[0]
-    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+def _topk_axis_k_shape(shape: Tuple, attrs: dict, name: str) -> Tuple[int, int]:
+    """``topk`` 族共用的属性校验：单个轴 + 正整数 k + k 不超过轴长。
+
+    三个算子（mask / values / indices）必须对同一份 attrs 给出同样的解释，
+    所以校验只写一遍；分开写迟早会出现"mask 拒绝 k=0 而 values 接受"这种
+    只有边界输入才暴露的分叉。参考实现手里只有 ndarray，没有 ``TensorType``，
+    所以按 shape 校验、``_topk_axis_k`` 只是包一层。
+    """
+    axes = _norm_axes(attrs.get("axis", -1), len(shape))
     if len(axes) != 1:
-        raise ValueError(f"topk_mask 只接受一个轴，得到 {axes}")
+        raise ValueError(f"{name} 只接受一个轴，得到 {axes}")
     k = attrs.get("k")
     if isinstance(k, bool) or not isinstance(k, int):
-        raise TypeError(f"topk_mask 的 k 必须是整数，得到 {k!r}")
+        raise TypeError(f"{name} 的 k 必须是整数，得到 {k!r}")
     if k <= 0:
-        raise ValueError(f"topk_mask 的 k 必须为正，得到 {k}")
-    dim = t.shape[axes[0]]
+        raise ValueError(f"{name} 的 k 必须为正，得到 {k}")
+    dim = shape[axes[0]]
     if isinstance(dim, int) and k > dim:
-        raise ValueError(f"topk_mask 的 k={k} 超过轴 {axes[0]} 的长度 {dim}")
+        raise ValueError(f"{name} 的 k={k} 超过轴 {axes[0]} 的长度 {dim}")
+    return axes[0], k
+
+
+def _topk_axis_k(t: TensorType, attrs: dict, name: str) -> Tuple[int, int]:
+    return _topk_axis_k_shape(t.shape, attrs, name)
+
+
+def _topk_shape(t: TensorType, axis: int, k: int) -> Tuple:
+    return tuple(k if i == axis else d for i, d in enumerate(t.shape))
+
+
+def _infer_topk_mask(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    t = inputs[0]
+    _topk_axis_k(t, attrs, "topk_mask")
     return t
+
+
+def _topk_order(x: np.ndarray, axis: int, k: int) -> np.ndarray:
+    """前 k 大的**下标**，按值降序、并列时小下标优先。
+
+    ``kind="stable"`` 是"并列时小下标优先"的实现：排序键相同的元素保持原
+    顺序，也就是下标升序。NaN 先替换成 +inf 再取负，于是被当成最大值排到
+    最前——这是 ``torch.topk`` 的口径，numpy 原生的 argsort 会把 NaN 丢到
+    末尾（升序时的未定义区），两边的 topk 结果会完全不同。
+    """
+    if x.dtype.kind == "f":
+        key = np.where(np.isnan(x), np.inf, x)
+    else:
+        key = x
+    order = np.argsort(-key, axis=axis, kind="stable")
+    return np.take(order, np.arange(k), axis=axis)
 
 
 def _ref_topk_mask(args: List[np.ndarray], attrs: dict) -> np.ndarray:
@@ -2529,8 +2565,7 @@ def _ref_topk_mask(args: List[np.ndarray], attrs: dict) -> np.ndarray:
     x = args[0]
     axis = _norm_axes(attrs.get("axis", -1), x.ndim)[0]
     k = int(attrs["k"])
-    order = np.argsort(-x, axis=axis, kind="stable")
-    picked = np.take(order, np.arange(k), axis=axis)
+    picked = _topk_order(x, axis, k)
     mask = np.zeros_like(x)
     np.put_along_axis(mask, picked, 1, axis=axis)
     return mask
@@ -2546,6 +2581,61 @@ register(
         "它不可导（选择是离散的），接进损失会在 backward 时明确报错，"
         "而不是静默给零；MoE 路由把掩码只用在门控权重的乘法里，"
         "梯度经 softmax 概率那条边回传",
+    )
+)
+
+
+def _infer_topk_values(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    t = inputs[0]
+    if t.dtype is DType.BOOL:
+        raise TypeError("topk_values 不接受 bool 张量；掩码请用 topk_mask")
+    axis, k = _topk_axis_k(t, attrs, "topk_values")
+    return TensorType(t.dtype, _topk_shape(t, axis, k))
+
+
+def _ref_topk_values(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x = args[0]
+    axis, k = _topk_axis_k_shape(tuple(x.shape), attrs, "topk_values")
+    return np.take_along_axis(x, _topk_order(x, axis, k), axis=axis)
+
+
+register(
+    Op(
+        name="topk_values",
+        infer=_infer_topk_values,
+        reference=_ref_topk_values,
+        attrs_schema=("k", "axis"),
+        doc="沿单个轴取前 k 大的值本身，dtype 与输入一致，按值降序、并列时小下标优先。"
+        "与 topk_indices 是两个算子而不是一个双输出算子：IR 节点是单输出，"
+        "拆开之后两者都能独立参与 DCE。它不可导（下标由离散比较决定）；"
+        "需要梯度请用 topk_mask 乘原值，让梯度走乘法那条边",
+    )
+)
+
+
+def _infer_topk_indices(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    t = inputs[0]
+    if t.dtype is DType.BOOL:
+        raise TypeError("topk_indices 不接受 bool 张量；掩码请用 topk_mask")
+    axis, k = _topk_axis_k(t, attrs, "topk_indices")
+    return TensorType(DType.I32, _topk_shape(t, axis, k))
+
+
+def _ref_topk_indices(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x = args[0]
+    axis, k = _topk_axis_k_shape(tuple(x.shape), attrs, "topk_indices")
+    return _topk_order(x, axis, k).astype(np.int32)
+
+
+register(
+    Op(
+        name="topk_indices",
+        infer=_infer_topk_indices,
+        reference=_ref_topk_indices,
+        attrs_schema=("k", "axis"),
+        doc="沿单个轴取前 k 大的下标，输出 i32，顺序与 topk_values 逐位一致"
+        "（值降序、并列时小下标优先）。它是离散结果，不可导；"
+        "torch.topk 的两个槽位由前端分别映射到 topk_values / topk_indices",
     )
 )
 
