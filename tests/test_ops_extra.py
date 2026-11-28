@@ -1029,6 +1029,169 @@ class TestCompare(unittest.TestCase):
             backward(g)
 
 
+class TestLogical(unittest.TestCase):
+    """逻辑算子：bool 进 bool 出，是掩码的组合端（5.330）。"""
+
+    def test_and_or_match_numpy(self):
+        rng = np.random.default_rng(7)
+        av = rng.integers(0, 2, (4, 6)).astype(bool)
+        bv = rng.integers(0, 2, (4, 6)).astype(bool)
+        for op, fn in (("logical_and", np.logical_and), ("logical_or", np.logical_or)):
+            with self.subTest(op=op):
+                g = Graph(op)
+                a = g.input("a", boolean[4, 6])
+                b = g.input("b", boolean[4, 6])
+                g.output(g.add_node(op, [a, b]), "y")
+                self.assertEqual(g.outputs[0].type, boolean[4, 6])
+                out = _run(g, {"a": av, "b": bv})["y"]
+                self.assertEqual(out.dtype, np.bool_)
+                np.testing.assert_array_equal(out, fn(av, bv))
+
+    def test_broadcast_matches_numpy(self):
+        rng = np.random.default_rng(8)
+        av = rng.integers(0, 2, (2, 3, 4)).astype(bool)
+        bv = rng.integers(0, 2, (4,)).astype(bool)
+        g = Graph("land_bcast")
+        a = g.input("a", boolean[2, 3, 4])
+        b = g.input("b", boolean[4])
+        g.output(g.add_node("logical_and", [a, b]), "y")
+        out = _run(g, {"a": av, "b": bv})["y"]
+        self.assertEqual(out.shape, (2, 3, 4))
+        np.testing.assert_array_equal(out, av & bv)
+
+    def test_not_matches_numpy(self):
+        rng = np.random.default_rng(9)
+        xv = rng.integers(0, 2, (3, 5)).astype(bool)
+        g = Graph("lnot")
+        x = g.input("x", boolean[3, 5])
+        g.output(g.add_node("logical_not", [x]), "y")
+        out = _run(g, {"x": xv})["y"]
+        self.assertEqual(out.dtype, np.bool_)
+        np.testing.assert_array_equal(out, np.logical_not(xv))
+
+    def test_float_input_rejected(self):
+        g = Graph("bad")
+        a = g.input("a", f32[2, 3])
+        b = g.input("b", f32[2, 3])
+        with self.assertRaises(TypeError):
+            g.add_node("logical_and", [a, b])
+        with self.assertRaises(TypeError):
+            g.add_node("logical_not", [a])
+
+    def test_has_no_gradient(self):
+        g = Graph("nograd")
+        a = g.input("a", boolean[2, 3])
+        b = g.input("b", boolean[2, 3])
+        g.output(g.add_node("logical_and", [a, b]), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g)
+
+    def test_mask_chain_matches_numpy(self):
+        """比较 -> 逻辑 -> where：前端 masked_fill 的真实形态。"""
+        rng = np.random.default_rng(10)
+        xv = rng.standard_normal((3, 4)).astype(np.float32)
+        g = Graph("mask_chain")
+        x = g.input("x", f32[3, 4])
+        lo = g.add_node("gt", [x, g.constant(0.0)])
+        hi = g.add_node("lt", [x, g.constant(1.0)])
+        mask = g.add_node("logical_and", [lo, hi])
+        g.output(g.where(mask, x, g.constant(-1.0)), "y")
+        out = _run(g, {"x": xv})["y"]
+        np.testing.assert_array_equal(
+            out, np.where((xv > 0.0) & (xv < 1.0), xv, np.float32(-1.0))
+        )
+
+
+class TestReduceBool(unittest.TestCase):
+    """bool 归约：``reduce_all`` / ``reduce_any``（5.330）。"""
+
+    def _reduce(self, op, shape, axis, keepdims, values):
+        g = Graph(op)
+        x = g.input("x", boolean[shape])
+        g.output(g.add_node(op, [x], {"axis": axis, "keepdims": keepdims}), "y")
+        return _run(g, {"x": values})["y"]
+
+    def test_matches_numpy_axis_and_keepdims(self):
+        rng = np.random.default_rng(12)
+        for shape in ((3, 4), (2, 3, 4)):
+            vals = rng.integers(0, 2, shape).astype(bool)
+            for axis in (-1, 0):
+                for keepdims in (False, True):
+                    for op, fn in (
+                        ("reduce_all", np.all),
+                        ("reduce_any", np.any),
+                    ):
+                        with self.subTest(
+                            shape=shape, axis=axis, keepdims=keepdims, op=op
+                        ):
+                            out = self._reduce(op, shape, axis, keepdims, vals)
+                            self.assertEqual(out.dtype, np.bool_)
+                            np.testing.assert_array_equal(
+                                out, fn(vals, axis=axis, keepdims=keepdims)
+                            )
+
+    def test_empty_axis_identity(self):
+        """空轴上的恒等式：全真为 True、有真为 False，与 numpy 一致。"""
+        vals = np.zeros((0, 3), dtype=bool)
+        np.testing.assert_array_equal(
+            self._reduce("reduce_all", (0, 3), 0, False, vals),
+            np.ones((3,), dtype=bool),
+        )
+        np.testing.assert_array_equal(
+            self._reduce("reduce_any", (0, 3), 0, False, vals),
+            np.zeros((3,), dtype=bool),
+        )
+
+    def test_reduce_sum_on_bool_rejected(self):
+        g = Graph("bad")
+        x = g.input("x", boolean[2, 3])
+        with self.assertRaises(TypeError) as ctx:
+            g.add_node("reduce_sum", [x], {"axis": -1})
+        self.assertIn("reduce_all", str(ctx.exception))
+
+    def test_float_input_rejected(self):
+        g = Graph("bad")
+        x = g.input("x", f32[2, 3])
+        with self.assertRaises(TypeError):
+            g.add_node("reduce_any", [x], {"axis": -1})
+
+    def test_no_gradient(self):
+        g = Graph("nograd")
+        x = g.input("x", boolean[2, 3])
+        g.output(g.add_node("reduce_all", [x], {"axis": -1}), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g)
+
+
+class TestBoolCast(unittest.TestCase):
+    """bool 与浮点的显式桥：两个方向语义确定，但都不可导（5.330）。"""
+
+    def test_roundtrip_matches_numpy(self):
+        rng = np.random.default_rng(13)
+        xv = rng.standard_normal((3, 4)).astype(np.float32)
+        xv[0, 0] = 0.0
+        g = Graph("to_bool")
+        x = g.input("x", f32[3, 4])
+        g.output(g.add_node("cast", [x], {"dtype": "bool"}), "y")
+        out = _run(g, {"x": xv})["y"]
+        self.assertEqual(out.dtype, np.bool_)
+        np.testing.assert_array_equal(out, xv != 0)
+
+        g2 = Graph("from_bool")
+        b = g2.input("b", boolean[3, 4])
+        g2.output(g2.add_node("cast", [b], {"dtype": "f32"}), "y")
+        out2 = _run(g2, {"b": out})["y"]
+        self.assertEqual(out2.dtype, np.float32)
+        np.testing.assert_array_equal(out2, out.astype(np.float32))
+
+    def test_from_bool_has_no_gradient(self):
+        g = Graph("cast_from_bool")
+        b = g.input("b", boolean[2, 3])
+        g.output(g.add_node("cast", [b], {"dtype": "f32"}), "y")
+        with self.assertRaises(ValueError):
+            backward(g)
+
+
 class TestWhere(unittest.TestCase):
     """``where(cond, a, b)``：bool 条件的三输入选择，支持三方广播。"""
 

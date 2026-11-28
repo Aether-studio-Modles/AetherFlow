@@ -1193,6 +1193,14 @@ def _rmsnorm(ctx):
 @vjp("reduce_sum")
 def _reduce_sum(ctx):
     b, g, x = ctx.b, ctx.g, ctx.input(0)
+    if x.type.dtype is DType.BOOL:
+        # 构图期 ``_infer_reduce`` 已经拒绝 bool；这里兜反序列化进来的旧图。
+        # 放行会让反向的"梯度广播回掩码形状"静默通过，而 bool 梯度本身
+        # 没有定义——宁可显式失败。
+        raise ValueError(
+            "reduce_sum 的输入是 bool，没有梯度；判定请用 reduce_all / reduce_any，"
+            "计数请先 cast 到 f32"
+        )
     # 归约的反向只需要"把梯度广播回原形状"，逐维保持原样即可：静态维与符号维
     # 走同一条路。reshape 的目标可以含裸符号，broadcast_to 也已接受符号目标。
     shape = tuple(x.type.shape)
@@ -1296,6 +1304,13 @@ def _broadcast_to(ctx):
 @vjp("cast")
 def _cast(ctx):
     target = ctx.input(0).type.dtype
+    if target is DType.BOOL or ctx.g.type.dtype is DType.BOOL:
+        # bool 是离散类型，两个方向都没有梯度：f32 -> bool 是"非零即真"，
+        # 反向若把上游的 0/1 掩码当成梯度传回去，等于凭空造了一个梯度。
+        raise ValueError(
+            "cast 的源或目标是 bool，没有梯度；"
+            "掩码不要进损失，或在 cast 之前就把这条支路从求导链上摘掉"
+        )
     if ctx.g.type.dtype == target:
         # 上游梯度已经是输入的类型：这一步 cast 是恒等。建成节点只会在
         # 反向图里多一次 kernel launch（混精里成片出现），直接透传。

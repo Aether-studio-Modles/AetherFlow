@@ -409,9 +409,13 @@ def render(template, dtype, *, f16_helpers: str | None = None, dialect=None) -> 
     """
     if isinstance(template, Kernel):
         if dialect is None:
-            from .dialect import CUDA_DIALECT
+            from .dialect import BOOL_DIALECT, CUDA_DIALECT
 
-            dialect = CUDA_DIALECT
+            # bool 的存储是 1 字节 ``unsigned char``，存取走 ``af_ld_q`` /
+            # ``af_st_q``；``CUDA_DIALECT`` 里没有这两项。一元逻辑非
+            # （``logical_not``）是唯一一个"只拿 dtype 就够"的 bool 内核，
+            # 在这里按 dtype 自动选方言，避免每个调用点各写一遍。
+            dialect = BOOL_DIALECT if _dtype_key(dtype) == "bool" else CUDA_DIALECT
         return emit(template, dialect, _ir_dtype(dtype))
 
     key = _dtype_key(dtype)

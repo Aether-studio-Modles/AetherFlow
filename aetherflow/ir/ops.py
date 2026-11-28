@@ -213,7 +213,7 @@ def _norm_axes(axis, rank: int) -> Tuple[int, ...]:
 
 
 def _reject_bool(dtype: DType, where: str) -> None:
-    """布尔张量只能参与比较与 ``where``，不参与算术。
+    """布尔张量只参与判定：比较、逻辑、``where`` 与显式 ``cast``，不做算术。
 
     设备端的 bool 容器是 1 字节，``add`` 之类的内核会把它当数值算，结果虽然
     能跑但语义上无意义（``真 + 真 = 2`` 存回 bool 又变成 1）。这里显式拒绝，
@@ -353,6 +353,75 @@ register(
         infer=_where_infer,
         reference=_where_ref,
         doc="按 bool 条件逐元素选择，支持三方 numpy 广播",
+    )
+)
+
+
+def _logical_binary_infer(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """逻辑与 / 或：两侧都必须是 bool，输出 bool，形状按广播。
+
+    与 ``eq`` 等比较算子不同，这里不接受浮点输入——"0.5 算真吗"的口径一旦
+    放开就会在两端产生分歧。浮点掩码需要先显式比较。
+    """
+    a, b = inputs
+    for t in (a, b):
+        if t.dtype is not DType.BOOL:
+            raise TypeError(
+                f"逻辑算子只接受 bool 输入，得到 {t.dtype.value}；"
+                "浮点请先用比较算子（如 ne(x, 0)）落成 bool"
+            )
+    return TensorType(DType.BOOL, _broadcast_shape(a.shape, b.shape))
+
+
+def _logical_binary_ref(np_fn):
+    def ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+        with np.errstate(all="ignore"):
+            return np.asarray(
+                np_fn(
+                    np.asarray(args[0], dtype=np.bool_),
+                    np.asarray(args[1], dtype=np.bool_),
+                ),
+                dtype=np.bool_,
+            )
+
+    return ref
+
+
+# 逻辑算子：没有 vjp，理由与比较算子相同——布尔代数不可导。
+for _name, _np_fn in (
+    ("logical_and", np.logical_and),
+    ("logical_or", np.logical_or),
+):
+    register(
+        Op(
+            name=_name,
+            infer=_logical_binary_infer,
+            reference=_logical_binary_ref(_np_fn),
+            doc=f"逐元素逻辑 {_name}，两侧 bool、输出 bool，支持 numpy 广播",
+        )
+    )
+
+
+def _infer_logical_not(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    t = inputs[0]
+    if t.dtype is not DType.BOOL:
+        raise TypeError(
+            f"logical_not 只接受 bool 输入，得到 {t.dtype.value}；"
+            "浮点请先用比较算子落成 bool"
+        )
+    return t
+
+
+def _ref_logical_not(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    return np.asarray(np.logical_not(np.asarray(args[0], dtype=np.bool_)), dtype=np.bool_)
+
+
+register(
+    Op(
+        name="logical_not",
+        infer=_infer_logical_not,
+        reference=_ref_logical_not,
+        doc="逐元素逻辑非，输入输出都是 bool",
     )
 )
 
@@ -3425,6 +3494,13 @@ register(
 
 def _infer_reduce(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     t = inputs[0]
+    if t.dtype is DType.BOOL:
+        raise TypeError(
+            "reduce_sum / reduce_max / reduce_mean 不接受 bool 输入："
+            "bool 求和会退化成计数、最大/最小会退化成 OR/AND，两者都不是"
+            "这个算子名字承诺的语义。判定掩码请用 reduce_all / reduce_any，"
+            "计数请先 cast 到 f32"
+        )
     axes = _norm_axes(attrs.get("axis", -1), t.rank)
     if attrs.get("keepdims", False):
         shape = tuple(1 if i in axes else d for i, d in enumerate(t.shape))
@@ -3491,6 +3567,61 @@ register(
         doc="均值归约（求和不带缩放，缩放放在反向）",
     )
 )
+
+
+def _infer_reduce_bool(what: str):
+    """bool 归约：输入必须是 bool，输出仍是 bool。
+
+    与 ``reduce_sum`` 分开成算子，是为了让"这一维是不是全真 / 有没有真"
+    这件事在 IR 里就没有歧义：``reduce_sum(bool)`` 的结果是计数还是 OR
+    取决于实现，而 ``reduce_all`` / ``reduce_any`` 只有一种读法。
+    """
+
+    def infer(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+        t = inputs[0]
+        if t.dtype is not DType.BOOL:
+            raise TypeError(
+                f"{what} 只接受 bool 输入，得到 {t.dtype.value}；"
+                "浮点掩码请先用比较算子落成 bool"
+            )
+        axes = _norm_axes(attrs.get("axis", -1), t.rank)
+        if attrs.get("keepdims", False):
+            shape = tuple(1 if i in axes else d for i, d in enumerate(t.shape))
+        else:
+            shape = tuple(d for i, d in enumerate(t.shape) if i not in axes)
+        return TensorType(DType.BOOL, shape)
+
+    return infer
+
+
+def _reduce_bool_ref(np_fn):
+    def ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+        with np.errstate(all="ignore"):
+            return np.asarray(
+                np_fn(
+                    np.asarray(args[0], dtype=np.bool_),
+                    axis=_reduce_axis(attrs),
+                    keepdims=attrs.get("keepdims", False),
+                ),
+                dtype=np.bool_,
+            )
+
+    return ref
+
+
+for _name, _np_fn, _what in (
+    ("reduce_all", np.all, "reduce_all"),
+    ("reduce_any", np.any, "reduce_any"),
+):
+    register(
+        Op(
+            name=_name,
+            infer=_infer_reduce_bool(_what),
+            reference=_reduce_bool_ref(_np_fn),
+            attrs_schema=("axis", "keepdims"),
+            doc=f"bool 归约 {_name}：沿 axis 判定全真 / 有真，输出 bool；不可导",
+        )
+    )
 
 
 def _infer_argmax(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:

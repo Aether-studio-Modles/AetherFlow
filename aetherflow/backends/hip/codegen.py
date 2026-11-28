@@ -40,13 +40,17 @@ __device__ __forceinline__ float af_add_h(unsigned short* p, float v) {
 """
 
 
-def render(template: str, dtype) -> str:
-    """展开模板；f16 的读写与原子加换成 HIP 方言。"""
+def render(template, dtype) -> str:
+    """展开模板；f16 的读写与原子加换成 HIP 方言，bool 换 1 字节容器方言。"""
     # 延迟导入：hip.dialect 依赖 cuda.codegen，顶层导入会成环。
-    from .dialect import HIP_DIALECT
+    from .dialect import BOOL_DIALECT, HIP_DIALECT
 
+    is_bool = _cuda._dtype_key(dtype) == "bool"
     return _cuda.render(
-        template, dtype, f16_helpers=_HIP_F16_HELPERS, dialect=HIP_DIALECT
+        template,
+        dtype,
+        f16_helpers=_HIP_F16_HELPERS,
+        dialect=BOOL_DIALECT if is_bool else HIP_DIALECT,
     )
 
 

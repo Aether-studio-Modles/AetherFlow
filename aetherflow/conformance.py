@@ -261,6 +261,31 @@ def _where_case(shape_c: tuple, shape_a: tuple, shape_b: tuple):
     return build
 
 
+def _logical_case(op: str, shape_a: tuple, shape_b: tuple):
+    """逻辑与 / 或：两侧都是真 bool 输入，走 numpy 广播。"""
+
+    def build(rng):
+        g = Graph(op)
+        a = g.input("a", boolean[shape_a])
+        b = g.input("b", boolean[shape_b])
+        g.output(g.add_node(op, [a, b]), "y")
+        av = rng.integers(0, 2, size=shape_a).astype(bool)
+        bv = rng.integers(0, 2, size=shape_b).astype(bool)
+        return g, {"a": av, "b": bv}
+
+    return build
+
+
+def _logical_not_case(shape: tuple):
+    def build(rng):
+        g = Graph("logical_not")
+        x = g.input("x", boolean[shape])
+        g.output(g.add_node("logical_not", [x]), "y")
+        return g, {"x": rng.integers(0, 2, size=shape).astype(bool)}
+
+    return build
+
+
 def _unary(op: str, shape: tuple, scale: float = 1.0):
     def build(rng):
         g = Graph(op)
@@ -788,6 +813,22 @@ def _reduce_other(op: str, axis: int = -1, keepdims: bool = False,
         x = g.input("x", f32[shape])
         g.output(g.add_node(op, [x], {"axis": axis, "keepdims": keepdims}), "y")
         return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
+def _reduce_bool(op: str, axis: int = -1, keepdims: bool = False,
+                 shape: tuple = (4, 7)):
+    """bool 归约：``reduce_all`` / ``reduce_any`` 的输入输出都是判定值。
+
+    结果为 bool，比对只能精确相等（rtol / atol 由调用点置 0）。
+    """
+
+    def build(rng):
+        g = Graph(op)
+        x = g.input("x", boolean[shape])
+        g.output(g.add_node(op, [x], {"axis": axis, "keepdims": keepdims}), "y")
+        return g, {"x": rng.integers(0, 2, size=shape).astype(bool)}
 
     return build
 
@@ -1671,6 +1712,11 @@ def default_cases() -> List[Case]:
         _case("gt_broadcast_bias", _cmp_case("gt", (2, 3, 4), (4,)),
               note="比较复用广播骨架，检验 strided 坐标还原"),
         _case("lt_broadcast_scalar", _cmp_case("lt", (3, 5), (1,))),
+        # 逻辑：bool 只参与判定，这三条是掩码的组合端
+        _case("logical_and_same", _logical_case("logical_and", (4, 6), (4, 6))),
+        _case("logical_or_broadcast", _logical_case("logical_or", (2, 3, 4), (4,)),
+              note="逻辑算子复用比较的广播骨架"),
+        _case("logical_not", _logical_not_case((7, 9))),
         # 掩码消费端：条件与两个分支三方广播
         _case("where_same", _where_case((4, 6), (4, 6), (4, 6))),
         _case("where_broadcast", _where_case((2, 1, 4), (2, 3, 4), (4,)),
@@ -1907,6 +1953,11 @@ def default_cases() -> List[Case]:
         _case("reduce_mean_last", _reduce_other("reduce_mean")),
         _case("reduce_mean_axis0", _reduce_other("reduce_mean", axis=0),
               note="非最后维均值：求和后除以归约长度，除法在 float 里做"),
+        _case("reduce_all_last", _reduce_bool("reduce_all"), rtol=0.0, atol=0.0,
+              note="bool 归约的输出仍是 bool，只能精确相等；空轴恒真"),
+        _case("reduce_any_axis0", _reduce_bool("reduce_any", axis=0),
+              rtol=0.0, atol=0.0,
+              note="非末轴 any：先置换到最后再复用同一套归约骨架"),
         _case("argmax_last", _argmax(), rtol=0.0, atol=0.0,
               note="输出 i32 下标：必须精确相等，且并列时取第一次出现"),
         _case("argmax_keepdims", _argmax(keepdims=True), rtol=0.0, atol=0.0),

@@ -150,6 +150,10 @@ UNARY_EXPR = {
     "round": lambda x: Call("nearbyintf", (x,)),
     "floor": lambda x: Call("floorf", (x,)),
     "ceil": lambda x: Call("ceilf", (x,)),
+    # 逻辑非：只用于 bool 输入（``af_ld_q`` 取出的是 0/1 的 float），
+    # 非零写 0、零写 1。写回经 ``af_st_q`` 归一，与参考端的 np.logical_not
+    # 在"任意非零即真"的口径上一致。
+    "lnot": lambda x: Cond(Bin("!=", x, Num("0.f")), Num("0.f"), Num("1.f")),
 }
 
 

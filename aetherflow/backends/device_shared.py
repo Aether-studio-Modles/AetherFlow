@@ -76,6 +76,9 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "ceil",
         "constant",
         "broadcast_to",
+        "logical_and",
+        "logical_or",
+        "logical_not",
         "matmul",
         "quantize_i8",
         "quantize_i8_zp",
@@ -199,10 +202,24 @@ _INDEX_DTYPES = ("int32", "int8")
 
 # 允许 bool 输入的算子。比较算子两侧都可以是 bool（``ne(mask, 0)`` 这类
 # "掩码再取反"的写法很常见），它们的设备存储是 1 字节 ``unsigned char``，
-# 走独立的 ``BOOL_DIALECT``。算术算子不在此列：true + true = 2 再归一成 1
-# 没有意义，IR 的 verifier 也已拒绝。
+# 走独立的 ``BOOL_DIALECT``。逻辑算子是纯 bool 算子；``cast`` 是两个方向
+# 都合法的显式桥（f32 -> bool 就是"非零即真"，bool -> f32 是 0/1）。
+# 算术算子不在此列：true + true = 2 再归一成 1
+# 没有意义，IR 的 infer 与 verifier 都已拒绝。
 _BOOL_OPS: FrozenSet[str] = frozenset(
-    {"eq", "ne", "lt", "le", "gt", "ge", "where"}
+    {
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "where",
+        "logical_and",
+        "logical_or",
+        "logical_not",
+        "cast",
+    }
 )
 
 # 带 ``layout`` 属性的算子。这些算子的自研内核只按 NCHW 寻址；NHWC 形态

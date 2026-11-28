@@ -47,6 +47,20 @@ class _ElementwiseMixin:
     def _op_ge(self, node, args, attrs):
         return self._binary("ge", args, compare=True)
 
+    # 逻辑算子：与比较共用内核形态（输出 bool、裸写 1 字节），运算符换成
+    # C 的 ``&&`` / ``||``。``af_ld_q`` 取出的操作数是 0/1 的 float，
+    # "非零即真"的口径与 numpy 一致。
+    def _op_logical_and(self, node, args, attrs):
+        return self._binary("land", args, compare=True)
+
+    def _op_logical_or(self, node, args, attrs):
+        return self._binary("lor", args, compare=True)
+
+    def _op_logical_not(self, node, args, attrs):
+        # 一元模板，输入输出都是 bool；``_unary`` 用 ``empty_like`` 跟随 bool，
+        # 源码由 ``render`` 按 dtype 自动选 1 字节容器的方言。
+        return self._unary("lnot", args)
+
     def _op_where(self, node, args, attrs):
         """``where(cond, a, b)``：cond 是 bool，a / b 同 dtype（输出跟随它）。"""
         cond, a, b = args

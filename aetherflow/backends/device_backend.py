@@ -424,6 +424,9 @@ class DeviceBackend(
         r.register("gt", self._op_gt)
         r.register("ge", self._op_ge)
         r.register("where", self._op_where)
+        r.register("logical_and", self._op_logical_and)
+        r.register("logical_or", self._op_logical_or)
+        r.register("logical_not", self._op_logical_not)
         r.register("sign", self._op_sign)
         r.register("round", self._op_round)
         r.register("floor", self._op_floor)
@@ -548,6 +551,10 @@ class DeviceBackend(
         bf16 同理：它的设备容器是 ``uint16`` 位模式，``astype`` 只会把位模式
         当整数做数值转换。三条跨宽度路径（f32/f16/bf16 任意方向）都走同一个
         ``cast_fn``，由 codegen 按源与目标的存储类型各自展开。
+
+        bool 与浮点之间走 ``_cast_bool``：bool 是 1 字节 ``unsigned char``，
+        f32 -> bool 就是"非零即真"，bool -> f32 是 0/1；涉及 f16 / bf16 时
+        经 f32 中转，避免 cupy 的 ``astype`` 在半精度上引用 ``__half`` 构造。
         """
         target = np.dtype(dtype)
         if value.dtype == target:
@@ -557,13 +564,33 @@ class DeviceBackend(
             np.dtype(np.float16): "f16",
             np.dtype(np.float32): "f32",
             np.dtype(np.uint16): "bf16",
+            np.dtype(np.bool_): "bool",
         }.get(target)
         if dst_key is None:
             # 与设备存储无关的类型（f64 等）：交给 cupy，走不到 GPU 计算路径
             return value.astype(target, copy=False)
         if dst_key == src_key:
             return value
+        if src_key == "bool" or dst_key == "bool":
+            return self._cast_bool(value, target, src_key, dst_key)
         return self._cast_kernel(value, target, src_key, dst_key)
+
+    def _cast_bool(self, value, target: np.dtype, src_key: str, dst_key: str):
+        """bool 与浮点存储之间的转换。
+
+        ``cupy`` 的 ``astype`` 只对"按值解释"的类型（f32 / f64 / 整数）可靠：
+        f16 的转换内核要 ``__half`` 构造（NVRTC 链接不到），bf16 的载体是
+        ``uint16`` 位模式（按整数转是错的）。因此非 bool 一侧是 f16 / bf16 时
+        先经 f32 中转，再交给既有的 ``cast`` 落到目标宽度。
+        """
+        cp = self.cp
+        if dst_key == "bool":
+            src = value if src_key == "f32" else self.cast(value, np.dtype(np.float32))
+            return src != cp.float32(0)
+        f = value.astype(np.float32)
+        if dst_key == "f32":
+            return f
+        return self._cast_kernel(f, target, "f32", dst_key)
 
     def device_dtype(self, dtype: DType) -> np.dtype:
         """bf16 在本后端以 ``uint16`` 位模式驻留（与 f16 同为两字节）。
