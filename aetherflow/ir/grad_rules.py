@@ -579,6 +579,35 @@ def _linear_i8a8(ctx):
     return (None, None, None, None, db)
 
 
+@vjp("linear_i8_zp")
+def _linear_i8_zp(ctx):
+    """非对称 weight-only 的反向：与 ``linear_i8`` 同口径，只对激活与 bias 求导。
+
+    梯度里的权重必须是**带零点反量化**的那一份，而不是 ``q * scale``：
+    零点非零时两者差一个常量偏置，dx 会整体偏移一个方向。
+    """
+    b, g = ctx.b, ctx.g
+    x = ctx.input(0)
+    weight = b.add_node(
+        "dequantize_i8_zp", [ctx.input(1), ctx.input(2), ctx.input(3)]
+    )
+    dx = b.add_node("matmul", [g, _transpose_last_two(b, weight)])
+    if len(ctx.node.inputs) < 5:
+        return (sum_to(b, dx, x.type.shape), None, None, None)
+    db = sum_axes(b, g, tuple(range(g.type.rank - 1)))
+    return (sum_to(b, dx, x.type.shape), None, None, None, db)
+
+
+@vjp("linear_i8a8_zp")
+def _linear_i8a8_zp(ctx):
+    """非对称 W8A8 的反向：激活、权重与两套量化参数都冻结，只有 bias 可导。"""
+    b, g = ctx.b, ctx.g
+    if len(ctx.node.inputs) < 7:
+        return (None, None, None, None, None, None)
+    db = sum_axes(b, g, tuple(range(g.type.rank - 1)))
+    return (None, None, None, None, None, None, db)
+
+
 @vjp("fake_quantize_i8")
 def _fake_quantize_i8(ctx):
     """QAT 的直通估计器（STE）：梯度原样穿过假量化。

@@ -1235,25 +1235,33 @@ _QUANT_MIN = -127
 _QUANT_MAX = 127
 
 
-def _check_scale_broadcast(target: TensorType, scale: TensorType, what: str) -> None:
-    """校验 scale 能广播到 target。
+def _check_broadcastable(
+    target: TensorType, param: TensorType, what: str, label: str
+) -> None:
+    """校验量化参数（scale / zero_point）能广播到 target。
 
     与 ``_broadcast_shape`` 同一套保守规则：符号维只在"等于 1 或两边相同"
     时才放行，其余情形构图期拒绝——IR 没有能表达"这一维可能是 1"的广播维。
     """
-    if scale.rank > target.rank:
+    if param.rank > target.rank:
         raise ValueError(
-            f"{what} 的 scale 秩 {scale.rank} 大于被量化张量的秩 {target.rank}"
+            f"{what} 的 {label} 秩 {param.rank} 大于被量化张量的秩 {target.rank}"
         )
-    for s, d in zip(reversed(scale.shape), reversed(target.shape)):
+    for s, d in zip(reversed(param.shape), reversed(target.shape)):
         if s == 1 or s == d:
             continue
         if isinstance(s, int) and isinstance(d, int):
-            raise ValueError(f"{what} 的 scale 形状 {scale.shape} 不能广播到 {target.shape}")
+            raise ValueError(
+                f"{what} 的 {label} 形状 {param.shape} 不能广播到 {target.shape}"
+            )
         raise ValueError(
-            f"{what} 的 scale 符号维 {s} 与目标维 {d} 无法在 IR 里表达广播："
+            f"{what} 的 {label} 符号维 {s} 与目标维 {d} 无法在 IR 里表达广播："
             "请给出静态的 1 或相同的符号"
         )
+
+
+def _check_scale_broadcast(target: TensorType, scale: TensorType, what: str) -> None:
+    _check_broadcastable(target, scale, what, "scale")
 
 
 def _infer_quantize_i8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
@@ -1580,6 +1588,328 @@ register(
         "再乘激活 scale（每个 token 一个）与权重 scale（每个输出通道一个），"
         "最后加 bias。语义是 ``(int32(x_q) @ int32(w_q)).f32() * xs * ws [+ b]``；"
         "K * 127 * 127 超过 int32 上界时显式拒绝，不做回绕",
+    )
+)
+
+
+# --------------------------------------------------------------------------
+# 非对称（带零点）int8 量化
+# --------------------------------------------------------------------------
+#
+# 与对称版本共用舍入与饱和口径（RNE、scale 严格为正），差别只有零点：
+#
+# - 对称：``q = clip(rint(x / scale), -127, 127)``，0 恒映射到 0。
+# - 非对称：``q = clip(rint(x / scale) + zp, -128, 127)``，反量化是
+#   ``x = (q - zp) * scale``。值域用满整段 256 级，因此负端点是 -128：
+#   两级都用来表示实际取值范围，而不是留一级维持对称性。
+# - 零点以 **i8 张量**进图：取值天然落在 ``[-128, 127]``，不需要一个
+#   "越界即拒绝"的哨兵，也不会出现"按 i32 传进来的零点超出 int8 桶"。
+# - **非对称的收益在激活**：权重分布通常近对称，零点接近 0；ReLU 之后的
+#   激活全为正，对称量化会把一半格子分给永远不会出现的负数。因此真正值得
+#   走这条路的入口是 W8A8（``linear_i8a8_zp``）；weight-only 版本
+#   （``linear_i8_zp``）主要给"导出模型里权重零点确实非零"的场景直接跑。
+# - W8A8 的 int32 累加上界比对称版更紧：``xq - zp`` 与 ``wq - zp`` 各自
+#   可取到 255，边界因此是 ``K * 255 * 255``，而不是 ``K * 127 * 127``。
+
+#: 非对称量化的负端点。两级都用满，所以是 -128，不是对称版的 -127。
+_QUANT_MIN_ZP = -128
+
+#: 非对称 W8A8 的 int32 累加上界：``K * 255 * 255 <= 2**31 - 1``。
+_I32_ACC_LIMIT_ZP = (2**31 - 1) // (255 * 255)
+
+
+def _infer_quantize_i8_zp(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 3:
+        raise ValueError(
+            "quantize_i8_zp 需要 (x, scale, zero_point) 三个输入，"
+            f"得到 {len(inputs)}"
+        )
+    x, scale, zp = inputs
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"quantize_i8_zp 只接受 f32 输入，得到 {x.dtype.value}；"
+            "bf16/f16 要先用 cast 转到 f32，量化语义只在 f32 上定义"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(f"quantize_i8_zp 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    if zp.dtype != DType.I8:
+        raise TypeError(
+            f"quantize_i8_zp 的 zero_point 必须是 i8，得到 {zp.dtype.value}；"
+            "整数零点作为 i8 缓冲进图，取值天然落在 [-128, 127]"
+        )
+    if x.rank < 1:
+        raise ValueError("quantize_i8_zp 至少需要 1 维输入")
+    _check_broadcastable(x, scale, "quantize_i8_zp", "scale")
+    _check_broadcastable(x, zp, "quantize_i8_zp", "zero_point")
+    return TensorType(DType.I8, x.shape)
+
+
+def _ref_quantize_i8_zp(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, scale, zp = args
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"quantize_i8_zp 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    # 先舍入到格点再平移：零点不是"在值域里加的偏移"，而是整数格点的平移，
+    # 两种写法在 x/scale 不是整数时结果不同（差一个舍入）。
+    q = np.rint(x / scale) + zp.astype(np.float32)
+    return np.clip(q, _QUANT_MIN_ZP, _QUANT_MAX).astype(np.int8)
+
+
+register(
+    Op(
+        name="quantize_i8_zp",
+        infer=_infer_quantize_i8_zp,
+        reference=_ref_quantize_i8_zp,
+        doc="非对称 int8 量化：q = clip(rint(x / scale) + zp, -128, 127)，"
+        "scale 与零点是 i8/f32 张量，都广播到 x；输出 i8 与 x 同形状。"
+        "负端点用满 -128（对称版刻意止步于 -127）",
+    )
+)
+
+
+def _infer_dequantize_i8_zp(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 3:
+        raise ValueError(
+            "dequantize_i8_zp 需要 (q, scale, zero_point) 三个输入，"
+            f"得到 {len(inputs)}"
+        )
+    q, scale, zp = inputs
+    if q.dtype != DType.I8:
+        raise TypeError(f"dequantize_i8_zp 的第一个输入必须是 i8，得到 {q.dtype.value}")
+    if scale.dtype != DType.F32:
+        raise TypeError(f"dequantize_i8_zp 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    if zp.dtype != DType.I8:
+        raise TypeError(
+            f"dequantize_i8_zp 的 zero_point 必须是 i8，得到 {zp.dtype.value}"
+        )
+    _check_broadcastable(q, scale, "dequantize_i8_zp", "scale")
+    _check_broadcastable(q, zp, "dequantize_i8_zp", "zero_point")
+    return TensorType(DType.F32, q.shape)
+
+
+def _ref_dequantize_i8_zp(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    q, scale, zp = args
+    # ``q - zp`` 先在 int32 里算：q=-128、zp=127 时差值是 -255，落在 i8 之外。
+    diff = q.astype(np.int32) - zp.astype(np.int32)
+    return diff.astype(np.float32) * scale
+
+
+register(
+    Op(
+        name="dequantize_i8_zp",
+        infer=_infer_dequantize_i8_zp,
+        reference=_ref_dequantize_i8_zp,
+        doc="非对称反量化：f32(q - zp) * scale，减法在 int32 里做；"
+        "输出与 q 同形状的 f32",
+    )
+)
+
+
+def _infer_linear_i8_zp(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) not in (4, 5):
+        raise ValueError(
+            "linear_i8_zp 需要 (x, qweight, scale, zero_point[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    x, qweight, scale, zp = inputs[0], inputs[1], inputs[2], inputs[3]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_i8_zp 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_i8_zp 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype != DType.I8:
+        raise TypeError(f"linear_i8_zp 的权重必须是 i8，得到 {qweight.dtype.value}")
+    if qweight.rank != 2:
+        raise ValueError(
+            f"linear_i8_zp 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(f"linear_i8_zp 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    if zp.dtype != DType.I8:
+        raise TypeError(f"linear_i8_zp 的 zero_point 必须是 i8，得到 {zp.dtype.value}")
+    _check_broadcastable(qweight, scale, "linear_i8_zp", "scale")
+    _check_broadcastable(qweight, zp, "linear_i8_zp", "zero_point")
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_i8_zp 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_i8_zp 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    if len(inputs) == 5:
+        bias = inputs[4]
+        if bias.dtype != DType.F32:
+            raise TypeError(f"linear_i8_zp 的 bias 必须是 f32，得到 {bias.dtype.value}")
+        if bias.rank != 1:
+            raise ValueError(f"linear_i8_zp 的 bias 必须是秩 1，得到秩 {bias.rank}")
+        if isinstance(bias.shape[0], int) and isinstance(n, int) and bias.shape[0] != n:
+            raise ValueError(f"linear_i8_zp 的 bias 长度 {bias.shape[0]} 与 N={n} 不一致")
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_i8_zp(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, qweight, scale, zp = args[0], args[1], args[2], args[3]
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"linear_i8_zp 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    weight = (qweight.astype(np.int32) - zp.astype(np.int32)).astype(np.float32) * scale
+    out = np.matmul(x, weight)
+    if len(args) > 4:
+        out = out + args[4]
+    return out
+
+
+register(
+    Op(
+        name="linear_i8_zp",
+        infer=_infer_linear_i8_zp,
+        reference=_ref_linear_i8_zp,
+        doc="非对称 weight-only int8 线性层：(..., K) x i8(K, N) -> (..., N)。"
+        "数值等于 ``matmul(x, dequantize_i8_zp(qweight, scale, zero_point)) "
+        "[+ bias]``；零点让导出模型里非零中心的那条权重轴不必再补一个偏置",
+    )
+)
+
+
+def _infer_linear_i8a8_zp(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) not in (6, 7):
+        raise ValueError(
+            "linear_i8a8_zp 需要 (x_q, x_scale, x_zero_point, w_q, w_scale, "
+            f"w_zero_point[, bias]) 输入，得到 {len(inputs)}"
+        )
+    xq, xs, xzp, wq, ws, wzp = inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5]
+    if xq.dtype != DType.I8:
+        raise TypeError(
+            f"linear_i8a8_zp 的激活必须是 i8，得到 {xq.dtype.value}；"
+            "浮点激活请先走 quantize_i8_zp，或改用 linear_i8_zp"
+        )
+    if wq.dtype != DType.I8:
+        raise TypeError(f"linear_i8a8_zp 的权重必须是 i8，得到 {wq.dtype.value}")
+    if xs.dtype != DType.F32:
+        raise TypeError(
+            f"linear_i8a8_zp 的激活 scale 必须是 f32，得到 {xs.dtype.value}"
+        )
+    if ws.dtype != DType.F32:
+        raise TypeError(f"linear_i8a8_zp 的权重 scale 必须是 f32，得到 {ws.dtype.value}")
+    if xzp.dtype != DType.I8:
+        raise TypeError(
+            f"linear_i8a8_zp 的激活 zero_point 必须是 i8，得到 {xzp.dtype.value}"
+        )
+    if wzp.dtype != DType.I8:
+        raise TypeError(
+            f"linear_i8a8_zp 的权重 zero_point 必须是 i8，得到 {wzp.dtype.value}"
+        )
+    if xq.rank < 2:
+        raise ValueError(f"linear_i8a8_zp 的激活至少是 2 维，得到秩 {xq.rank}")
+    if wq.rank != 2:
+        raise ValueError(
+            f"linear_i8a8_zp 的量化权重必须是 2 维 (K, N)，得到 {wq.shape}"
+        )
+
+    k, n = wq.shape
+    kx = xq.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_i8a8_zp 的内维不匹配：激活的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_i8a8_zp 的内维符号不一致：激活 {kx} 与权重 K={k}")
+
+    _check_broadcastable(xq, xs, "linear_i8a8_zp", "激活 scale")
+    _check_broadcastable(xq, xzp, "linear_i8a8_zp", "激活 zero_point")
+    # int32 累加要求量化参数能提到求和号之外：激活侧必须沿 K 维恒定
+    # （每个 token 一组），权重侧必须沿 K 维恒定（每个输出通道一组）。
+    for label, param in (("激活 scale", xs), ("激活 zero_point", xzp)):
+        if param.rank > 0 and param.shape[-1] != 1:
+            raise ValueError(
+                f"linear_i8a8_zp 的{label}形状 {param.shape} 沿 K 维不是 1："
+                "int32 累加要求每个 token 一组量化参数（如 (B, T, 1) 或标量）"
+            )
+    for label, param in (("权重 scale", ws), ("权重 zero_point", wzp)):
+        if param.rank > 1:
+            raise ValueError(
+                f"linear_i8a8_zp 的{label}必须是逐输出通道 (N,) 或逐张量标量，"
+                f"得到秩 {param.rank} 形状 {param.shape}；沿 K 维逐元素变化的"
+                "量化参数无法用 int32 累加表达"
+            )
+        if param.rank == 1 and param.shape[0] != 1 and param.shape[0] != n:
+            raise ValueError(
+                f"linear_i8a8_zp 的{label}长度 {param.shape[0]} 与 N={n} 不一致"
+            )
+    if isinstance(k, int) and k > _I32_ACC_LIMIT_ZP:
+        raise ValueError(
+            f"linear_i8a8_zp 的 K={k} 超过 int32 累加上限 {_I32_ACC_LIMIT_ZP}："
+            "(xq - zp) 与 (wq - zp) 各可取 255，K * 255 * 255 会溢出 int32；"
+            "请分段累加"
+        )
+
+    if len(inputs) == 7:
+        bias = inputs[6]
+        if bias.dtype != DType.F32:
+            raise TypeError(
+                f"linear_i8a8_zp 的 bias 必须是 f32，得到 {bias.dtype.value}"
+            )
+        if bias.rank != 1:
+            raise ValueError(f"linear_i8a8_zp 的 bias 必须是秩 1，得到秩 {bias.rank}")
+        if isinstance(bias.shape[0], int) and isinstance(n, int) and bias.shape[0] != n:
+            raise ValueError(
+                f"linear_i8a8_zp 的 bias 长度 {bias.shape[0]} 与 N={n} 不一致"
+            )
+    return TensorType(DType.F32, xq.shape[:-1] + (n,))
+
+
+def _ref_linear_i8a8_zp(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    xq, xs, xzp, wq, ws, wzp = args[0], args[1], args[2], args[3], args[4], args[5]
+    if float(np.min(xs)) <= 0.0:
+        raise ValueError(
+            f"linear_i8a8_zp 的激活 scale 必须严格为正，得到最小值 {float(np.min(xs))}"
+        )
+    if float(np.min(ws)) <= 0.0:
+        raise ValueError(
+            f"linear_i8a8_zp 的权重 scale 必须严格为正，得到最小值 {float(np.min(ws))}"
+        )
+    k = int(xq.shape[-1])
+    if k > _I32_ACC_LIMIT_ZP:
+        raise ValueError(
+            f"linear_i8a8_zp 的 K={k} 超过 int32 累加上限 {_I32_ACC_LIMIT_ZP}："
+            "(xq - zp) 与 (wq - zp) 各可取 255，K * 255 * 255 会溢出 int32；"
+            "请分段累加"
+        )
+    # 与对称版唯一的数值差别是每个乘子先减自己的零点。先减再乘、在 int32 里
+    # 累加，展开后的偏置项（-zx*colsum - zw*rowsum + K*zx*zw）才与整数累加
+    # 逐位一致；"先算 acc 再在 f32 里补偏置"需要额外的归约，数值上也不等价。
+    xq32 = xq.astype(np.int32) - xzp.astype(np.int32)
+    wq32 = wq.astype(np.int32) - wzp.astype(np.int32)
+    acc = np.matmul(xq32, wq32)
+    row = np.broadcast_to(xs, xq.shape)[..., :1].astype(np.float32)
+    out = acc.astype(np.float32) * row * ws
+    if len(args) > 6:
+        out = out + args[6]
+    return out
+
+
+register(
+    Op(
+        name="linear_i8a8_zp",
+        infer=_infer_linear_i8a8_zp,
+        reference=_ref_linear_i8a8_zp,
+        doc="非对称 W8A8 线性层：激活与权重各带一个 i8 零点，先做 "
+        "(x_q - x_zp) 与 (w_q - w_zp) 的 int32 累加，再乘两个 scale 的积并加 "
+        "bias。语义是 ``((x_q - x_zp) @ (w_q - w_zp)).f32() * xs * ws [+ b]``；"
+        "K * 255 * 255 超过 int32 上界时显式拒绝",
     )
 )
 

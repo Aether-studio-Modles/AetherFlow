@@ -28,10 +28,15 @@ from aetherflow.conformance import default_cases, run_conformance
 from aetherflow.models.quantize import (
     QUANT_MAX,
     build_int8_linear,
+    build_int8_linear_zp,
     build_int8a8_linear,
+    build_int8a8_linear_zp,
     dequantize_weight,
+    dequantize_weight_asymmetric,
     quantize_activation,
+    quantize_activation_asymmetric,
     quantize_weight,
+    quantize_weight_asymmetric,
 )
 
 BACKEND = ReferenceBackend()
@@ -832,6 +837,420 @@ class TestFakeQuantizeI8LSQ(unittest.TestCase):
         np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
 
 
+def _quantize_zp_graph(shape):
+    g = Graph("quantize_i8_zp")
+    x = g.input("x", f32[shape])
+    s = g.input("s", f32[(shape[-1],)])
+    zp = g.input("zp", i8[(shape[-1],)])
+    g.output(g.add_node("quantize_i8_zp", [x, s, zp]), "q")
+    return g
+
+
+def _dequantize_zp_graph(shape):
+    g = Graph("dequantize_i8_zp")
+    q = g.input("q", i8[shape])
+    s = g.input("s", f32[(shape[-1],)])
+    zp = g.input("zp", i8[(shape[-1],)])
+    g.output(g.add_node("dequantize_i8_zp", [q, s, zp]), "w")
+    return g
+
+
+class TestAsymmetricQuantizeSemantics(unittest.TestCase):
+    def test_zero_point_shifts_the_integer_lattice(self):
+        x = np.array([[0.0, 0.0], [1.0, -1.0]], np.float32)
+        s = np.ones(2, np.float32)
+        zp = np.array([-128, 0], np.int8)
+        q = _run(_quantize_zp_graph((2, 2)), {"x": x, "s": s, "zp": zp})["q"]
+        np.testing.assert_array_equal(q, np.array([[-128, 0], [-127, -1]], np.int8))
+
+    def test_zero_point_is_applied_after_rounding(self):
+        """``0.5 / 1 = 0.5`` 先按 RNE 舍成 0，再加 1 得 1。
+
+        先加零点再舍入会得到 ``rint(1.5) = 2``——两条路径在 .5 处差一格，
+        这正是"零点是整数格点的平移"与"零点是一个浮点偏移"的区别。
+        """
+        q = _run(
+            _quantize_zp_graph((1, 1)),
+            {
+                "x": np.array([[0.5]], np.float32),
+                "s": np.ones(1, np.float32),
+                "zp": np.array([1], np.int8),
+            },
+        )["q"]
+        np.testing.assert_array_equal(q, np.array([[1]], np.int8))
+
+    def test_uses_both_endpoints(self):
+        """非对称的负端点必须真的用上 -128，而不是对称版的 -127。"""
+        x = np.array([[-127.0, 127.0, -1.0, 1.0]], np.float32)
+        zp = np.array([-1, 0, -128, 127], np.int8)
+        q = _run(
+            _quantize_zp_graph((1, 4)),
+            {"x": x, "s": np.ones(4, np.float32), "zp": zp},
+        )["q"]
+        np.testing.assert_array_equal(q, np.array([[-128, 127, -128, 127]], np.int8))
+
+    def test_dequantize_subtracts_in_int32(self):
+        """``q - zp`` 在 int32 里做：``-128 - 127 = -255``，不回绕成 1。"""
+        q = np.array([[-128, 127, -128, 127]], np.int8)
+        zp = np.array([127, -128, 127, -128], np.int8)
+        s = np.array([0.5, 0.5, 1.0, 1.0], np.float32)
+        got = _run(_dequantize_zp_graph((1, 4)), {"q": q, "s": s, "zp": zp})["w"]
+        np.testing.assert_array_equal(
+            got, np.array([[-127.5, 127.5, -255.0, 255.0]], np.float32)
+        )
+
+    def test_non_positive_scale_is_rejected(self):
+        for bad in (0.0, -0.5):
+            with self.subTest(scale=bad):
+                with self.assertRaises(ValueError):
+                    _run(
+                        _quantize_zp_graph((2, 3)),
+                        {
+                            "x": np.ones((2, 3), np.float32),
+                            "s": np.full(3, bad, np.float32),
+                            "zp": np.zeros(3, np.int8),
+                        },
+                    )
+
+    def test_build_time_rejections(self):
+        with self.subTest(case="zero_point_must_be_i8"):
+            g = Graph("bad_zp")
+            x = g.input("x", f32[2, 3])
+            s = g.input("s", f32[3])
+            zp = g.input("zp", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("quantize_i8_zp", [x, s, zp])
+        with self.subTest(case="zero_point_rank_exceeds_input"):
+            g = Graph("bad_zp")
+            x = g.input("x", f32[2, 3])
+            s = g.input("s", f32[3])
+            zp = g.input("zp", i8[1, 2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("quantize_i8_zp", [x, s, zp])
+        with self.subTest(case="symbolic_broadcast_unrepresentable"):
+            g = Graph("bad_zp")
+            x = g.input("x", f32["B", 4])
+            s = g.input("s", f32[4])
+            zp = g.input("zp", i8["S"])
+            with self.assertRaises(ValueError):
+                g.add_node("quantize_i8_zp", [x, s, zp])
+        with self.subTest(case="wrong_arity"):
+            g = Graph("bad_zp")
+            x = g.input("x", f32[2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("quantize_i8_zp", [x])
+
+    def test_json_round_trip(self):
+        rng = np.random.default_rng(100)
+        g = _quantize_zp_graph((3, 2))
+        feed = {
+            "x": (rng.standard_normal((3, 2)) * 3).astype(np.float32),
+            "s": np.array([0.25, 0.5], np.float32),
+            "zp": np.array([-128, 7], np.int8),
+        }
+        again = loads(dumps(g))
+        np.testing.assert_array_equal(_run(g, feed)["q"], _run(again, feed)["q"])
+
+
+class TestAsymmetricHelpers(unittest.TestCase):
+    def test_weight_params_map_channel_ends_to_both_endpoints(self):
+        """手算一份小权重：``-2..2`` 与 ``0..4`` 两条通道都该用满 -128..127。
+
+        这里不写死每个格子：float32 的 ``scale`` 存不下 4/255 的精确值，
+        ``-2 / scale`` 会落在 -127.4999 而不是 -127.5，RNE 对"恰好在半格上"
+        的取整方向因此依赖末位。钉住端点覆盖 + 半步误差界，语义不变而断言
+        不会因浮点细节抖动。
+        """
+        w = np.array([[-2.0, 0.0], [0.0, 2.0], [2.0, 4.0]], np.float32)
+        q, scale, zp = quantize_weight_asymmetric(w)
+        self.assertEqual(q.dtype, np.int8)
+        self.assertEqual(zp.dtype, np.int8)
+        np.testing.assert_array_equal(zp, np.array([0, -128], np.int8))
+        np.testing.assert_allclose(scale, np.array([4 / 255, 4 / 255], np.float32))
+        # 通道 0（值域 -2..2，跨零）：两端各被覆盖到。
+        self.assertLessEqual(int(q[0, 0]), -126)
+        self.assertGreaterEqual(int(q[2, 0]), 126)
+        # 通道 1（值域 0..4，扩展后仍从 0 起）：-128 对应 0，127 对应 4；
+        # 中间的 2.0 恰好落在半格上（2/scale = 127.5），取整方向由 float32 的
+        # 末位决定，因此只要求它落在 ±1 格内。
+        self.assertEqual(int(q[0, 1]), -128)
+        self.assertEqual(int(q[2, 1]), 127)
+        self.assertLessEqual(abs(int(q[1, 1])), 1)
+        back = dequantize_weight_asymmetric(q, scale, zp)
+        err = np.max(np.abs(back - w), axis=0)
+        self.assertTrue(np.all(err <= scale / 2 + 1e-6), (err, scale))
+
+    def test_round_trip_error_is_bounded_by_half_a_step(self):
+        rng = np.random.default_rng(101)
+        # 全正、0 起点的数据是 ReLU 之后激活的典型形态。
+        w = (rng.random((32, 8)) * 5).astype(np.float32)
+        q, scale, zp = quantize_weight_asymmetric(w)
+        back = dequantize_weight_asymmetric(q, scale, zp)
+        err = np.max(np.abs(back - w), axis=0)
+        self.assertTrue(np.all(err <= scale / 2 + 1e-6), (err, scale))
+
+    def test_zero_channel_gets_unit_scale_and_zero_value(self):
+        w = np.zeros((4, 3), np.float32)
+        w[0, 1] = 2.0
+        q, scale, zp = quantize_weight_asymmetric(w)
+        self.assertEqual(float(scale[0]), 1.0)
+        np.testing.assert_array_equal(q[:, 0], np.full(4, -128, np.int8))
+        np.testing.assert_array_equal(zp[0], np.int8(-128))
+        np.testing.assert_array_equal(
+            dequantize_weight_asymmetric(q, scale, zp)[:, 0], np.zeros(4, np.float32)
+        )
+
+    def test_zero_point_always_lands_inside_i8(self):
+        """把值域扩到含 0 之后，零点对任何有限数据都不会越界。
+
+        这是 ``_asymmetric_params`` 的核心不变量：``zp = -128 - lo'/scale``，
+        ``lo' = min(lo, 0) <= 0`` 且 ``scale >= (hi'-lo')/255``，于是
+        ``-128 <= zp <= 127``。不扩到 0 时全正数据的 ``zp < -128`` 会被夹死，
+        正端整片饱和——这个用例就是那条老 bug 的守门人。
+        """
+        rng = np.random.default_rng(104)
+        cases = {
+            "跨零": rng.standard_normal((16, 4)).astype(np.float32),
+            "全正": (rng.random((16, 4)) * 5 + 1).astype(np.float32),
+            "全负": (-rng.random((16, 4)) * 5 - 1).astype(np.float32),
+            "常数正": np.full((4, 2), 3.0, np.float32),
+            "常数负": np.full((4, 2), -3.0, np.float32),
+        }
+        for name, w in cases.items():
+            with self.subTest(case=name):
+                q, scale, zp = quantize_weight_asymmetric(w)
+                self.assertTrue(np.all(zp >= -128), zp)
+                self.assertTrue(np.all(zp <= 127), zp)
+                back = dequantize_weight_asymmetric(q, scale, zp)
+                err = np.max(np.abs(back - w), axis=0)
+                self.assertTrue(np.all(err <= scale / 2 + 1e-6), (err, scale))
+
+    def test_constant_channel_is_represented_exactly(self):
+        """常数通道在扩到含 0 之后可以被精确表示，而不是被压成 0。"""
+        w = np.full((3, 1), 3.0, np.float32)
+        q, scale, zp = quantize_weight_asymmetric(w)
+        self.assertEqual(int(zp[0]), -128)
+        np.testing.assert_array_equal(q[:, 0], np.full(3, 127, np.int8))
+        np.testing.assert_allclose(
+            dequantize_weight_asymmetric(q, scale, zp)[:, 0], w[:, 0], rtol=0, atol=1e-6
+        )
+
+    def test_asymmetric_beats_symmetric_on_positive_activations(self):
+        rng = np.random.default_rng(102)
+        x = (rng.random((64, 16)) * 10).astype(np.float32)
+        q_sym, s_sym = quantize_activation(x)
+        err_sym = float(np.mean(np.abs(q_sym.astype(np.float32) * s_sym - x)))
+        q_asym, s_asym, zp_asym = quantize_activation_asymmetric(x)
+        err_asym = float(
+            np.mean(np.abs(dequantize_weight_asymmetric(q_asym, s_asym, zp_asym) - x))
+        )
+        self.assertLess(err_asym, err_sym * 0.7, (err_asym, err_sym))
+
+    def test_helper_rejections(self):
+        with self.assertRaises(ValueError):
+            quantize_weight_asymmetric(np.zeros((2, 2, 2), np.float32))
+        with self.assertRaises(TypeError):
+            quantize_weight_asymmetric(np.zeros((2, 2), np.int32))
+        bad = np.zeros((2, 2), np.float32)
+        bad[0, 0] = np.nan
+        with self.assertRaises(ValueError):
+            quantize_weight_asymmetric(bad)
+        with self.assertRaises(ValueError):
+            quantize_activation_asymmetric(np.zeros(4, np.float32))
+        with self.assertRaises(ValueError):
+            quantize_activation_asymmetric(np.full((2, 3), np.inf, np.float32))
+
+
+class TestAsymmetricLinearGraphs(unittest.TestCase):
+    def test_weight_only_matches_dequantize_then_matmul(self):
+        rng = np.random.default_rng(103)
+        k, n = 8, 5
+        w = rng.standard_normal((k, n)).astype(np.float32)
+        q, s, zp = quantize_weight_asymmetric(w)
+        x = rng.standard_normal((2, k)).astype(np.float32)
+        b = rng.standard_normal(n).astype(np.float32)
+
+        g = Graph("int8_zp_linear")
+        inputs, out = build_int8_linear_zp(g, k, n)
+        g.output(out, "y")
+        got = _run(
+            g,
+            {
+                "x": x,
+                "w_i8": q,
+                "scale": s,
+                "zero_point": zp,
+                "bias": b,
+            },
+        )["y"]
+        want = x @ dequantize_weight_asymmetric(q, s, zp) + b
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+        self.assertEqual(set(inputs), {"x", "w_i8", "scale", "zero_point", "bias"})
+
+    def test_w8a8_matches_int32_expansion(self):
+        rng = np.random.default_rng(104)
+        k, n = 8, 4
+        w = rng.standard_normal((k, n)).astype(np.float32)
+        x = (rng.random((3, k)) * 6).astype(np.float32)  # 全正激活
+        wq, ws, wzp = quantize_weight_asymmetric(w)
+        xq, xs, xzp = quantize_activation_asymmetric(x)
+        b = rng.standard_normal(n).astype(np.float32)
+
+        g = Graph("w8a8_zp_linear")
+        inputs, out = build_int8a8_linear_zp(g, k, n)
+        g.output(out, "y")
+        got = _run(
+            g,
+            {
+                "x_q": xq,
+                "x_scale": xs,
+                "x_zero_point": xzp,
+                "w_q": wq,
+                "w_scale": ws,
+                "w_zero_point": wzp,
+                "bias": b,
+            },
+        )["y"]
+
+        acc = (xq.astype(np.int32) - xzp.astype(np.int32)) @ (
+            wq.astype(np.int32) - wzp.astype(np.int32)
+        )
+        want = acc.astype(np.float32) * xs * ws + b
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-5)
+        self.assertEqual(
+            set(inputs),
+            {"x_q", "x_scale", "x_zero_point", "w_q", "w_scale", "w_zero_point", "bias"},
+        )
+
+    def test_zero_point_changes_the_result(self):
+        """同一份 int8 数据、同一组 scale，只改零点：结果必须不同。"""
+        wq = np.array([[1, -2], [3, 4]], np.int8)
+        ws = np.ones(2, np.float32)
+        b = np.zeros(2, np.float32)
+        xq = np.array([[5, 6]], np.int8)
+        xs = np.ones((1, 1), np.float32)
+
+        def _out(wzp, xzp):
+            g = Graph("zp_matters")
+            _, out = build_int8a8_linear_zp(g, 2, 2)
+            g.output(out, "y")
+            return _run(
+                g,
+                {
+                    "x_q": xq,
+                    "x_scale": xs,
+                    "x_zero_point": np.array([[xzp]], np.int8),
+                    "w_q": wq,
+                    "w_scale": ws,
+                    "w_zero_point": np.array([wzp, 0], np.int8),
+                    "bias": b,
+                },
+            )["y"]
+
+        np.testing.assert_array_equal(_out(0, 0), np.array([[23, 14]], np.float32))
+        np.testing.assert_array_equal(_out(-3, -1), np.array([[66, 16]], np.float32))
+
+    def test_int32_accumulation_limit_is_rejected(self):
+        g = Graph("too_wide")
+        xq = g.input("x_q", i8[1, 33026])
+        xs = g.input("x_scale", f32[1, 1])
+        xzp = g.input("x_zp", i8[1, 1])
+        wq = g.input("w_q", i8[33026, 1])
+        ws = g.input("w_scale", f32[1])
+        wzp = g.input("w_zp", i8[1])
+        with self.assertRaises(ValueError):
+            g.add_node("linear_i8a8_zp", [xq, xs, xzp, wq, ws, wzp])
+
+    def test_build_time_rejections(self):
+        with self.subTest(case="activation_must_be_i8"):
+            g = Graph("bad_w8a8")
+            xq = g.input("x_q", f32[2, 8])
+            xs = g.input("x_scale", f32[2, 1])
+            xzp = g.input("x_zp", i8[2, 1])
+            wq = g.input("w_q", i8[8, 4])
+            ws = g.input("w_scale", f32[4])
+            wzp = g.input("w_zp", i8[4])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_i8a8_zp", [xq, xs, xzp, wq, ws, wzp])
+        with self.subTest(case="activation_scale_not_constant_along_k"):
+            g = Graph("bad_w8a8")
+            xq = g.input("x_q", i8[2, 8])
+            xs = g.input("x_scale", f32[2, 8])
+            xzp = g.input("x_zp", i8[2, 1])
+            wq = g.input("w_q", i8[8, 4])
+            ws = g.input("w_scale", f32[4])
+            wzp = g.input("w_zp", i8[4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_i8a8_zp", [xq, xs, xzp, wq, ws, wzp])
+        with self.subTest(case="weight_scale_must_be_per_channel"):
+            g = Graph("bad_w8a8")
+            xq = g.input("x_q", i8[2, 8])
+            xs = g.input("x_scale", f32[2, 1])
+            xzp = g.input("x_zp", i8[2, 1])
+            wq = g.input("w_q", i8[8, 4])
+            ws = g.input("w_scale", f32[1, 4])
+            wzp = g.input("w_zp", i8[4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_i8a8_zp", [xq, xs, xzp, wq, ws, wzp])
+        with self.subTest(case="weight_only_rejects_f16_input"):
+            g = Graph("bad_w")
+            x = g.input("x", f16[2, 8])
+            wq = g.input("w_q", i8[8, 4])
+            ws = g.input("w_scale", f32[4])
+            wzp = g.input("w_zp", i8[4])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_i8_zp", [x, wq, ws, wzp])
+
+    def test_backward_uses_zero_point_aware_weight(self):
+        g = Graph("zp_bwd")
+        x = g.input("x", f32[2, 3])
+        q = g.input("q", i8[3, 2])
+        s = g.input("s", f32[2])
+        zp = g.input("zp", i8[2])
+        g.output(g.add_node("linear_i8_zp", [x, q, s, zp]), "y")
+
+        feed = {
+            "x": np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]], np.float32),
+            "q": np.array([[1, -2], [3, 4], [-5, 6]], np.int8),
+            "s": np.array([0.5, 0.25], np.float32),
+            "zp": np.array([-128, 7], np.int8),
+            "dy": np.array([[1.0, -1.0], [0.5, 2.0]], np.float32),
+        }
+        got = _run(backward(g, wrt=[g.find("x")]), feed)["dx"]
+        weight = dequantize_weight_asymmetric(feed["q"], feed["s"], feed["zp"])
+        np.testing.assert_allclose(got, feed["dy"] @ weight.T, rtol=0, atol=1e-6)
+        for name in ("q", "s", "zp"):
+            with self.subTest(frozen=name):
+                with self.assertRaises(NoGradientError):
+                    backward(g, wrt=[g.find(name)])
+
+    def test_w8a8_backward_only_bias(self):
+        g = Graph("zp_w8a8_bwd")
+        xq = g.input("x_q", i8[2, 3])
+        xs = g.input("x_scale", f32[2, 1])
+        xzp = g.input("x_zp", i8[2, 1])
+        wq = g.input("w_q", i8[3, 2])
+        ws = g.input("w_scale", f32[2])
+        wzp = g.input("w_zp", i8[2])
+        b = g.input("bias", f32[2])
+        g.output(g.add_node("linear_i8a8_zp", [xq, xs, xzp, wq, ws, wzp, b]), "y")
+
+        feed = {
+            "x_q": np.array([[1, -2, 3], [-4, 5, 6]], np.int8),
+            "x_scale": np.array([[0.1], [0.2]], np.float32),
+            "x_zp": np.array([[-128], [0]], np.int8),
+            "w_q": np.array([[1, -2], [3, 4], [-5, 6]], np.int8),
+            "w_scale": np.array([0.5, 0.25], np.float32),
+            "w_zp": np.array([-128, 7], np.int8),
+            "bias": np.zeros(2, np.float32),
+            "dy": np.array([[1.0, 2.0], [3.0, 4.0]], np.float32),
+        }
+        got = _run(backward(g, wrt=[g.find("bias")]), feed)["dbias"]
+        np.testing.assert_array_equal(got, np.array([4.0, 6.0], np.float32))
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[g.find("x_q")])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
@@ -841,6 +1260,10 @@ class TestConformanceCases(unittest.TestCase):
             "fake_quantize_i8_lsq_channel",
             "linear_i8_bias",
             "linear_i8a8_bias",
+            "quantize_i8_zp_channel",
+            "dequantize_i8_zp_channel",
+            "linear_i8_zp_bias",
+            "linear_i8a8_zp_bias",
         }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)

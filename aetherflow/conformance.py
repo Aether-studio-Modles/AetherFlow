@@ -380,6 +380,104 @@ def _linear_i8a8(x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)):
     return build
 
 
+def _quantize_i8_zp(shape: tuple = (8, 6)):
+    """非对称量化：值域用满 ``[-128, 127]``，零点按通道不同。
+
+    零点覆盖三个区域：``-128``（把 0 映射到负端点）、``0``（退化为对称但
+    负端点仍是 -128）、正零点是"0 落在格子内部"。参考实现先舍入再平移，
+    这三类零点足以把"先加零点再舍入"的错误写法区分出来。
+    """
+
+    def build(rng):
+        g = Graph("quantize_i8_zp")
+        w = g.input("w", f32[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        zp = g.input("zp", i8[(shape[-1],)])
+        g.output(g.add_node("quantize_i8_zp", [w, s, zp]), "q")
+        scale = (np.abs(_f32(rng, (shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        zps = np.array([-128, 0, 1, -127, 127, -64], dtype=np.int8)
+        return g, {"w": _f32(rng, shape, scale=0.5), "s": scale, "zp": zps}
+
+    return build
+
+
+def _dequantize_i8_zp(shape: tuple = (8, 6)):
+    """非对称反量化：``q - zp`` 在 int32 里做，``(-128) - 127`` 不能回绕成 1。"""
+
+    def build(rng):
+        g = Graph("dequantize_i8_zp")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(shape[-1],)])
+        zp = g.input("zp", i8[(shape[-1],)])
+        g.output(g.add_node("dequantize_i8_zp", [q, s, zp]), "w")
+        scale = (np.abs(_f32(rng, (shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        zps = np.array([-128, 0, 1, -127, 127, -64], dtype=np.int8)
+        return g, {
+            "q": rng.integers(-128, 128, size=shape, dtype=np.int8),
+            "s": scale,
+            "zp": zps,
+        }
+
+    return build
+
+
+def _linear_i8_zp(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("linear_i8_zp")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(w_shape[-1],)])
+        zp = g.input("zp", i8[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_i8_zp", [x, q, s, zp, b]), "y")
+        scale = (np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        zps = np.array([-128, 0, 1, -127, 127, -64], dtype=np.int8)
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": rng.integers(-128, 128, size=w_shape, dtype=np.int8),
+            "s": scale,
+            "zp": zps,
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
+def _linear_i8a8_zp(x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)):
+    def build(rng):
+        g = Graph("linear_i8a8_zp")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input("x_scale", f32[x_shape[:-1] + (1,)])
+        xzp = g.input("x_zp", i8[x_shape[:-1] + (1,)])
+        wq = g.input("w_q", i8[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        wzp = g.input("w_zp", i8[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(
+            g.add_node(
+                "linear_i8a8_zp", [q, sx, xzp, wq, sw, wzp, b]
+            ),
+            "y",
+        )
+        return g, {
+            "x_q": rng.integers(-128, 128, size=x_shape, dtype=np.int8),
+            "x_scale": (
+                np.abs(_f32(rng, x_shape[:-1] + (1,), scale=0.1)) + 0.02
+            ).astype(np.float32),
+            # 激活零点全为 -128（ReLU 之后的典型形态：值域全正），
+            # 权重零点逐通道不同，覆盖"零点确实非零"的路径。
+            "x_zp": np.full(x_shape[:-1] + (1,), -128, dtype=np.int8),
+            "w_q": rng.integers(-128, 128, size=w_shape, dtype=np.int8),
+            "w_scale": (
+                np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05
+            ).astype(np.float32),
+            "w_zp": np.array([-128, 0, 1, -127, 127, -64], dtype=np.int8),
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
 def _softmax(axis: int = -1, scaled: bool = False, shape: tuple = (6, 11)):
     def build(rng):
         g = Graph("softmax")
@@ -1488,6 +1586,17 @@ def default_cases() -> List[Case]:
         _case("linear_i8a8_bias", _linear_i8a8(),
               note="int8 激活 × int8 权重先在 int32 里累加，再乘两个 scale；"
                    "尚未承接 int8 矩阵乘的后端必须显式拒绝，而不是退回 f32 累加"),
+        # 非对称（带零点）int8
+        _case("quantize_i8_zp_channel", _quantize_i8_zp(),
+              note="非对称量化用满 [-128,127]，零点覆盖 -128 / 0 / 正数；"
+                   "按通道给定的零点必须是先舍入再平移，不是先平移再舍入"),
+        _case("dequantize_i8_zp_channel", _dequantize_i8_zp(),
+              note="q - zp 在 int32 里算：(-128) - 127 = -255 不能回绕成 1"),
+        _case("linear_i8_zp_bias", _linear_i8_zp(),
+              note="非对称 weight-only：数值必须等于 dequantize_i8_zp 之后再 matmul"),
+        _case("linear_i8a8_zp_bias", _linear_i8a8_zp(),
+              note="非对称 W8A8：先各自减零点再 int32 累加；"
+                   "激活零点取 -128（全正激活的典型形态），权重零点逐通道不同"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),
