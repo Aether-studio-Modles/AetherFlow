@@ -19105,7 +19105,7 @@ cc 112 段 0.359（6.4%）。
 
 | 序 | 缺口 | 挡的是什么 |
 | --- | --- | --- |
-| 1 | bool 已是一等类型（5.330）且导入侧已接（5.340）；仍缺设备端 bool 归约内核 | 带 mask 的模型能进、参考端能跑逻辑组合；`reduce_all` / `reduce_any` 仍只有参考后端承接 |
+| 1 | bool 已是一等类型（5.330）、导入侧已接（5.340）、设备端归约内核已接（5.341）；仅剩真机回归 | 带 mask 的模型能进、参考端与设备端都能跑逻辑组合；`reduce_all` / `reduce_any` 缺 V100 / gfx1100 上的 conformance |
 | 2 | 设备侧归约已是数据并行默认（5.331），主机态已有桶间并发归约（5.302）；仍缺"设备态与反向重叠"与 P2P | 多卡扩展性（设备态反向是整图 capture / replay，准入判据见 5.338） |
 | 3 | 量化只到 weight-only int8 | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，但仍无 fp8 GEMM 与存储容器） |
 | 4 | 无调度搜索 / GEMM epilogue（loop IR 见 5.332、原生 NHWC 见 5.334；5.333 只把配置库接进执行路径） | 峰值性能上限 |
@@ -21787,6 +21787,61 @@ mtime、不重写。`generate` 之后紧接 `finish` 会连着走两次 `_persis
 - 没有 `count_nonzero`；计数先 `cast` 到 f32（5.330 的约束不变）。
 - 设备端 bool 归约仍无内核（`af_add_q` 仍是 stub，`reduce_all/any` 不在
   `GPU_OPS`）；bool 逻辑组合的设备路径仍是 5.330 的源码级交付，V100 未回归。
+
+### 5.341 bool 归约的设备内核：`reduce_any` / `reduce_all`
+
+**缺口。** 5.330 把 bool 定成一等类型（IR 侧 `reduce_all` / `reduce_any` 已有
+参考语义、1 字节存储与 `BOOL_DIALECT`），5.340 把逻辑组合接进了导入侧，但设备
+端一直缺这两个内核：`GPU_OPS` 没有它们，CUDA / HIP 在构图期就显式拒绝。结果
+是带 mask 的模型能导入、参考后端能跑，"用 bool 判一段序列是否全命中"这类写法
+一到设备就断。
+
+**实现。** 只加内核与分派，不改 IR、不改前端。
+
+1. L2（`lower/kernels/reduce.py`）：`_reduce_last` 增加 `pred` 参数。bool 在
+   设备上是 0/1 的 1 字节，求和等价于"数真值个数"，因此复用
+   `block_reduce_sum` 的骨架——`any` 归约后判"和 `!= 0`"，`all` 判"和
+   `== 列数`"。判定必须在块内归约**之后**：逐元素阶段只有"某一行全假"
+   （和仍为 0）能提前确定，而"全真"要等所有元素加完。`reduce_axis` /
+   `reduce_axis_tiled` 同一口径，判定放在一维步进（或两维树归约）的 `acc`
+   之后；内核名仍是 `reduce_{kind}_*`（bool 走 `kind="sum"`），缓存 key 里
+   带上 `pred` 区分。
+2. codegen（`backends/cuda/codegen.py`）：新增 `reduce_any_source()` /
+   `reduce_all_source()`，配两份手写对照模板 `REDUCE_ANY_SRC` /
+   `REDUCE_ALL_SRC`（测试逐 token 对齐）；`reduce_axis_source(kind, pred)` /
+   `reduce_axis_tiled_source(kind, pred)` 透传。写回仍走 `%ST%`，bool 的
+   `render` 自动选 `BOOL_DIALECT`，`af_st_q` 把 float 归一成 1 字节 0/1。
+3. 设备分派（`backends/device_reduce.py`）：kind 映射
+   `reduce_any / reduce_all → sum`，`_op_reduce_any` / `_op_reduce_all` 进
+   注册表；`GPU_OPS` 与 `_BOOL_OPS` 同时扩面（前者让注册表接受，后者让
+   dtype 检查放行 bool 输入）。HIP 与 CUDA 共用同一份声明与 codegen，自动
+   继承。
+4. 空轴与空输入按 numpy 的单位元：末维 `cols == 0` 时 any→False、all→True
+   （多轴合并后同理）；非末维 `reduce_len == 0` 由内核的 0 次循环自然给出
+   同样的值（`acc` 停在 0，`0 == reduce_len` 成立）。
+5. 轴长上限 `2^24`：`all` 的判定是"和恰好等于长度"，bool 元素是 0/1，求和
+   必须精确，而 float 只能精确表示 2^24 以内的整数。超长时抛
+   `BackendCapabilityError`，不给一个依赖累加顺序的答案；`any` 本可放宽，
+   但与 `all` 共用同一内核与同一份说明，保持口径一致。
+6. 不走窄末维的 rows 打包（那条快路径的条件是 `op == "reduce_sum"`）：bool
+   归约保持"一个 block 一行"，形状语义与 sum 的通用路径一致。
+
+**验证。** `tests/test_lower_kernel.py` 新增 6 条：末维 any / all 的源码与
+手写模板逐 token 相等、`any` 的判定是"和 `!= 0`"、`all` 的判定是"和
+`== 列数`"、bool 输出是 1 字节且走 `af_st_q`、非末维与两维铺法的 `pred`
+落在 `acc` 之后。`tests/test_cuda_backend.py` 新增 3 条（本地无 GPU 跳过）：
+末维全真 / 全假 / 混合、非末维（含 keepdims）与多轴、空轴单位元。
+
+`py -3.14 -m ruff check aetherflow tests` 通过；全量 3402 条通过 / 464 跳过
+（5.340 的 3393 加 9 条，其中 3 条设备用例本地跳过）。
+
+**未声称。**
+
+- 没有真机数据：V100 / gfx1100 上的 conformance 未跑，本节只到源码与参考
+  语义对齐。
+- 一次归约的轴长上限 `2^24`；更长请先分段再合并。
+- `reduce_sum(bool)` 仍然拒绝（5.330 的约束不变，计数先 `cast` 到 f32）。
+- bool 归约没有梯度（5.330：掩码不该进损失）。
 
 
 

@@ -826,9 +826,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   uint16 按数值读会变成位模式）。反向对"源或目标是 bool"显式抛
   `ValueError`——掩码不该进损失；`reduce_sum(bool)` 的反向同理（原先会静默
   把 bool 梯度传回去）。
-- **5.330 的真机债**：`reduce_all` / `reduce_any` 只有参考语义，不在
-  `GPU_OPS`（设备端无 bool 归约内核，`af_add_q` 仍是 stub），CUDA / HIP 会
-  显式拒绝；逻辑组合与 bool cast 的设备路径只有源码级检查，V100 未回归。
+- **bool 归约里的"和"只是计数器**（5.341）：`reduce_any` / `reduce_all` 复用
+  `block_reduce_sum` 的骨架，判定必须在块内归约**之后**——逐元素阶段只能
+  确定"全假"，"全真"要等所有元素加完。`all` 的等式"和 == 列数"要求求和
+  精确，因此轴长超过 2^24 显式拒绝（float 的整数精确区间），`any` 与它
+  同口径。
+- **5.341 的真机债**：`reduce_any` / `reduce_all` 已进 `GPU_OPS` /
+  `_BOOL_OPS`，但 CUDA / HIP 上的执行、逻辑组合与 bool cast 的设备路径仍只有
+  源码级检查，V100 / gfx1100 未回归。
 - **能力声明按"库能不能加载"，不按"路径有没有接"**（5.331）：
   `collective_support` 先前恒报 `device_allreduce=False`，理由是"路径没接"，
   但 5.228 / 5.244 之后库已能加载。声明与实际不符会让调用方永远不敢用设备侧
