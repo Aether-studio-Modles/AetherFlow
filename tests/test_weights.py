@@ -2,8 +2,8 @@
 
 三条判据：
 
-1. **字节级往返**：写进去什么 dtype / shape / 值，读回来必须逐位相同（bf16 是
-   唯一的例外——numpy 没有这个类型，约定无损展宽成 f32）。
+1. **字节级往返**：写进去什么 dtype / shape / 值，读回来必须逐位相同（bf16 /
+   fp8 是例外——numpy 没有这两种类型，约定无损展宽 / 解码成 f32）。
 2. **坏文件在拿到内存之前就被拒**：头长、offsets、shape 与字节数对不上的组合
    逐条断言。权重文件是外部输入，解析器的默认假设必须是"它是坏的"。
 3. **装填要么全成、要么全不动**：一个参数对不上时，别的参数不能被悄悄写进去。
@@ -129,6 +129,51 @@ class TestRead(_TempDir):
         self.assertEqual(out[2], 0.0)
         self.assertTrue(np.isnan(out[3]))
 
+    def test_fp8_e4m3_is_decoded_to_float32(self):
+        # 0x38 = 1.0、0x3C = 1.5、0x7E = 最大有限值 448、0x80 = -0
+        bits = np.array([0x38, 0x3C, 0x7E, 0x80], dtype=np.uint8)
+        target = self.path("fp8e4m3.safetensors")
+        _raw_file(
+            target,
+            {
+                "w": {
+                    "dtype": "F8_E4M3",
+                    "shape": [2, 2],
+                    "data_offsets": [0, bits.nbytes],
+                }
+            },
+            bits.tobytes(),
+        )
+        out = load_safetensors(target)["w"]
+        self.assertEqual(out.dtype, np.float32)
+        self.assertEqual(out.shape, (2, 2))
+        np.testing.assert_array_equal(
+            out, np.array([[1.0, 1.5], [448.0, -0.0]], np.float32)
+        )
+        self.assertTrue(np.signbit(out[1, 1]))
+
+    def test_fp8_e5m2_keeps_inf_and_nan(self):
+        # 0x3C = 1.0、0x7B = 最大有限值 57344、0x7C = inf、0x7D = NaN
+        bits = np.array([0x3C, 0x7B, 0x7C, 0x7D], dtype=np.uint8)
+        target = self.path("fp8e5m2.safetensors")
+        _raw_file(
+            target,
+            {
+                "w": {
+                    "dtype": "F8_E5M2",
+                    "shape": [4],
+                    "data_offsets": [0, bits.nbytes],
+                }
+            },
+            bits.tobytes(),
+        )
+        out = load_safetensors(target)["w"]
+        self.assertEqual(out.dtype, np.float32)
+        self.assertEqual(out[0], 1.0)
+        self.assertEqual(out[1], 57344.0)
+        self.assertTrue(np.isinf(out[2]))
+        self.assertTrue(np.isnan(out[3]))
+
     def test_metadata_and_names(self):
         target = self.path("meta.safetensors")
         _file(target, {"x": np.zeros((2,), np.float32)}, metadata={"format": "pt"})
@@ -155,18 +200,6 @@ class TestRead(_TempDir):
         with SafeTensorsFile(target) as fh:
             with self.assertRaises(KeyError):
                 fh.tensor("nope")
-
-    def test_fp8_is_rejected_explicitly(self):
-        target = self.path("fp8.safetensors")
-        _raw_file(
-            target,
-            {"w": {"dtype": "F8_E4M3", "shape": [2], "data_offsets": [0, 2]}},
-            b"\x00\x01",
-        )
-        with SafeTensorsFile(target) as fh:
-            with self.assertRaises(SafeTensorsError) as ctx:
-                fh.tensor("w")
-        self.assertIn("fp8", str(ctx.exception))
 
 
 class TestHeaderRejections(_TempDir):

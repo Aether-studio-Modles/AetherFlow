@@ -38,6 +38,8 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from .runtime.fp8 import unpack_fp8
+
 __all__ = [
     "SafeTensorsError",
     "TensorInfo",
@@ -55,8 +57,8 @@ __all__ = [
 # 先分配内存。
 _MAX_HEADER_BYTES = 100 << 20
 
-# dtype 名 → 每元素字节数。F8 两种格式登记在案但**不支持**（见 ``_read_tensor``）：
-# 本仓库还没有 fp8 数值类型，假装读成 u8 只会把问题推到链路下游。
+# dtype 名 → 每元素字节数。F8 两种格式是 1 字节位模式，读取时按 ``_FP8``
+# 解码成 f32 载体。
 _ITEMSIZE: Dict[str, int] = {
     "BOOL": 1,
     "U8": 1,
@@ -92,7 +94,9 @@ _NUMPY: Dict[str, str] = {
     "F64": "<f8",
 }
 
-_FP8 = ("F8_E4M3", "F8_E5M2")
+# safetensors 的 fp8 dtype 名 → ``runtime/fp8`` 的格式名。numpy 没有 fp8 标量
+# 类型：读取时解码成 f32 载体（fp8 -> f32 是精确的），与 bf16 的展宽同一策略。
+_FP8: Dict[str, str] = {"F8_E4M3": "e4m3", "F8_E5M2": "e5m2"}
 
 
 class SafeTensorsError(ValueError):
@@ -271,20 +275,19 @@ class SafeTensorsFile:
         返回值总是拷贝：``np.frombuffer(bytes)`` 得到的是只读视图，而参数要被
         优化器原地更新；让它带着只读标志流进训练，错误会在第一步更新时才炸。
         bf16 在这里无损展宽成 f32（左移 16 位是精确的），因为 numpy 没有
-        bf16 原生类型；fp8 直接拒绝（见模块说明）。
+        bf16 原生类型；fp8 同理解码成 f32 载体（``unpack_fp8``，fp8 -> f32
+        是精确的）。
         """
         info = self.info(name)
-        if info.dtype in _FP8:
-            raise SafeTensorsError(
-                f"张量 {name!r} 的 dtype 是 {info.dtype}：本仓库还没有 fp8 数值类型"
-                "（见 DESIGN 5.301 的量化缺口），不能把它当成权重装进来"
-            )
         size = info.nbytes
         self._fh.seek(self._data_start + info.offsets[0])
         raw = self._fh.read(size)
         if len(raw) != size:
             raise SafeTensorsError(f"{self.path}：读取张量 {name!r} 时文件被截断")
 
+        if info.dtype in _FP8:
+            bits = np.frombuffer(raw, dtype=np.uint8)
+            return unpack_fp8(bits, _FP8[info.dtype]).reshape(info.shape).copy()
         if info.dtype == "BF16":
             bits = np.frombuffer(raw, dtype="<u2")
             widened = (bits.astype(np.uint32) << 16).view(np.float32)
