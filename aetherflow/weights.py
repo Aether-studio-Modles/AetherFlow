@@ -366,14 +366,14 @@ def load_safetensors_dir(folder, pattern: str = "*.safetensors") -> Dict[str, np
 # - ``q``：``(K, N)`` 的 int8，``K`` 是输入维、``N`` 是输出维，与 ``linear_i8``
 #   / ``linear_i8_zp`` 的 ``w_i8`` 同布局。PyTorch 的 ``nn.Linear`` 是
 #   ``(N, K)``，要显式 ``transpose=True``。
-# - ``scale``：f32，``(1,)`` 或 ``(N,)``——逐输出通道一组，与
-#   ``quantize_weight`` / ``quantize_weight_asymmetric`` 的输出一致。
+# - ``scale``：f32，``(1,)`` / ``(N,)``（逐输出通道）或 ``(K/G, N)``（逐组，
+#   GPTQ / AWQ 的 group_size 形态），与 ``quantize_weight`` /
+#   ``quantize_weight_asymmetric`` 的输出一致。
 # - ``zero_point``：只在非对称时存在，int8，形状与 ``scale`` 相同。
 # - metadata ``quantization``：``"int8"``（对称）或 ``"int8_zp"``（非对称）。
 #   缺省时不校验，兼容别处导出的文件。
-# - metadata ``quantization.group_size``：只接受缺省或 ``"1"``。逐组
-#   （per-group）反量化还没有算子承接（DESIGN 5.317），写别的值一律显式拒绝，
-#   而不是按逐通道读进来给出错的数。
+# - metadata ``quantization.group_size``：可缺省（形状已经自描述）；一旦写了，
+#   必须等于由形状推出的组大小。
 
 _QUANTIZATION_KINDS = ("int8", "int8_zp")
 
@@ -382,8 +382,9 @@ _QUANTIZATION_KINDS = ("int8", "int8_zp")
 class QuantizedWeight:
     """一份已量化的线性层权重。
 
-    ``q`` 是 ``(K, N)`` 的 int8，``scale`` 与 ``zero_point`` 是逐输出通道
-    （``(1,)`` 或 ``(N,)``）。``zero_point is None`` 表示对称量化。
+    ``q`` 是 ``(K, N)`` 的 int8，``scale`` 与 ``zero_point`` 是 ``(1,)`` /
+    ``(N,)``（逐输出通道）或 ``(K/G, N)``（逐组）。``zero_point is None``
+    表示对称量化。
 
     这三个数组可能直接引用调用方传进来的数组（大权重不重复拷贝），
     当成只读用。
@@ -409,10 +410,31 @@ class QuantizedWeight:
     def out_features(self) -> int:
         return self.shape[1]
 
+    @property
+    def group_size(self) -> int:
+        """沿输入维每组包含多少行。
+
+        一维 scale 表示整列共用一份参数，等价于 ``group_size = K``；
+        二维 scale 的组大小由 ``K / K_g`` 推出。
+        """
+        if self.scale.ndim == 2:
+            return self.in_features // int(self.scale.shape[0])
+        return self.in_features
+
+    @property
+    def per_group(self) -> bool:
+        return self.group_size < self.in_features
+
     def dequantize(self) -> np.ndarray:
-        """按 IR 的同一份语义还原成 f32（``dequantize_i8`` / ``dequantize_i8_zp``）。"""
+        """按 IR 的同一份语义还原成 f32（``dequantize_i8*`` 系列）。"""
         from .ir.ops import get_op  # 延迟导入：本模块的运行期依赖保持 numpy + 标准库
 
+        if self.scale.ndim == 2:
+            if self.zero_point is None:
+                return get_op("dequantize_i8_group").reference([self.q, self.scale], {})
+            return get_op("dequantize_i8_group_zp").reference(
+                [self.q, self.scale, self.zero_point], {}
+            )
         if self.zero_point is None:
             return get_op("dequantize_i8").reference([self.q, self.scale], {})
         return get_op("dequantize_i8_zp").reference(
@@ -449,15 +471,27 @@ def _check_quantized_arrays(
     scale = np.asarray(scale)
     if scale.dtype.kind != "f":
         raise SafeTensorsError(f"{label}的 scale 必须是浮点，得到 {scale.dtype}")
-    if scale.ndim > 1:
+    if scale.ndim > 2:
         raise SafeTensorsError(
-            f"{label}的 scale 必须是一维 (1,) 或 (N,)，得到形状 {scale.shape}"
+            f"{label}的 scale 必须是一维 (1,) / (N,) 或二维 (K/G, N)，"
+            f"得到形状 {scale.shape}"
         )
-    if scale.size not in (1, n):
-        raise SafeTensorsError(
-            f"{label}的 scale 有 {scale.size} 个元素，但 q 的输出维是 {n}："
-            "逐通道量化只接受 1 个（逐张量）或 N 个（逐通道）"
-        )
+    if scale.ndim == 1:
+        if scale.size not in (1, n):
+            raise SafeTensorsError(
+                f"{label}的 scale 有 {scale.size} 个元素，但 q 的输出维是 {n}："
+                "逐通道量化只接受 1 个（逐张量）或 N 个（逐通道）"
+            )
+    else:
+        groups, cols = scale.shape
+        if cols != n:
+            raise SafeTensorsError(
+                f"{label}的 scale 形状是 {scale.shape}，列数与 q 的输出维 {n} 不一致"
+            )
+        if groups <= 0 or k % groups != 0:
+            raise SafeTensorsError(
+                f"{label}的 scale 有 {groups} 组，但 q 的输入维 K={k} 不能被它整除"
+            )
     if not allow_downcast and not np.can_cast(scale.dtype, np.float32, casting="safe"):
         raise SafeTensorsError(
             f"{label}的 scale 是 {scale.dtype}，转成 f32 是有损转换，需要 allow_downcast=True"
@@ -476,13 +510,21 @@ def _check_quantized_arrays(
                 f"{label}的 zero_point 必须是整数（int8 / int32 / int64），"
                 f"得到 {zp.dtype}：浮点零点说明它是中间量，不是量化零点"
             )
-        if zp.ndim > 1:
+        if zp.ndim > 2:
             raise SafeTensorsError(
-                f"{label}的 zero_point 必须是一维 (1,) 或 (N,)，得到形状 {zp.shape}"
+                f"{label}的 zero_point 必须是一维 (1,) / (N,) 或二维 (K/G, N)，"
+                f"得到形状 {zp.shape}"
             )
-        if zp.size not in (1, n):
+        if scale.ndim == 2:
+            if tuple(zp.shape) != tuple(scale.shape):
+                raise SafeTensorsError(
+                    f"{label}的 zero_point 形状 {zp.shape} 必须与 scale "
+                    f"{scale.shape} 相同：同一组共用一对参数"
+                )
+        elif zp.ndim != 1 or zp.size not in (1, n):
             raise SafeTensorsError(
-                f"{label}的 zero_point 有 {zp.size} 个元素，但 q 的输出维是 {n}"
+                f"{label}的 zero_point 形状 {zp.shape} 与逐通道 scale 不匹配"
+                "（一维时必须是 (1,) 或 (N,)）"
             )
         lo, hi = int(zp.min()), int(zp.max())
         if lo < -128 or hi > 127:
@@ -523,7 +565,7 @@ def build_quantized_weight(
 
 
 def _check_quantization_metadata(
-    metadata: Mapping[str, str], has_zero_point: bool, where: str
+    metadata: Mapping[str, str], weight: QuantizedWeight, where: str
 ) -> None:
     """校验 metadata 的量化自描述与张量是否自洽（缺失即不校验）。"""
     kind = metadata.get("quantization")
@@ -533,22 +575,33 @@ def _check_quantization_metadata(
                 f"{where}：metadata 里的 quantization={kind!r} 未知"
                 f"（支持 {', '.join(_QUANTIZATION_KINDS)}）"
             )
-        if kind == "int8_zp" and not has_zero_point:
+        if kind == "int8_zp" and weight.symmetric:
             raise SafeTensorsError(
                 f"{where}：metadata 声称 quantization=int8_zp，但没有给 zero_point 张量"
             )
-        if kind == "int8" and has_zero_point:
+        if kind == "int8" and not weight.symmetric:
             raise SafeTensorsError(
                 f"{where}：metadata 声称 quantization=int8，却给了 zero_point 张量"
             )
 
     group = metadata.get("quantization.group_size")
-    if group is not None and group.strip() not in ("", "1"):
-        raise SafeTensorsError(
-            f"{where}：metadata 的 quantization.group_size={group!r}，"
-            "逐组（per-group）反量化还没有算子承接（DESIGN 5.317），"
-            "拒绝按逐通道读进来"
-        )
+    if group is not None:
+        text = group.strip()
+        try:
+            size = int(text)
+        except ValueError:
+            raise SafeTensorsError(
+                f"{where}：metadata 的 quantization.group_size={group!r} 不是正整数"
+            ) from None
+        if size <= 0:
+            raise SafeTensorsError(
+                f"{where}：metadata 的 quantization.group_size={group!r} 必须为正"
+            )
+        if size != weight.group_size:
+            raise SafeTensorsError(
+                f"{where}：metadata 的 quantization.group_size={group!r} 与张量矛盾"
+                f"（q 的 K={weight.in_features}，scale 推出每组 {weight.group_size} 行）"
+            )
 
 
 def load_quantized_linear(
@@ -569,14 +622,13 @@ def load_quantized_linear(
     """
     root = os.fspath(path)
     with SafeTensorsFile(root) as fh:
-        if check_metadata:
-            _check_quantization_metadata(fh.metadata, zero_point is not None, root)
         needed = [weight, scale] + ([zero_point] if zero_point is not None else [])
         missing = [name for name in needed if name not in fh]
         if missing:
             raise SafeTensorsError(f"{root} 里缺少量化权重需要的张量: {missing}")
         arrays = {name: fh.tensor(name) for name in needed}
-    return _check_quantized_arrays(
+        metadata = dict(fh.metadata)
+    got = _check_quantized_arrays(
         arrays[weight],
         arrays[scale],
         None if zero_point is None else arrays[zero_point],
@@ -584,6 +636,9 @@ def load_quantized_linear(
         allow_downcast=allow_downcast,
         label=f"{root} 的量化权重",
     )
+    if check_metadata:
+        _check_quantization_metadata(metadata, got, root)
+    return got
 
 
 def load_into_store(

@@ -421,6 +421,53 @@ def _dequantize_i8_zp(shape: tuple = (8, 6)):
     return build
 
 
+def _dequantize_i8_group(shape: tuple = (8, 6), groups: int = 4):
+    """逐组反量化：K=8 分成 4 组，每组 2 行共用一份 scale。
+
+    组数取在 1 与 K 之间（不是端点），这样"按行读"和"按列读"都会给出不同的
+    形状或不同的数，不会因为退化成逐通道而碰巧对上。
+    """
+
+    def build(rng):
+        k, n = shape
+        if k % groups != 0:
+            raise ValueError(f"逐组形态要求 K={k} 能被组数 {groups} 整除")
+        g = Graph("dequantize_i8_group")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(groups, n)])
+        g.output(g.add_node("dequantize_i8_group", [q, s]), "w")
+        scale = (np.abs(_f32(rng, (groups, n), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {
+            "q": rng.integers(-127, 128, size=shape, dtype=np.int8),
+            "s": scale,
+        }
+
+    return build
+
+
+def _dequantize_i8_group_zp(shape: tuple = (8, 6), groups: int = 4):
+    """逐组非对称反量化：``q - zp`` 仍在 int32 里做。"""
+
+    def build(rng):
+        k, n = shape
+        if k % groups != 0:
+            raise ValueError(f"逐组形态要求 K={k} 能被组数 {groups} 整除")
+        g = Graph("dequantize_i8_group_zp")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(groups, n)])
+        zp = g.input("zp", i8[(groups, n)])
+        g.output(g.add_node("dequantize_i8_group_zp", [q, s, zp]), "w")
+        scale = (np.abs(_f32(rng, (groups, n), scale=0.2)) + 0.05).astype(np.float32)
+        zps = rng.integers(-128, 128, size=(groups, n), dtype=np.int8)
+        return g, {
+            "q": rng.integers(-128, 128, size=shape, dtype=np.int8),
+            "s": scale,
+            "zp": zps,
+        }
+
+    return build
+
+
 def _linear_i8_zp(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
     def build(rng):
         g = Graph("linear_i8_zp")
@@ -1597,6 +1644,12 @@ def default_cases() -> List[Case]:
         _case("linear_i8a8_zp_bias", _linear_i8a8_zp(),
               note="非对称 W8A8：先各自减零点再 int32 累加；"
                    "激活零点取 -128（全正激活的典型形态），权重零点逐通道不同"),
+        # 逐组（per-group）weight-only 反量化（GPTQ / AWQ 的 group_size 形态）
+        _case("dequantize_i8_group", _dequantize_i8_group(),
+              note="K=8 分成 4 组，组内共用一份 scale；组大小由形状推出，"
+                   "不能按逐通道或逐行读"),
+        _case("dequantize_i8_group_zp", _dequantize_i8_group_zp(),
+              note="逐组非对称：q - zp 在 int32 里算，scale / zp 同形"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

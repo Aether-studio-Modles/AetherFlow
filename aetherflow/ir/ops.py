@@ -1708,6 +1708,132 @@ register(
 )
 
 
+def _check_group_params(
+    q: TensorType, param: TensorType, what: str, label: str
+) -> None:
+    """逐组量化参数：二维 ``(K/G, N)``，列数与 q 对齐，``K/G`` 必须整除 K。
+
+    组大小不单独入图：``G = K / K_g`` 由两张量的形状唯一确定。多留一个 attr
+    就等于多一份真值，两者对不上时没人知道该信谁。
+    """
+    if param.rank != 2:
+        raise ValueError(
+            f"{what} 的 {label} 必须是二维 (K/G, N)，得到秩 {param.rank}"
+        )
+    k, n = q.shape
+    kg, pn = param.shape
+    if pn != n:
+        raise ValueError(
+            f"{what} 的 {label} 形状 {param.shape} 的列数与 q 的输出维 {n} 不一致"
+        )
+    if not isinstance(k, int) or not isinstance(kg, int):
+        raise ValueError(
+            f"{what} 的分组要求静态的 K 与 K/G，得到 q {q.shape}、{label} {param.shape}"
+        )
+    if k <= 0 or kg <= 0:
+        raise ValueError(f"{what} 的形状非法：q {q.shape}，{label} {param.shape}")
+    if k % kg != 0:
+        raise ValueError(
+            f"{what} 的 {label} 有 {kg} 组，但 q 的输入维 K={k} 不能被它整除"
+        )
+
+
+def _infer_dequantize_i8_group(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(
+            f"dequantize_i8_group 需要 (q, scale) 两个输入，得到 {len(inputs)}"
+        )
+    q, scale = inputs
+    if q.dtype != DType.I8:
+        raise TypeError(
+            f"dequantize_i8_group 的第一个输入必须是 i8，得到 {q.dtype.value}"
+        )
+    if q.rank != 2:
+        raise ValueError(
+            f"dequantize_i8_group 的 q 必须是二维 (K, N)，得到秩 {q.rank}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"dequantize_i8_group 的 scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+    _check_group_params(q, scale, "dequantize_i8_group", "scale")
+    return TensorType(DType.F32, q.shape)
+
+
+def _ref_dequantize_i8_group(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    q, scale = args
+    # 组内共用一份 scale：把 (K/G, N) 沿 K 重复 G 次再乘。
+    repeated = np.repeat(scale, q.shape[0] // scale.shape[0], axis=0)
+    return q.astype(np.float32) * repeated
+
+
+register(
+    Op(
+        name="dequantize_i8_group",
+        infer=_infer_dequantize_i8_group,
+        reference=_ref_dequantize_i8_group,
+        doc="逐组对称反量化：q (K, N) 沿输入维分成 K/G 组，scale (K/G, N) "
+        "组内共用（GPTQ / AWQ 的 group_size 形态）；scale 的组数为 1 时等于逐通道，"
+        "为 K 时等于逐行。组大小由形状推出，不另设 attr",
+    )
+)
+
+
+def _infer_dequantize_i8_group_zp(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 3:
+        raise ValueError(
+            "dequantize_i8_group_zp 需要 (q, scale, zero_point) 三个输入，"
+            f"得到 {len(inputs)}"
+        )
+    q, scale, zp = inputs
+    if q.dtype != DType.I8:
+        raise TypeError(
+            f"dequantize_i8_group_zp 的第一个输入必须是 i8，得到 {q.dtype.value}"
+        )
+    if q.rank != 2:
+        raise ValueError(
+            f"dequantize_i8_group_zp 的 q 必须是二维 (K, N)，得到秩 {q.rank}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"dequantize_i8_group_zp 的 scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+    if zp.dtype != DType.I8:
+        raise TypeError(
+            f"dequantize_i8_group_zp 的 zero_point 必须是 i8，得到 {zp.dtype.value}"
+        )
+    _check_group_params(q, scale, "dequantize_i8_group_zp", "scale")
+    if tuple(zp.shape) != tuple(scale.shape):
+        raise ValueError(
+            f"dequantize_i8_group_zp 的 zero_point 形状 {zp.shape} "
+            f"必须与 scale {scale.shape} 相同（同一组共用一对参数）"
+        )
+    return TensorType(DType.F32, q.shape)
+
+
+def _ref_dequantize_i8_group_zp(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    q, scale, zp = args
+    # 与 dequantize_i8_zp 同一顺序：先在 int32 里减，再放大。
+    diff = q.astype(np.int32) - np.repeat(zp.astype(np.int32), q.shape[0] // zp.shape[0], axis=0)
+    repeated = np.repeat(scale, q.shape[0] // scale.shape[0], axis=0)
+    return diff.astype(np.float32) * repeated
+
+
+register(
+    Op(
+        name="dequantize_i8_group_zp",
+        infer=_infer_dequantize_i8_group_zp,
+        reference=_ref_dequantize_i8_group_zp,
+        doc="逐组非对称反量化：f32(q - zp) * scale，减法在 int32 里做；"
+        "scale / zero_point 形状都是 (K/G, N)，组内共用（AWQ / GPTQ 的 group_size 形态）",
+    )
+)
+
+
 def _infer_linear_i8_zp(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (4, 5):
         raise ValueError(

@@ -1251,6 +1251,125 @@ class TestAsymmetricLinearGraphs(unittest.TestCase):
             backward(g, wrt=[g.find("x_q")])
 
 
+def _group_graph(shape, groups, with_zp=False):
+    name = "dequantize_i8_group_zp" if with_zp else "dequantize_i8_group"
+    g = Graph(name)
+    q = g.input("q", i8[shape])
+    s = g.input("s", f32[(groups, shape[1])])
+    inputs = [q, s]
+    if with_zp:
+        inputs.append(g.input("z", i8[(groups, shape[1])]))
+    g.output(g.add_node(name, inputs), "w")
+    return g
+
+
+class TestGroupDequantize(unittest.TestCase):
+    """逐组（per-group）weight-only 反量化。
+
+    组大小由 ``K / K_g`` 推出（没有额外 attr）：``K_g = 1`` 退化成逐通道，
+    ``K_g = K`` 退化成逐行。组数取中间值时必须和"按行读 scale"给出不同的
+    数，否则这个测试就只是在测逐通道。
+    """
+
+    def test_matches_manual_group_expansion(self):
+        q = np.array([[1, -2], [3, -4], [5, -6], [7, -8]], np.int8)
+        scale = np.array([[0.5, 0.25], [1.5, 2.0]], np.float32)
+        got = _run(_group_graph((4, 2), 2), {"q": q, "s": scale})["w"]
+        want = q.astype(np.float32) * np.repeat(scale, 2, axis=0)
+        np.testing.assert_array_equal(got, want)
+        # 第二组的第一行用的是 scale[1] 而不是 scale[0]：按行读会得到 5.0
+        self.assertEqual(float(got[2, 0]), 7.5)
+
+    def test_zero_point_is_applied_per_group_and_in_int32(self):
+        q = np.full((4, 2), -128, np.int8)
+        scale = np.array([[1.0, 2.0], [3.0, 4.0]], np.float32)
+        zp = np.array([[0, 1], [127, -128]], np.int8)
+        got = _run(
+            _group_graph((4, 2), 2, with_zp=True),
+            {"q": q, "s": scale, "z": zp},
+        )["w"]
+        diff = q.astype(np.int32) - np.repeat(zp.astype(np.int32), 2, axis=0)
+        np.testing.assert_array_equal(
+            got, diff.astype(np.float32) * np.repeat(scale, 2, axis=0)
+        )
+        # (-128 - 127) * 3 = -765：先减再乘，减法不会在 int8 里回绕成 1
+        self.assertEqual(float(got[2, 0]), -765.0)
+
+    def test_group_of_one_matches_per_channel_dequantize(self):
+        rng = np.random.default_rng(7)
+        q = rng.integers(-127, 128, size=(4, 6), dtype=np.int8)
+        scale = (np.abs(rng.standard_normal((1, 6))) * 0.1 + 0.01).astype(np.float32)
+        g = Graph("per_channel")
+        qq = g.input("q", i8[4, 6])
+        ss = g.input("s", f32[(6,)])
+        g.output(g.add_node("dequantize_i8", [qq, ss]), "w")
+        want = _run(g, {"q": q, "s": scale[0]})["w"]
+        got = _run(_group_graph((4, 6), 1), {"q": q, "s": scale})["w"]
+        np.testing.assert_array_equal(got, want)
+
+    def test_group_of_k_matches_per_row_scale(self):
+        rng = np.random.default_rng(8)
+        q = rng.integers(-127, 128, size=(3, 4), dtype=np.int8)
+        scale = (np.abs(rng.standard_normal((3, 4))) * 0.1 + 0.01).astype(np.float32)
+        got = _run(_group_graph((3, 4), 3), {"q": q, "s": scale})["w"]
+        np.testing.assert_array_equal(got, q.astype(np.float32) * scale)
+
+    def test_rejections(self):
+        with self.subTest(case="k_not_divisible_by_groups"):
+            g = Graph("bad_group")
+            q = g.input("q", i8[5, 4])
+            s = g.input("s", f32[2, 4])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_i8_group", [q, s])
+        with self.subTest(case="column_mismatch"):
+            g = Graph("bad_group")
+            q = g.input("q", i8[4, 4])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_i8_group", [q, s])
+        with self.subTest(case="scale_rank_three"):
+            g = Graph("bad_group")
+            q = g.input("q", i8[4, 4])
+            s = g.input("s", f32[2, 2, 2])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_i8_group", [q, s])
+        with self.subTest(case="symbolic_k"):
+            g = Graph("bad_group")
+            q = g.input("q", i8["K", 4])
+            s = g.input("s", f32[2, 4])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_i8_group", [q, s])
+        with self.subTest(case="zero_point_shape_mismatch"):
+            g = Graph("bad_group_zp")
+            q = g.input("q", i8[4, 4])
+            s = g.input("s", f32[2, 4])
+            z = g.input("z", i8[(4,)])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_i8_group_zp", [q, s, z])
+        with self.subTest(case="wrong_dtype"):
+            g = Graph("bad_group")
+            q = g.input("q", f32[4, 4])
+            s = g.input("s", f32[2, 4])
+            with self.assertRaises(TypeError):
+                g.add_node("dequantize_i8_group", [q, s])
+        with self.subTest(case="wrong_arity"):
+            g = Graph("bad_group")
+            q = g.input("q", i8[4, 4])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_i8_group", [q])
+
+    def test_json_round_trip(self):
+        rng = np.random.default_rng(9)
+        g = _group_graph((6, 4), 3, with_zp=True)
+        feed = {
+            "q": rng.integers(-128, 128, size=(6, 4), dtype=np.int8),
+            "s": (np.abs(rng.standard_normal((3, 4))) * 0.2 + 0.01).astype(np.float32),
+            "z": rng.integers(-128, 128, size=(3, 4), dtype=np.int8),
+        }
+        again = loads(dumps(g))
+        np.testing.assert_array_equal(_run(g, feed)["w"], _run(again, feed)["w"])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
@@ -1264,6 +1383,8 @@ class TestConformanceCases(unittest.TestCase):
             "dequantize_i8_zp_channel",
             "linear_i8_zp_bias",
             "linear_i8a8_zp_bias",
+            "dequantize_i8_group",
+            "dequantize_i8_group_zp",
         }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)

@@ -441,11 +441,39 @@ class TestQuantizedWeight(_TempDir):
         got = load_quantized_linear(target, "w_q", "w_scale")
         np.testing.assert_array_equal(got.dequantize(), dequantize_weight(q, scale))
 
-    def test_group_size_one_is_accepted(self):
+    def test_group_size_matching_shape_is_accepted(self):
         target, _, _ = self._symmetric_file(
-            {"quantization": "int8", "quantization.group_size": "1"}
+            {"quantization": "int8", "quantization.group_size": "3"}
         )
         self.assertTrue(load_quantized_linear(target, "w_q", "w_scale").symmetric)
+
+    def test_group_size_must_match_shape(self):
+        # W 是 3x3，逐通道 scale 意味着每组 3 行；声明 1 与形状矛盾。
+        target, _, _ = self._symmetric_file({"quantization.group_size": "1"})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_quantized_linear(target, "w_q", "w_scale")
+        self.assertIn("group_size", str(ctx.exception))
+
+    def test_per_group_round_trip(self):
+        q = np.array(
+            [[1, -2], [3, -4], [5, -6], [7, -8]], dtype=np.int8
+        )  # (K, N) = (4, 2)，每组 2 行
+        scale = np.array([[0.5, 0.25], [1.5, 2.0]], dtype=np.float32)  # (2, 2)
+        zp = np.array([[0, 1], [-2, 3]], dtype=np.int8)
+        target = self.path("group.safetensors")
+        _file(
+            target,
+            {"q": q, "s": scale, "z": zp},
+            metadata={"quantization": "int8_zp", "quantization.group_size": "2"},
+        )
+        got = load_quantized_linear(target, "q", "s", "z")
+        self.assertFalse(got.symmetric)
+        self.assertEqual(got.group_size, 2)
+        self.assertTrue(got.per_group)
+        want = (q.astype(np.int32) - np.repeat(zp.astype(np.int32), 2, axis=0)).astype(
+            np.float32
+        ) * np.repeat(scale, 2, axis=0)
+        np.testing.assert_array_equal(got.dequantize(), want)
 
     def test_metadata_kind_must_match_zero_point(self):
         target, _, _ = self._symmetric_file({"quantization": "int8_zp"})
@@ -460,11 +488,13 @@ class TestQuantizedWeight(_TempDir):
         with self.assertRaises(SafeTensorsError):
             load_quantized_linear(target, "w_q", "w_scale")
 
-    def test_per_group_metadata_is_rejected(self):
-        target, _, _ = self._symmetric_file({"quantization.group_size": "32"})
-        with self.assertRaises(SafeTensorsError) as ctx:
+    def test_group_size_must_be_positive_integer(self):
+        target, _, _ = self._symmetric_file({"quantization.group_size": "batch"})
+        with self.assertRaises(SafeTensorsError):
             load_quantized_linear(target, "w_q", "w_scale")
-        self.assertIn("per-group", str(ctx.exception))
+        target, _, _ = self._symmetric_file({"quantization.group_size": "0"})
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "w_q", "w_scale")
 
     def test_check_metadata_false_only_skips_self_description(self):
         target, q, scale = self._symmetric_file({"quantization": "int8_zp"})
