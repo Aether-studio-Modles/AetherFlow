@@ -21575,8 +21575,8 @@ mma 片段形状不同（天数 16×16×32、C500 16×16×16），这部分各�
   会很大，靠 `max_bytes` 兜底而不是编码。
 - 不做跨进程锁与自动清理：多进程同目录写不同条目安全，同 key 并发写是"最后
   一份赢"（内容相同）；坏文件不自动删，`clear()` 手动清。
-- 只有 `generate` 结束才落盘：`feed` / `prefill` 手工驱动的序列没有"结束"
-  信号，不会自动落盘。
+- `generate` 结束与 `finish` 释放前都会落盘；裸 `feed` / `prefill` 之后不
+  `finish` 就不会落盘（`finish` 是手工驱动序列的结束信号，5.339）。
 - 仍是主机态组件：没有真机 D2H 与落盘时延数据。
 - 未接 `LMRunner`（Mamba 主干没有随上下文增长的 KV）。
 
@@ -21662,6 +21662,68 @@ tests` 通过，`py -3.14 -m unittest discover -s tests -t .` 全量 3382 条通
   跨机网络的数字。
 - 真机债不变：`ncclCommInitAll` 多卡归约与 `from_env` uid 分发仍只有 mock
   覆盖（5.331 未声称）。
+
+
+### 5.339 手工驱动序列的落盘时机：`finish` 释放前落盘与"真写入"计数
+
+5.337 的落盘只挂在 `generate` 返回前，未声称里留了一条："只有 `generate`
+结束才落盘：`feed` / `prefill` 手工驱动的序列没有'结束'信号"。这条其实不
+准确：`finish` 就是结束信号——它释放页、删掉 `_tokens[rid]`，正是"这条序列
+到此为止"的时刻。本节把落盘补在 `finish` 上，并顺带把 `disk_stores` 的计数
+改成"真正写入了条目"。
+
+**落盘点：`finish` 释放前。**
+
+- `PagedGenerator.finish` 现在先 `_persist(rid)`，再 `scheduler.finish(rid)`、
+  删 `_tokens[rid]`。顺序不能反：`_persist` 要从池里 `gather` 每层 K/V，
+  `scheduler.finish` 之后页已经回收。
+- 只用驻留态序列落盘。换出态（`suspend(evict=True)` 之后）的 KV 在主机副本
+  里，池里 `gather` 取不到；为一次释放先 `resume` 换入再落盘，等于为一个马上
+  要释放的序列多付一次换入。所以 `finish` 里先问 `is_swapped(rid)`，是就跳过
+  ——序列照常释放，只是不产生条目。
+- 空序列（`submit` 之后没喂过 token）不落盘：`_tokens[rid]` 为空，
+  `_persist` 直接返回，不留 `tokens=[]` 的废条目。
+- 落盘失败（`OSError` 等）时 `finish` 抛错、序列仍驻留，调用方可以清盘后
+  重试；不吞异常，与 `generate` 的 `_persist` 一致。
+
+**为什么不在 `feed` / `prefill` 里落盘。** 条目粒度是"一条已解码的完整
+前缀 + 每层连续 K/V"（5.337），每喂一个 token 就存一条，会在盘上留下一串
+几乎重复的条目（长度 1..T），既浪费空间也把 LRU 冲掉。`finish` 是唯一确定
+"不再变长"的点，与 `generate` 结束时落盘同一粒度。
+
+**计数修正：`disk_stores` 是"真写入"。** 5.337 里 `_persist` 每调用一次就让
+`disk_stores += 1`，而 `DiskPrefixCache.store` 对"同 key 且等长"的条目只刷新
+mtime、不重写。`generate` 之后紧接 `finish` 会连着走两次 `_persist`，旧写法
+计成 2，盘上却只有 1 条。现在 `DiskPrefixCache` 暴露只读属性 `stores`
+（`_stores`，只在真正新增 / 重写时自增），`_persist` 比较调用前后的值，只有
+真写入才计入生成侧统计。`stats()` 里的 `stores` 与它同源，语义一致。
+
+**验证。** `TestGeneratorDiskCache` 新增 5 条：
+
+1. `test_finish_persists_manual_sequence`：`submit` + `prefill` 后 `finish`，
+   `disk_stores == 1`、目录里 1 条；新实例以"prompt + 1 个 token"生成，
+   `disk_hits == 1`、`disk_reused_tokens == len(prompt)`，且输出与
+   `_dense_greedy` 逐 token 相等。
+2. `test_finish_after_generate_does_not_rewrite`：`generate` 后 `finish`，
+   `disk_stores` 仍为 1（同 key 等长只刷新 mtime），条目数仍为 1。
+3. `test_finish_skips_persist_when_swapped`：`suspend(evict=True)` 后 `finish`
+   不落盘、不抛，序列正常移除。
+4. `test_finish_without_tokens_stores_nothing`：`submit` 后直接 `finish`，
+   不产生条目。
+5. `test_finish_respects_disabled_prefix_cache`：`prefix_cache=False` 时
+   `finish` 不落盘（该开关同时关掉查盘与落盘，语义与 5.337 一致）。
+
+`py -3.14 -m ruff check aetherflow tests` 通过；
+`py -3.14 -m unittest discover -s tests -t .` 全量 3387 条通过（5.337 的 3382
+加本节 5 条）。
+
+**未声称 / 剩余**
+
+- 换出态序列在 `finish` 时不落盘；要落盘必须显式 `resume` 后再 `finish`。
+- 裸 `feed` / `prefill` 之后不调 `finish` 仍不会落盘——落盘需要"结束"这个
+  触发点，没有隐式判定"用户不再续写"的办法。
+- 仍是主机态：`gather` 与 `np.savez` 的时延没有真机数据；条目大小随
+  `L × T` 线性增长，靠 `max_bytes` 兜底（5.337 的约束不变）。
 
 
 
