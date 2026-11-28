@@ -86,6 +86,14 @@ from .backends.registry import KernelRegistry
 from .conformance import Case, CaseResult, CheckResult, Report, default_cases, run_conformance
 from .deploy import BundleError, Deployment, load_bundle, save_bundle
 from .dynamic import DynamicRunner
+from .weights import (
+    SafeTensorsError,
+    SafeTensorsFile,
+    TensorInfo,
+    load_into_store,
+    load_safetensors,
+    load_safetensors_dir,
+)
 from .ir import (
     IR_VERSION,
     UNREPLAYABLE_EFFECTS,
@@ -150,6 +158,12 @@ __api_version__ = "1"
 __all__ = [
     "Graph",
     "DynamicRunner",
+    "SafeTensorsError",
+    "SafeTensorsFile",
+    "TensorInfo",
+    "load_safetensors",
+    "load_safetensors_dir",
+    "load_into_store",
     "BundleError",
     "Deployment",
     "load_bundle",
