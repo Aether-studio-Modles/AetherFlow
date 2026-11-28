@@ -1647,6 +1647,100 @@ class TestServingEngine(unittest.TestCase):
             engine.step()
 
 
+class TestChunkedPrefill(unittest.TestCase):
+    """chunked prefill：长 prompt 拆到多个解码步里推进。
+
+    判据两条：**输出与整段预填充逐位相同**（分块只改"什么时候算"），
+    以及**推进确实是分块的**（最后一块之前不产出 logits，别的请求照常解码）。
+    """
+
+    def _spec(self, **overrides):
+        return _small(batch=1, steps=6, **overrides)
+
+    def test_matches_whole_prefill_outputs(self):
+        spec = self._spec()
+        params = spec.init_params(seed=31)
+        prompts = [[2], [4, 5], [6, 7, 8, 9, 10]]
+        cases = dict(max_new_tokens=4, temperature=1.0)
+        want = [
+            list(generate(BACKEND, params, prompt, spec, seed=index, **cases))
+            for index, prompt in enumerate(prompts)
+        ]
+        for chunk in (1, 2, 3):
+            with self.subTest(chunk=chunk):
+                engine = ServingEngine(
+                    BACKEND, params, spec, capacity=2,
+                    chunk_size=chunk, chunked_prefill=True,
+                )
+                ids = [
+                    engine.submit(prompt, seed=index, **cases)
+                    for index, prompt in enumerate(prompts)
+                ]
+                got = dict(engine.run())
+                self.assertEqual([got[rid] for rid in ids], want)
+                self.assertEqual(engine.pending, 0)
+                self.assertEqual(engine.active, 0)
+                engine.close()
+
+    def test_prefix_is_advanced_one_chunk_per_step(self):
+        """长度 5、chunk=2：三步推进完，第四步才采样。"""
+        spec = self._spec()
+        params = spec.init_params(seed=32)
+        prompt = [2, 3, 4, 5, 6]
+        engine = ServingEngine(
+            BACKEND, params, spec, chunk_size=2, chunked_prefill=True
+        )
+        rid = engine.submit(prompt, max_new_tokens=1, temperature=0.0)
+        steps = []
+        for _ in range(10):
+            done = engine.step()
+            steps.append(done)
+            if done:
+                break
+        self.assertEqual(len(steps), 4)
+        self.assertEqual(steps[0], [])
+        self.assertEqual(steps[1], [])
+        self.assertEqual(steps[2], [])
+        self.assertEqual(
+            dict(steps[-1])[rid],
+            list(generate(BACKEND, params, prompt, spec,
+                          max_new_tokens=1, temperature=0.0)),
+        )
+        engine.close()
+
+    def test_decoding_continues_while_long_prompt_is_prefilled(self):
+        """短请求的 token 不会等长 prompt 整段预填充完才出。"""
+        spec = self._spec()
+        params = spec.init_params(seed=33)
+        engine = ServingEngine(
+            BACKEND, params, spec, capacity=2, chunk_size=1,
+            chunked_prefill=True,
+        )
+        short = engine.submit([2], max_new_tokens=3, temperature=0.0)
+        engine.step()                       # 短请求预填充完，拿到 logits
+        long = engine.submit([3, 4, 5, 6], max_new_tokens=1, temperature=0.0)
+        order = []
+        for _ in range(20):
+            order.extend(rid for rid, _ in engine.step())
+            if not engine.pending and engine.active == 0:
+                break
+        self.assertIn(short, order)
+        self.assertIn(long, order)
+        self.assertLess(order.index(short), order.index(long))
+        engine.close()
+
+    def test_configuration_is_rejected(self):
+        spec = self._spec()
+        params = spec.init_params(seed=34)
+        with self.assertRaisesRegex(TypeError, "chunked_prefill"):
+            ServingEngine(BACKEND, params, spec, chunked_prefill=1)
+        with self.assertRaisesRegex(ValueError, "device_state"):
+            ServingEngine(
+                BACKEND, params, spec,
+                chunked_prefill=True, resident=True, device_state=True,
+            )
+
+
 class _FakeClock:
     """手动推进的时钟。
 

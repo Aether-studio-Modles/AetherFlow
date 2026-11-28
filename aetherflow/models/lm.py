@@ -1331,6 +1331,7 @@ def _prefill(
     graph_for,
     consumed: Optional[Sequence[int]] = None,
     state=None,
+    limit: Optional[int] = None,
 ):
     """把 ``prompts`` 从 ``consumed`` 位置起送进图，返回 ``(state, logits)``。
 
@@ -1338,6 +1339,10 @@ def _prefill(
     token 处置 ``reset=1``，行与行互不影响。``state`` 不为 ``None`` 表示接着
     一段已消费的前缀继续：此时**不允许**左填充（pad 会推进状态，而 reset 又
     会把已消费的历史清掉），各行剩余的 token 数必须一致。
+
+    ``limit`` 是**本步每行最多消费的 token 数**（chunked prefill 用）：给出时
+    只推进这么多个，没走到 prompt 末尾就不投影末位置，``logits`` 返回 ``None``，
+    调用方留着 ``state`` 下次接着推。默认 ``None`` 表示一次把前缀吃完。
     """
     batch = spec.batch
     consumed = list(consumed) if consumed is not None else [0] * batch
@@ -1347,14 +1352,21 @@ def _prefill(
             "增量前缀至少要包含一个未消费的 token；前缀已经全部消费时"
             "直接采样末位置即可"
         )
-    width = max(remain)
-    pads = [width - count for count in remain]
+    takes = list(remain) if limit is None else [min(count, int(limit)) for count in remain]
+    if any(count <= 0 for count in takes):
+        raise ValueError(f"limit 至少要为每行推进一个 token，得到 {limit!r}")
+    width = max(takes)
+    pads = [width - count for count in takes]
     fresh = state is None
     if not fresh and any(pads):
         raise ValueError(
             "增量前缀要求各行长度一致：左侧补 pad 会推进状态，"
             "而 reset 又会把已消费的历史清掉"
         )
+    # 本步是否走到每行的 prompt 末尾：决定要不要投影末位置。
+    reaches_end = all(
+        consumed[row] + takes[row] == len(prompts[row]) for row in range(batch)
+    )
 
     # 固定块：中间块只带状态，最后一块只投影末位置。尾块按实际长度构图，
     # 不用 pad 填满——pad 会推进状态，而 reset 又会连带清掉真实历史。
@@ -1363,7 +1375,8 @@ def _prefill(
     logits = None
     for index, (start, length) in enumerate(blocks):
         is_last = index == len(blocks) - 1
-        graph, inputs, _ = graph_for(length, "last" if is_last else "none")
+        head = "last" if is_last and reaches_end else "none"
+        graph, inputs, _ = graph_for(length, head)
         ids = np.full((batch, length), spec.pad_id, dtype=np.int32)
         reset = np.zeros((batch, length), dtype=np.float32)
         for row in range(batch):
@@ -1371,7 +1384,7 @@ def _prefill(
             # 提前于真实起点表示这一块整段都是左填充。
             offset = pads[row] - start
             lo = max(offset, 0)
-            hi = min(offset + remain[row], length)
+            hi = min(offset + takes[row], length)
             if hi > lo:
                 begin = consumed[row] + lo - offset
                 ids[row, lo:hi] = prompts[row][begin:begin + hi - lo]
@@ -1394,7 +1407,7 @@ def _prefill(
         feed[inputs["reset"].name] = reset
         out = backend.execute(graph, feed)
         state = spec.carry_state(out)
-        if is_last:
+        if is_last and reaches_end:
             logits = out["logits"]
     return state, logits
 
@@ -2158,6 +2171,7 @@ class _ServingRequest:
         "state",
         "logits",
         "feed_token",
+        "prefilled",
         "deadline",
     )
 
@@ -2192,6 +2206,8 @@ class _ServingRequest:
         self.state: Optional[Dict[str, Any]] = None
         self.logits = None
         self.feed_token: Optional[int] = None
+        # 已送进图的前缀长度：chunked prefill 靠它决定下一块从哪开始。
+        self.prefilled = 0
         self.deadline = deadline
 
 
@@ -2212,7 +2228,9 @@ class ServingEngine:
     调度单位是**解码步**而不是请求：
 
     1. 先用上一轮交出的 logits 为每个活动槽位采样一个 token（停就输出并腾槽）；
-    2. 把等待队列里的请求填进空槽，按"本次准入的那几条"做一次批量预填充；
+    2. 把等待队列里的请求填进空槽：默认把"本次准入的那几条"一次批量吃完
+       前缀；``chunked_prefill=True`` 时改成每步给每个还在预填充的请求推进
+       一块 ``chunk_size``，第 3 步照常进行；
     3. 对需要往里喂 token 的槽位跑一次批量 decode（图的 batch 固定为
        ``capacity``，空槽喂 ``pad_id`` 并丢弃结果）。
 
@@ -2237,6 +2255,10 @@ class ServingEngine:
       的图捕获一次），每步只回传 logits 块。代价是**准入**新请求时要把整块状态
       取回主机、改掉那几行、再传回去（低频事件，一次整块往返）；空槽行仍随 pad
       推进，结果被丢弃。它要求 ``resident=True``，并且同样只支持静态形状。
+    - ``chunked_prefill=True`` 把长 prompt 拆到多个解码步：新请求的首 token
+      晚 ``ceil(len(prompt) / chunk_size)`` 步，换来已经就绪的请求不被挡住。
+      分块推进逐个请求各跑一次 execute（不与 decode 合批），且不与
+      ``device_state=True`` 组合（构造即显式拒绝）。
 
     **服务侧的三件事**（AF-35 补）：
 
@@ -2260,6 +2282,7 @@ class ServingEngine:
         *,
         capacity: int = 4,
         chunk_size: Optional[int] = None,
+        chunked_prefill: bool = False,
         resident: bool = False,
         device_state: bool = False,
         max_graphs: int = 16,
@@ -2281,6 +2304,10 @@ class ServingEngine:
                 raise ValueError(f"max_pending 必须 >= 1，得到 {max_pending}")
         if clock is not None and not callable(clock):
             raise TypeError(f"clock 必须是可调用对象，得到 {clock!r}")
+        if not isinstance(chunked_prefill, bool):
+            raise TypeError(
+                f"chunked_prefill 必须是 bool，得到 {chunked_prefill!r}"
+            )
         self.spec = spec or LMSpec()
         if self.spec.batch != 1:
             raise ValueError(
@@ -2296,8 +2323,15 @@ class ServingEngine:
                 f"chunk_size 必须落在 [1, {self.spec.steps}]，得到 {self.chunk}"
             )
         self.resident = bool(resident)
-        _require_resident(backend, self.resident, "ServingEngine(resident=True)")
         self.device_state = bool(device_state)
+        self.chunked_prefill = chunked_prefill
+        if self.chunked_prefill and self.device_state:
+            raise ValueError(
+                "chunked_prefill 与 device_state 暂不组合：分块推进要从常驻的"
+                "整块状态里取一行回填给 prefill 图，这条路径还没有设备侧验证；"
+                "两者分开用，或先把状态放到主机（device_state=False）"
+            )
+        _require_resident(backend, self.resident, "ServingEngine(resident=True)")
         if self.device_state:
             if not self.resident:
                 raise ValueError(
@@ -2605,46 +2639,18 @@ class ServingEngine:
             else:
                 request.feed_token = token
 
-        # 2) 准入：空槽按 FIFO 填入等待请求，只对本次准入的做一次批量预填充
-        admitted: List[Tuple[int, _ServingRequest]] = []
+        # 2) 准入：空槽按 FIFO 填入等待请求，再按模式推进预填充
+        admitted: List[int] = []
         for index, request in enumerate(self._slots):
             if request is not None or not self._pending:
                 continue
             request = self._pending.popleft()
             self._slots[index] = request
-            admitted.append((index, request))
-        if admitted:
-            batch = len(admitted)
-            state, logits = _prefill(
-                self.backend,
-                self.params,
-                [request.prompt for _, request in admitted],
-                self.spec.with_batch(batch),
-                chunk=self.chunk,
-                resident=self.resident,
-                graph_for=lambda length, head: self._graph_for(batch, length, head),
-            )
-            host_logits = _host_array(self.backend, logits)
-            if self.device_state:
-                # 新请求的状态整块写进设备（一次低频往返），此后每步只 D2D
-                self._decode_plan_for()
-                self._write_state_rows([
-                    (
-                        index,
-                        {
-                            name: _host_array(self.backend, state[name])[row]
-                            for name in self.spec.state_shapes
-                        },
-                    )
-                    for row, (index, _request) in enumerate(admitted)
-                ])
-            for row, (_index, request) in enumerate(admitted):
-                if not self.device_state:
-                    request.state = {
-                        name: _host_array(self.backend, value)[row]
-                        for name, value in state.items()
-                    }
-                request.logits = host_logits[row, 0, :]
+            admitted.append(index)
+        if self.chunked_prefill:
+            self._advance_prefill(admitted)
+        elif admitted:
+            self._prefill_admitted(admitted)
 
         # 3) 解码：需要喂 token 的槽位走一次容量为 capacity 的批量 decode
         feeding = [
@@ -2697,11 +2703,92 @@ class ServingEngine:
                     request.logits = host_logits[index, 0, :]
         return finished
 
+    def _prefill_admitted(self, admitted: Sequence[int]) -> None:
+        """默认路径：把本次准入的请求一次吃完前缀（多请求合批）。"""
+        requests = [self._slots[index] for index in admitted]
+        batch = len(requests)
+        state, logits = _prefill(
+            self.backend,
+            self.params,
+            [request.prompt for request in requests],
+            self.spec.with_batch(batch),
+            chunk=self.chunk,
+            resident=self.resident,
+            graph_for=lambda length, head: self._graph_for(batch, length, head),
+        )
+        host_logits = _host_array(self.backend, logits)
+        if self.device_state:
+            # 新请求的状态整块写进设备（一次低频往返），此后每步只 D2D
+            self._decode_plan_for()
+            self._write_state_rows([
+                (
+                    index,
+                    {
+                        name: _host_array(self.backend, state[name])[row]
+                        for name in self.spec.state_shapes
+                    },
+                )
+                for row, index in enumerate(admitted)
+            ])
+        for row, index in enumerate(admitted):
+            request = self._slots[index]
+            request.prefilled = len(request.prompt)
+            if not self.device_state:
+                request.state = {
+                    name: _host_array(self.backend, value)[row]
+                    for name, value in state.items()
+                }
+            request.logits = host_logits[row, 0, :]
+
+    def _advance_prefill(self, admitted: Sequence[int]) -> None:
+        """chunked 路径：每个在预填充中的请求本步只推进一块。
+
+        与默认路径的差别只在粒度：长 prompt 不再在准入的那一步整段算完，
+        已经跑起来的请求每步照常拿一个 decode token。块大小沿用
+        ``chunk_size``——构图块与每步推进量是同一个数，不另立旋钮。
+        """
+        order = list(admitted)
+        seen = set(admitted)
+        for index, request in enumerate(self._slots):
+            if request is None or index in seen:
+                continue
+            if request.state is not None and request.prefilled < len(request.prompt):
+                order.append(index)
+        for index in order:
+            request = self._slots[index]
+            started = request.state is not None
+            state, logits = _prefill(
+                self.backend,
+                self.params,
+                [request.prompt],
+                self.spec.with_batch(1),
+                chunk=self.chunk,
+                resident=self.resident,
+                graph_for=lambda length, head: self._graph_for(1, length, head),
+                consumed=[request.prefilled] if started else None,
+                state=(
+                    {name: np.stack([request.state[name]])
+                     for name in self.spec.state_shapes}
+                    if started else None
+                ),
+                limit=self.chunk,
+            )
+            request.prefilled = min(
+                len(request.prompt), request.prefilled + self.chunk
+            )
+            request.state = {
+                name: _host_array(self.backend, value)[0]
+                for name, value in state.items()
+            }
+            if logits is not None:
+                request.logits = _host_array(self.backend, logits)[0, 0, :]
+
     def run(self) -> List[Tuple[int, List[int]]]:
         """推进到所有请求完成，按**完成先后**返回 ``(请求 id, 生成 token)``。
 
-        ``step`` 里每个活动请求每步至少前进一个 token（或直接完成），
-        所以循环一定终止：总步数不超过"所有请求的 max_new_tokens 之和"。
+        ``step`` 里每个活动请求每步至少前进一个 token（分块预填充时每步推进
+        一块前缀，推完照常出 token），所以循环一定终止：总步数不超过"所有请求的
+        ``max_new_tokens`` 之和"加上各自前缀的块数。
         """
         outputs: List[Tuple[int, List[int]]] = []
         while True:
