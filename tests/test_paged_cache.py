@@ -748,5 +748,169 @@ class TestManagerFork(unittest.TestCase):
         np.testing.assert_array_equal(k2[3:], extra[0])
 
 
+class TestQuantizedStorage(unittest.TestCase):
+    """int8 量化存储：口径、误差上界、写时复制与换出都不该丢 scale。
+
+    判据：
+
+    1. ``gather`` 返回 f32，且与原始值的差不超过所在行的 ``0.5 * scale``
+       （对称量化 + 四舍五入的固有上界）；
+    2. ``gather_quantized`` 返回的 int8 与 hand-rolled 量化逐位相同；
+    3. 全零行取 ``scale=1``、``q=0``，反量化仍是 0；
+    4. fork 拆页与换出换入都搬运 scale，取回值与拆页前逐位一致。
+    """
+
+    def _qcache(self, **overrides):
+        options = dict(num_blocks=4, block_size=2, layers=2, heads=2, dim=3)
+        options.update(overrides)
+        return PagedKVCache(
+            num_blocks=options["num_blocks"],
+            block_size=options["block_size"],
+            num_layers=options["layers"],
+            num_heads=options["heads"],
+            head_dim=options["dim"],
+            quantize="i8",
+        )
+
+    def test_configuration_and_storage_dtype(self):
+        cache = self._qcache()
+        self.assertEqual(cache.quantize, "i8")
+        self.assertEqual(cache.storage_dtype, np.dtype(np.int8))
+        self.assertEqual(cache.dtype, np.dtype(np.float32))
+        plain = _cache()
+        self.assertIsNone(plain.quantize)
+        self.assertEqual(plain.storage_dtype, np.dtype(np.float32))
+        with self.assertRaisesRegex(ValueError, "quantize"):
+            PagedKVCache(
+                num_blocks=1,
+                block_size=1,
+                num_layers=1,
+                num_heads=1,
+                head_dim=1,
+                quantize="i4",
+            )
+        with self.assertRaisesRegex(ValueError, "float32"):
+            PagedKVCache(
+                num_blocks=1,
+                block_size=1,
+                num_layers=1,
+                num_heads=1,
+                head_dim=1,
+                dtype=np.float16,
+                quantize="i8",
+            )
+
+    def test_gather_dequantizes_within_half_scale(self):
+        cache = self._qcache()
+        cache.allocate(1)
+        keys, values = _append(cache, 1, 3, seed=2)
+        got_k, got_v = cache.gather(1, 0)
+        self.assertEqual(got_k.dtype, np.dtype(np.float32))
+        self.assertEqual(got_v.dtype, np.dtype(np.float32))
+        for got, want in ((got_k, keys[0]), (got_v, values[0])):
+            absmax = np.max(np.abs(want), axis=-1, keepdims=True)
+            scale = np.where(absmax > 0, absmax / 127.0, 1.0).astype(np.float32)
+            self.assertTrue(np.all(np.abs(got - want) <= 0.5 * scale + 1e-6))
+
+    def test_gather_quantized_matches_hand_rolled_quantization(self):
+        cache = self._qcache()
+        cache.allocate(1)
+        keys, values = _append(cache, 1, 3, seed=3)
+        kq, ks, vq, vs = cache.gather_quantized(1, 0)
+        self.assertEqual(kq.dtype, np.int8)
+        self.assertEqual(vq.dtype, np.int8)
+        self.assertEqual(ks.shape, (3, cache.num_heads))
+        self.assertEqual(vs.shape, (3, cache.num_heads))
+        for q, scale, want in ((kq, ks, keys[0]), (vq, vs, values[0])):
+            absmax = np.max(np.abs(want), axis=-1, keepdims=True)
+            expect_scale = np.where(absmax > 0, absmax / 127.0, 1.0).astype(np.float32)
+            np.testing.assert_array_equal(scale, expect_scale[:, :, 0])
+            expect_q = np.clip(
+                np.rint(want / expect_scale), -127.0, 127.0
+            ).astype(np.int8)
+            np.testing.assert_array_equal(q, expect_q)
+        # gather 与"手工反量化"逐位一致：两条路径不能各算一套。
+        got_k, got_v = cache.gather(1, 0)
+        np.testing.assert_array_equal(
+            got_k, (kq * ks[:, :, None]).astype(np.float32)
+        )
+        np.testing.assert_array_equal(
+            got_v, (vq * vs[:, :, None]).astype(np.float32)
+        )
+
+    def test_zero_rows_use_unit_scale(self):
+        cache = self._qcache(layers=1)
+        cache.allocate(1)
+        zeros = np.zeros((2, 2, 3), dtype=np.float32)
+        cache.append(1, [zeros], [zeros])
+        kq, ks, vq, vs = cache.gather_quantized(1, 0)
+        np.testing.assert_array_equal(kq, 0)
+        np.testing.assert_array_equal(vq, 0)
+        np.testing.assert_array_equal(ks, 1.0)
+        np.testing.assert_array_equal(vs, 1.0)
+        got_k, _ = cache.gather(1, 0)
+        np.testing.assert_array_equal(got_k, 0.0)
+
+    def test_pad_to_returns_zero_with_unit_scale(self):
+        cache = self._qcache(layers=1)
+        cache.allocate(1)
+        _append(cache, 1, 1, seed=4)
+        kq, ks, vq, vs = cache.gather_quantized(1, 0, pad_to=3)
+        self.assertEqual(kq.shape, (3, cache.num_heads, cache.head_dim))
+        np.testing.assert_array_equal(kq[1:], 0)
+        np.testing.assert_array_equal(ks[1:], 1.0)
+        got_k, got_v = cache.gather(1, 0, pad_to=3)
+        np.testing.assert_array_equal(got_k[1:], 0.0)
+        np.testing.assert_array_equal(got_v[1:], 0.0)
+
+    def test_fork_cow_copies_scales(self):
+        cache = self._qcache(layers=1)
+        cache.allocate(1)
+        _append(cache, 1, 3, seed=5)
+        before = cache.gather(1, 0)[0]
+        cache.fork(1, 2)
+        extra_k, extra_v = _kv(1, cache.num_heads, cache.head_dim, seed=9)
+        cache.append(2, [extra_k], [extra_v])  # 拆共享尾页
+        np.testing.assert_array_equal(cache.gather(1, 0)[0], before)
+        np.testing.assert_array_equal(cache.gather(2, 0)[0][:3], before)
+        self.assertEqual(cache.shared_blocks, 1)
+
+    def test_swap_out_and_in_keeps_quantized_values(self):
+        cache = self._qcache()
+        cache.allocate(1)
+        _append(cache, 1, 3, seed=6)
+        before = [cache.gather(1, layer) for layer in range(cache.num_layers)]
+        cache.swap_out(1)
+        self.assertEqual(cache.swapped_tokens, 3)
+        self.assertTrue(cache.is_swapped(1))
+        cache.swap_in(1)
+        for layer in range(cache.num_layers):
+            keys, values = cache.gather(1, layer)
+            np.testing.assert_array_equal(keys, before[layer][0])
+            np.testing.assert_array_equal(values, before[layer][1])
+
+    def test_gather_quantized_requires_quantization(self):
+        cache = _cache()
+        cache.allocate(1)
+        _append(cache, 1, 1)
+        with self.assertRaisesRegex(ValueError, "quantize"):
+            cache.gather_quantized(1, 0)
+
+    def test_manager_gather_quantized_swaps_in(self):
+        cache = self._qcache(num_blocks=2, block_size=2, layers=1)
+        mgr = PagedCacheManager(cache)
+        mgr.allocate(1)
+        _append(mgr, 1, 2, seed=8)
+        before = mgr.gather(1, 0)[0]
+        mgr.evict(1)
+        self.assertTrue(cache.is_swapped(1))
+        kq, ks, _, _ = mgr.gather_quantized(1, 0)
+        self.assertEqual(kq.dtype, np.int8)
+        np.testing.assert_array_equal(
+            (kq * ks[:, :, None]).astype(np.float32), before
+        )
+        self.assertFalse(cache.is_swapped(1))
+
+
 if __name__ == "__main__":
     unittest.main()

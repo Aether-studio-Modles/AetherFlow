@@ -27,12 +27,12 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import replace
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from ..ir.graph import Graph, Value
-from ..ir.types import f32
+from ..ir.types import f32, i8
 from ..runtime.paged_cache import PagedCacheFullError, PagedCacheManager, PagedKVCache
 from ..runtime.prefix_store import DiskPrefixCache
 from .transformer import TransformerSpec
@@ -87,13 +87,47 @@ def _check_spec(spec: TransformerSpec) -> None:
         )
 
 
+def _dequantize_kv(
+    g: Graph,
+    q: Value,
+    scale: Value,
+    *,
+    batch: int,
+    length: int,
+    heads: int,
+    head_dim: int,
+) -> Value:
+    """把量化缓存的 int8 K/V 与 per-head scale 还原成 f32。
+
+    走既有的 ``dequantize_i8_group``：它要求二维 ``(K, N)`` 且 scale 形如
+    ``(K/G, N)``，列方向必须完整给出，而这里的 scale 在**头**方向完整、在
+    head_dim 方向共享。于是缓存按 ``(B*L*D, H)`` 喂入（组大小正好是 D：同一个
+    token、同一个头的一组 D 个元素共用一行 scale），scale 按 ``(B*L, H)`` 喂入。
+
+    **为什么输入直接是二维、而不是图内 reshape 出来：** 设备端的 ``reshape``
+    与 ``transpose`` 都不承接 i8（不做隐式降级），int8 张量在图上除了被
+    ``dequantize_i8_group`` 消费之外什么都不能做。所以展平放在主机侧完成
+    （1 字节/元素的一次拷贝），图内只留一次反量化与 f32 的 reshape/transpose。
+    """
+    deq = g.dequantize_i8_group(q, scale)  # (B*L*D, H)，组大小 D
+    back = g.reshape(deq, shape=(batch, length, head_dim, heads))
+    return g.transpose(back, perm=(0, 3, 1, 2))  # (B, H, L, D)
+
+
 def build_cached_decoder_step(
-    g: Graph, spec: TransformerSpec, *, cache_steps: int
+    g: Graph, spec: TransformerSpec, *, cache_steps: int, quantized_cache: bool = False
 ) -> Tuple[Dict[str, Value], Value, Dict[str, Value]]:
     """构建单步增量解码图，返回 ``(inputs, y, new_kv)``。
 
     ``cache_steps`` 是缓存里**已保留的固定宽度**（含补零位），当前 token 的
     k/v 会拼在它末尾，因此注意力长度是 ``cache_steps + 1``。
+
+    ``quantized_cache=True`` 时缓存按 int8 存储：``l{i}_k`` / ``l{i}_v`` 是
+    ``(B*cache_steps*D, H)`` 的 i8（主机侧展平，原因见 :func:`_dequantize_kv`），
+    另配 ``l{i}_k_scale`` / ``l{i}_v_scale`` ``(B*cache_steps, H)`` 的 f32
+    （逐 token、逐头对称量化的 scale）。图内先用 ``dequantize_i8_group`` 还原成
+    f32，再走与非量化形态**同一套**注意力节点——量化只改"缓存怎么存、怎么读回"，
+    不改解码语义。
 
     输入表：
 
@@ -104,6 +138,9 @@ def build_cached_decoder_step(
         补零位与未来位都靠它屏蔽。
     ``l{i}_k`` / ``l{i}_v``
         第 ``i`` 层已缓存（或补零）的 K/V ``(B, cache_steps, H, D)``。
+        量化缓存时是 i8 且形状为 ``(B*cache_steps*D, H)``，并要求静态整数
+        ``B``；另配 ``l{i}_k_scale`` / ``l{i}_v_scale``
+        ``(B*cache_steps, H)`` 的 f32。
     ``l{i}_*``
         与 :class:`TransformerSpec` 同名的层权重。
 
@@ -115,10 +152,20 @@ def build_cached_decoder_step(
         raise TypeError(f"cache_steps 必须是 int，得到 {type(cache_steps).__name__}")
     if cache_steps < 1:
         raise ValueError(f"cache_steps 必须 >= 1，得到 {cache_steps}")
+    if not isinstance(quantized_cache, bool):
+        raise TypeError(
+            f"quantized_cache 必须是 bool，得到 {type(quantized_cache).__name__}"
+        )
     _check_spec(spec)
 
     d, h, dh = spec.d_model, spec.num_heads, spec.head_dim
     batch = spec.batch
+    if quantized_cache and (
+        isinstance(batch, bool) or not isinstance(batch, int)
+    ):
+        raise TypeError(
+            f"量化缓存需要静态的整数 batch（reshape 要具体维长），得到 {batch!r}"
+        )
     scale_value = 1.0 / math.sqrt(dh)
 
     inputs: Dict[str, Value] = {
@@ -130,12 +177,26 @@ def build_cached_decoder_step(
             inputs[f"l{layer}_{base}"] = g.input(
                 f"l{layer}_{base}", f32[spec.param_shapes[f"l{layer}_{base}"]]
             )
-        inputs[f"l{layer}_k"] = g.input(
-            f"l{layer}_k", f32[batch, cache_steps, h, dh]
-        )
-        inputs[f"l{layer}_v"] = g.input(
-            f"l{layer}_v", f32[batch, cache_steps, h, dh]
-        )
+        if quantized_cache:
+            inputs[f"l{layer}_k"] = g.input(
+                f"l{layer}_k", i8[batch * cache_steps * dh, h]
+            )
+            inputs[f"l{layer}_v"] = g.input(
+                f"l{layer}_v", i8[batch * cache_steps * dh, h]
+            )
+            inputs[f"l{layer}_k_scale"] = g.input(
+                f"l{layer}_k_scale", f32[batch * cache_steps, h]
+            )
+            inputs[f"l{layer}_v_scale"] = g.input(
+                f"l{layer}_v_scale", f32[batch * cache_steps, h]
+            )
+        else:
+            inputs[f"l{layer}_k"] = g.input(
+                f"l{layer}_k", f32[batch, cache_steps, h, dh]
+            )
+            inputs[f"l{layer}_v"] = g.input(
+                f"l{layer}_v", f32[batch, cache_steps, h, dh]
+            )
     for base in ("final_g", "final_b"):
         inputs[base] = g.input(base, f32[spec.param_shapes[base]])
 
@@ -164,8 +225,28 @@ def build_cached_decoder_step(
             g.reshape(v, shape=(batch, 1, h, dh)), perm=(0, 2, 1, 3)
         )
         # 缓存里的 (B, T, H, D) 换成 (B, H, T, D) 再与当前这一个位置拼接
-        past_k = g.transpose(inputs[prefix + "k"], perm=(0, 2, 1, 3))
-        past_v = g.transpose(inputs[prefix + "v"], perm=(0, 2, 1, 3))
+        if quantized_cache:
+            past_k = _dequantize_kv(
+                g,
+                inputs[prefix + "k"],
+                inputs[prefix + "k_scale"],
+                batch=batch,
+                length=cache_steps,
+                heads=h,
+                head_dim=dh,
+            )
+            past_v = _dequantize_kv(
+                g,
+                inputs[prefix + "v"],
+                inputs[prefix + "v_scale"],
+                batch=batch,
+                length=cache_steps,
+                heads=h,
+                head_dim=dh,
+            )
+        else:
+            past_k = g.transpose(inputs[prefix + "k"], perm=(0, 2, 1, 3))
+            past_v = g.transpose(inputs[prefix + "v"], perm=(0, 2, 1, 3))
         k_all = g.concat(past_k, kh, axis=2)
         v_all = g.concat(past_v, vh, axis=2)
 
@@ -219,6 +300,16 @@ def _host(backend, value) -> np.ndarray:
     return np.asarray(convert(value) if convert is not None else value)
 
 
+def _kv_2d(keys: np.ndarray) -> np.ndarray:
+    """``(T, H, D)`` → 图输入要求的 ``(T*D, H)``，且必须连续。
+
+    这一步不是"顺手转置"：设备端的 ``reshape`` / ``transpose`` 都不承接 i8，
+    int8 张量到图上只能被 ``dequantize_i8_group`` 消费，所以展平必须在喂入前
+    完成（见 :func:`_dequantize_kv`）。
+    """
+    return np.ascontiguousarray(keys.transpose(0, 2, 1)).reshape(-1, keys.shape[1])
+
+
 def cached_forward(
     backend,
     params: Dict[str, np.ndarray],
@@ -226,6 +317,7 @@ def cached_forward(
     xs,
     *,
     block_size: int = 4,
+    quantize: Optional[str] = None,
 ) -> np.ndarray:
     """逐 token 走增量解码，返回 ``(1, T, d)`` 的隐状态序列。
 
@@ -236,8 +328,15 @@ def cached_forward(
     页宽 ``block_size`` 只影响分配粒度，不影响数值；``T`` 个 token 至少需要
     ``ceil(T / block_size)`` 页，这里按需分配，用完不回收（调用方持有返回值，
     缓存生命周期就是这次调用）。
+
+    ``quantize="i8"`` 让缓存按 int8 存储（口径见
+    :class:`PagedKVCache`）：每步取回的是 int8 与逐 (token, head) 的 f32 scale，
+    图内用 ``dequantize_i8_group`` 还原成 f32 再算注意力。此时输出与
+    未量化路径**不逐位相同**——误差来自缓存读写的一次量化，不是算法差异。
     """
     _check_spec(spec)
+    if quantize not in (None, "i8"):
+        raise ValueError(f'quantize 只支持 None 或 "i8"，得到 {quantize!r}')
     if isinstance(spec.batch, bool) or not isinstance(spec.batch, int):
         raise TypeError(
             f"cached_forward 需要静态的整数 batch，得到 {spec.batch!r}；"
@@ -267,12 +366,15 @@ def cached_forward(
         num_layers=spec.num_layers,
         num_heads=spec.num_heads,
         head_dim=spec.head_dim,
+        quantize=quantize,
     )
     rid = 0
     cache.allocate(rid)
 
     g = Graph("cached_decoder_step")
-    inputs, y, new_kv = build_cached_decoder_step(g, spec, cache_steps=steps)
+    inputs, y, new_kv = build_cached_decoder_step(
+        g, spec, cache_steps=steps, quantized_cache=quantize is not None
+    )
     g.output(y, "y")
     for name, value in new_kv.items():
         g.output(value, name)
@@ -289,9 +391,22 @@ def cached_forward(
         feed[inputs["x"].name] = values[step][None, None, :]
         feed[inputs["mask"].name] = _causal_step_mask(steps, step)
         for layer in range(spec.num_layers):
-            keys, vals = cache.gather(rid, layer, pad_to=steps)
-            feed[inputs[f"l{layer}_k"].name] = keys[None]
-            feed[inputs[f"l{layer}_v"].name] = vals[None]
+            if quantize is None:
+                keys, vals = cache.gather(rid, layer, pad_to=steps)
+                feed[inputs[f"l{layer}_k"].name] = keys[None]
+                feed[inputs[f"l{layer}_v"].name] = vals[None]
+            else:
+                keys, k_scale, vals, v_scale = cache.gather_quantized(
+                    rid, layer, pad_to=steps
+                )
+                feed[inputs[f"l{layer}_k"].name] = _kv_2d(keys)
+                feed[inputs[f"l{layer}_k_scale"].name] = k_scale.reshape(
+                    -1, spec.num_heads
+                )
+                feed[inputs[f"l{layer}_v"].name] = _kv_2d(vals)
+                feed[inputs[f"l{layer}_v_scale"].name] = v_scale.reshape(
+                    -1, spec.num_heads
+                )
         out = backend.execute(g, feed)
         outs.append(_host(backend, out["y"]).reshape(1, spec.d_model))
         keys_out = [
@@ -330,7 +445,8 @@ class PagedDecodeScheduler:
 
     数值判据与 :func:`cached_forward` 相同：交错执行的每步隐状态与
     ``build_transformer`` 整段前向的对应位置逐位一致——池的大小与换出次数都
-    不该改数值。
+    不该改数值。``quantize="i8"`` 时这条判据降级为"与未量化路径在量化误差内
+    一致"：缓存读写各量化一次，误差是口径的一部分，不是调度引入的。
     """
 
     def __init__(
@@ -344,8 +460,11 @@ class PagedDecodeScheduler:
         block_size: int = 4,
         on_swap_out=None,
         on_swap_in=None,
+        quantize: Optional[str] = None,
     ) -> None:
         _check_spec(spec)
+        if quantize not in (None, "i8"):
+            raise ValueError(f'quantize 只支持 None 或 "i8"，得到 {quantize!r}')
         if isinstance(spec.batch, bool) or not isinstance(spec.batch, int):
             raise TypeError(
                 f"分页解码需要静态的整数 batch，得到 {spec.batch!r}"
@@ -368,6 +487,7 @@ class PagedDecodeScheduler:
         self.params = params
         self.spec = spec
         self.max_steps = max_steps
+        self.quantize = quantize
         self.cache = PagedCacheManager(
             PagedKVCache(
                 num_blocks=num_blocks,
@@ -375,6 +495,7 @@ class PagedDecodeScheduler:
                 num_layers=spec.num_layers,
                 num_heads=spec.num_heads,
                 head_dim=spec.head_dim,
+                quantize=quantize,
             ),
             on_swap_out=on_swap_out,
             on_swap_in=on_swap_in,
@@ -383,7 +504,7 @@ class PagedDecodeScheduler:
 
         g = Graph("paged_decode_step")
         self._inputs, self._y, self._new_kv = build_cached_decoder_step(
-            g, spec, cache_steps=max_steps
+            g, spec, cache_steps=max_steps, quantized_cache=quantize is not None
         )
         g.output(self._y, "y")
         for name, value in self._new_kv.items():
@@ -484,9 +605,22 @@ class PagedDecodeScheduler:
         feed[self._inputs["x"].name] = values
         feed[self._inputs["mask"].name] = _causal_step_mask(self.max_steps, valid)
         for layer in range(self.spec.num_layers):
-            keys, vals = self.cache.gather(rid, layer, pad_to=self.max_steps)
-            feed[self._inputs[f"l{layer}_k"].name] = keys[None]
-            feed[self._inputs[f"l{layer}_v"].name] = vals[None]
+            if self.quantize is None:
+                keys, vals = self.cache.gather(rid, layer, pad_to=self.max_steps)
+                feed[self._inputs[f"l{layer}_k"].name] = keys[None]
+                feed[self._inputs[f"l{layer}_v"].name] = vals[None]
+            else:
+                keys, k_scale, vals, v_scale = self.cache.gather_quantized(
+                    rid, layer, pad_to=self.max_steps
+                )
+                feed[self._inputs[f"l{layer}_k"].name] = _kv_2d(keys)
+                feed[self._inputs[f"l{layer}_k_scale"].name] = k_scale.reshape(
+                    -1, self.spec.num_heads
+                )
+                feed[self._inputs[f"l{layer}_v"].name] = _kv_2d(vals)
+                feed[self._inputs[f"l{layer}_v_scale"].name] = v_scale.reshape(
+                    -1, self.spec.num_heads
+                )
 
         out = self.backend.execute(self._graph, feed)
         y = _host(self.backend, out["y"]).reshape(width)
@@ -611,6 +745,10 @@ class PagedGenerator:
     ``disk_reused_tokens`` / ``disk_misses`` / ``disk_stores`` 里。条目装不进
     池（``PagedCacheFullError``）时退回普通 prefill；``prefix_cache=False``
     同时关闭盘缓存查询——那是对"自动前缀复用"的显式拒绝。
+
+    ``quantize="i8"`` 原样透传给调度器：池里的 K/V 按 int8 存，读写一次的
+    量化误差会传播到解码结果；落盘前缀缓存存的仍是 f32（取回时已反量化），
+    所以量化只作用于池内存储。
     """
 
     def __init__(
@@ -626,6 +764,7 @@ class PagedGenerator:
         on_swap_in=None,
         prefix_cache: bool = True,
         disk_cache=None,
+        quantize: Optional[str] = None,
     ) -> None:
         if isinstance(spec.vocab, bool) or not isinstance(spec.vocab, int):
             raise TypeError(
@@ -678,6 +817,7 @@ class PagedGenerator:
             block_size=block_size,
             on_swap_out=on_swap_out,
             on_swap_in=on_swap_in,
+            quantize=quantize,
         )
 
         g = Graph("paged_head")

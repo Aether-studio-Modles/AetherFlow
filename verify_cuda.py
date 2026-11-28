@@ -472,6 +472,33 @@ def _extra_cases() -> list:
             "b": _rand(rng, 5),
         }
 
+    def kv_i8_dequant_4d():
+        """KV 缓存的量化反量化形态：二维 i8 + ``(B*L, H)`` scale。
+
+        这是 :func:`aetherflow.models.cached_attention.build_cached_decoder_step`
+        在量化缓存下对每层 K/V 做的同一串节点：``dequantize_i8_group``（组大小
+        D = head_dim）、``reshape`` 回 ``(B,L,D,H)``、``transpose`` 成
+        ``(B,L,H,D)``。i8 只被反量化消费——设备端的 reshape / transpose 都不
+        承接 i8，展平在主机侧做完（与 ``cached_attention._kv_2d`` 同一口径）。
+        选 ``H != D`` 且 ``D`` 不是 2 的幂，避免展平顺序碰巧对上。
+        """
+        b, length, heads, dh = 2, 3, 3, 5
+        g = Graph("kv_i8_dequant_4d")
+        q = g.input("q", i8[b * length * dh, heads])
+        s = g.input("s", f32[b * length, heads])
+        deq = g.dequantize_i8_group(q, s)
+        back = g.reshape(deq, shape=(b, length, dh, heads))
+        g.output(g.transpose(back, perm=(0, 3, 1, 2)), "y")
+        raw = rng.integers(-127, 128, (b, length, heads, dh), dtype=np.int8)
+        return g, {
+            "q": np.ascontiguousarray(raw.transpose(0, 1, 3, 2)).reshape(
+                b * length * dh, heads
+            ),
+            "s": (np.abs(_rand(rng, b, length, heads)) * 0.1 + 0.01).reshape(
+                b * length, heads
+            ),
+        }
+
     def linear_i8a8_no_bias():
         """W8A8 的无 bias 形态 + K 恰为 4 的倍数：走纯 dp4a 主循环。"""
         g = Graph("w8a8_nobias")
@@ -595,6 +622,7 @@ def _extra_cases() -> list:
         ("mod_negative_floor", mod_negative_floor),
         ("linear_i8a8_tail_rank3", linear_i8a8_tail),
         ("linear_i8a8_no_bias", linear_i8a8_no_bias),
+        ("kv_i8_dequant_4d", kv_i8_dequant_4d),
         ("silu_gate_odd_length", silu_gate_odd),
         ("layernorm_residual_odd_cols", layernorm_residual_odd),
         ("atan2_quadrants_broadcast", atan2_quadrants_broadcast),
@@ -659,6 +687,73 @@ def _run_dropout_exact(cuda: CudaBackend, ref: ReferenceBackend) -> list:
     except Exception as exc:  # noqa: BLE001
         failures.append(("dropout_train_bitwise", f"{type(exc).__name__}: {exc}"))
         print(f"  [FAIL] dropout_train_bitwise: {exc}")
+
+    return failures
+
+
+def _run_quantized_cache(cuda: CudaBackend, ref: ReferenceBackend) -> list:
+    """KV 缓存 int8 量化的端到端形态：缓存按 i8 存，图内反量化。
+
+    两条判据：
+
+    1. 设备与参考后端在**同一份**量化缓存输入上一致（f32 舍入内）：量化口径
+       只有一套，设备不该按自己的理解再量化一遍。这里不要求逐位——设备端
+       反量化内核与参考实现的乘加次序可以差 1 ULP，语义仍然相同；
+    2. 与不量化的稠密路径相比，误差停在量化误差量级。上界取 0.05 是刻意宽松
+       的（它只用来抓"漏乘 scale / 组大小错位"这类结构性错误），实际最大值会
+       一并打印出来。
+    """
+    from aetherflow.models import TransformerSpec
+    from aetherflow.models.cached_attention import cached_forward
+
+    spec = TransformerSpec(
+        d_model=8,
+        num_heads=2,
+        d_ff=16,
+        num_layers=2,
+        seq=6,
+        vocab=0,
+        batch=1,
+        dropout=0.0,
+    )
+    rng = np.random.default_rng(37)
+    params = {}
+    for name, shape in spec.param_shapes.items():
+        if name == "pos":
+            params[name] = np.zeros(shape, dtype=np.float32)
+        elif name.endswith("_g"):
+            params[name] = np.ones(shape, dtype=np.float32)
+        elif name.endswith("_b"):
+            params[name] = np.zeros(shape, dtype=np.float32)
+        else:
+            fan_in = shape[0] if shape else 1
+            params[name] = (rng.standard_normal(shape) / np.sqrt(fan_in)).astype(
+                np.float32
+            )
+    xs = (rng.standard_normal((6, spec.d_model)) * 0.5).astype(np.float32)
+
+    failures = []
+    try:
+        got = cached_forward(cuda, params, spec, xs, block_size=2, quantize="i8")
+        want = cached_forward(ref, params, spec, xs, block_size=2, quantize="i8")
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+        print("  [PASS] cached_forward_i8_matches_reference")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(
+            ("cached_forward_i8_matches_reference", f"{type(exc).__name__}: {exc}")
+        )
+        print(f"  [FAIL] cached_forward_i8_matches_reference: {exc}")
+
+    try:
+        base = cached_forward(ref, params, spec, xs, block_size=2)
+        got = cached_forward(cuda, params, spec, xs, block_size=2, quantize="i8")
+        err = float(np.max(np.abs(got - base)))
+        if err > 0.05:
+            raise AssertionError(f"量化误差 {err:.3e} 超过 0.05")
+        print(f"  [PASS] cached_forward_i8_error err={err:.3e}")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(("cached_forward_i8_error", f"{type(exc).__name__}: {exc}"))
+        print(f"  [FAIL] cached_forward_i8_error: {exc}")
 
     return failures
 
@@ -845,6 +940,7 @@ def main(argv: list) -> int:
     ref = ReferenceBackend()
     failures = _run_extra(cuda, ref)
     failures += _run_dropout_exact(cuda, ref)
+    failures += _run_quantized_cache(cuda, ref)
     failures += _run_f16_extra(cuda, ref)
     failures += _run_budget_check(cuda)
     failures += _run_tuning_check(cuda)

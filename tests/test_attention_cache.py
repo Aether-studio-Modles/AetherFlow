@@ -103,6 +103,30 @@ class TestCachedForward(unittest.TestCase):
         spec = _spec(num_layers=1, num_heads=1, d_model=4, d_ff=8)
         self._check(spec, 5, 2)
 
+    def test_quantized_cache_matches_dense_within_error(self):
+        spec = _spec()
+        params = _params(spec, seed=4)
+        steps = 5
+        rng = np.random.default_rng(17)
+        xs = rng.standard_normal((steps, spec.d_model)).astype(np.float32) * 0.5
+        want = _dense(xs, params, spec)
+        base = cached_forward(BACKEND, params, spec, xs, block_size=2)
+        got = cached_forward(
+            BACKEND, params, spec, xs, block_size=2, quantize="i8"
+        )
+        self.assertEqual(got.shape, base.shape)
+        # 量化只改"缓存怎么存、怎么读回"，误差应远小于一次前向的量级；
+        # 同时要求确实不是逐位相同（否则说明量化没生效）。
+        self.assertLess(np.max(np.abs(got - want)), 0.05)
+        self.assertGreater(np.max(np.abs(got - base)), 0.0)
+
+    def test_quantized_cache_rejects_unknown_scheme(self):
+        spec = _spec()
+        params = _params(spec)
+        xs = np.zeros((3, spec.d_model), dtype=np.float32)
+        with self.assertRaisesRegex(ValueError, "quantize"):
+            cached_forward(BACKEND, params, spec, xs, quantize="i4")
+
     def test_rejections(self):
         spec = _spec()
         params = _params(spec)
@@ -147,6 +171,22 @@ class TestPagedDecodeScheduler(unittest.TestCase):
 
     def _stream(self, scheduler, rid, xs):
         return np.stack([scheduler.step(rid, x) for x in xs])
+
+    def test_quantized_scheduler_matches_dense_within_error(self):
+        spec = _spec()
+        params = _params(spec, seed=6)
+        steps = 4
+        rng = np.random.default_rng(23)
+        xs = rng.standard_normal((steps, spec.d_model)).astype(np.float32) * 0.5
+        sched = self._scheduler(spec, params, max_steps=steps, quantize="i8")
+        self.assertEqual(sched.quantize, "i8")
+        sched.submit(1)
+        got = self._stream(sched, 1, xs)
+        self.assertLess(
+            np.max(np.abs(got - _dense(xs, params, spec)[0])), 0.05
+        )
+        self.assertEqual(sched.length(1), steps)
+        self.assertEqual(sched.cache.cache.quantize, "i8")
 
     def test_interleaved_matches_dense(self):
         spec = _spec()

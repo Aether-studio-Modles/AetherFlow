@@ -81,6 +81,13 @@ class PagedKVCache:
     页在每一层都落在同一个物理页号上），这样上层只需要维护一张表。
 
     ``dtype`` 只影响存储，不参与任何计算；写入时按它转换，读取时原样返回。
+
+    ``quantize="i8"`` 打开量化存储：物理页是 int8，另配一份逐 token、逐头的
+    f32 scale，``gather`` 时反量化为 ``dtype`` 返回。量化口径是**对称、逐行**
+    （一行 = 一个 token 的一个头）：``scale = max(|x|) / 127``，
+    ``q = clip(round(x / scale), -127, 127)``，反量化 ``q * scale``。全零行的
+    scale 取 1.0、q 全零，反量化仍是 0。4 字节降到 1 字节（加 4/head_dim 的
+    scale 开销）；换出副本同样保存 int8，不把量化损失留给"换出再写回"。
     """
 
     def __init__(
@@ -92,6 +99,7 @@ class PagedKVCache:
         num_heads: int,
         head_dim: int,
         dtype=np.float32,
+        quantize: Optional[str] = None,
     ) -> None:
         self.num_blocks = _positive_int(num_blocks, "num_blocks")
         self.block_size = _positive_int(block_size, "block_size")
@@ -101,6 +109,13 @@ class PagedKVCache:
         self.dtype = np.dtype(dtype)
         if self.dtype.kind != "f":
             raise TypeError(f"dtype 必须是浮点类型，得到 {self.dtype}")
+        if quantize not in (None, "i8"):
+            raise ValueError(f'quantize 只支持 None 或 "i8"，得到 {quantize!r}')
+        if quantize == "i8" and self.dtype != np.float32:
+            raise ValueError(
+                f'quantize="i8" 要求 dtype=float32（反量化输出按 f32），得到 {self.dtype}'
+            )
+        self.quantize = quantize
 
         self._free: List[int] = list(range(self.num_blocks - 1, -1, -1))
         self._tables: Dict[int, List[int]] = {}
@@ -111,11 +126,14 @@ class PagedKVCache:
         # 每层懒分配：只用了 2 层就只占 2 层的显存。
         self._keys: Dict[int, np.ndarray] = {}
         self._values: Dict[int, np.ndarray] = {}
-        # 换出到主机的 K/V：rid → (层号表, 每层 keys, 每层 values, 长度)。
+        # 换出到主机的 K/V：rid → (层号表, 每层载荷, 长度)。
+        # 载荷是 (keys, values, key_scale, value_scale)；未量化时后两项为 None，
+        # 量化时前两项是 int8、后两项是 f32——换出不引入二次量化。
         # 只记录**已经分配过**的层，未用过的层换出后仍然不占空间。
-        self._swapped: Dict[
-            int, Tuple[List[int], List[np.ndarray], List[np.ndarray], int]
-        ] = {}
+        self._swapped: Dict[int, Tuple[List[int], List[tuple], int]] = {}
+        # 量化时的逐 (token, head) scale，与 ``_keys`` / ``_values`` 同生命周期。
+        self._key_scale: Dict[int, np.ndarray] = {}
+        self._value_scale: Dict[int, np.ndarray] = {}
         self._peak_blocks = 0
 
     # -- 只读视图 -----------------------------------------------------
@@ -185,7 +203,7 @@ class PagedKVCache:
     @property
     def swapped_tokens(self) -> int:
         """换出到主机的 token 总数（按序列长度累加，不是页数）。"""
-        return sum(item[3] for item in self._swapped.values())
+        return sum(item[2] for item in self._swapped.values())
 
     def stats(self) -> Dict[str, int]:
         """一眼看清占用：页数、空闲页、页大小、序列数、历史峰值。"""
@@ -288,13 +306,17 @@ class PagedKVCache:
         if rid in self._swapped:
             # 换出态没有物理页；直接裁剪主机副本，不涉及页回收。
             if length < current:
-                layers, keys, values, _ = self._swapped[rid]
-                self._swapped[rid] = (
-                    layers,
-                    [item[:length].copy() for item in keys],
-                    [item[:length].copy() for item in values],
-                    length,
-                )
+                layers, payload, _ = self._swapped[rid]
+                trimmed = [
+                    (
+                        key[:length].copy(),
+                        None if key_scale is None else key_scale[:length].copy(),
+                        value[:length].copy(),
+                        None if value_scale is None else value_scale[:length].copy(),
+                    )
+                    for key, key_scale, value, value_scale in payload
+                ]
+                self._swapped[rid] = (layers, trimmed, length)
                 self._lengths[rid] = length
             return 0
         table = self._tables[rid]
@@ -353,19 +375,14 @@ class PagedKVCache:
         if rid in self._swapped:
             raise ValueError(f"序列 {rid} 已经换出；重复换出会覆盖主机副本")
         layers = [layer for layer in range(self.num_layers) if layer in self._keys]
-        keys: List[np.ndarray] = []
-        values: List[np.ndarray] = []
-        for layer in layers:
-            key, value = self.gather(rid, layer)
-            keys.append(key)
-            values.append(value)
+        payload = [self._gather_raw(rid, layer) for layer in layers]
         table = self._tables[rid]
         released = 0
         for block in table:
             if self._give_back(block):
                 released += 1
         self._tables[rid] = []
-        self._swapped[rid] = (layers, keys, values, current)
+        self._swapped[rid] = (layers, payload, current)
         return released
 
     def swap_in(self, rid: int) -> int:
@@ -379,7 +396,7 @@ class PagedKVCache:
         item = self._swapped.get(rid)
         if item is None:
             raise ValueError(f"序列 {rid} 没有换出；swap_in 只接受换出态")
-        layers, keys, values, length = item
+        layers, payload, length = item
         need = _pages_for(length, self.block_size)
         if need > len(self._free):
             raise PagedCacheFullError(
@@ -388,13 +405,16 @@ class PagedKVCache:
                 "序列保持换出态，腾出页后可重试"
             )
         table = [self._take_page() for _ in range(need)]
-        for layer, key, value in zip(layers, keys, values):
+        for layer, (key, key_scale, value, value_scale) in zip(layers, payload):
             store_keys, store_values = self._layer_arrays(layer)
             for position in range(length):
                 page, slot = divmod(position, self.block_size)
                 physical = table[page]
                 store_keys[physical, slot] = key[position]
                 store_values[physical, slot] = value[position]
+                if key_scale is not None:
+                    self._key_scale[layer][physical, slot] = key_scale[position]
+                    self._value_scale[layer][physical, slot] = value_scale[position]
         self._tables[rid] = table
         del self._swapped[rid]
         self._peak_blocks = max(self._peak_blocks, self.used_blocks)
@@ -409,9 +429,108 @@ class PagedKVCache:
             raise ValueError(f"layer={layer} 越界：[0, {self.num_layers})")
         if layer not in self._keys:
             shape = (self.num_blocks, self.block_size, self.num_heads, self.head_dim)
-            self._keys[layer] = np.zeros(shape, dtype=self.dtype)
-            self._values[layer] = np.zeros(shape, dtype=self.dtype)
+            storage = self.storage_dtype
+            self._keys[layer] = np.zeros(shape, dtype=storage)
+            self._values[layer] = np.zeros(shape, dtype=storage)
+            if self.quantize is not None:
+                scale_shape = (self.num_blocks, self.block_size, self.num_heads)
+                self._key_scale[layer] = np.ones(scale_shape, dtype=np.float32)
+                self._value_scale[layer] = np.ones(scale_shape, dtype=np.float32)
         return self._keys[layer], self._values[layer]
+
+    @property
+    def storage_dtype(self) -> np.dtype:
+        """物理页的 dtype：``quantize="i8"`` 时是 int8，否则等于 ``dtype``。"""
+        return np.dtype(np.int8) if self.quantize is not None else self.dtype
+
+    @staticmethod
+    def _quantize_rows(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """逐行对称 int8 量化，返回 ``(q, scale)``；一行 = 一个 token 的一个头。"""
+        rows = np.asarray(x, dtype=np.float32)
+        absmax = np.max(np.abs(rows), axis=-1, keepdims=True)
+        scale = np.where(absmax > 0, absmax / 127.0, 1.0).astype(np.float32)
+        q = np.clip(np.rint(rows / scale), -127.0, 127.0).astype(np.int8)
+        return q, scale[..., 0]
+
+    def _write_range(
+        self, layer: int, table: List[int], start: int, keys: np.ndarray, values: np.ndarray
+    ) -> None:
+        """把一段 ``(T, H, D)`` 写到块表指向的位置；量化时顺带写 scale。"""
+        store_keys, store_values = self._layer_arrays(layer)
+        for offset in range(keys.shape[0]):
+            position = start + offset
+            page, slot = divmod(position, self.block_size)
+            physical = table[page]
+            if self.quantize is None:
+                store_keys[physical, slot] = keys[offset]
+                store_values[physical, slot] = values[offset]
+                continue
+            key_q, key_scale = self._quantize_rows(keys[offset])
+            value_q, value_scale = self._quantize_rows(values[offset])
+            store_keys[physical, slot] = key_q
+            store_values[physical, slot] = value_q
+            self._key_scale[layer][physical, slot] = key_scale
+            self._value_scale[layer][physical, slot] = value_scale
+
+    def _width(self, length: int, pad_to: Optional[int]) -> int:
+        """解析 ``pad_to``，返回取回宽度（补齐部分不参与注意力）。"""
+        if pad_to is None:
+            return length
+        if isinstance(pad_to, bool) or not isinstance(pad_to, int):
+            raise TypeError(f"pad_to 必须是 int 或 None，得到 {type(pad_to).__name__}")
+        if pad_to < length:
+            raise ValueError(f"pad_to={pad_to} 小于当前长度 {length}；补齐不能丢数据")
+        if pad_to > self.capacity_tokens:
+            raise ValueError(f"pad_to={pad_to} 超过缓存容量 {self.capacity_tokens}")
+        return pad_to
+
+    def _gather_raw(
+        self, rid: int, layer: int, pad_to: Optional[int] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray, Optional[np.ndarray]]:
+        """取回未反量化的槽：``(keys, key_scale, values, value_scale)``。
+
+        未量化时两个 scale 是 ``None``；量化时 keys/values 是 int8、scale 是
+        f32。补齐位置是 q=0、scale=1（反量化后为 0）。
+        """
+        length = self.length(rid)
+        if rid in self._swapped:
+            raise ValueError(f"序列 {rid} 已换出到主机；先 swap_in 再取回")
+        width = self._width(length, pad_to)
+        store_keys, store_values = self._layer_arrays(layer)
+        shape = (width, self.num_heads, self.head_dim)
+        if self.quantize is None:
+            keys = np.zeros(shape, dtype=self.dtype)
+            values = np.zeros(shape, dtype=self.dtype)
+            key_scale = None
+            value_scale = None
+        else:
+            keys = np.zeros(shape, dtype=np.int8)
+            values = np.zeros(shape, dtype=np.int8)
+            key_scale = np.ones((width, self.num_heads), dtype=np.float32)
+            value_scale = np.ones((width, self.num_heads), dtype=np.float32)
+        table = self._tables[rid]
+        for position in range(length):
+            page, slot = divmod(position, self.block_size)
+            physical = table[page]
+            keys[position] = store_keys[physical, slot]
+            values[position] = store_values[physical, slot]
+            if key_scale is not None:
+                key_scale[position] = self._key_scale[layer][physical, slot]
+                value_scale[position] = self._value_scale[layer][physical, slot]
+        return keys, key_scale, values, value_scale
+
+    def gather_quantized(
+        self, rid: int, layer: int, *, pad_to: Optional[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """取回量化存储的 ``(K_q, K_scale, V_q, V_scale)``，供设备侧反量化。
+
+        仅 ``quantize="i8"`` 的缓存可用；``pad_to`` 语义与 :meth:`gather` 一致。
+        形状：``K_q`` / ``V_q`` 是 ``(L, H, D)`` int8，scale 是 ``(L, H)`` f32。
+        """
+        if self.quantize is None:
+            raise ValueError("gather_quantized 需要 quantize='i8' 的缓存")
+        keys, key_scale, values, value_scale = self._gather_raw(rid, layer, pad_to)
+        return keys, key_scale, values, value_scale
 
     def _check_pair(self, keys: np.ndarray, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         keys = np.asarray(keys)
@@ -496,19 +615,13 @@ class PagedKVCache:
         for page in cow:
             old = table[page]
             fresh = self._take_page()
-            for stores in (self._keys, self._values):
+            for stores in (self._keys, self._values, self._key_scale, self._value_scale):
                 for store in stores.values():
                     store[fresh] = store[old]
             table[page] = fresh
             self._give_back(old)
         for layer, (keys_layer, values_layer) in enumerate(pairs):
-            store_keys, store_values = self._layer_arrays(layer)
-            for offset in range(tokens):
-                position = current + offset
-                page, slot = divmod(position, self.block_size)
-                physical = table[page]
-                store_keys[physical, slot] = keys_layer[offset]
-                store_values[physical, slot] = values_layer[offset]
+            self._write_range(layer, table, current, keys_layer, values_layer)
         new_length = current + tokens
         self._lengths[rid] = new_length
         used = self.used_blocks
@@ -525,35 +638,13 @@ class PagedKVCache:
         供固定形状的增量图使用；补出来的位置一定在 mask 之外，不参与注意力。
         返回的数组是**副本**：页随时可能被别的序列拿走。
         """
-        length = self.length(rid)
-        if rid in self._swapped:
-            raise ValueError(
-                f"序列 {rid} 已换出到主机；先 swap_in 再取回"
-            )
-        if pad_to is None:
-            width = length
-        else:
-            if isinstance(pad_to, bool) or not isinstance(pad_to, int):
-                raise TypeError(f"pad_to 必须是 int 或 None，得到 {type(pad_to).__name__}")
-            if pad_to < length:
-                raise ValueError(
-                    f"pad_to={pad_to} 小于当前长度 {length}；补齐不能丢数据"
-                )
-            if pad_to > self.capacity_tokens:
-                raise ValueError(
-                    f"pad_to={pad_to} 超过缓存容量 {self.capacity_tokens}"
-                )
-            width = pad_to
-        store_keys, store_values = self._layer_arrays(layer)
-        key_out = np.zeros((width, self.num_heads, self.head_dim), dtype=self.dtype)
-        value_out = np.zeros_like(key_out)
-        table = self._tables[rid]
-        for position in range(length):
-            page, slot = divmod(position, self.block_size)
-            physical = table[page]
-            key_out[position] = store_keys[physical, slot]
-            value_out[position] = store_values[physical, slot]
-        return key_out, value_out
+        keys, key_scale, values, value_scale = self._gather_raw(rid, layer, pad_to)
+        if key_scale is None:
+            return keys, values
+        return (
+            (keys * key_scale[:, :, None]).astype(self.dtype),
+            (values * value_scale[:, :, None]).astype(self.dtype),
+        )
 
     def __repr__(self) -> str:
         return (
@@ -764,6 +855,16 @@ class PagedCacheManager:
         if self.cache.is_swapped(rid):
             self.ensure_resident(rid)
         return self.cache.gather(rid, layer, pad_to=pad_to)
+
+    def gather_quantized(
+        self, rid: int, layer: int, *, pad_to: Optional[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """取回量化存储的 ``(K_q, K_scale, V_q, V_scale)``；换出时先换入。"""
+        self._require(rid)
+        self._order.move_to_end(rid)
+        if self.cache.is_swapped(rid):
+            self.ensure_resident(rid)
+        return self.cache.gather_quantized(rid, layer, pad_to=pad_to)
 
     # -- 换出选择 -----------------------------------------------------
 
