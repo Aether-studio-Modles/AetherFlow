@@ -45,11 +45,13 @@ from .lm_wordpiece import WordPieceTokenizer, WordPieceTokenizerError
 from .lm_tools import JsonGrammar, Tool, ToolRegistry, parse_tool_call
 from .llama import (
     LlamaSpec,
+    LoraSpec,
     build_llama,
     llama_inv_freq,
     llama_param_shapes,
     llama_param_transposes,
     load_llama_weights,
+    lora_param_shapes,
 )
 from .mamba import (
     MambaModelSpec,
@@ -201,9 +203,11 @@ __all__ = [
     "SpeculativeDecoder",
     "greedy_draft",
     "LlamaSpec",
+    "LoraSpec",
     "build_llama",
     "load_llama_weights",
     "llama_inv_freq",
     "llama_param_shapes",
     "llama_param_transposes",
+    "lora_param_shapes",
 ]

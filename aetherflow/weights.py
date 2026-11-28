@@ -1044,12 +1044,18 @@ def load_into_store(
     transpose: Iterable[str] = (),
     strict: bool = True,
     allow_downcast: bool = False,
+    skip: Iterable[str] = (),
 ) -> Tuple[str, ...]:
     """把外部张量装进 ``ParameterStore``，返回**没有被用到**的张量名。
 
     参数名默认与张量名相同；``mapping`` 只写"名字对不上"的那些
     （``{"w_q": "model.layers.0.self_attn.q_proj.weight"}``）。``transpose``
     列出需要按 PyTorch ``nn.Linear`` 布局转一次的参数名（见模块说明）。
+
+    ``skip`` 是"外部文件里没有、也不该被覆盖"的参数（LoRA 的 adapter 就是
+    这一类）：它们必须已经在 store 里，但不参与张量匹配，也不会被写入。少
+    写一个已知的 LoRA 参数会落到"文件里没有这个张量"的报错上，不会静默跳过
+    一个真正缺失的权重。
 
     顺序是刻意的：**先把所有问题收集齐再报**，且全部校验通过后才写。装填中途
     失败会让一半参数是新权重、一半是旧初始化——不报错、训练也能跑，但结果
@@ -1067,12 +1073,17 @@ def load_into_store(
     names = store.names
     mapping = dict(mapping or {})
     transposed = set(transpose)
+    skipped = set(skip)
 
     unknown = sorted(set(mapping) - set(names))
     if unknown:
         raise SafeTensorsError(f"mapping 里有 store 不认识的参数名: {unknown}")
     if bad := sorted(transposed - set(names)):
         raise SafeTensorsError(f"transpose 里有 store 不认识的参数名: {bad}")
+    if bad := sorted(skipped - set(names)):
+        raise SafeTensorsError(f"skip 里有 store 不认识的参数名: {bad}")
+    if both := sorted(skipped & transposed):
+        raise SafeTensorsError(f"参数同时出现在 skip 与 transpose 里: {both}")
     for key, value in mapping.items():
         if not isinstance(value, str) or not value:
             raise SafeTensorsError(f"mapping[{key!r}] 必须是非空张量名，得到 {value!r}")
@@ -1080,6 +1091,8 @@ def load_into_store(
     problems: List[str] = []
     plan: Dict[str, Tuple[str, np.ndarray]] = {}
     for param in names:
+        if param in skipped:
+            continue
         source = mapping.get(param, param)
         if source not in tensors:
             problems.append(f"参数 {param!r} 需要张量 {source!r}，但文件里没有")

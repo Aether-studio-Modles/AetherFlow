@@ -226,6 +226,13 @@ class Trainer:
     ``store`` 里的参数在 ZeRO-3 下是**借出的完整副本**：训练期间它是旧值，
     ``sync_to_host()`` 把分片拼回来覆盖它（``snapshot`` 会先做这一步，避免
     存档静默写旧参数）。参数的真身始终是 ``zero3.shards``。
+
+    ``trainable`` 指定"反向对谁求导"（默认 ``None`` 表示 ``store`` 的全部
+    参数）。LoRA / 冻结基座靠它实现：图里仍然同时读基座与 adapter，但反向图
+    的 ``wrt`` 只含 adapter，冻结参数既不会算梯度，也不会被优化器碰到。给
+    这个参数时 ``optimizer.params`` 必须**恰好**是可训练集合——优化器只持
+    adapter 时，``prepare_step`` 才不会把基座当成"缺梯度"；可训练集合与
+    ``zero3`` / 分桶反向互斥（两者都假设梯度覆盖全部参数）。
     """
 
     def __init__(
@@ -250,6 +257,7 @@ class Trainer:
         scaler: Optional[GradScaler] = None,
         bn_momentum: Optional[float] = 0.1,
         zero3: Optional[Zero3Rank] = None,
+        trainable: Optional[Sequence[str]] = None,
     ) -> None:
         if not isinstance(graph, Graph):
             raise TypeError(f"graph 必须是 Graph，得到 {type(graph).__name__}")
@@ -257,6 +265,25 @@ class Trainer:
             raise TypeError(f"store 必须是 ParameterStore，得到 {type(store).__name__}")
         if not isinstance(optimizer, Optimizer):
             raise TypeError(f"optimizer 必须是 Optimizer，得到 {type(optimizer).__name__}")
+        if trainable is None:
+            trainable_names = tuple(store.names)
+        else:
+            if isinstance(trainable, str):
+                raise TypeError("trainable 必须是参数名序列，不能是单个字符串")
+            trainable_names = tuple(dict.fromkeys(trainable))
+            if not trainable_names:
+                raise ValueError("trainable 不能为空：至少要有一个参数参与反向")
+            unknown = [name for name in trainable_names if name not in store]
+            if unknown:
+                raise KeyError(f"trainable 里有 store 不认识的参数: {unknown}")
+            if set(optimizer.params) != set(trainable_names):
+                raise ValueError(
+                    "trainable 与 optimizer.params 必须一致：优化器多出 "
+                    f"{sorted(set(optimizer.params) - set(trainable_names))}，"
+                    f"少 {sorted(set(trainable_names) - set(optimizer.params))}。"
+                    "冻结参数不能留在优化器里（prepare_step 会把它当成缺梯度），"
+                    "可训练参数也不能没有优化器"
+                )
         if isinstance(accumulate_steps, bool) or int(accumulate_steps) < 1:
             raise ValueError(f"accumulate_steps 必须是 >= 1 的整数，得到 {accumulate_steps!r}")
         if scaler is not None and not isinstance(scaler, GradScaler):
@@ -327,6 +354,11 @@ class Trainer:
             if not isinstance(zero3, Zero3Rank):
                 raise TypeError(
                     f"zero3 必须是 Zero3Rank，得到 {type(zero3).__name__}"
+                )
+            if trainable is not None:
+                raise ValueError(
+                    "ZeRO-3 与 trainable 子集互斥：分片计划的 ReduceScatter 假设"
+                    "每一步都有全部参数的梯度，冻结参数没有梯度，拼不回去"
                 )
             if device_state:
                 raise ValueError(
@@ -467,6 +499,11 @@ class Trainer:
         # 设备态的运行期状态：参数/数据/种子的显存缓冲 + 两张捕获计划。
         # 主机态下这些一直是空的，``sync_to_host`` 因此是个空操作。
         self._param_names = frozenset(store.names)
+        # 反向只对可训练集合求导；默认等于全部参数。两者分开保存：
+        # ``_param_names`` 还负责"哪些图输入是参数"（数据分流、上传、存档），
+        # ``_trainable_names`` 只决定反向图与梯度字典的内容。
+        self._trainable = trainable_names
+        self._trainable_names = frozenset(trainable_names)
         self._input_names = frozenset(value.name for value in graph.inputs)
         # 随机状态输入（dropout 的运行时 key）：每步写入派生 key，同一 step
         # 的前向、重算与反向都用同一个值。不是参数，也不该由用户逐批提供。
@@ -508,7 +545,7 @@ class Trainer:
         self._seed_name = "d" + chosen
         self._chosen = chosen
         self._loss_value = target
-        self._params = [graph.find(name) for name in store.names]
+        self._params = [graph.find(name) for name in self._trainable]
         self.segments = segments
         # 分桶反向：设置后每桶一张独立反向图，桶算完就回调（数据并行据此
         # "桶就绪即发"地提交归约）。默认 None，单步行为逐位不变。
@@ -569,7 +606,8 @@ class Trainer:
     ) -> None:
         """把主机态反向拆成若干参数桶，桶算完立刻回调（数据并行归约用）。
 
-        ``buckets`` 必须不重不漏地覆盖 ``store`` 的全部参数。每个桶单独建一张
+        ``buckets`` 必须不重不漏地覆盖 ``store`` 的全部参数，且全部参数都可
+        训练（有 ``trainable`` 子集时不能分桶）。每个桶单独建一张
         反向图并单独执行：数值与整图反向逐位相同（同样的 vjp、同样的顺序），
         但**共同的链式路径会按桶数重算**——桶越多越慢。只在"通信占比高、
         且桶很大（例如按层分块）"时才划算。
@@ -581,6 +619,11 @@ class Trainer:
         """
         if self.device_state:
             raise ValueError("设备态不支持分桶反向：capture / replay 是整图")
+        if self._trainable_names != self._param_names:
+            raise ValueError(
+                "分桶反向要求全部参数可训练：冻结参数没有梯度，桶覆盖检查"
+                "与归约都按「每桶都有梯度」设计"
+            )
         if self._plan is not None:
             raise ValueError("分桶反向与 checkpoint 分段反向不能同时开启")
         if self._accumulator is not None:
@@ -669,7 +712,7 @@ class Trainer:
                 self._bwd,
                 {**feed, self._seed_name: self._seed(out.dtype)},
             )
-            grads = {name: result["d" + name] for name in self.store.names}
+            grads = {name: result["d" + name] for name in self._trainable}
         else:
             # 分段反向也只喂损失那一个种子：CheckpointPlan 已按输出做了
             # 可达性剪枝，未参与损失的图输出不进任何段的反向图。
@@ -999,7 +1042,7 @@ class Trainer:
         seeds = {**self._dev_data, **self._dev_params, **self._dev_seeds}
         result = self._bwd_plan.run_device(seeds)
         if self._update(
-            {name: result["d" + name] for name in self.store.names}, weight=weight
+            {name: result["d" + name] for name in self._trainable}, weight=weight
         ):
             self._copy_master_to_resident()
         self.steps += 1
@@ -1036,7 +1079,7 @@ class Trainer:
         bwd_inputs = {**shared, **dev_seeds}
         bwd = backend.capture(self._bwd, bwd_inputs, shared_buffers=bwd_inputs)
 
-        self.optimizer.rebind(master)
+        self.optimizer.rebind({name: master[name] for name in self._trainable})
         self._dev_params = dev_params
         self._dev_master = None if master is dev_params else master
         self._dev_data = dev_data
@@ -1164,9 +1207,11 @@ class Trainer:
 
         dev_grads = {
             name: backend.to_array(np.zeros(self.store[name].shape, self.store[name].dtype))
-            for name in self.store.names
+            for name in self._trainable
         }
-        self.optimizer.rebind(master)
+        # 优化器只拿可训练的那几块显存：冻结参数留在驻留缓冲里当图输入，
+        # 但不参与 rebind，否则 prepare_step 会因"缺梯度"拒绝。
+        self.optimizer.rebind({name: master[name] for name in self._trainable})
         self._dev_params = dev_params
         self._dev_master = None if master is dev_params else master
         self._dev_data = dev_data
@@ -1324,7 +1369,10 @@ class Trainer:
             updated = (
                 self._dev_master[name] if self._dev_master is not None else resident
             )
-            if self.optimizer.params.get(name) is not updated:
+            if (
+                name in self.optimizer.params
+                and self.optimizer.params[name] is not updated
+            ):
                 problems.append(f"优化器手里的 {name} 不是上传的那份参数")
             for label, plan in plans:
                 buf = plan.buffers.get(name)
@@ -1637,7 +1685,7 @@ class Trainer:
                 raise ValueError(
                     f"存档里的累积权重 {saved_meta['accum_weight']!r} 不是有限正数"
                 )
-            want_aux = {f"grad/{name}" for name in self.store.names}
+            want_aux = {f"grad/{name}" for name in self._trainable}
             saved_grad = {str(key) for key in saved_aux} - saved_bn_keys
             if saved_grad != want_aux:
                 raise KeyError(
@@ -1657,7 +1705,7 @@ class Trainer:
         # "这份存档真的会有的条目"：没提交的累积窗口不写梯度模板。
         template: Dict[str, np.ndarray] = {}
         if pending:
-            for name in self.store.names:
+            for name in self._trainable:
                 template[f"grad/{name}"] = np.zeros(
                     tuple(like[name].shape), dtype=np.float32
                 )
@@ -1708,7 +1756,7 @@ class Trainer:
                     "count": pending,
                     "weight": accum_weight,
                     "sum": {
-                        name: template[f"grad/{name}"] for name in self.store.names
+                        name: template[f"grad/{name}"] for name in self._trainable
                     },
                 },
                 like=like,

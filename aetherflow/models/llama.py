@@ -53,7 +53,7 @@ IR 图，而不是靠新增算子。当前覆盖的结构（Qwen2.5-0.5B 与 Lla
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, FrozenSet, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -66,11 +66,13 @@ if TYPE_CHECKING:  # 只为类型注解：weights 会反过来导入本包的运
 
 __all__ = [
     "LlamaSpec",
+    "LoraSpec",
     "build_llama",
     "load_llama_weights",
     "llama_inv_freq",
     "llama_param_shapes",
     "llama_param_transposes",
+    "lora_param_shapes",
 ]
 
 
@@ -196,6 +198,56 @@ class LlamaSpec:
         return cls(**base)
 
 
+_LORA_TARGETS: Tuple[str, ...] = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
+@dataclass(frozen=True)
+class LoraSpec:
+    """LoRA adapter 的形状与缩放。
+
+    ``rank`` 是低秩瓶颈宽度，``alpha`` 是缩放分子（增量乘 ``alpha / rank``，
+    与 HF PEFT 的默认口径一致）。``targets`` 取 :data:`_LORA_TARGETS` 里的
+    投影名，默认只挂 q/v——原始 LoRA 论文的配置；全挂 7 个线性层通常在小
+    数据上更稳，但要显式写出来。
+
+    **``lora_b`` 必须初始化为 0**：A 是随机低秩基，B 为零时增量恰好为 0，
+    带 adapter 的模型在第一步与基座逐位相同；B 也随机会让"加载基座权重"
+    之后的初始损失凭空跳一下。构建器只负责形状，初始化在 ``ParameterStore``
+    侧做（示例见 ``examples/llm/lora.py``）。
+    """
+
+    rank: int = 8
+    alpha: float = 16.0
+    targets: Tuple[str, ...] = ("q_proj", "v_proj")
+
+    def __post_init__(self) -> None:
+        if isinstance(self.rank, bool) or not isinstance(self.rank, int) or self.rank < 1:
+            raise ValueError(f"rank 必须是正整数，得到 {self.rank!r}")
+        if not self.alpha > 0:
+            raise ValueError(f"alpha 必须为正，得到 {self.alpha!r}")
+        if not isinstance(self.targets, tuple):
+            object.__setattr__(self, "targets", tuple(self.targets))
+        unknown = [t for t in self.targets if t not in _LORA_TARGETS]
+        if unknown:
+            raise ValueError(
+                f"未知的 LoRA 目标 {unknown}；可用: {list(_LORA_TARGETS)}"
+            )
+        if len(set(self.targets)) != len(self.targets):
+            raise ValueError(f"targets 有重复: {self.targets}")
+
+    @property
+    def scale(self) -> float:
+        return self.alpha / self.rank
+
+
 def llama_inv_freq(spec: LlamaSpec) -> np.ndarray:
     """RoPE 的逆频率 ``theta^(-2i/head_dim)``，长度 ``head_dim / 2``。
 
@@ -206,8 +258,14 @@ def llama_inv_freq(spec: LlamaSpec) -> np.ndarray:
     return (1.0 / (spec.rope_theta ** (index / spec.head_dim))).astype(np.float32)
 
 
-def llama_param_shapes(spec: LlamaSpec) -> Dict[str, Tuple[int, ...]]:
-    """IR 参数名 → 形状。名字与 HF ``state_dict`` 相同，形状已转置成 IR 约定。"""
+def llama_param_shapes(
+    spec: LlamaSpec, lora: Optional[LoraSpec] = None
+) -> Dict[str, Tuple[int, ...]]:
+    """IR 参数名 → 形状。名字与 HF ``state_dict`` 相同，形状已转置成 IR 约定。
+
+    给了 ``lora`` 时把 adapter 的名字一并返回：基座参数与 adapter 在同一个
+    ``ParameterStore`` 里，训练器才能把二者一起喂进图。
+    """
     d = spec.d_model
     hd = spec.head_dim
     q_dim = spec.num_heads * hd
@@ -233,6 +291,42 @@ def llama_param_shapes(spec: LlamaSpec) -> Dict[str, Tuple[int, ...]]:
             shapes[f"{p}.self_attn.v_proj.bias"] = (kv_dim,)
     shapes["model.norm.weight"] = (d,)
     shapes["lm_head.weight"] = (d, vocab)
+    if lora is not None:
+        shapes.update(lora_param_shapes(spec, lora))
+    return shapes
+
+
+def lora_param_shapes(
+    spec: LlamaSpec, lora: LoraSpec
+) -> Dict[str, Tuple[int, ...]]:
+    """LoRA adapter 的参数名 → 形状（IR 约定：``x @ A @ B``，无转置）。
+
+    ``lora_a`` 是 ``(in, rank)``，``lora_b`` 是 ``(rank, out)``；名字挂在被
+    适配的投影后面（``...self_attn.q_proj.lora_a``），与基座参数同一命名空间，
+    ``load_llama_weights`` 用 ``skip`` 把它们排除在基座权重之外。
+    """
+    d = spec.d_model
+    hd = spec.head_dim
+    q_dim = spec.num_heads * hd
+    kv_dim = spec.kv_dim
+    ff = spec.d_ff
+    rank = lora.rank
+    dims = {
+        "q_proj": ("self_attn", d, q_dim),
+        "k_proj": ("self_attn", d, kv_dim),
+        "v_proj": ("self_attn", d, kv_dim),
+        "o_proj": ("self_attn", q_dim, d),
+        "gate_proj": ("mlp", d, ff),
+        "up_proj": ("mlp", d, ff),
+        "down_proj": ("mlp", ff, d),
+    }
+    shapes: Dict[str, Tuple[int, ...]] = {}
+    for i in range(spec.num_layers):
+        for target in lora.targets:
+            scope, in_dim, out_dim = dims[target]
+            stem = f"model.layers.{i}.{scope}.{target}"
+            shapes[f"{stem}.lora_a"] = (in_dim, rank)
+            shapes[f"{stem}.lora_b"] = (rank, out_dim)
     return shapes
 
 
@@ -263,6 +357,7 @@ def build_llama(
     *,
     name: str = "llama",
     with_logits: bool = True,
+    lora: Optional[LoraSpec] = None,
 ) -> Tuple[Graph, Dict[str, Value]]:
     """构建一张完整的 Llama / Qwen2 前向图。
 
@@ -270,10 +365,15 @@ def build_llama(
     的 :class:`Value`，训练器用 ``ParameterStore.from_graph(graph, exclude=("tokens",))``
     即可把参数与数据分开。
 
+    ``lora`` 给出时，``targets`` 指定的线性层多一条低秩旁路
+    ``x @ A @ B * (alpha / rank)``，旁路参数与基座参数一起作为图输入。冻结
+    基座、只更新旁路不是构建器的事：图只是把两者都算进去，训练器靠
+    ``trainable`` 指定反向对谁求导（见 ``Trainer``）。
+
     图**不 seal**：与仓库里其他构建器一致，调用方要在这张图上继续接
     ``masked_lm_loss_indexed`` 之类的损失节点。需要冻结结构时自己调 ``seal()``。
     """
-    shapes = llama_param_shapes(spec)
+    shapes = llama_param_shapes(spec, lora)
     g = Graph(name)
 
     tokens = g.input("tokens", i32[spec.batch, spec.seq])
@@ -292,7 +392,7 @@ def build_llama(
     )
 
     for i in range(spec.num_layers):
-        x = _block(g, x, params, spec, i, cos, sin, mask)
+        x = _block(g, x, params, spec, i, cos, sin, mask, lora)
 
     x = g.rmsnorm(
         x, params["model.norm.weight"], axes=(-1,), eps=spec.norm_eps
@@ -312,6 +412,7 @@ def load_llama_weights(
     tie_weights: Optional[bool] = None,
     strict: bool = True,
     allow_downcast: bool = False,
+    skip: Iterable[str] = (),
 ) -> Tuple[str, ...]:
     """把 HF 形态的张量装进 ``ParameterStore``，返回没用到的张量名。
 
@@ -324,6 +425,9 @@ def load_llama_weights(
 
     ``tie_weights=None`` 时按文件内容判断（缺 ``lm_head.weight`` 即视为 tied），
     因为"文件里有什么"是唯一不会骗人的依据；显式传布尔值则覆盖该判断。
+
+    ``skip`` 传给 ``load_into_store``：LoRA adapter 不在基座权重文件里，但必须
+    已经在 store 里，加载基座时既不能要求文件提供它、也不能覆盖它。
     """
     from ..weights import load_into_store
 
@@ -343,6 +447,7 @@ def load_llama_weights(
         transpose=llama_param_transposes(spec),
         strict=strict,
         allow_downcast=allow_downcast,
+        skip=skip,
     )
 
 
@@ -396,6 +501,28 @@ def _repeat_kv(g: Graph, x: Value, spec: LlamaSpec) -> Value:
     )
 
 
+def _linear(
+    g: Graph,
+    x: Value,
+    params: Dict[str, Value],
+    lora: Optional[LoraSpec],
+    stem: str,
+) -> Value:
+    """``x @ W``，``lora`` 命中该投影时再加低秩旁路 ``x @ A @ B * scale``。
+
+    ``stem`` 是不带后缀的参数名前缀（如 ``model.layers.0.self_attn.q_proj``），
+    目标名取最后一段。旁路里 ``A`` 的形状是 ``(in, rank)``、``B`` 是
+    ``(rank, out)``，与基座权重同一 IR 约定，所以三处矩阵乘共用同一套形状
+    推断；缩放是 0 维常量，靠 ``mul`` 的广播把 ``(B, T, out)`` 整体乘过去，
+    **不**把 scale 预先折进 B——折进去会让存档里的 B 与"标准 LoRA"语义不符。
+    """
+    out = g.matmul(x, params[f"{stem}.weight"])
+    if lora is None or stem.rsplit(".", 1)[-1] not in lora.targets:
+        return out
+    delta = g.matmul(g.matmul(x, params[f"{stem}.lora_a"]), params[f"{stem}.lora_b"])
+    return g.add(out, g.mul(delta, g.constant(lora.scale)))
+
+
 def _block(
     g: Graph,
     x: Value,
@@ -405,15 +532,16 @@ def _block(
     cos: Value,
     sin: Value,
     mask: Optional[Value],
+    lora: Optional[LoraSpec] = None,
 ) -> Value:
     p = f"model.layers.{index}"
     batch, seq = spec.batch, spec.seq
     q_dim = spec.num_heads * spec.head_dim
 
     h = g.rmsnorm(x, params[f"{p}.input_layernorm.weight"], axes=(-1,), eps=spec.norm_eps)
-    q = g.matmul(h, params[f"{p}.self_attn.q_proj.weight"])
-    k = g.matmul(h, params[f"{p}.self_attn.k_proj.weight"])
-    v = g.matmul(h, params[f"{p}.self_attn.v_proj.weight"])
+    q = _linear(g, h, params, lora, f"{p}.self_attn.q_proj")
+    k = _linear(g, h, params, lora, f"{p}.self_attn.k_proj")
+    v = _linear(g, h, params, lora, f"{p}.self_attn.v_proj")
     if spec.qkv_bias:
         q = g.add(q, params[f"{p}.self_attn.q_proj.bias"])
         k = g.add(k, params[f"{p}.self_attn.k_proj.bias"])
@@ -436,14 +564,17 @@ def _block(
     merged = g.reshape(
         g.transpose(ctx, perm=(0, 2, 1, 3)), shape=(batch, seq, q_dim)
     )
-    x = g.add(x, g.matmul(merged, params[f"{p}.self_attn.o_proj.weight"]))
+    x = g.add(x, _linear(g, merged, params, lora, f"{p}.self_attn.o_proj"))
 
     h = g.rmsnorm(
         x, params[f"{p}.post_attention_layernorm.weight"], axes=(-1,), eps=spec.norm_eps
     )
-    gate = g.matmul(h, params[f"{p}.mlp.gate_proj.weight"])
-    up = g.matmul(h, params[f"{p}.mlp.up_proj.weight"])
+    gate = _linear(g, h, params, lora, f"{p}.mlp.gate_proj")
+    up = _linear(g, h, params, lora, f"{p}.mlp.up_proj")
     x = g.add(
-        x, g.matmul(g.mul(g.silu(gate), up), params[f"{p}.mlp.down_proj.weight"])
+        x,
+        _linear(
+            g, g.mul(g.silu(gate), up), params, lora, f"{p}.mlp.down_proj"
+        ),
     )
     return x
