@@ -235,9 +235,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   W8A8 也尚无反向（bias 除外）。非对称零点的量化 / 反量化与融合线性层都已有
   设备内核（5.322 / 5.323，V100 上 conformance 通过），但 `linear_i8a8_zp`
   走标量乘加、没用 dp4a / IMMA，也**不融合 epilogue**（int32 累加后仍物化一份
-  f32 输出）；逐组反量化已有设备内核（5.321，只做反量化、不融合 GEMM，
-  融合成 `linear_i8_group` 仍未做），但没有主机侧的逐组量化 helper
-  （写侧由导出器负责）。
+  f32 输出）；逐组反量化已有设备内核（5.321），`linear_i8_group` 由它与
+  GEMM 组合（5.329，bias 在 epilogue），但反量化仍要物化一份 f32 权重、
+  不融合进 GEMM；没有主机侧的逐组量化 helper（写侧由导出器负责）。
 - **布局**：NHWC 传播 pass 已交付；设备端自 5.334 起有原生 NHWC 内核——conv2d
   只走分块直算（f32、groups=1），maxpool2d / avgpool2d 只覆盖前向。im2col /
   隐式 / Winograd / 分组 / cuDNN 遇到 `layout="nhwc"` 在入口显式报错；
@@ -280,7 +280,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   NaN；`atan2` 只接同 dtype 浮点，四象限由 `atan2f` 保证。5.349 / 5.350 的 8 个
   设备内核在 V100 上数值等价（`verify_cuda.py` 177 executed / 3 refused /
   0 failed，新用例 err 全为 0），但没有吞吐基准，不作性能结论（5.349 / 5.350）。
-  `interpolate` 仍未做，构图期显式拒绝。
+  5.351 补了 `interpolate`：只做 4D NCHW 的 `nearest` / `bilinear`（含反向，
+  反向用 `atomicAdd` 累加），`bicubic` / 三线性 / `antialias` / `scale_factor`
+  在构图期显式拒绝；V100 真机数值对拍通过，没有吞吐基准。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
@@ -348,7 +350,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `softplus.threshold` 一律拒绝；常量构造（zeros / ones / full / arange 等）
   落成图属性，单个常量上限 65536 元素；`padding_idx` / `sparse` /
   `scale_grad_by_freq` 显式拒绝。
-- **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径，且无 VJP；`topk_values` /
+- **数值与内核**：`fft` / `rfft` 仅 CUDA 的 cuFFT 路径（5.354 起支持 1–3 个
+  末尾连续轴的 `axes`，`cufftPlanMany` 的 rank 上限为 3），且无 VJP；`topk_values` /
   `topk_indices` / `topk_mask` 的设备内核是**朴素 k 轮块内选择**（f32 / f16，
   bf16 与 `argmax` 一样不支持，k 受 48 KiB 动态共享内存约束）；`spike_linear` 的
   `dspikes` 必须稠密；卷积的差距按稳态口径读
@@ -396,12 +399,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 ### 维护者备注
 
 - 临时脚本（`_tmp_*.py` 等）用完即删；结论写进 DESIGN 对应小节，凭证不落盘。
-- **文档里的算子总数长期滞后**：5.323 后实测 `len(OPS) == 93`、`len(GPU_OPS) == 91`
-  （HIP 的 `HIP_OPS` 直接继承，`CUDA_OPS` 同为 91），而正文明面上的 80 / 77 是
-  5.312 起的增量口径（5.315、5.317、5.318、5.321、5.322、5.323 各加若干），与实际值
-  仍差 13 / 14。未承接的只剩 `fft` / `rfft`（CUDA 由 cuFFT 承接）。下次统一校准一次，以
-  `py -3.14 -c "from aetherflow.ir.ops import OPS; print(len(OPS))"` 与
-  `device_shared.GPU_OPS` 为准，并把"70 个自研内核"这类分项一起重数，不要只改总数。
+- **算子总数以注册表为准**：5.355 后实测 `len(OPS) == 122`、`len(GPU_OPS) == 119`
+  （HIP 的 `HIP_OPS` 直接继承；CUDA 再额外承接 `fft` / `rfft`，即 121 个）。
+  不在 `GPU_OPS` 的三个是 `fft` / `rfft`（CUDA 由 cuFFT 承接）与 `sort`
+  （设备端刻意不承接）。改算子面时同步 README 第 4 节，并以
+  `py -3.14 -c "from aetherflow.ir.ops import OPS; from aetherflow.backends.device_shared import GPU_OPS; print(len(OPS), len(GPU_OPS))"` 复核。
 - 提交后用 `git status` / `git diff --stat` 核对。曾出现工作区文件被旧版覆盖
   （表现为 `git diff` 里只有"删除已提交内容"）：用 `git checkout HEAD -- <file>`
   逐个恢复，再在其上继续编辑，不要重写整份文件。
