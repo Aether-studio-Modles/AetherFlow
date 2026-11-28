@@ -122,10 +122,10 @@ spec = tok.spec(d_model=768, steps=8)            # 与这份词表对齐的 LMSp
 python -m unittest discover -s tests -t .   # 本地必须用 Python 3.14（3.10 的 torch 会被兼容矩阵拦下）
 python verify_cuda.py                       # 有 NVIDIA 卡时验证 CUDA 后端
 python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda）
-python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照
+python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3152 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3153 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
@@ -336,7 +336,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3152 个用例
+tests/                3153 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```

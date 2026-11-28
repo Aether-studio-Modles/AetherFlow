@@ -100,13 +100,14 @@ out = ReferenceBackend().execute(g, {
 python demo_transformer_block.py
 python verify_cuda.py                        # 有 NVIDIA 卡时验证 CUDA 后端
 python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda）
+python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compile 同机对照（整图，5.316）
 ```
 
 ### 已验证的配置
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3152 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3153 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
