@@ -40,6 +40,11 @@
   `fake_quantize_i8_lsq`（前向逐位相同，反向按非饱和区直通并给 scale 梯度，
   5.312）；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
+- **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
+  支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8 显式拒绝；
+  `load_into_store` 把外部张量装进参数容器——名字映射、PyTorch `nn.Linear` 布局
+  转置、有损 dtype 转换都要显式声明，先全量校验再原地写，失败不留半装状态
+  （5.313）。
 
 ### 安装
 
@@ -93,7 +98,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3040 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3078 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
@@ -171,6 +176,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   （否则前缀已发出、撤回不了）。检测粒度是 token，跨 token 的 stop 会多生成到
   完整命中为止。流式仍由每个请求轮询 `ServingEngine.progress()` 快照，并发很大
   时应改成调度器推送增量。
+- **权重入口**：只读 `safetensors` 容器（不读 GGUF / PyTorch `.bin` / `.pt` / TF
+  检查点）；fp8 / fp4、稀疏张量与量化元数据不支持（fp8 显式报错，不复用成 u8）；
+  没有内置任何具体模型的转换表——名字映射与 `nn.Linear` 转置由调用方声明；
+  大模型按需读取的接口已就位，但没有 GB 级权重的实机加载耗时与内存峰值数字（5.313）。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
   无 `bool` 张量，因此 `where` / `masked_fill` / 比较算子 / `topk` 显式拒绝；
   `sign` / `round` / `floor` / `ceil`、`baddbmm`、原地 `copy_` 无对应语义；
@@ -599,6 +608,15 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   与 `fake_quantize_i8_lsq` 的前向逐位相同，只差 vjp。用 `learnable_scale`
   之类的 attrs 也能实现，但"这个 scale 到底会不会被训练"就藏进了属性；
   两个算子名让 `backward(wrt=[s])` 从报错变返回梯度的差异直接写在图上。
+- **外部权重格式自己解析，不为一个容器加依赖**（5.313）：运行期只依赖 numpy 是
+  "参考后端在任意平台可用"的前提。safetensors 的头就是 8 字节小端长度 + 一段
+  JSON，标准库足够；而且校验口径（头长上限、offsets 边界、字节数与 shape 相符）
+  要按本项目的"显式失败"自己定，通用读取器的默认宽容度不一样。
+- **装载不能猜名字、布局与精度**（5.313）：HF 的 `...q_proj.weight` 与本地参数名
+  没有可推导关系；PyTorch `nn.Linear` 是 `(out, in)` 而本仓库 `x @ W` 是
+  `(in, out)`。猜错的后果不是崩溃，是静默训出一个错模型——所以映射、转置、
+  有损 dtype 都必须显式声明。另：先全量校验再 `dst[...] = ...` 原地写，
+  避免失败时留下"一半新权重、一半旧初始化"。
 - **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
   移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
   账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100

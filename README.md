@@ -84,6 +84,22 @@ from aetherflow.serve import OpenAIService, serve
 RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）、多层 SNN
 （LIF + 替代梯度 + 稀疏事件）。
 
+### 装外部权重
+
+```python
+from aetherflow import load_safetensors, load_safetensors_dir, load_into_store
+
+tensors = load_safetensors("model.safetensors")     # 分片目录用 load_safetensors_dir("ckpt/")
+unused = load_into_store(
+    params, tensors,
+    mapping={"w_q": "model.layers.0.self_attn.q_proj.weight"},
+    transpose=["w_q"],                              # PyTorch nn.Linear 是 (out, in)
+)
+```
+
+名字与布局都不猜：没写进 `mapping` 的参数按同名取，需要转置的必须列进 `transpose`。
+装填先全量校验再原地写，一个参数对不上就整体不动（DESIGN 5.313）。
+
 ### 自检
 
 ```bash
@@ -93,13 +109,14 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照
 ```
 
-当前基线：**3040 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3078 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
 
 | 面 | 已交付 |
 |---|---|
+| 权重入口 | `safetensors` 读取（自解析，运行期仍只依赖 numpy）：按需取单张量、分片目录合并、bf16 无损展宽为 f32、fp8 显式拒绝；`load_into_store` 把外部张量装进参数容器（名字映射 / PyTorch `nn.Linear` 布局转置 / 有损 dtype 需显式同意，先全量校验再原地写，失败不留半装状态，DESIGN 5.313） |
 | 前端 | `torch.export` 导入：卷积 / 池化 / linear / LayerNorm / softmax / SDPA / 归一化 / 索引与切片之外，P7 补上了逐元素数学、激活展开、clamp 与标量运算、dtype 转换、归约（mean / sum / amax / max.dim / argmax）、tril / triu / cumsum / pad、栈与切分、mm / mv / dot / addmm、常量构造（zeros / ones / full / arange 等）；不能精确表达的算子显式拒绝（见第 6 节） |
 | 算子 | IR 里 74 个算子；CUDA / HIP 各自承接 71 个（68 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8` + 1 个由量化与反量化组合的 `fake_quantize_i8` + 1 个前向同源、反向为 LSQ 的 `fake_quantize_i8_lsq`，其中 W8A8 的 `linear_i8a8` 是 int8 读入、int32 累加的专用内核，5.309；QAT 假量化见 5.311，LSQ 见 5.312），CUDA 另有 cuFFT 的 fft/rfft；参考后端承接全部 |
 | 精度 | f32 全覆盖；f16 覆盖 65 个（71 个设备端算子去掉 5 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` / `fake_quantize_i8` / `fake_quantize_i8_lsq` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
@@ -301,7 +318,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3040 个用例
+tests/                3078 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
