@@ -116,10 +116,10 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3198 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3199 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `137 executed / 3 refused / 0 failed`（5.324 后；`matmul_partial_batch` 首次成功、err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05；3 个 refused 是 `cast_f8e4m3` / `cast_f8e5m2` / `f64_input_relu`）；`tests.test_cuda_backend` 382 条 2.5 秒全过（2 跳过）；未跑全量 unittest |
+| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
 
 ```bash
 # 本地全量
@@ -151,9 +151,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   tensor core（没有 IMMA / wmma 分块），**不要期待"int8 算得更快"的结论**；
   QAT 到假量化算子（`fake_quantize_i8`，5.311）与 LSQ 的可学步长版本
   （`fake_quantize_i8_lsq`，5.312）——后者要求 scale 作为图输入才能收到梯度，
-  没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 有参考语义与
-  权重读取入口（e4m3 / e5m2，5.318 / 5.319），设备端没有存储容器与内核、
-  遇到即显式拒绝；
+  没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 有参考语义、
+  权重读取入口与设备端 `cast`（e4m3 / e5m2，5.318 / 5.319 / 5.325：设备上
+  载体仍是 f32，只把值落到格式格点、不省带宽），其它算子遇到 fp8 仍显式
+  拒绝，也没有 fp8 GEMM；
   W8A8 也尚无反向（bias 除外）。非对称零点的量化 / 反量化与融合线性层都已有
   设备内核（5.322 / 5.323，V100 上 conformance 通过），但 `linear_i8a8_zp`
   走标量乘加、没用 dp4a / IMMA，也**不融合 epilogue**（int32 累加后仍物化一份
@@ -202,7 +203,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   完整命中为止。流式仍由每个请求轮询 `ServingEngine.progress()` 快照，并发很大
   时应改成调度器推送增量。
 - **权重入口**：只读 `safetensors` 容器（不读 GGUF / PyTorch `.bin` / `.pt` / TF
-  检查点）；fp8 / fp4 与稀疏张量不支持（fp8 显式报错，不复用成 u8）；量化权重
+  检查点）；fp4 与稀疏张量不支持，fp8 权重读入时解码成 f32 载体（5.319）、
+  不保留单字节；量化权重
   支持本仓库自己的 `quantization` / `quantization.group_size` 约定（5.317），
   **不声称兼容 GPTQ / AWQ 原始检查点**（它们的 int32 交织打包与 `qzeros` 的
   +1 偏移是另一套约定）；没有内置任何具体模型的转换表——名字映射与
@@ -683,6 +685,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   表现为 "算错" 而不是 "拒绝"（`verify_cuda.py` 从 2 refused 变 2 failed）。
   预绑定条件必须与 `invoke` 的检查一一对应，**输入与输出都要判**；判不了就返回
   `None` 退回原路径，报错时机与文案不变。
+- **NVRTC / hipRTC 源码只能是 ASCII**（5.325）：`device_shared.py` 的 `_SRC`
+  里写中文注释，本地看不出来，真机上抛
+  `UnicodeEncodeError: 'ascii' codec can't encode characters`，并被 conformance
+  记成 `failed`（不是编译错误）。内核注释一律用英文，Python 侧的注释不受影响。
+- **设备端 fp8 是 f32 载体**（5.325）：`cast` 到 f8 只把值舍入到格式格点，
+  不省带宽也不省显存；`invoke` 与 `_planned_kernel` 只对 `cast` 放行，其它
+  算子仍 refused。`_fast_step` 的量化标记要包含 `F8E4M3` / `F8E5M2`，否则
+  图输出会跳过 `quantize`、真机表现为 failed。
 
 ---
 

@@ -285,7 +285,9 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   前向逐位相同，反向按非饱和区直通、并把 `sum(g * (v_hat - v))` 送给
   scale，5.312）；fp8（e4m3 / e5m2）有参考语义与单字节位模式编解码
   （`cast(dtype="f8e4m3")` + `runtime/fp8.py`，e4m3 无 inf 并饱和到 ±448、
-  e5m2 溢出到 inf，5.318），但设备端没有存储容器与内核、显式拒绝；
+  e5m2 溢出到 inf，5.318），设备端 `cast` 已有量化内核（5.325：载体仍是
+  f32、只把值落到格式格点，不省带宽），其它算子遇到 fp8 仍显式拒绝；
+  没有 fp8 GEMM 与 1 字节存储容器；
   没有 int8 tensor core 级的矩阵乘；非对称零点
   有主机侧语义与构图入口（`quantize_i8_zp` / `dequantize_i8_zp` /
   `linear_i8_zp` / `linear_i8a8_zp`，5.315），四个都已有设备内核
