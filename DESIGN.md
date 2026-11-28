@@ -238,7 +238,7 @@ GPU 作业仍未接上真实 runner。
 | 算子覆盖 | 78 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），对称与非对称零点两套主机侧语义（非对称见 5.315、量化 / 反量化内核见 5.322、融合线性层见 5.323；逐组的非对称 `dequantize_i8_group_zp` 见 5.321），逐组（per-group）weight-only 反量化（`dequantize_i8_group` / `_zp`，5.317 语义、5.321 设备内核），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），fp8 的 cast 已落到设备端（5.325，载体仍是 f32、不省带宽），但没有 fp8 GEMM |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
-| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314），但没有内置 HF 权重转换表、无 GGUF、无 WordPiece / Unigram |
+| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314）与 WordPiece（5.345），但没有内置 HF 权重转换表、无 GGUF、无 Unigram / SentencePiece |
 | 生态 | 能读 safetensors（5.313，按需读取 + 名字 / 布局显式映射）与 HF `tokenizer.json` 的 ByteLevel BPE 谱系（5.314），无预训练权重分发、无 Hub、无第三方算子库 | 各自有完整生态 | 权重与分词入口已通，分发仍然缺位 |
 | 失败语义 | 能力未覆盖即显式报错（构图期拒绝或 `BackendCapabilityError`），捕获期登记、replay 后复查 | 常见做法是回落或静默降级 | 这是设计差异，不是能力差异 |
 
@@ -19946,7 +19946,7 @@ transpose=(), strict=True, allow_downcast=False)`：
 - `decoder`：null / `ByteLevel` / `Sequence`（`Replace` 不参与解码，ByteLevel
   已经能还原字节）。
 
-拒绝 WordPiece / Unigram、SentencePiece 的 `byte_fallback` /
+拒绝 WordPiece（另起 `WordPieceTokenizer`，见 5.345）/ Unigram、SentencePiece 的 `byte_fallback` /
 `end_of_word_suffix` / `continuing_subword_prefix`、`Metaspace`、以及 `Split`
 预分词。`Split` 这一条最值得说：它的 `pattern` 会改切分边界（Llama-3 把数字按
 1～3 位一组切），忽略 pattern 就是把别的分词器当成自己的用——拼出来的 id 每个
@@ -20007,8 +20007,9 @@ added 与 vocab 之间、added 与 added 之间都查——两个 added 共用 i
 - 不解析 `tokenizer_config.json` 与 `special_tokens_map.json`：`eos` / `pad` 从
   added token 的候选名推断，或由调用方显式传入；chat 模板仍用 `ChatTemplate`
   手写，没有"读模板字符串"的能力。
-- 不支持 Llama-3 的 `Split` 预分词、SentencePiece（Llama-2 系）、WordPiece
-  （BERT 系）、Unigram（T5 系）、BPE dropout、`lstrip` / `rstrip`。
+- 不支持 Llama-3 的 `Split` 预分词、SentencePiece（Llama-2 系）、Unigram
+  （T5 系）、BPE dropout、`lstrip` / `rstrip`；BERT 系的 WordPiece 不走本模块，
+  由 5.345 的 `WordPieceTokenizer` 承接。
 - 不做 offset mapping（char → token 的 span），因此没有"把生成结果定位回原文"
   的能力。
 - 用自造小词表逐 id 对拍，没有与 HF 官方实现在真实 15 万级词表上做全量对拍，
@@ -22044,7 +22045,7 @@ step 推进，每步与其它请求的 decode 交错。
 块 2 时前三步不返回结果、第四步才采样，且出的 token 与整段路径相同；块 1 时
 长 prompt 仍在推进而短请求的 3 个 token 先出完（不分块时长请求会先完成，这条
 断言能区分两种语义）；非 bool 与 `chunked_prefill + device_state` 的拒绝面。
-ruff 通过；全量 3428 条通过（464 跳过）。
+ruff 通过；全量 3457 条通过（464 跳过）。
 
 **未声称。**
 
@@ -22056,6 +22057,57 @@ ruff 通过；全量 3428 条通过（464 跳过）。
 - 每步推进量就是 `chunk_size`（构图块与推进量是同一个数），没有独立的
   `prefill_chunk` 旋钮。
 - 设备态（`device_state=True`）未接，调用即拒绝。
+
+### 5.345　文本入口补 WordPiece：读 BERT 的 `vocab.txt`
+
+**缺口。** 5.314 只吃 HF `tokenizer.json` 的 ByteLevel BPE 谱系，WordPiece 是显式
+拒绝的。BERT 系（以及大量分类 / embedding / 检索模型）发布的词表就是一行一个
+token 的 `vocab.txt` 加 BasicTokenizer + WordPiece——这条入口不通，那些模型的
+"权重 + 词表"就还是没法一起落地：权重读进来，文本过不去。
+
+**为什么不塞进 `BpeTokenizer`。** ByteLevel BPE 先把整段文本映射成字节再合并，
+WordPiece 是先做 BasicTokenizer 预切分、再对每个词做贪心最长前缀匹配；切分边界
+与词表形态都不同。塞进一处只会让两边都变糊，所以另起
+`aetherflow/models/lm_wordpiece.py`，接口与 `ByteTokenizer` / `BpeTokenizer` 对齐
+（`encode` / `decode` / `vocab_size` / `spec`），实现仍然只用标准库。
+
+**实现面。**
+
+- 词表来源两种：`vocab.txt`（行号即 id；末尾换行不算空行，**中间**的空行与重复
+  token 都拒绝——它们会让 id 整体偏移或分叉，且解码时不会报错）与 HF
+  `tokenizer.json`（要求 `model.type == "WordPiece"`、`normalizer` 为 null 或
+  `BertNormalizer`、`pre_tokenizer` 为 null 或 `BertPreTokenizer`，其它形态显式
+  拒绝；`added_tokens` 里的 content 必须真的在 `model.vocab` 里）。
+- BasicTokenizer 的四件事：清控制字符（`\x00` / `\ufffd` / C* 类别，`\t\n\r`
+  除外）、空白统一成空格、CJK 按字两侧加空格、小写与去重音（`strip_accents`
+  默认跟随 `do_lower_case`），然后按空白与标点切分（标点判定用
+  `unicodedata.category` 的 P* 加 ASCII 标点区间）。
+- WordPiece：贪心最长匹配，续接片段带 `##`；词长超过
+  `max_input_chars_per_word`、或某一段匹配不上，整个词退成 `[UNK]`。
+- `decode` 把 `##` 片段拼回前一个 token、在 eos 处停止、跳过 pad；特殊 token
+  按 BERT 的形态识别（`[` 开头 `]` 结尾），也可用 `special_tokens` 显式指定。
+- `spec()` 复用 `LMSpec`；`pad_id` 从 `[PAD]` 推断，`eos_id` 从 `[SEP]` 推断，
+  词表里没有 `[SEP]` 时**显式报错**而不是悄悄用别的 id。
+
+**验证。** `tests/test_lm_wordpiece.py` 29 条：标点切分与小写、中文按字、缩写
+（`don` / `'` / `t`）、`##` 子词与"最长片优先于短片组合"、去重音、`[UNK]`
+回退、超长词、空白分隔与控制字符、`handle_chinese_chars` / `do_lower_case` 开关；
+解码的 `##` 拼接、eos 停止、pad 跳过、`skip_special_tokens`、越界 id 拒绝、
+eos 与 pad 同 id 时先停；`vocab.txt` 的行号即 id、中间空行 / 重复 token 拒绝；
+`tokenizer.json` 的正常路径与 `BPE` / `NFC` / `Metaspace` / 幽灵 added token
+的拒绝面；构造期校验与 `spec()`。ruff 通过；全量 3457 条通过（464 跳过）。
+
+**未声称。**
+
+- 不做 added token 的整体匹配：文本里字面的 `[CLS]` 会被 BasicTokenizer 切成
+  `[` / `cls` / `]`（HF 的 BERT 会按 added token 先整体切出来）。特殊 token 请
+  直接用 id 拼接（`tokenizer.vocab["[CLS]"]`），这是本地闭环的实际用法。
+- `decode` 的语义是"空格连接 + 拼回 `##`"，不是逐字节还原原文——标点与空白不会
+  贴回去。这与 HF `BertTokenizer.decode` 一致，但与 5.314 的 BPE 解码不同。
+- 不解析 `tokenizer_config.json` / `special_tokens_map.json`（同 5.314）；
+  Unigram / SentencePiece / `Metaspace` 仍然显式拒绝；不做自定义 normalizer。
+- 只在参考实现上验证语义，没有拿真实 BERT 权重跑端到端。
+
 
 
 
