@@ -20620,6 +20620,78 @@ f32，中间不出现单字节。想省带宽必须另做打包（`pack_fp8` 是
 - 参考后端把"每个节点输出"都量化一次，这不是 fp8 硬件的行为；两边一致
   的只是单节点 `cast` 的边界结果。
 
+### 5.326　fp8 写侧：带 scale 的量化 helper 与权重容器
+
+**缺口。** 5.318 定义了 fp8 的数值与位模式，5.319 让 fp8 的 safetensors
+读得进来，5.325 让设备端能 `cast` 到 fp8。但整条链路缺"产生 fp8 量化结果"
+的一侧：没有任何 helper 把 f32 权重 / 激活压到格点并给出 scale，也没有一个
+容器把 `weight` / `weight_scale` / 可选的 `input_scale` 绑在一起做形状与
+一致性校验。缺了它，5.319 的读取入口只能读别人导出好的文件，本仓库自己造
+不出能被它接受的权重。
+
+**带 scale 的量化只有一条公式。** `runtime/fp8.py` 新增
+`quantize_fp8(x, scale, kind) = round_fp8(clip(x / scale, ±max))`，与 int8 的
+`quantize_i8` 同构：
+
+- 先除以 scale 把值域压进 `±max`（e4m3 是 448、e5m2 是 57344）；
+- 落到格式格点，产物是**缩放后的 f8 载体**（数量级在 `±max` 内）；
+- 反量化 `dequantize_fp8(q, scale) = q * scale`，与 `dequantize_i8` 同一口径。
+
+`clip` 不是冗余：e4m3 在 encode 阶段自己饱和，但 e5m2 溢出会按 IEEE 舍到
+`±inf`；量化权重里出现 inf 会让整条推理链变成 inf，所以两种格式统一先夹到
+最大有限值。fp8 的 0 精确可表示，非对称量化没有收益，因此这里**不提供
+zero_point**（与 `*_zp` 族明确区分）。
+
+**scale 的口径与 int8 逐字对齐。** `models/quantize.py` 新增三个写侧入口：
+
+- `quantize_weight_fp8(w, kind, per_tensor=False)`：`(K, N)` 权重逐输出通道
+  算 `amax / max`，返回 `(w_f8, (N,))`；`per_tensor=True` 退化成 `(1,)`，就是
+  HF fp8 检查点里的 `weight_scale` 形态。
+- `quantize_activation_fp8(x, kind)`：按 token（最后一维）算 scale，返回
+  `(x_f8, x.shape[:-1] + (1,))`，与 int8 的逐 token 版本同口径。
+- `dequantize_weight_fp8(w, scale)`：`w * scale`。
+
+全零的通道 / token 给 `scale = 1.0`：零在任何 scale 下都量化为零，但
+`scale = 0` 会触发"非正 scale"拒绝，这个分支必须显式写出来。反过来，
+`quantize_fp8` 自身拒绝非正 / 非有限的 scale，且在 `quantize_weight_fp8`
+里先拒绝 NaN / Inf 的输入——量化会把一个坏值扩散到整条输出。
+
+**容器多守一条 int8 不需要的规则：值必须在格点上。**
+`weights.FP8Weight` 与 `QuantizedWeight` 的字段对齐（`shape` /
+`in_features` / `out_features` / `group_size` / `per_group` / `dequantize`），
+但载荷是 f32 载体，所以 dtype 证明不了"这份数组量化过"。一份原始 f32 权重
+与一份量化后的 f8 载体在字节层面完全同型：不查，就会把"忘了量化"读成
+"量化精度很高"，推理照跑、数值只差一点，没有任何症状。因此
+`_check_fp8_arrays` 要求 `round_fp8(w, kind) == w` 逐位成立，否则直接报
+"不在格点上，请先 quantize_weight_fp8"。
+
+**格式由文件决定，不让人重复声明。** `load_fp8_linear` 的规则：
+
+- 权重张量的 dtype 是 `F8_E4M3` / `F8_E5M2` 时 `kind` 可缺省，由 dtype 推出；
+  显式给了就必须一致，矛盾直接报错。
+- 权重存成 `F32`（已解码的载体）时无法从 dtype 推格式，必须显式给 `kind`。
+- `weight_scale` 接受 `(1,)` / `(N,)` / `(K/G, N)`，有限且严格为正；逐组时
+  要求 `K` 能被组数整除，`dequantize` 沿 K 重复 scale。
+- `input_scale` 是可选张量，只接受标量（`(1,)`），对应静态激活 scale；
+  动态 per-token 场景没有这个张量，缺省即不校验。
+- `transpose=True` 读 PyTorch 的 `(N, K)` 布局，与本仓库 `(K, N)` 对齐。
+- metadata 的 `quantization` 若存在，必须是 `fp8`（格式另定）/ `fp8_e4m3` /
+  `fp8_e5m2`，与 `kind` 矛盾即报错；`quantization.group_size` 的校验与 int8
+  共用同一个函数（同一条自描述必须与形状自洽的规则）。
+
+**验证。** 本地 `3220` 个用例 / 460 跳过全绿（较 5.325 增加 21：
+`test_quantize.py` 9 条钉住量化公式、逐通道 / 逐 token scale 与误差界；
+`test_weights.py` 12 条钉住格式推断、格点拒绝、transpose、逐组 scale、
+metadata 交叉校验与缺张量报错），ruff 通过。5.326 没有设备端改动，
+V100 上的 `verify_cuda.py` 与 `tests.test_cuda_backend` 作为回归确认。
+
+**未声称。**
+
+- 不支持逐块 scale（`weight_block_size = [128, 128]` 这类二维块布局）；
+  容器只认 `(1,)` / `(N,)` / `(K/G, N)`。
+- 不提供 fp8 linear 算子——写侧只产出数组与 scale，怎么参与 GEMM 是 5.327。
+- 不改变存储宽度：`w` 仍是 f32 载体，1 字节打包与传输是 5.328。
+
 
 
 

@@ -46,7 +46,11 @@
   不另设 attr，5.317；设备内核 5.321，同一份源码供 NVRTC / hipRTC，只做反量化、
   不融合 GEMM，V100 上 conformance 逐位相同）；fp8（e4m3 / e5m2）的参考语义与单字节位模式
   编解码（`cast(dtype="f8e4m3")` / `pack_fp8` / `unpack_fp8`，e4m3 无 inf 并
-  饱和到 ±448，e5m2 溢出到 inf，5.318），设备端无存储与内核、显式拒绝；
+  饱和到 ±448，e5m2 溢出到 inf，5.318），设备端 `cast` 已有量化内核（5.325，
+  载体仍是 f32、不省带宽），写侧有带 scale 的量化（5.326：
+  `quantize_weight_fp8` 逐输出通道 / `per_tensor=True` 对齐 HF 的
+  `weight_scale`，`quantize_activation_fp8` 逐 token），其它算子遇到 fp8 仍
+  显式拒绝；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
   支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8（e4m3 / e5m2）
@@ -55,7 +59,11 @@
   转置、有损 dtype 转换都要显式声明，先全量校验再原地写，失败不留半装状态
   （5.313）；`load_quantized_linear` / `QuantizedWeight` 读量化权重——int8 强制、
   scale 与零点的形状 / 值域 / 正值校验、逐通道与逐组、metadata 自描述
-  （`quantization` / `quantization.group_size`）与张量一致（5.317）。
+  （`quantization` / `quantization.group_size`）与张量一致（5.317）；
+  `load_fp8_linear` / `FP8Weight` 读 fp8 量化权重——载荷每个值必须真的落在
+  fp8 格点上（未量化的 f32 与 f8 载体同型，只能按值判定）、格式由文件 dtype
+  推出、显式 kind 不许与文件矛盾、支持 `input_scale` 标量与 `(K/G, N)` 逐组
+  scale（5.326）。
 - **文本入口**：`BpeTokenizer` 读 HF `tokenizer.json` 的 ByteLevel BPE 谱系
   （GPT-2 / Qwen2 / Qwen3），不引 `tokenizers`；支持 merges 两种写法、added /
   special token 整体匹配、NFC 系 normalizer、`use_regex` / `add_prefix_space`；
@@ -152,9 +160,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   QAT 到假量化算子（`fake_quantize_i8`，5.311）与 LSQ 的可学步长版本
   （`fake_quantize_i8_lsq`，5.312）——后者要求 scale 作为图输入才能收到梯度，
   没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 有参考语义、
-  权重读取入口与设备端 `cast`（e4m3 / e5m2，5.318 / 5.319 / 5.325：设备上
-  载体仍是 f32，只把值落到格式格点、不省带宽），其它算子遇到 fp8 仍显式
-  拒绝，也没有 fp8 GEMM；
+  写入 / 读取入口与设备端 `cast`（e4m3 / e5m2，5.318 / 5.319 / 5.325 /
+  5.326：带 scale 的逐通道权重与逐 token 激活量化、`FP8Weight` 容器要求载荷
+  值真的在格点上；设备上载体仍是 f32，只把值落到格式格点、不省带宽），
+  其它算子遇到 fp8 仍显式拒绝，也没有 fp8 GEMM 与逐块 scale；
   W8A8 也尚无反向（bias 除外）。非对称零点的量化 / 反量化与融合线性层都已有
   设备内核（5.322 / 5.323，V100 上 conformance 通过），但 `linear_i8a8_zp`
   走标量乘加、没用 dp4a / IMMA，也**不融合 epilogue**（int32 累加后仍物化一份
