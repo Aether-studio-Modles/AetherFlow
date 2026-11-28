@@ -804,6 +804,92 @@ class TestFP8Weight(_TempDir):
         np.testing.assert_array_equal(got.w, q)
         np.testing.assert_array_equal(got.dequantize(), q * scale)
 
+    def test_pack_returns_one_byte_bit_patterns(self):
+        """``pack()`` 把 f32 载体换成 i8 码：字节数降到 1/4，解码数不变。"""
+        target, q, scale = self._f8_file()
+        got = load_fp8_linear(target, "weight", "weight_scale")
+        self.assertFalse(got.packed)
+
+        packed = got.pack()
+        self.assertTrue(packed.packed)
+        self.assertEqual(packed.w.dtype, np.int8)
+        self.assertEqual(packed.w.nbytes * 4, got.w.nbytes)
+        np.testing.assert_array_equal(packed.w.view(np.uint8), pack_fp8(q, "e4m3"))
+        np.testing.assert_array_equal(packed.dequantize(), got.dequantize())
+        self.assertEqual(packed.shape, got.shape)
+        # 幂等：已经是 packed 就原样返回，不再多拷一份。
+        self.assertIs(packed.pack(), packed)
+
+    def test_pack_keeps_group_scale(self):
+        w = np.arange(24, dtype=np.float32).reshape(8, 3) - 10.0
+        q, _ = quantize_weight_fp8(w)
+        groups = np.array([[1.0, 2.0, 3.0], [0.5, 0.25, 0.125]], dtype=np.float32)
+        got = build_fp8_weight(
+            {"weight": q, "weight_scale": groups}, "weight", "weight_scale"
+        )
+        packed = got.pack()
+        self.assertTrue(packed.per_group)
+        self.assertEqual(packed.group_size, 4)
+        np.testing.assert_array_equal(packed.dequantize(), got.dequantize())
+
+    def test_load_packed_reads_raw_bytes(self):
+        """``packed=True`` 直接保留文件里的字节，也接受 I8 容器（需显式 kind）。"""
+        target, q, scale = self._f8_file()
+        got = load_fp8_linear(target, "weight", "weight_scale", packed=True)
+        self.assertTrue(got.packed)
+        np.testing.assert_array_equal(got.w.view(np.uint8), pack_fp8(q, "e4m3"))
+        np.testing.assert_array_equal(got.dequantize(), q * scale)
+
+        codes = pack_fp8(q, "e4m3").view(np.int8)
+        i8_target = self.path("w8_i8.safetensors")
+        _file(i8_target, {"weight": codes, "weight_scale": scale})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(i8_target, "weight", "weight_scale", packed=True)
+        self.assertIn("kind", str(ctx.exception))
+        got = load_fp8_linear(
+            i8_target, "weight", "weight_scale", kind="e4m3", packed=True
+        )
+        np.testing.assert_array_equal(got.w, codes)
+
+    def test_packed_rejects_f32_carrier_and_non_2d(self):
+        q, scale = quantize_weight_fp8(self.W)
+        target = self.path("carrier.safetensors")
+        _file(target, {"weight": q, "weight_scale": scale})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(
+                target, "weight", "weight_scale", kind="e4m3", packed=True
+            )
+        self.assertIn("1 字节", str(ctx.exception))
+
+        bad = self.path("packed_3d.safetensors")
+        _file(
+            bad,
+            {
+                "weight": np.zeros((2, 2, 2), np.int8),
+                "weight_scale": np.ones((2,), np.float32),
+            },
+        )
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(bad, "weight", "weight_scale", kind="e4m3", packed=True)
+        self.assertIn("二维", str(ctx.exception))
+
+    def test_packed_transpose_reads_torch_layout(self):
+        w = np.arange(12, dtype=np.float32).reshape(4, 3) - 5.5
+        q, scale = quantize_weight_fp8(w)
+        target = self.path("torch8_packed.safetensors")
+        _typed_file(
+            target,
+            {
+                "weight": ("F8_E4M3", np.ascontiguousarray(pack_fp8(q, "e4m3").T)),
+                "weight_scale": ("F32", scale),
+            },
+        )
+        got = load_fp8_linear(
+            target, "weight", "weight_scale", transpose=True, packed=True
+        )
+        self.assertEqual(got.shape, (4, 3))
+        np.testing.assert_array_equal(got.w.view(np.uint8), pack_fp8(q, "e4m3"))
+
     def test_scale_f64_requires_allow_downcast(self):
         target = self.path("s64.safetensors")
         _file(target, {"q": np.zeros((2, 3), np.int8), "s": np.ones((3,), np.float64)})

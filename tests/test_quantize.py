@@ -43,7 +43,7 @@ from aetherflow.models.quantize import (
     quantize_weight_asymmetric,
     quantize_weight_fp8,
 )
-from aetherflow.runtime.fp8 import FP8_MAX, quantize_fp8, round_fp8
+from aetherflow.runtime.fp8 import FP8_MAX, pack_fp8, quantize_fp8, round_fp8, unpack_fp8
 
 BACKEND = ReferenceBackend()
 
@@ -1652,6 +1652,190 @@ class TestLinearFP8(unittest.TestCase):
         np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
 
 
+class TestLinearFP8Packed(unittest.TestCase):
+    """5.328：fp8 的 1 字节存储（``pack_fp8`` / ``unpack_fp8`` / packed 线性层）。
+
+    钉住三件事：
+
+    1. 位模式与主机侧 ``pack_fp8`` / ``unpack_fp8`` 逐位一致（int8 载荷是
+       字节，不是整数，差 1 就是格式错了）；
+    2. packed 线性层与 ``matmul(x, unpack(q) * scale) + bias`` 数值一致；
+    3. 设备端用不了的形态（不是 i8 位模式的权重、秩 > 1 的 scale、错 dtype）
+       在构图期就拒绝。
+    """
+
+    def _pack_graph(self, n, kind="e4m3"):
+        dtype = f8e4m3 if kind == "e4m3" else f8e5m2
+        g = Graph("pack_fp8")
+        x = g.input("x", dtype[(n,)])
+        g.output(g.add_node("pack_fp8", [x], {"kind": kind}), "q")
+        return g
+
+    def _unpack_graph(self, n, kind="e4m3"):
+        g = Graph("unpack_fp8")
+        q = g.input("q", i8[(n,)])
+        g.output(g.add_node("unpack_fp8", [q], {"kind": kind}), "y")
+        return g
+
+    def _packed_graph(
+        self, x_shape, w_shape, bias=True, kind="e4m3", scale_shape=None
+    ):
+        g = Graph("linear_fp8_packed")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input(
+            "s", f32[scale_shape if scale_shape is not None else (w_shape[-1],)]
+        )
+        args = [x, q, s]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_fp8_packed", args, {"kind": kind}), "y")
+        return g
+
+    def test_pack_matches_host_bits(self):
+        values = np.array(
+            [0.0, -0.0, 1.0, -1.5, 0.3125, 1e-7, 448.0, 512.0, 1e30, 0.001953125],
+            np.float32,
+        )
+        for kind in ("e4m3", "e5m2"):
+            with self.subTest(kind=kind):
+                got = _run(self._pack_graph(values.size, kind), {"x": values})["q"]
+                self.assertEqual(got.dtype, np.int8)
+                np.testing.assert_array_equal(got, pack_fp8(values, kind).view(np.int8))
+
+    def test_unpack_matches_host_bits(self):
+        codes = np.array(
+            [0x00, 0x80, 0x01, 0x08, 0x38, 0xB8, 0x78, 0x7E, 0xFE, 0x39], np.uint8
+        ).view(np.int8)
+        got = _run(self._unpack_graph(codes.size), {"q": codes})["y"]
+        np.testing.assert_array_equal(
+            got, unpack_fp8(codes.view(np.uint8), "e4m3")
+        )
+
+    def test_pack_unpack_roundtrip_equals_cast(self):
+        """pack 再 unpack 必须等于 ``cast``：这两个方向共用同一份编解码。"""
+        x = np.array(
+            [0.0, -0.0, 0.55, -1.234, 1e-7, 448.0, 512.0, -0.001953125], np.float32
+        )
+        g = Graph("roundtrip")
+        src = g.input("x", f8e4m3[(x.size,)])
+        q = g.add_node("pack_fp8", [src], {"kind": "e4m3"})
+        g.output(g.add_node("unpack_fp8", [q], {"kind": "e4m3"}), "y")
+        got = _run(g, {"x": x})["y"]
+        np.testing.assert_array_equal(got, round_fp8(x, "e4m3"))
+
+    def test_packed_linear_matches_manual(self):
+        rng = np.random.default_rng(41)
+        x = rng.standard_normal((2, 4, 8)).astype(np.float32)
+        scale = (rng.random(6).astype(np.float32) + 0.1)
+        wq = quantize_fp8(rng.standard_normal((8, 6)).astype(np.float32) * 3.0, scale)
+        packed = pack_fp8(wq, "e4m3").view(np.int8)
+        b = rng.standard_normal(6).astype(np.float32)
+        got = _run(
+            self._packed_graph((2, 4, 8), (8, 6)),
+            {"x": x, "q": packed, "s": scale, "b": b},
+        )["y"]
+        weight = unpack_fp8(packed.view(np.uint8), "e4m3") * scale
+        np.testing.assert_allclose(
+            got, np.matmul(x, weight) + b, rtol=1e-6, atol=1e-6
+        )
+
+    def test_packed_linear_per_tensor_scale_e5m2(self):
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((3, 5)).astype(np.float32)
+        scale = np.array([0.5], np.float32)
+        wq = quantize_fp8(
+            rng.standard_normal((5, 4)).astype(np.float32) * 2.0, scale, "e5m2"
+        )
+        packed = pack_fp8(wq, "e5m2").view(np.int8)
+        got = _run(
+            self._packed_graph(
+                (3, 5), (5, 4), bias=False, kind="e5m2", scale_shape=(1,)
+            ),
+            {"x": x, "q": packed, "s": scale},
+        )["y"]
+        weight = unpack_fp8(packed.view(np.uint8), "e5m2") * np.float32(0.5)
+        np.testing.assert_allclose(got, np.matmul(x, weight), rtol=1e-6, atol=1e-6)
+
+    def test_rejects_bad_shapes_and_dtypes(self):
+        with self.subTest(case="pack_input_not_fp8"):
+            g = Graph("pack_fp8")
+            x = g.input("x", f32[4])
+            with self.assertRaises(TypeError):
+                g.add_node("pack_fp8", [x], {"kind": "e4m3"})
+        with self.subTest(case="pack_kind_mismatch"):
+            g = Graph("pack_fp8")
+            x = g.input("x", f8e5m2[4])
+            with self.assertRaises(TypeError):
+                g.add_node("pack_fp8", [x], {"kind": "e4m3"})
+        with self.subTest(case="pack_bad_kind"):
+            g = Graph("pack_fp8")
+            x = g.input("x", f8e4m3[4])
+            with self.assertRaises(ValueError):
+                g.add_node("pack_fp8", [x], {"kind": "e3m4"})
+        with self.subTest(case="unpack_not_i8"):
+            g = Graph("unpack_fp8")
+            q = g.input("q", f32[4])
+            with self.assertRaises(TypeError):
+                g.add_node("unpack_fp8", [q], {"kind": "e4m3"})
+        with self.subTest(case="packed_weight_not_i8"):
+            g = Graph("linear_fp8_packed")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", f8e4m3[4, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8_packed", [x, q, s], {"kind": "e4m3"})
+        with self.subTest(case="packed_x_not_f32"):
+            g = Graph("linear_fp8_packed")
+            x = g.input("x", f16[2, 4])
+            q = g.input("q", i8[4, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8_packed", [x, q, s], {"kind": "e4m3"})
+        with self.subTest(case="packed_group_scale"):
+            g = Graph("linear_fp8_packed")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", i8[4, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8_packed", [x, q, s])
+        with self.subTest(case="packed_bias_length"):
+            g = Graph("linear_fp8_packed")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", i8[4, 3])
+            s = g.input("s", f32[3])
+            b = g.input("b", f32[4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8_packed", [x, q, s, b])
+
+    def test_rejects_non_positive_scale(self):
+        x = np.ones((2, 4), np.float32)
+        packed = pack_fp8(np.ones((4, 3), np.float32), "e4m3").view(np.int8)
+        for bad in (0.0, -0.5):
+            with self.subTest(scale=bad):
+                with self.assertRaises(ValueError):
+                    _run(
+                        self._packed_graph((2, 4), (4, 3), bias=False),
+                        {"x": x, "q": packed, "s": np.full(3, bad, np.float32)},
+                    )
+
+    def test_graph_survives_json_roundtrip(self):
+        rng = np.random.default_rng(43)
+        scale = np.array([0.5, 0.25, 0.125], np.float32)
+        packed = pack_fp8(
+            rng.standard_normal((8, 3)).astype(np.float32), "e4m3"
+        ).view(np.int8)
+        feed = {
+            "x": rng.standard_normal((2, 8)).astype(np.float32),
+            "q": packed,
+            "s": scale,
+            "b": np.zeros(3, np.float32),
+        }
+        g = self._packed_graph((2, 8), (8, 3))
+        again = loads(dumps(g))
+        np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
@@ -1671,6 +1855,12 @@ class TestConformanceCases(unittest.TestCase):
             "linear_fp8_e5m2_bias",
             "linear_fp8a8_e4m3_bias",
             "linear_fp8a8_e5m2_rank2",
+            "pack_fp8_e4m3",
+            "pack_fp8_e5m2",
+            "unpack_fp8_e4m3",
+            "unpack_fp8_e5m2",
+            "linear_fp8_packed_e4m3_bias",
+            "linear_fp8_packed_e5m2",
         }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)

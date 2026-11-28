@@ -33,12 +33,12 @@ from __future__ import annotations
 import json
 import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from .runtime.fp8 import FP8_KINDS, round_fp8, unpack_fp8
+from .runtime.fp8 import FP8_KINDS, pack_fp8, round_fp8, unpack_fp8
 
 __all__ = [
     "SafeTensorsError",
@@ -301,6 +301,20 @@ class SafeTensorsFile:
             return np.frombuffer(raw, dtype=np.uint8).astype(np.bool_).reshape(info.shape)
         arr = np.frombuffer(raw, dtype=_NUMPY[info.dtype]).reshape(info.shape)
         return arr.copy()
+
+    def raw(self, name: str) -> np.ndarray:
+        """按原字节读出，不做 dtype 解释（返回 uint8 的拷贝）。
+
+        1 字节打包的 fp8 必须走这里：``tensor()`` 会把 ``F8_*`` 解码成 f32
+        载体，再编回去虽然数值相同，但 NaN 的多个码会被归一化成一个
+        （e4m3 的 0x7F / 0xFF），位模式不再是原文件里的那一份。
+        """
+        info = self.info(name)
+        self._fh.seek(self._data_start + info.offsets[0])
+        raw = self._fh.read(info.nbytes)
+        if len(raw) != info.nbytes:
+            raise SafeTensorsError(f"{self.path}：读取张量 {name!r} 时文件被截断")
+        return np.frombuffer(raw, dtype=np.uint8).reshape(info.shape).copy()
 
     # -- 生命周期 -----------------------------------------------------
 
@@ -696,12 +710,16 @@ class FP8Weight:
     量级），``weight_scale`` 是 ``(1,)`` / ``(N,)`` / ``(K/G, N)``。
     ``input_scale`` 是可选的静态激活 scale（标量），动态 per-token 场景为
     ``None``。三个数组可能直接引用调用方传入的数组，当成只读用。
+
+    ``packed=True`` 时 ``w`` 是 **i8 位模式**（1 字节，见 5.328）：它不代表
+    整数，只借用 int8 的 8 位宽度承装 fp8 码，``dequantize`` 会先按位解码。
     """
 
     w: np.ndarray
     weight_scale: np.ndarray
     kind: str = "e4m3"
     input_scale: Optional[np.ndarray] = None
+    packed: bool = False
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -727,11 +745,28 @@ class FP8Weight:
         return self.group_size < self.in_features
 
     def dequantize(self) -> np.ndarray:
-        """还原成 f32 的真实数值：``w * weight_scale``（逐组时沿 K 重复）。"""
+        """还原成 f32 的真实数值：``(w or unpack(w)) * weight_scale``（逐组沿 K 重复）。"""
+        if self.packed:
+            codes = np.ascontiguousarray(self.w, dtype=np.int8).view(np.uint8)
+            base = unpack_fp8(codes, self.kind)
+        else:
+            base = self.w
         scale = self.weight_scale
         if scale.ndim == 2:
             scale = np.repeat(scale, self.in_features // int(scale.shape[0]), axis=0)
-        return (self.w * scale.astype(np.float32)).astype(np.float32)
+        return (base * scale.astype(np.float32)).astype(np.float32)
+
+    def pack(self) -> "FP8Weight":
+        """返回 1 字节打包的副本：``w`` 变成 i8 位模式（5.328）。
+
+        构造时已逐位校验过格点，这里只做一次位拷贝，不再重复校验。设备端的
+        ``linear_fp8_packed`` 直接吃这份 ``w``，驻留与读带宽降到 f32 载体的
+        1/4。已经是 packed 时原样返回（幂等）。
+        """
+        if self.packed:
+            return self
+        codes = np.ascontiguousarray(pack_fp8(self.w, self.kind)).view(np.int8)
+        return replace(self, w=codes, packed=True)
 
 
 def _check_fp8_scale(
@@ -789,38 +824,57 @@ def _check_fp8_arrays(
     transpose: bool,
     allow_downcast: bool,
     label: str,
+    packed: bool = False,
 ) -> FP8Weight:
     """校验并规整成 :class:`FP8Weight`（唯一的构造路径）。"""
     if kind not in FP8_KINDS:
         raise SafeTensorsError(f"未知的 fp8 格式 {kind!r}；支持 {FP8_KINDS}")
 
     w = np.asarray(w)
-    if w.dtype.kind != "f":
-        raise SafeTensorsError(
-            f"{label}的 w 必须是浮点载体（fp8 位模式请先用 unpack_fp8 解码），"
-            f"得到 {w.dtype}"
-        )
-    if not allow_downcast and not np.can_cast(w.dtype, np.float32, casting="safe"):
-        raise SafeTensorsError(
-            f"{label}的 w 是 {w.dtype}，转成 f32 是有损转换，需要 allow_downcast=True"
-        )
-    w = np.ascontiguousarray(w.astype(np.float32))
-    if w.ndim != 2:
-        raise SafeTensorsError(f"{label}的 w 必须是二维 (K, N)，得到形状 {w.shape}")
-    if transpose:
-        # PyTorch nn.Linear 的 (out, in) → 本仓库的 (in, out)。
-        w = np.ascontiguousarray(w.T)
-    k, n = w.shape
-    if k <= 0 or n <= 0:
-        raise SafeTensorsError(f"{label}的 w 形状非法：{tuple(w.shape)}（两维都必须为正）")
-    if not np.all(np.isfinite(w)):
-        raise SafeTensorsError(f"{label}的 w 含 NaN / Inf：量化权重必须全部有限")
-    if not np.array_equal(round_fp8(w, kind), w, equal_nan=True):
-        raise SafeTensorsError(
-            f"{label}的 w 有值不在 {kind} 的格点上：这份数组不是 fp8 量化结果，"
-            "而是原始 f32 权重（或用了另一种格式）。请先用 quantize_weight_fp8 量化，"
-            "或确认 kind 与实际格式一致"
-        )
+    if packed:
+        # 1 字节容器：任意字节都是合法的 fp8 码（含 NaN 的多个码），
+        # 因此这里没有"格点"检查——只有宽度与形状要对。
+        if w.dtype != np.int8:
+            raise SafeTensorsError(
+                f"{label}的 packed w 必须是 int8 位模式（1 字节），得到 {w.dtype}；"
+                "浮点载体请用 packed=False 读"
+            )
+        if w.ndim != 2:
+            raise SafeTensorsError(f"{label}的 w 必须是二维 (K, N)，得到形状 {w.shape}")
+        if transpose:
+            w = np.ascontiguousarray(w.T)
+        else:
+            w = np.ascontiguousarray(w)
+        k, n = w.shape
+        if k <= 0 or n <= 0:
+            raise SafeTensorsError(f"{label}的 w 形状非法：{tuple(w.shape)}（两维都必须为正）")
+    else:
+        if w.dtype.kind != "f":
+            raise SafeTensorsError(
+                f"{label}的 w 必须是浮点载体（fp8 位模式请先用 unpack_fp8 解码），"
+                f"得到 {w.dtype}"
+            )
+        if not allow_downcast and not np.can_cast(w.dtype, np.float32, casting="safe"):
+            raise SafeTensorsError(
+                f"{label}的 w 是 {w.dtype}，转成 f32 是有损转换，需要 allow_downcast=True"
+            )
+        w = np.ascontiguousarray(w.astype(np.float32))
+        if w.ndim != 2:
+            raise SafeTensorsError(f"{label}的 w 必须是二维 (K, N)，得到形状 {w.shape}")
+        if transpose:
+            # PyTorch nn.Linear 的 (out, in) → 本仓库的 (in, out)。
+            w = np.ascontiguousarray(w.T)
+        k, n = w.shape
+        if k <= 0 or n <= 0:
+            raise SafeTensorsError(f"{label}的 w 形状非法：{tuple(w.shape)}（两维都必须为正）")
+        if not np.all(np.isfinite(w)):
+            raise SafeTensorsError(f"{label}的 w 含 NaN / Inf：量化权重必须全部有限")
+        if not np.array_equal(round_fp8(w, kind), w, equal_nan=True):
+            raise SafeTensorsError(
+                f"{label}的 w 有值不在 {kind} 的格点上：这份数组不是 fp8 量化结果，"
+                "而是原始 f32 权重（或用了另一种格式）。请先用 quantize_weight_fp8 量化，"
+                "或确认 kind 与实际格式一致"
+            )
 
     scale = _check_fp8_scale(
         weight_scale, w, allow_downcast=allow_downcast, label=label, what="weight_scale"
@@ -849,7 +903,7 @@ def _check_fp8_arrays(
                 f"{label}的 input_scale 必须是有限且严格为正的数，得到 {iscale.tolist()}"
             )
 
-    return FP8Weight(w=w, weight_scale=scale, kind=kind, input_scale=iscale)
+    return FP8Weight(w=w, weight_scale=scale, kind=kind, input_scale=iscale, packed=packed)
 
 
 def _check_fp8_metadata(
@@ -911,6 +965,7 @@ def load_fp8_linear(
     transpose: bool = False,
     allow_downcast: bool = False,
     check_metadata: bool = True,
+    packed: bool = False,
 ) -> FP8Weight:
     """从 ``.safetensors`` 读一份 fp8 量化线性层权重。
 
@@ -918,6 +973,12 @@ def load_fp8_linear(
     时 ``kind`` 可缺省，显式给了就必须一致；权重存成 ``F32``（已解码的载体）
     时必须显式给 ``kind``。这与"名字与布局都显式给、不猜"是同一条原则——
     格式能由文件唯一确定时就不该再让调用方重复一遍。
+
+    ``packed=True`` 读 **1 字节位模式**（5.328）：返回的 ``FP8Weight.w`` 是
+    i8 码，直接喂给 ``linear_fp8_packed`` 的权重输入，驻留与读带宽是 f32
+    载体的 1/4。此时权重 dtype 必须是 ``F8_E4M3`` / ``F8_E5M2`` / ``I8`` /
+    ``U8``；``I8`` / ``U8`` 的格式信息不在 dtype 里，``kind`` 必须显式给。
+    字节按原样读出（``SafeTensorsFile.raw``），不经过解码再编码。
     """
     root = os.fspath(path)
     with SafeTensorsFile(root) as fh:
@@ -927,11 +988,18 @@ def load_fp8_linear(
         missing = [name for name in needed if name not in fh]
         if missing:
             raise SafeTensorsError(f"{root} 里缺少 fp8 量化权重需要的张量: {missing}")
-        file_kind = _FP8.get(fh.info(weight).dtype)
+        weight_dtype = fh.info(weight).dtype
+        if packed and weight_dtype not in _FP8 and weight_dtype not in ("I8", "U8"):
+            raise SafeTensorsError(
+                f"{root}：packed=True 要求权重是 1 字节位模式"
+                f"（F8_E4M3 / F8_E5M2 / I8 / U8），得到 {weight_dtype}；"
+                "浮点载体请用 packed=False 读"
+            )
+        file_kind = _FP8.get(weight_dtype)
         if kind is None:
             if file_kind is None:
                 raise SafeTensorsError(
-                    f"{root}：张量 {weight!r} 的 dtype 是 {fh.info(weight).dtype}，"
+                    f"{root}：张量 {weight!r} 的 dtype 是 {weight_dtype}，"
                     "推不出 fp8 格式；请显式给 kind"
                 )
             resolved = file_kind
@@ -940,11 +1008,19 @@ def load_fp8_linear(
                 raise SafeTensorsError(f"未知的 fp8 格式 {kind!r}；支持 {FP8_KINDS}")
             if file_kind is not None and file_kind != kind:
                 raise SafeTensorsError(
-                    f"{root}：张量 {weight!r} 的 dtype 是 {fh.info(weight).dtype}"
+                    f"{root}：张量 {weight!r} 的 dtype 是 {weight_dtype}"
                     f"（{file_kind}），与 kind={kind} 矛盾"
                 )
             resolved = kind
-        arrays = {name: fh.tensor(name) for name in needed}
+        if packed:
+            # 原字节读出再按位 view 成 i8：不做 dtype 解释，Nan 的多码才不会丢。
+            codes = np.ascontiguousarray(fh.raw(weight)).view(np.int8)
+            arrays = {weight: codes}
+            for name in needed:
+                if name != weight:
+                    arrays[name] = fh.tensor(name)
+        else:
+            arrays = {name: fh.tensor(name) for name in needed}
         metadata = dict(fh.metadata)
     got = _check_fp8_arrays(
         arrays[weight],
@@ -954,6 +1030,7 @@ def load_fp8_linear(
         transpose=transpose,
         allow_downcast=allow_downcast,
         label=f"{root} 的 fp8 权重",
+        packed=packed,
     )
     if check_metadata:
         _check_fp8_metadata(metadata, got, root)

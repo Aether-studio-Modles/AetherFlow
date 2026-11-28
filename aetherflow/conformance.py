@@ -54,7 +54,7 @@ from .ir.serialize import dumps, loads, to_dict
 from .ir.types import boolean, c64, f32, f64, f8e4m3, f8e5m2, i8, i32
 from .ir.verifier import verify_portable_only
 from .models.transformer import BlockSpec, build_transformer_block
-from .runtime.fp8 import quantize_fp8
+from .runtime.fp8 import pack_fp8, quantize_fp8
 
 __all__ = [
     "Case",
@@ -599,6 +599,68 @@ def _linear_fp8a8(kind: str = "e4m3", x_shape: tuple = (2, 3, 8), w_shape: tuple
             "x_scale": x_scale,
             "w_q": quantize_fp8(_f32(rng, w_shape, scale=1.5), w_scale, kind),
             "w_scale": w_scale,
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
+def _pack_fp8(kind: str = "e4m3"):
+    """pack_fp8：直接对拍 1 字节位模式（码值差 1 就该失败）。
+
+    载荷刻意覆盖 0 / -0 / 次正规 / 最小正规 / 最大有限值，以及会在编码阶段
+    走特殊分支的值：e4m3 超出 448 走饱和，e5m2 溢出到 inf。
+    """
+    dtype = f8e4m3 if kind == "e4m3" else f8e5m2
+    if kind == "e4m3":
+        values = [0.0, -0.0, 1.0, -1.5, 0.3125, 1e-7, 448.0, 512.0, -512.0,
+                  0.001953125, -0.001953125, 1e30]
+    else:
+        values = [0.0, -0.0, 1.0, -1.5, 0.3125, 1e-7, 57344.0, 1e9, -1e9,
+                  float("inf"), float("-inf"), 0.0000152587890625]
+
+    def build(rng):
+        g = Graph("pack_fp8")
+        x = g.input("x", dtype[(len(values),)])
+        g.output(g.add_node("pack_fp8", [x], {"kind": kind}), "q")
+        return g, {"x": np.array(values, dtype=np.float32)}
+
+    return build
+
+
+def _unpack_fp8(kind: str = "e4m3"):
+    """unpack_fp8：逐码解码，覆盖 ±0、次正规、正规、最大有限值与 inf（e5m2）。"""
+    if kind == "e4m3":
+        codes = [0x00, 0x80, 0x01, 0x08, 0x38, 0xB8, 0x78, 0x7E, 0xFE, 0x39]
+    else:
+        codes = [0x00, 0x80, 0x01, 0x04, 0x3C, 0xBC, 0x7B, 0x7C, 0xFC, 0x3D]
+
+    def build(rng):
+        g = Graph("unpack_fp8")
+        q = g.input("q", i8[(len(codes),)])
+        g.output(g.add_node("unpack_fp8", [q], {"kind": kind}), "y")
+        return g, {"q": np.array(codes, dtype=np.uint8).view(np.int8)}
+
+    return build
+
+
+def _linear_fp8_packed(
+    kind: str = "e4m3", x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)
+):
+    """1 字节驻留的 weight-only fp8 线性层：权重是 i8 位模式。"""
+    def build(rng):
+        g = Graph("linear_fp8_packed")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_fp8_packed", [x, q, s, b], {"kind": kind}), "y")
+        scale = (np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        qvalues = quantize_fp8(_f32(rng, w_shape, scale=1.5), scale, kind)
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": pack_fp8(qvalues, kind).view(np.int8),
+            "s": scale,
             "b": _f32(rng, (w_shape[-1],), scale=0.1),
         }
 
@@ -1749,6 +1811,19 @@ def default_cases() -> List[Case]:
                    "反量化后 f32 累加（不是 int32，也不是 tensor core）"),
         _case("linear_fp8a8_e5m2_rank2", _linear_fp8a8("e5m2", x_shape=(4, 8)),
               note="秩 2 激活 + 逐 token scale：与秩 3 共用同一条实现"),
+        _case("pack_fp8_e4m3", _pack_fp8("e4m3"),
+              note="f8 载体 -> 1 字节位模式：码值逐位对拍（饱和分支被 512 走到）"),
+        _case("pack_fp8_e5m2", _pack_fp8("e5m2"),
+              note="e5m2 的溢出分支：1e9 与 ±inf 都必须落到 inf 码 0x7c / 0xfc"),
+        _case("unpack_fp8_e4m3", _unpack_fp8("e4m3"),
+              note="位模式 -> f8 载体：覆盖 ±0、次正规、正规与最大有限值 448"),
+        _case("unpack_fp8_e5m2", _unpack_fp8("e5m2"),
+              note="e5m2 的 inf 码 0x7c / 0xfc 与 57344 的最大有限值"),
+        _case("linear_fp8_packed_e4m3_bias", _linear_fp8_packed("e4m3"),
+              note="权重以 i8 位模式驻留（1 字节），设备端寄存器解码后 f32 累加；"
+                   "权重读流量与驻留都是 linear_fp8 的 1/4"),
+        _case("linear_fp8_packed_e5m2", _linear_fp8_packed("e5m2", x_shape=(4, 8)),
+              note="秩 2 激活 + e5m2 位模式：与 e4m3 共用同一条内核"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

@@ -9,11 +9,14 @@ from .device_shared import (
     _DEQUANTIZE_I8_GROUP_ZP_SRC,
     _DEQUANTIZE_I8_SRC,
     _DEQUANTIZE_I8_ZP_SRC,
+    _LINEAR_FP8_PACKED_SRC,
     _LINEAR_I8A8_DP4A_SRC,
     _LINEAR_I8A8_SRC,
     _LINEAR_I8A8_ZP_SRC,
+    _PACK_FP8_SRC,
     _QUANTIZE_I8_SRC,
     _QUANTIZE_I8_ZP_SRC,
+    _UNPACK_FP8_SRC,
 )
 
 
@@ -607,6 +610,152 @@ class _LinearMixin:
         out = self._op_matmul(node, [x, weight], {})
         if len(args) > 4:
             out = self._binary("add", [out, args[4]])
+        return out
+
+    # ------------------------------------------------------------------
+    # fp8 的 1 字节存储（5.328）
+    # ------------------------------------------------------------------
+
+    def _fp8_kind(self, attrs, name: str) -> int:
+        """attr ``kind`` -> 内核整数码。与 ``cast`` 同口径：1 = e4m3，2 = e5m2。"""
+        kind = attrs.get("kind")
+        if kind == "e4m3":
+            return 1
+        if kind == "e5m2":
+            return 2
+        raise BackendCapabilityError(
+            f"{self._LABEL}的 {name} 需要 attr kind='e4m3' 或 'e5m2'，收到 {kind!r}"
+        )
+
+    def _op_pack_fp8(self, node, args, attrs):
+        """f8 载体 -> i8 位模式：每元素 1 字节，数值与 ``cast`` 完全相同。
+
+        收益是驻留与读带宽（4 字节降到 1 字节），不是算力。参考语义按位
+        转成 uint8，所以这里不经手任何数值转换，只把编码落成 8 位存储。
+        """
+        cp = self.cp
+        x = args[0]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 pack_fp8 要求输入是 f32 载体，收到 {x.dtype}"
+            )
+        kind = self._fp8_kind(attrs, "pack_fp8")
+        xx = self._contig(x)
+        out = cp.empty(xx.shape, np.int8)
+        n = int(xx.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(("pack_fp8", kind), _PACK_FP8_SRC, "af_pack_fp8")
+        block, grid = self._grid("pack_fp8", n)
+        kernel((grid,), (block,), (xx, out, np.int64(n), np.int32(kind)))
+        return out
+
+    def _op_unpack_fp8(self, node, args, attrs):
+        """i8 位模式 -> f8 载体。逐位精确（含 ±inf / NaN 与次正规）。"""
+        cp = self.cp
+        q = args[0]
+        if q.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 unpack_fp8 要求输入是 i8 位模式，收到 {q.dtype}"
+            )
+        kind = self._fp8_kind(attrs, "unpack_fp8")
+        qq = self._contig(q)
+        out = cp.empty(qq.shape, cp.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(("unpack_fp8", kind), _UNPACK_FP8_SRC, "af_unpack_fp8")
+        block, grid = self._grid("unpack_fp8", n)
+        kernel((grid,), (block,), (qq, out, np.int64(n), np.int32(kind)))
+        return out
+
+    def _op_linear_fp8_packed(self, node, args, attrs):
+        """weight-only fp8 线性层，权重以 1 字节位模式驻留。
+
+        与 ``linear_fp8`` 的数值语义相同（反量化后 f32 累加），区别在读法：
+        这里不把权重反量化成 f32 张量，而是让内核按 ``unsigned char`` 读入、
+        在寄存器里解码，因此权重的显存占用与读流量都是 1/4。代价是放弃
+        cuBLAS / hipBLAS（``_LINEAR_FP8_PACKED_SRC`` 是朴素每线程一个输出
+        元素、无分块），**交付的是存储形态而不是速度**；fp8 tensor core 仍
+        不在本版范围内。
+
+        scale 只接逐张量 ``(1,)`` 与逐输出通道 ``(N,)``：内核按列取 scale，
+        逐组 / 逐元素 scale 需要把 K 方向的折返也带进内核（IR 已拒绝，留待
+        后续）；非正 scale 与其它量化算子同一口径（读回主机判定）。
+        """
+        cp = self.cp
+        x, qweight, scale = args[0], args[1], args[2]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_packed 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if qweight.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_packed 要求权重是 i8 位模式"
+                f"（用 pack_fp8 生成），收到 {qweight.dtype}；"
+                "已解码的 f8 载体请用 linear_fp8"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_packed 要求 scale 是 f32，收到 {scale.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_packed 要求 x 秩 >= 2、权重秩 2，"
+                f"收到 {x.shape} 与 {qweight.shape}"
+            )
+        k = int(x.shape[-1])
+        n = int(qweight.shape[-1])
+        if int(qweight.shape[0]) != k:
+            raise BackendCapabilityError(
+                f"linear_fp8_packed 的内维不匹配：{x.shape} @ {qweight.shape}"
+            )
+        if scale.ndim > 1 or int(scale.size) not in (1, n):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_packed 的 scale 只能是逐张量 (1,) 或"
+                f"逐输出通道 ({n},)，收到 {scale.shape}"
+            )
+        if float(np.min(self.to_host(scale))) <= 0.0:
+            raise BackendCapabilityError(
+                "linear_fp8_packed 的 scale 必须严格为正；非正 scale 的反量化为未定义"
+            )
+        if len(args) > 3:
+            bias = args[3]
+            if bias.dtype != cp.float32 or int(bias.size) != n:
+                raise BackendCapabilityError(
+                    f"linear_fp8_packed 的 bias 必须是长度 {n} 的 f32，收到 "
+                    f"{bias.dtype} {bias.shape}"
+                )
+        kind = self._fp8_kind(attrs, "linear_fp8_packed")
+        xx = self._contig(x)
+        w = self._contig(qweight)
+        s = self._contig(scale)
+        m = int(np.prod(xx.shape[:-1]))
+        out = cp.empty(tuple(xx.shape[:-1]) + (n,), cp.float32)
+        if m * n == 0:
+            return out
+        ws_stride = 0 if int(scale.size) == 1 else 1
+        kernel = self._kernel(
+            ("linear_fp8_packed", kind), _LINEAR_FP8_PACKED_SRC, "af_linear_fp8_packed"
+        )
+        block, grid = self._grid("linear_fp8_packed", m * n)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                xx,
+                w,
+                s,
+                out,
+                np.int64(m),
+                np.int64(k),
+                np.int64(n),
+                np.int64(ws_stride),
+                np.int32(kind),
+            ),
+        )
+        if len(args) > 3:
+            out = self._binary("add", [out, args[3]])
         return out
 
     def _op_linear_i8_zp(self, node, args, attrs):

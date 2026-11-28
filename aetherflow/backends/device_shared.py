@@ -24,19 +24,23 @@ from ..lower.plan import (
 from .base import BackendCapabilityError
 
 
-#: fp8 在 IR 里的载体也是 f32（``np_dtype``），设备端没有 1 字节容器。
+#: fp8 在 IR 里的载体也是 f32（``np_dtype``）；1 字节容器是 **i8 位模式**
+#: （``pack_fp8`` / ``unpack_fp8``，见 5.328），不是独立的 fp8 dtype。
 #: ``cast`` 由 ``_CAST_FP8_SRC`` 在设备上把数值舍入到格式格点（见 5.325）；
-#: 承接 fp8 的算子只有 ``cast`` 与两个线性层（5.327：它们按 f32 载体读出、
-#: 反量化后走既有 GEMM），其余算子遇到 fp8 仍必须显式拒绝——否则会被 f32
-#: 载体悄悄当成 f32 计算。放在共享层是因为两条路径都要用它：逐节点的
-#: ``invoke`` 与计划构建期的 ``_planned_kernel``（后者预绑定内核后就不再
-#: 经过 ``invoke`` 的检查）。
+#: 承接 fp8 的算子只有 ``cast``、两个线性层与 pack/unpack（5.327 / 5.328），
+#: 其余算子遇到 fp8 仍必须显式拒绝——否则会被 f32 载体悄悄当成 f32 计算。
+#: 放在共享层是因为两条路径都要用它：逐节点的 ``invoke`` 与计划构建期的
+#: ``_planned_kernel``（后者预绑定内核后就不再经过 ``invoke`` 的检查）。
 FP8_DTYPES: FrozenSet[DType] = frozenset({DType.F8E4M3, DType.F8E5M2})
 
 #: 允许输入 / 输出带 fp8 标量的算子。fp8 的载体就是 f32，所以它们不需要
 #: 新内核，只需要让 ``invoke`` 与 ``_planned_kernel`` 不再按"fp8 一律拒绝"
 #: 处理。刻意写成白名单而不是"排除几个"：新算子默认仍然不承接 fp8。
-FP8_OPS: FrozenSet[str] = frozenset({"cast", "linear_fp8", "linear_fp8a8"})
+#: ``linear_fp8_packed`` 不在这里：它的权重是 i8 位模式，图里根本没有
+#: fp8 标量（位模式即存储形态）。
+FP8_OPS: FrozenSet[str] = frozenset(
+    {"cast", "linear_fp8", "linear_fp8a8", "pack_fp8", "unpack_fp8"}
+)
 
 
 # 同一批自研内核模板（NVRTC / hipRTC 各编译一份）承接的算子面。它是声明，
@@ -90,6 +94,11 @@ GPU_OPS: FrozenSet[str] = frozenset(
         # 与注册表必须逐项对账。
         "linear_fp8",
         "linear_fp8a8",
+        # 5.328 的 1 字节存储：pack / unpack 是逐元素位模式搬运，
+        # ``linear_fp8_packed`` 直接读 i8 字节、在寄存器里解码。
+        "pack_fp8",
+        "unpack_fp8",
+        "linear_fp8_packed",
         "conv2d",
         "maxpool2d",
         "maxpool2d_indices",
@@ -173,6 +182,10 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     # 非对称版：多出来的是两处 zero_point（都是 i8 数据）。
     "linear_i8_zp": frozenset({1, 3}),
     "linear_i8a8_zp": frozenset({0, 2, 3, 5}),
+    # 1 字节 fp8：pack 的输入是 f32 载体，unpack 的输入与 packed 线性层
+    # 的权重都是 i8 位模式（不是整数数据，但同样不能走"只支持浮点"）。
+    "unpack_fp8": frozenset({0}),
+    "linear_fp8_packed": frozenset({1}),
     # 整数取模：两侧都是**整数数据**，不是下标。
     "mod": frozenset({0, 1}),
 }
@@ -297,13 +310,15 @@ extern "C" __global__ void af_dequantize_i8_group_zp(
 }
 """
 
-# fp8 的量化：f32 载体 → fp8 格点，**输出仍是 f32**。设备端没有 1 字节容器，
-# "cast 到 fp8"在设备上只是把数值舍入到该格式可表示的格点上，不省带宽
-# （见 DESIGN 5.325）。算法逐位复刻 runtime/fp8.py 的 ``pack_fp8`` /
-# ``unpack_fp8``：double 精度下的 RNE、e4m3 饱和到 ±448（无 inf）、e5m2
-# 溢出到 ±inf。全部用 double，是为了和主机侧 numpy float64 的参考实现逐位一致；
-# ``fabs / isinf`` 都靠 f32 位模式判断，避免依赖设备端 libm 的符号。
-_CAST_FP8_SRC = r"""
+# fp8 的编解码：f32 载体 ↔ fp8 格点。算法逐位复刻 runtime/fp8.py 的
+# ``pack_fp8`` / ``unpack_fp8``：double 精度下的 RNE、e4m3 饱和到 ±448（无
+# inf）、e5m2 溢出到 ±inf。全部用 double，是为了和主机侧 numpy float64 的
+# 参考实现逐位一致；``fabs / isinf`` 都靠 f32 位模式判断，避免依赖设备端
+# libm 的符号。
+#
+# 5.325 的 ``cast`` 只做"落到格点上"（输出仍是 f32、不省带宽）；5.328 的
+# pack / unpack 与融合线性层共用同一份编解码，区别只在落盘宽度（1 字节）。
+_FP8_COMMON_SRC = r"""
 __device__ __forceinline__ unsigned int af_fp8_u32(float f) {
   union { float f; unsigned int u; } v;
   v.f = f;
@@ -350,13 +365,10 @@ __device__ __forceinline__ double af_fp8_rint(double x) {
   return (double)(q + (q & 1ull));
 }
 
-extern "C" __global__ void af_cast_fp8(
-    const float* __restrict__ in,
-    float* __restrict__ out,
-    long long n, int kind) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-
+/* 把 f32 载体编码成 fp8 字节（含符号位）。规则与 runtime/fp8.py 的
+   ``pack_fp8`` 逐位一致：double 下的两次 RNE、e4m3 饱和到 ±448（无 inf）、
+   e5m2 溢出到 inf。 */
+__device__ __forceinline__ int af_fp8_encode(float f, int kind) {
   int M = (kind == 1) ? 3 : 2;
   int exp_bits = (kind == 1) ? 4 : 5;
   int bias = (kind == 1) ? 7 : 15;
@@ -368,7 +380,7 @@ extern "C" __global__ void af_cast_fp8(
   int nan_code = 0x7f;
   int inf_code = (kind == 1) ? 0x7e : (exp_all << M);
 
-  unsigned int bits = af_fp8_u32(in[i]);
+  unsigned int bits = af_fp8_u32(f);
   int negative = (int)(bits >> 31);
   double exact = (double)af_fp8_f32(bits & 0x7fffffffu);
 
@@ -415,7 +427,19 @@ extern "C" __global__ void af_cast_fp8(
   else if (value > 1e308) code = inf_code;
   if (value == 0.0) code = 0;
 
-  /* unpack: decode the code back into the f32 carrier (sign applied later). */
+  return negative ? (code | 0x80) : code;
+}
+
+/* 解码：fp8 字节 -> f32 载体。每个编码恰好对应一个 f32 值（含 ±inf / NaN），
+   与 runtime/fp8.py 的 ``unpack_fp8`` 逐位一致。 */
+__device__ __forceinline__ float af_fp8_decode(int byte, int kind) {
+  int M = (kind == 1) ? 3 : 2;
+  int bias = (kind == 1) ? 7 : 15;
+  int e_min = (kind == 1) ? -6 : -14;
+  int exp_all = (kind == 1) ? 15 : 31;
+
+  int negative = (byte >> 7) & 1;
+  int code = byte & 0x7f;
   int ue = (code >> M) & exp_all;
   int um = code & ((1 << M) - 1);
   double uval;
@@ -430,7 +454,72 @@ extern "C" __global__ void af_cast_fp8(
   if (u_nan) uval = af_fp8_nan();
   else if (u_inf) uval = af_fp8_inf();
   float result = (float)uval;
-  out[i] = negative ? -result : result;
+  return negative ? -result : result;
+}
+
+"""
+
+# 5.325 的语义：f32 载体 -> 落到格式格点上的 f32 载体（不省带宽）。
+_CAST_FP8_SRC = _FP8_COMMON_SRC + r"""
+extern "C" __global__ void af_cast_fp8(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    long long n, int kind) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = af_fp8_decode(af_fp8_encode(in[i], kind), kind);
+}
+"""
+
+# 5.328 的 1 字节容器：fp8 本身存成 i8 字节（IR 没有 u8，``signed char``
+# 正好 8 位）。两个方向和 ``cast`` 共用同一份编解码，所以 pack/unpack 往返
+# 恒等，且 pack 的数值与 ``cast`` 相同——只是把结果落成 1 字节。
+_PACK_FP8_SRC = _FP8_COMMON_SRC + r"""
+extern "C" __global__ void af_pack_fp8(
+    const float* __restrict__ in,
+    signed char* __restrict__ out,
+    long long n, int kind) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = (signed char)(af_fp8_encode(in[i], kind) & 0xff);
+}
+"""
+
+_UNPACK_FP8_SRC = _FP8_COMMON_SRC + r"""
+extern "C" __global__ void af_unpack_fp8(
+    const signed char* __restrict__ in,
+    float* __restrict__ out,
+    long long n, int kind) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = af_fp8_decode((int)(unsigned char)in[i], kind);
+}
+"""
+
+# weight-only fp8 的融合内核：权重按 1 字节读出、在寄存器里解码再乘 scale，
+# 不物化 f32 权重。结构照 ``_LINEAR_I8A8_SRC``（每线程一个输出元素、无分块），
+# 交付的是"权重驻留与读带宽降到 1/4"，**不是**算力：没有 fp8 tensor core，
+# 累加仍是 f32。``ws_stride`` 为 0 表示逐张量 scale（scale 只有 1 个）。
+_LINEAR_FP8_PACKED_SRC = _FP8_COMMON_SRC + r"""
+extern "C" __global__ void af_linear_fp8_packed(
+    const float* __restrict__ x,
+    const signed char* __restrict__ w,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    long long m, long long k, long long n, long long ws_stride, int kind) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= m * n) return;
+  long long row = idx / n;
+  long long col = idx - row * n;
+  const float* xr = x + row * k;
+  const signed char* wc = w + col;
+  float s = ws_stride ? ws[col] : ws[0];
+  float acc = 0.0f;
+  for (long long kk = 0; kk < k; ++kk) {
+    float wv = af_fp8_decode((int)(unsigned char)wc[kk * n], kind);
+    acc += xr[kk] * (wv * s);
+  }
+  out[idx] = acc;
 }
 """
 

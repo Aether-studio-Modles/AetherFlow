@@ -1672,6 +1672,187 @@ register(
 )
 
 
+# ---------------------------------------------------------------------------
+# fp8 的 1 字节存储（5.328）
+#
+# ``linear_fp8`` 只把数值落到 fp8 格点，IR 里的载体仍是 f32：省的是写入侧
+# 的精度的描述，不省驻留与带宽。要真的降到 1/4，需要把 fp8 存成 8 位字节：
+#
+# - ``pack_fp8``：f8 载体 -> i8 位模式（每元素 1 字节）；
+# - ``unpack_fp8``：位模式 -> f8 载体（精确，无信息损失）；
+# - ``linear_fp8_packed``：直接吃 i8 位模式的 weight-only 线性层，设备端在
+#   寄存器里解码，不物化 f32 权重。
+#
+# 位模式用 ``i8`` 承载：IR 没有 u8，而 ``signed char`` 正好 8 位。它不代表
+# 整数，只代表 fp8 的字节；参考语义按位转成 uint8 再解码，因此 int8 的负数
+# 不会参与任何数值运算。
+# ---------------------------------------------------------------------------
+
+_FP8_KIND_DTYPE: Dict[str, DType] = {"e4m3": DType.F8E4M3, "e5m2": DType.F8E5M2}
+
+
+def _fp8_kind_attr(attrs: dict, what: str) -> str:
+    kind = attrs.get("kind")
+    if kind not in _FP8_KIND_DTYPE:
+        raise ValueError(f"{what} 需要 attr kind='e4m3' 或 'e5m2'，得到 {kind!r}")
+    return kind
+
+
+def _infer_pack_fp8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"pack_fp8 需要 (x,) 输入，得到 {len(inputs)}")
+    kind = _fp8_kind_attr(attrs, "pack_fp8")
+    x = inputs[0]
+    expected = _FP8_KIND_DTYPE[kind]
+    if x.dtype != expected:
+        raise TypeError(
+            f"pack_fp8 的输入 dtype 与 kind={kind} 不一致："
+            f"期望 {expected.value}，得到 {x.dtype.value}"
+        )
+    return TensorType(DType.I8, x.shape)
+
+
+def _ref_pack_fp8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    from ..runtime.fp8 import pack_fp8
+
+    kind = _fp8_kind_attr(attrs, "pack_fp8")
+    return pack_fp8(args[0], kind).view(np.int8)
+
+
+register(
+    Op(
+        name="pack_fp8",
+        infer=_infer_pack_fp8,
+        reference=_ref_pack_fp8,
+        attrs_schema=("kind",),
+        doc="f8 载体 -> i8 位模式：每元素 1 字节，数值与 ``cast`` 相同。"
+        "``kind`` 必须与输入 dtype 一致；往返由 ``unpack_fp8`` 闭合",
+    )
+)
+
+
+def _infer_unpack_fp8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"unpack_fp8 需要 (q,) 输入，得到 {len(inputs)}")
+    kind = _fp8_kind_attr(attrs, "unpack_fp8")
+    q = inputs[0]
+    if q.dtype != DType.I8:
+        raise TypeError(
+            f"unpack_fp8 的输入必须是 i8 位模式（用 pack_fp8 生成），"
+            f"得到 {q.dtype.value}"
+        )
+    return TensorType(_FP8_KIND_DTYPE[kind], q.shape)
+
+
+def _ref_unpack_fp8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    from ..runtime.fp8 import unpack_fp8
+
+    kind = _fp8_kind_attr(attrs, "unpack_fp8")
+    codes = np.ascontiguousarray(args[0], dtype=np.int8).view(np.uint8)
+    return unpack_fp8(codes, kind)
+
+
+register(
+    Op(
+        name="unpack_fp8",
+        infer=_infer_unpack_fp8,
+        reference=_ref_unpack_fp8,
+        attrs_schema=("kind",),
+        doc="i8 位模式 -> f8 载体：逐位精确（含 ±inf / NaN 与次正规）。"
+        "主机侧等价 ``pack_fp8`` 的逆运算，设备端有对应内核",
+    )
+)
+
+
+def _infer_linear_fp8_packed(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) not in (3, 4):
+        raise ValueError(
+            "linear_fp8_packed 需要 (x, qweight, weight_scale[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    _fp8_kind_attr(attrs, "linear_fp8_packed")
+    x, qweight, scale = inputs[0], inputs[1], inputs[2]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8_packed 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加，混精度入口不在这一版"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_fp8_packed 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype != DType.I8:
+        raise TypeError(
+            f"linear_fp8_packed 的权重必须是 i8 位模式（用 pack_fp8 生成），"
+            f"得到 {qweight.dtype.value}；已解码的 f8 载体请用 linear_fp8"
+        )
+    if qweight.rank != 2:
+        raise ValueError(
+            f"linear_fp8_packed 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8_packed 的 weight_scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_fp8_packed 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_fp8_packed 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    # 设备内核按列取 scale（``ws_stride`` 只有 0 / 1 两种）。逐组 scale
+    # 需要把 K 方向折回也带进内核，属于下一阶段；这里显式拒绝而不是让
+    # 参考后端悄悄支持、设备端再报错（不静默降级）。
+    if scale.rank > 1:
+        raise ValueError(
+            f"linear_fp8_packed 的 weight_scale 只能是逐输出通道 (N,) 或逐张量标量，"
+            f"得到秩 {scale.rank} 形状 {scale.shape}"
+        )
+    if scale.rank == 1 and scale.shape[0] != 1 and scale.shape[0] != n:
+        raise ValueError(
+            f"linear_fp8_packed 的 weight_scale 长度 {scale.shape[0]} 与 N={n} 不一致"
+        )
+
+    _check_bias(inputs, 3, n, "linear_fp8_packed")
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_fp8_packed(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    from ..runtime.fp8 import unpack_fp8
+
+    kind = _fp8_kind_attr(attrs, "linear_fp8_packed")
+    x, qweight, scale = args[0], args[1], args[2]
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            "linear_fp8_packed 的 weight_scale 必须严格为正，"
+            f"得到最小值 {float(np.min(scale))}"
+        )
+    codes = np.ascontiguousarray(qweight, dtype=np.int8).view(np.uint8)
+    weight = unpack_fp8(codes, kind) * scale
+    out = np.matmul(x, weight)
+    if len(args) > 3:
+        out = out + args[3]
+    return out
+
+
+register(
+    Op(
+        name="linear_fp8_packed",
+        infer=_infer_linear_fp8_packed,
+        reference=_ref_linear_fp8_packed,
+        attrs_schema=("kind",),
+        doc="weight-only fp8 线性层，权重以 i8 位模式驻留：(..., K) x i8(K, N)"
+        " -> (..., N)。数值等于 ``matmul(x, unpack_fp8(q) * weight_scale) [+ bias]``；"
+        "省的是权重驻留与读带宽（1/4），不是算力（没有 fp8 tensor core）",
+    )
+)
+
+
 def _infer_linear_i8a8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (4, 5):
         raise ValueError(

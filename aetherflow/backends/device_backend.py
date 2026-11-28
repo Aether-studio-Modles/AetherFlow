@@ -456,9 +456,13 @@ class DeviceBackend(
         r.register("linear_i8a8", self._op_linear_i8a8)
         r.register("linear_i8a8_zp", self._op_linear_i8a8_zp)
         # fp8 线性层没有专用内核：载体是 f32，反量化是一次 ``mul``，之后复用
-        # sgemm（见 DESIGN 5.327）。
+        # sgemm（见 DESIGN 5.327）。5.328 的 pack / unpack 与融合线性层有
+        # 自己的内核：前者是位模式搬运，后者按 1 字节读权重、寄存器里解码。
         r.register("linear_fp8", self._op_linear_fp8)
         r.register("linear_fp8a8", self._op_linear_fp8a8)
+        r.register("pack_fp8", self._op_pack_fp8)
+        r.register("unpack_fp8", self._op_unpack_fp8)
+        r.register("linear_fp8_packed", self._op_linear_fp8_packed)
         r.register("conv2d", self._op_conv2d)
         r.register("maxpool2d", self._op_maxpool2d)
         r.register("maxpool2d_indices", self._op_maxpool2d_indices)
@@ -1116,17 +1120,19 @@ class DeviceBackend(
             raise BackendCapabilityError(
                 f"{self._LABEL}未实现算子 {name}（节点 %{node.output.name}）"
             )
-        # fp8 的载体是 f32，但语义要求节点边界落在格式格点上；设备端只有
-        # ``cast``（内核在设备上重做 RNE 量化，见 5.325）与两个线性层
-        # （按 f32 载体读出、反量化后走既有 GEMM，见 5.327）承接 fp8。其它
-        # 算子遇到 fp8 必须显式拒绝，否则会被 f32 载体当成 f32 算掉。
+        # fp8 的载体是 f32，但语义要求节点边界落在格式格点上；设备端承接
+        # fp8 的只有 ``cast``（内核在设备上重做 RNE 量化，见 5.325）、两个
+        # 线性层（按 f32 载体读出、反量化后走既有 GEMM，见 5.327）与
+        # pack / unpack（位模式与载体互转，见 5.328）。其它算子遇到 fp8
+        # 必须显式拒绝，否则会被 f32 载体当成 f32 算掉。
         if name not in _FP8_OPS:
             for item in (*node.inputs, node.output):
                 if item.type.dtype in _FP8_DTYPES:
                     raise BackendCapabilityError(
                         f"{self._LABEL}的 {name} 不承接 fp8（节点 "
                         f"%{node.output.name} 涉及 {item.type.dtype.value}）；"
-                        "目前只有 cast 能做 fp8 的类型转换，见 DESIGN 5.325"
+                        "目前只有 cast / pack_fp8 / unpack_fp8 与两个 fp8 "
+                        "线性层承接，见 DESIGN 5.325 / 5.328"
                     )
         if name in _LAYOUT_OPS and attrs.get("layout", "nchw") != "nchw":
             raise BackendCapabilityError(
