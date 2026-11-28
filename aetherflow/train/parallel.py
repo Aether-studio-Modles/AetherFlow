@@ -20,7 +20,10 @@
 **集合通信到哪一级，写在声明里。** :func:`collective_support` 返回
 ``CollectiveSupport``：5.331 起判据是"NCCL / RCCL 能不能加载"——能就声明
 ``device_allreduce=True``，数据并行默认走设备侧；加载不到才经主机中转。
-``overlap`` 仍恒为 False。单进程多卡的设备侧归约由
+``overlap`` 声明的是"设备态集合调用能否与反向计算交错"，它仍恒为 False：
+设备态的反向是整图 capture / replay，没有"某个桶就绪"的时刻。主机态的桶间
+并发是另一个开关（``DistributedDataParallel(overlap=True)``，5.302），不进
+这份声明。单进程多卡的设备侧归约由
 ``nccl_device_collective(backend, devices)`` 提供（``ncclCommInitAll`` +
 每卡原地 AllReduce），``DataParallelTrainer(collective="auto")`` 在库可用时
 自动调用它，不再要求注入。库缺失却显式要 ``collective="device"`` 时抛
@@ -161,9 +164,12 @@ class _BucketReducer:
 class CollectiveSupport:
     """后端在集合通信上的能力声明。
 
-    ``device_allreduce`` 为 False 时，多卡路径只能走主机中转归约；``overlap``
-    目前恒为 False——执行器是同步的、切卡是串行的，进程内没有可重叠的窗口。
-    ``reason`` 是给人读的"为什么不行"，空字符串只出现在全部能力都具备时。
+    ``device_allreduce`` 为 False 时，多卡路径只能走主机中转归约。``overlap``
+    声明的是"**设备态**集合调用能否与反向计算交错"，目前恒为 False：设备态反向
+    是整图 capture / replay，没有"某个桶就绪"的时刻。主机态的桶间并发是独立
+    开关（``DistributedDataParallel(overlap=True)``，5.302），不进这份声明，
+    所以 False 不等于"完全没有重叠"。``reason`` 是给人读的"为什么不行"，
+    空字符串只出现在全部能力都具备时。
     """
 
     device_allreduce: bool
@@ -196,8 +202,9 @@ def collective_support(
             overlap=False,
             provider=str(name),
             reason=(
-                "设备侧归约由注入的 provider 提供；计算/通信重叠仍未实现："
-                "执行器同步、切卡串行，进程内没有重叠窗口"
+                "设备侧归约由注入的 provider 提供；设备态与反向的重叠仍未实现："
+                "反向是整图 capture / replay，没有「桶就绪」的时刻"
+                "（主机态桶间并发见 DistributedDataParallel(overlap=True)）"
             ),
         )
     available, reason = _device_collective_reason()
@@ -228,14 +235,14 @@ def _device_collective_reason() -> Tuple[bool, str]:
             False,
             "设备侧集合通信（NCCL / RCCL）未接入：本机也加载不到这两套库；"
             "跨卡归约一律经主机中转（D2H → 主机求和 → H2D）；"
-            "计算/通信重叠也未实现",
+            "设备态与反向的重叠也未实现（主机态桶间并发见 5.302）",
         )
     return (
         True,
         f"{label} {version} 已接入数据并行默认路径：单进程多卡用 "
         "ncclCommInitAll（collective='device' 自动建），每进程一卡用 "
         "NcclDeviceCollective.from_env()（rank 0 分发 uid）；"
-        "计算/通信重叠仍未实现",
+        "设备态与反向的重叠仍未实现（主机态桶间并发见 5.302）",
     )
 
 
