@@ -29,7 +29,7 @@ if str(REPO) not in sys.path:
 from aetherflow.backends.reference_backend import ReferenceBackend
 from aetherflow.ir.types import f32, i32
 from aetherflow.models import ByteTokenizer, LlamaSpec, build_llama, masked_lm_loss_indexed
-from aetherflow.train import Adam, ParameterStore, Trainer
+from aetherflow.train import Adam, ParameterStore, Trainer, save_checkpoint
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -52,6 +52,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device", choices=("cpu", "cuda"), default="cpu", help="执行后端"
+    )
+    parser.add_argument(
+        "--save", default=None, help="训练结束后把权重写成 .npz（可接 sft.py --init）"
     )
     return parser.parse_args(argv)
 
@@ -148,6 +151,16 @@ def main(argv=None) -> int:
     head = sum(losses[:window]) / window
     tail = sum(losses[-window:]) / window
     print(f"loss {head:.4f} -> {tail:.4f}  ({'下降' if tail < head else '未下降'})")
+
+    if args.save:
+        # 设备态训练期间 store 是上传时的旧值，先写回再存档。
+        trainer.sync_to_host()
+        save_checkpoint(
+            args.save,
+            store,
+            meta={"stage": "pretrain", "steps": args.steps, "lr": args.lr},
+        )
+        print(f"权重已写入 {args.save}")
     return 0 if tail < head else 1
 
 
