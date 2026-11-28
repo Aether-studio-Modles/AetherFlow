@@ -1336,6 +1336,104 @@ class TestTorchExport(unittest.TestCase):
             (torch.randn(2, 3), torch.randn(2, 3), torch.randn(2, 3)),
         )
 
+    def test_logical_ops_and_operator_sugar(self):
+        """``& | ~`` 与 ``torch.logical_*`` 在 bool 上等价，广播沿用 numpy 规则。"""
+
+        class Sugar(nn.Module):
+            def forward(self, a, b):
+                return (a & b) | ~a
+
+        class Explicit(nn.Module):
+            def forward(self, a, b):
+                return torch.logical_or(torch.logical_and(a, b), torch.logical_not(a))
+
+        example = (
+            torch.tensor([[True], [False]]),
+            torch.tensor([[True, False, True]]),
+        )
+        for model in (Sugar().eval(), Explicit().eval()):
+            with self.subTest(model=type(model).__name__):
+                imported, expected, got = self._import_and_run(model, example)
+                np.testing.assert_array_equal(got, expected)
+                names = [n.op.name for n in imported.graph.nodes]
+                self.assertIn("logical_and", names)
+                self.assertIn("logical_or", names)
+                self.assertIn("logical_not", names)
+
+    def test_compare_and_combine_then_where(self):
+        """mask 的常见写法：两个比较用 ``&`` 组合后喂给 where。"""
+
+        class M(nn.Module):
+            def forward(self, x, y):
+                mask = (x > 0) & (y > 0)
+                return torch.where(mask, x, y)
+
+        imported, expected, got = self._import_and_run(
+            M().eval(), (torch.randn(2, 3), torch.randn(2, 3))
+        )
+        np.testing.assert_array_equal(got, expected)
+        self.assertIn("logical_and", [n.op.name for n in imported.graph.nodes])
+
+    def test_bool_cast_roundtrip(self):
+        """bool 与浮点显式互转：非零为真，转回是 0/1。"""
+
+        class M(nn.Module):
+            def forward(self, x):
+                return x.bool().float()
+
+        imported, expected, got = self._import_and_run(
+            M().eval(), (torch.tensor([[0.0, 1.5], [-2.0, 0.0]]),)
+        )
+        np.testing.assert_array_equal(got, expected)
+        self.assertEqual(got.dtype, np.float32)
+        self.assertEqual([n.op.name for n in imported.graph.nodes].count("cast"), 2)
+
+    def test_bool_graph_serializes(self):
+        """bool 输出（含 bool 中间值）的图可以 JSON 往返并继续执行。"""
+
+        from aetherflow.ir.serialize import dumps, loads
+
+        class M(nn.Module):
+            def forward(self, x, y):
+                return (x > 0) & (y > 0)
+
+        x, y = torch.randn(2, 3), torch.randn(2, 3)
+        imported = self.import_exported(torch.export.export(M().eval(), (x, y)))
+        feed = imported.feed(x=x.numpy(), y=y.numpy())
+        before = list(self.ref.execute(imported.graph, feed).values())[0]
+        restored = loads(dumps(imported.graph))
+        after = list(self.ref.execute(restored, feed).values())[0]
+        self.assertEqual(after.dtype, np.bool_)
+        np.testing.assert_array_equal(before, after)
+
+    def test_float_logical_is_rejected(self):
+        """torch 允许浮点 logical_*（非零为真），IR 要求显式比较，前端拒绝。"""
+
+        from aetherflow.frontend.torch_export import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x, y):
+                return torch.logical_and(x, y)
+
+        ep = torch.export.export(M().eval(), (torch.randn(2, 3), torch.randn(2, 3)))
+        with self.assertRaises(UnsupportedOperatorError):
+            self.import_exported(ep)
+
+    def test_integer_bitwise_is_rejected(self):
+        """整数 ``&`` 是位运算而不是逻辑与，IR 没有对应算子。"""
+
+        from aetherflow.frontend.torch_export import UnsupportedOperatorError
+
+        class M(nn.Module):
+            def forward(self, x, y):
+                return x & y
+
+        ep = torch.export.export(
+            M().eval(), (torch.tensor([1, 2]), torch.tensor([2, 1]))
+        )
+        with self.assertRaises(UnsupportedOperatorError):
+            self.import_exported(ep)
+
 
 @unittest.skipUnless(TORCH_AVAILABLE and CUDA_AVAILABLE, "需要 torch 与 GPU")
 class TestTorchExportOnCuda(unittest.TestCase):

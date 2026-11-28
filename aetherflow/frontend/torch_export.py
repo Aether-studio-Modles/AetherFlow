@@ -46,7 +46,9 @@ _TORCH_DTYPE = {
     # 越界值在入口就报错（见 5.181）。
     "int32": i32,
     "int64": i32,
-    # bool 只用于掩码：比较 / where / masked_fill 的条件，不参与算术。
+    # bool 是掩码载体：比较 / logical_* / where / masked_fill 的条件，不参与
+    # 算术；显式 cast（``to(dtype=torch.bool)`` / ``x.bool()`` / ``type_as``）
+    # 可以双向进出，落成 IR 的 ``cast``（见 5.340）。
     "bool": boolean,
 }
 
@@ -1692,6 +1694,48 @@ def _translate(g: Graph, node: Any, env: Dict[str, Any]) -> Any:
                 "IR 的比较要求同 dtype，请在模型里显式 cast"
             )
         return getattr(g, compare_kind)(x, y)
+
+    # ------------------------------------------------------------------
+    # 逻辑算子：IR 的 logical_* 只接受 bool（与比较算子的产出同一载体）。
+    # ``&`` / ``|`` / ``~`` 在 FX 图里是 ``aten.__and__`` 等位运算重载，bool
+    # 上的语义与 logical_* 相同；整数位运算 IR 没有对应算子，一并拒绝。
+    # ------------------------------------------------------------------
+    logical_kind = {
+        "aten.logical_and": "logical_and",
+        "aten.bitwise_and": "logical_and",
+        "aten.__and__": "logical_and",
+        "aten.logical_or": "logical_or",
+        "aten.bitwise_or": "logical_or",
+        "aten.__or__": "logical_or",
+    }.get(target.rsplit(".", 1)[0])
+
+    if logical_kind is not None:
+        _reject_unknown_kwargs(node, kwargs, set())
+        x = a(0)
+        y = operand(1, x, "逻辑运算的右操作数")
+        for value in (x, y):
+            if value.type.dtype is not DType.BOOL:
+                raise UnsupportedOperatorError(
+                    f"节点 {node.name} 的 {target} 输入 dtype 是 "
+                    f"{value.type.dtype.value}；IR 的逻辑 / 位运算只接受 bool"
+                    "（浮点请先用 ne(x, 0) 落成 bool，整数位运算没有对应算子）"
+                )
+        return getattr(g, logical_kind)(x, y)
+
+    if target.rsplit(".", 1)[0] in (
+        "aten.logical_not",
+        "aten.bitwise_not",
+        "aten.__invert__",
+    ):
+        _reject_unknown_kwargs(node, kwargs, set())
+        x = a(0)
+        if x.type.dtype is not DType.BOOL:
+            raise UnsupportedOperatorError(
+                f"节点 {node.name} 的 {target} 输入 dtype 是 "
+                f"{x.type.dtype.value}；IR 的逻辑 / 位运算只接受 bool"
+                "（浮点请先用 ne(x, 0) 落成 bool，整数位运算没有对应算子）"
+            )
+        return g.logical_not(x)
 
     if target.startswith("aten.where."):
         _reject_unknown_kwargs(node, kwargs, {"condition", "input", "other"})
