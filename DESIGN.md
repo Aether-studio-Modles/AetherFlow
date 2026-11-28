@@ -22108,6 +22108,52 @@ eos 与 pad 同 id 时先停；`vocab.txt` 的行号即 id、中间空行 / 重�
   Unigram / SentencePiece / `Metaspace` 仍然显式拒绝；不做自定义 normalizer。
 - 只在参考实现上验证语义，没有拿真实 BERT 权重跑端到端。
 
+### 5.346　真机复测（V100）：源码必须 ASCII，两处设备态 bug
+
+**缺口。** 5.344 / 5.345 都是纯 Python，本地全绿；把整份代码同步到远端
+V100-SXM2-32GB 跑 `verify_cuda.py` + 全量之后，暴露出三个"本地测不到"的问题：
+
+1. `device_shared.py` 里 fp8 编解码与非对称零点 i8 累加两段设备源码带着中文
+   注释。NVRTC 只接受 ASCII，报 `UnicodeEncodeError: 'ascii' codec can't
+   encode characters`，`cast_f8e4m3` 等 15 个算子直接 failed，连带
+   `linear_i8a8_zp_bias` 的 conformance 也失败。上一轮 5.325 已经踩过一次
+   同样的坑，但当时只把旧模板加进了 `TestCodegenDtypes.TEMPLATES` 的白名单，
+   新加的源码自然不在里面。
+2. conformance 的 `linear_fp8a8_packed_e4m3_bias`：IR 对秩 3 激活推导出
+   `(2, 3, 6)`，后端却按 `(m, n)` 分配输出——`_op_linear_fp8a8_packed`
+   把 `xq` 展平后忘了 reshape 回去，执行器写回时形状对不上。
+3. `test_device_state_with_segments_matches_host`：分段 + 设备态下损失
+   整体滞后一步。前向本身正确，问题在取损失的时序：边界值先用默认流做
+   D2D 写回、D2H 却排在 `seg_stream` 上，非阻塞流与默认流之间没有隐式
+   同步，拷贝先跑就会读到上一轮的缓冲。
+
+**改法。**
+
+- 两段设备源码注释改成英文；测试改成**按目录扫**而不是维护模板清单：
+  `tests/test_cuda_backend.py::test_every_device_source_is_ascii` 遍历
+  `aetherflow/backends/**/*.py` 的 AST，凡是含 `__global__ void` /
+  `__device__ __forceinline__` / `extern "C"` 的字符串常量都断言
+  `isascii()`。新增源码不改测试就会纳入，模块 docstring 里提到这些词不算。
+- `_op_linear_fp8a8_packed` 的输出改为 `tuple(xq.shape[:-1]) + (n,)`，内核
+  拿 `out.reshape(m, n)` 的视图写。内核只按线性索引写 `m*n` 个数，形状
+  本来就不进内核。
+- `_step_device_segments` 的损失直接取**最后一段的图输出**发起 D2H，不再
+  读边界缓冲。这样拷贝与前向 replay 同一条流，顺序由流本身保证；边界缓冲
+  的 D2D 写回保持不动（反向重算要靠它）。
+
+**验证。** 远端 `python3 verify_cuda.py` 全部通过；全量 `Ran 3444 tests /
+OK (skipped=178)`（比本地少 14 条，是那台机 torch 2.5.1 不在兼容矩阵里、
+前端用例被 `UnsupportedTorchVersion` 显式拒绝，与本轮改动无关）。修复前
+同一套是 `3444 / failures=2`。本地新增 1 条 ASCII 扫描用例，`3458 通过 /
+464 跳过`，ruff 通过。
+
+**未声称。**
+
+- 只在一台 V100-SXM2-32GB（驱动 550.127.05）上复测；A800 与 HIP 机器本轮
+  没有重跑，前面那些数字仍是上一轮的。
+- 第 3 条的修复靠"拷贝与前向同流"成立，没有加显式的跨流事件；如果以后
+  有别的路径把损失值再拷一次到另一条流上，同样的滞后会以另一种形式回来。
+
 
 
 

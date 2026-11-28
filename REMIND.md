@@ -157,7 +157,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3457 个用例，464 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3458 个用例，464 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -752,7 +752,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   显式报"不支持 Split"，也不静默产出"看起来能用"的 id。
 - **远端 V100 的凭证与环境**（5.304 / 5.309 / 5.320）：两条线路同一个端口与
   密码，移动 `ssh root@223.109.239.36 -p 24432`、电信
-  `ssh root@180.127.11.177 -p 24432`，账户 `root` / `vipuser`，密码 `hogheiW9`。
+  `ssh root@180.127.11.177 -p 24432`，账户 `root`（`vipuser` 也登记过），
+  密码 `goobei9s`（旧密码 `hogheiW9` 已失效）。
   单卡 Tesla V100-SXM2-32GB（32768 MiB，compute_cap 7.0 / `sm_70`，驱动
   550.127.05），Ubuntu 22.04（内核 6.2.0-37）、python3.10.12 + numpy 2.2.6 +
   cupy 14.2.0，系统未装 nvcc。同步方式：本地
@@ -762,19 +763,37 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `223.109.239.32:20824` / `180.127.11.166:20824`（密码 `co7eeNie`、
   `/root/afv2`）已释放，别再用。
   SSH 偶发 `banner` 被重置，连接要带 3–5 次重试，别把一次失败当环境坏了。
-  2026-11-28 复测：两条线路 24432 端口的 SSH 可达（banner 正常），但
-  `root` / `vipuser` × `hogheiW9` 四组组合全部 `AuthenticationException`，
-  凭证已与上面的记录不一致，用前先向用户确认新密码或账户。
+  2026-11-28 复测：两条线路 `root` × `goobei9s` 均登录成功，是同一台
+  `ubuntu22`（V100-SXM2-32GB / 驱动 550.127.05 / py 3.10.12 + np 2.2.6），
+  `/root/afv3` 与 `/root/af_latest.tgz` 仍在。旧密码 `hogheiW9` 已失效。
+  同日真机结果：`verify_cuda.py` 全部通过，全量 `3444 tests / OK（178 跳过）`
+  （少的那 14 条是该机 torch 2.5.1 不在兼容矩阵、前端用例被
+  `UnsupportedTorchVersion` 拒绝；修复前同一套是 `failures=2`，见 5.346）。
 - **两条执行路径要逐条对齐检查**（5.320）：设备后端同时有逐节点 `invoke` 与
   计划期预绑定后的批量派发快路径。5.318 只在 `invoke` 里判 fp8，`_planned_kernel`
   只扫输入 dtype，于是 `cast`（输入 f32、输出 fp8）被预绑定、绕开检查，真机上
   表现为 "算错" 而不是 "拒绝"（`verify_cuda.py` 从 2 refused 变 2 failed）。
   预绑定条件必须与 `invoke` 的检查一一对应，**输入与输出都要判**；判不了就返回
   `None` 退回原路径，报错时机与文案不变。
-- **NVRTC / hipRTC 源码只能是 ASCII**（5.325）：`device_shared.py` 的 `_SRC`
-  里写中文注释，本地看不出来，真机上抛
+- **NVRTC / hipRTC 源码只能是 ASCII**（5.325 / 5.346）：`device_shared.py` 的
+  `_SRC` 里写中文注释，本地看不出来，真机上抛
   `UnicodeEncodeError: 'ascii' codec can't encode characters`，并被 conformance
   记成 `failed`（不是编译错误）。内核注释一律用英文，Python 侧的注释不受影响。
+  5.325 只把旧模板加进白名单，5.346 新加的 fp8 / i8a8_zp 源码又踩一次——现在
+  测试改成扫 `backends/**/*.py` 的 AST，凡含 `__global__ void` /
+  `__device__ __forceinline__` / `extern "C"` 的字符串常量都断言 `isascii()`，
+  白名单不再需要维护。
+- **默认流与 `seg_stream` 之间没有隐式同步**（5.346）：分段 + 设备态训练里，
+  边界值用过一次默认流的 D2D 写回、损失 D2H 却排在非阻塞的 `seg_stream` 上，
+  顺序颠倒后读到上一轮的缓冲——真机表现是损失整体滞后一步，前向数值全对，
+  很容易误判成"反向错了"。D2H 的源要么就是本段图输出（与前向 replay 同流），
+  要么必须显式建跨流事件依赖。
+- **秩 >= 3 的激活走 2D 内核要 reshape 回去**（5.346）：`linear_fp8a8_packed`
+  把 `xq` 展平成 `(m, k)`、输出按 `(m, n)` 分配，忘了 IR 推导的是
+  `(..., n)`；执行器写回时形状对不上，conformance 记成 `strictness`（抛了
+  `ShapeMismatchError` 而不是 `BackendCapabilityError`）。内核只按线性索引写
+  `m*n` 个数，形状不进内核，所以正确做法是**按输入前导维分配再 reshape 成
+  2D 视图**传进去。
 - **设备端 fp8 是 f32 载体**（5.325）：`cast` 到 f8 只把值舍入到格式格点，
   不省带宽也不省显存；`invoke` 与 `_planned_kernel` 只对 `cast` 放行，其它
   算子仍 refused。`_fast_step` 的量化标记要包含 `F8E4M3` / `F8E5M2`，否则
