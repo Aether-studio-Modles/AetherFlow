@@ -183,6 +183,11 @@ class TestCudaDeclarations(unittest.TestCase):
         self.assertEqual(_INDEX_ARGS["dequantize_i8_group_zp"], frozenset({0, 2}))
         self.assertIn("dequantize_i8_group", GPU_OPS)
         self.assertIn("dequantize_i8_group_zp", GPU_OPS)
+        # 非对称量化 / 反量化：zero_point 位置是 i8 数据，scale 仍是 f32。
+        self.assertEqual(_INDEX_ARGS["quantize_i8_zp"], frozenset({2}))
+        self.assertEqual(_INDEX_ARGS["dequantize_i8_zp"], frozenset({0, 2}))
+        self.assertIn("quantize_i8_zp", GPU_OPS)
+        self.assertIn("dequantize_i8_zp", GPU_OPS)
 
 
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")

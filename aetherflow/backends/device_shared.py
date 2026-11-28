@@ -67,7 +67,9 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "broadcast_to",
         "matmul",
         "quantize_i8",
+        "quantize_i8_zp",
         "dequantize_i8",
+        "dequantize_i8_zp",
         "dequantize_i8_group",
         "dequantize_i8_group_zp",
         "fake_quantize_i8",
@@ -145,7 +147,9 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "spike_linear_weight_grad": frozenset({2, 3}),
     "spike_csr": frozenset({1}),
     # 量化：i8 是**数据**而不是下标，但它同样不能走"只支持浮点"的默认检查。
+    "quantize_i8_zp": frozenset({2}),
     "dequantize_i8": frozenset({0}),
+    "dequantize_i8_zp": frozenset({0, 2}),
     # 逐组反量化：q 与 L2 的 zero_point 是 i8 **数据**；scale 仍是 f32。
     "dequantize_i8_group": frozenset({0}),
     "dequantize_i8_group_zp": frozenset({0, 2}),
@@ -201,6 +205,41 @@ extern "C" __global__ void af_dequantize_i8(
   if (i >= n) return;
   float sv = per_row ? s[i % cols] : s[i];
   out[i] = (float)q[i] * sv;
+}
+"""
+
+# 非对称版本：零点作为 i8 张量进图，**先舍入到格点再平移**——零点不是值域里
+# 的浮点偏移，而是整数格点的平移，两种写法在 x/scale 非整数时差一个舍入。
+# 饱和两端都少用一格对称性：负端点取 -128，把 256 级全部用上。
+_QUANTIZE_I8_ZP_SRC = r"""
+extern "C" __global__ void af_quantize_i8_zp(
+    const float* __restrict__ x,
+    const float* __restrict__ s,
+    const signed char* __restrict__ zp,
+    signed char* __restrict__ out,
+    long long n, long long cols, long long per_row) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long si = per_row ? (i % cols) : i;
+  float q = rintf(x[i] / s[si]) + (float)zp[si];
+  q = q > 127.0f ? 127.0f : (q < -128.0f ? -128.0f : q);
+  out[i] = (signed char)q;
+}
+"""
+
+# 非对称反量化：减法留在 int32 里做（-128 减 127 是 -255，超出 i8 范围），
+# 与参考实现的 ``(int32)q - (int32)zp`` 顺序一致，因此逐位相同。
+_DEQUANTIZE_I8_ZP_SRC = r"""
+extern "C" __global__ void af_dequantize_i8_zp(
+    const signed char* __restrict__ q,
+    const float* __restrict__ s,
+    const signed char* __restrict__ zp,
+    float* __restrict__ out,
+    long long n, long long cols, long long per_row) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long si = per_row ? (i % cols) : i;
+  out[i] = (float)((int)q[i] - (int)zp[si]) * s[si];
 }
 """
 

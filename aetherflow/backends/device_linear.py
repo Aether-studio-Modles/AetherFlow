@@ -8,9 +8,11 @@ from .device_shared import (
     _DEQUANTIZE_I8_GROUP_SRC,
     _DEQUANTIZE_I8_GROUP_ZP_SRC,
     _DEQUANTIZE_I8_SRC,
+    _DEQUANTIZE_I8_ZP_SRC,
     _LINEAR_I8A8_DP4A_SRC,
     _LINEAR_I8A8_SRC,
     _QUANTIZE_I8_SRC,
+    _QUANTIZE_I8_ZP_SRC,
 )
 
 
@@ -122,6 +124,77 @@ class _LinearMixin:
             0,
         )
 
+    def _zp_args(self, shape, scale, zp):
+        """把可广播的 scale 与 zero_point 归一成内核能吃的形态。
+
+        返回 ``(scale, zp, cols, per_row)``。两者都恰好是"最后一维长度 = N"
+        的一维张量时走 ``[i % cols]`` 的复用读法——这是逐通道量化的常态，
+        避免把参数物化成与数据同大的数组。其余广播形态（逐张量、逐元素、
+        或两者形态不一致）一次性物化：量化是离线步骤，反量化的参数通常也
+        只有 N 个，代价可忽略，而"任意广播都能正确"比省这份临时量重要。
+        """
+        cp = self.cp
+        n = int(shape[-1]) if len(shape) else 0
+        if (
+            scale.ndim == 1
+            and zp.ndim == 1
+            and int(scale.size) == n
+            and int(zp.size) == n
+        ):
+            return self._contig(scale), self._contig(zp), n, 1
+        return (
+            cp.ascontiguousarray(cp.broadcast_to(scale, shape)),
+            cp.ascontiguousarray(cp.broadcast_to(zp, shape)),
+            0,
+            0,
+        )
+
+    def _op_quantize_i8_zp(self, node, args, attrs):
+        """非对称 int8 量化：``clip(rint(x / scale) + zp, -128, 127)``。
+
+        与对称版只差零点与负端点：零点在**舍入之后**加到整数格点上，饱和
+        下界用满 -128。非正 scale 的检查与对称版同一口径（走 ``to_host``）。
+        """
+        cp = self.cp
+        x, scale, zp = args
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 quantize_i8_zp 只接受 f32 输入，收到 {x.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 quantize_i8_zp 的 scale 必须是 f32，收到 {scale.dtype}"
+            )
+        if zp.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 quantize_i8_zp 的 zero_point 必须是 i8，"
+                f"收到 {zp.dtype}"
+            )
+        if x.ndim < 1:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 quantize_i8_zp 至少需要 1 维输入，收到 {x.shape}"
+            )
+        if float(np.min(self.to_host(scale))) <= 0.0:
+            raise BackendCapabilityError(
+                "quantize_i8_zp 的 scale 必须严格为正；非正 scale 的量化为未定义"
+            )
+        xx = self._contig(x)
+        s, z, cols, per_row = self._zp_args(xx.shape, scale, zp)
+        out = cp.empty(xx.shape, np.int8)
+        n = int(xx.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("quantize_i8_zp", per_row), _QUANTIZE_I8_ZP_SRC, "af_quantize_i8_zp"
+        )
+        block, grid = self._grid("quantize_i8_zp", n)
+        kernel(
+            (grid,),
+            (block,),
+            (xx, s, z, out, np.int64(n), np.int64(cols), np.int64(per_row)),
+        )
+        return out
+
     def _op_quantize_i8(self, node, args, attrs):
         """对称 int8 量化：``rintf(w / s)`` 后饱和到 [-127, 127]。
 
@@ -186,6 +259,41 @@ class _LinearMixin:
             (grid,),
             (block,),
             (qq, s, out, np.int64(n), np.int64(cols), np.int64(per_row)),
+        )
+        return out
+
+    def _op_dequantize_i8_zp(self, node, args, attrs):
+        """非对称反量化：``f32((int32)q - (int32)zp) * scale``。
+
+        减法留在 int32 里做（-128 减 127 等于 -255，超出 i8），与参考实现
+        逐位相同。
+        """
+        cp = self.cp
+        q, scale, zp = args
+        if q.dtype != cp.int8 or zp.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_zp 要求 q 与 zero_point 都是 i8，"
+                f"收到 {q.dtype} 与 {zp.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_zp 的 scale 必须是 f32，"
+                f"收到 {scale.dtype}"
+            )
+        qq = self._contig(q)
+        s, z, cols, per_row = self._zp_args(qq.shape, scale, zp)
+        out = cp.empty(qq.shape, np.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("dequantize_i8_zp", per_row), _DEQUANTIZE_I8_ZP_SRC, "af_dequantize_i8_zp"
+        )
+        block, grid = self._grid("dequantize_i8_zp", n)
+        kernel(
+            (grid,),
+            (block,),
+            (qq, s, z, out, np.int64(n), np.int64(cols), np.int64(per_row)),
         )
         return out
 
