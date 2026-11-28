@@ -1156,6 +1156,12 @@ bool 归约 / remainder_floor / logical_not）。
 LN 很常用，同法处理即可（第一遍缓存 `Narrow(x + residual)`，与重算逐位
 相同）。
 
+端到端（单层图 LN→GEMM→GELU→softmax→+x→GEMM，`(64,512,1024)` f16，
+两个 GEMM 走 cuBLAS）：最初 5.674 ms → block=256 后 3.647（-35.7%）→
+寄存器缓存后 3.094（**-45.5%**）。注意这一层归约占比偏高（两个 1024³×
+32768 的 GEMM 合计只约 1.4 ms），所以这是收益上限的口径；真实 LLM 层
+还有 attention，GEMM 占比更高，端到端提升会按占比打折。
+
 复测脚本见 `aetherflow_iluvatar/bench/op_bw_probe.py`（f16 各算子带宽表）。
 
 ---
