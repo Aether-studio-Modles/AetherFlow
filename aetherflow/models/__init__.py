@@ -43,6 +43,13 @@ from .lm_text import ByteTokenizer, ChatTemplate
 from .lm_unigram import UnigramTokenizer, UnigramTokenizerError
 from .lm_wordpiece import WordPieceTokenizer, WordPieceTokenizerError
 from .lm_tools import JsonGrammar, Tool, ToolRegistry, parse_tool_call
+from .llama import (
+    LlamaSpec,
+    build_llama,
+    llama_inv_freq,
+    llama_param_shapes,
+    llama_param_transposes,
+)
 from .mamba import (
     MambaModelSpec,
     MambaSpec,
@@ -192,4 +199,9 @@ __all__ = [
     "DraftModel",
     "SpeculativeDecoder",
     "greedy_draft",
+    "LlamaSpec",
+    "build_llama",
+    "llama_inv_freq",
+    "llama_param_shapes",
+    "llama_param_transposes",
 ]
