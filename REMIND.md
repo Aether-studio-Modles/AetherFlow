@@ -1124,6 +1124,38 @@ cols=256 的极窄行是 128 略好，但 256 只差 13%，不为此加分支。
 failed=16` 与基线同名同数（既有 fp8 / topk / bool 缺口），归约类
 err 1e-8~5e-7；`test_plan.py` / `test_transformer` 相关本地测试全过。
 
+## 归约类内核的寄存器缓存：整行只读一遍（5.358，2026-11-28）
+
+5.357 之后归约类已经贴到带宽上限，但瓶颈转换成"扫太多遍"：softmax 3 遍、
+layernorm 3 遍、rmsnorm 2 遍，每次都重读显存。
+
+做法：`_reduce_cache(cols, block)` 在 `cols % block == 0` 且每线程元素数
+不超过 8 时返回 `cols / block`；三个模板（`norm.layernorm_last`、
+`norm.rmsnorm_last`、`reduce.softmax_last`）用 `ArrayDecl` 把值存进每线程
+float 数组，后面的扫描直接读寄存器。softmax 连 `exp` 结果也存一份，省掉
+第二次 `expf`。内核源码与 key 都按 cache 分档（`(op, dtype, cache)`），
+不整除或更宽的行继续走逐遍重读。
+
+天数 MR-V100 实测（3355 万元素 f16、block=256）：
+
+| 用例 | 5.357 | 5.358 | 对最初 |
+|---|---|---|---|
+| layernorm | 0.651 ms | 0.362 ms | -78%（1.637） |
+| softmax | 0.675 ms | 0.353 ms | -76%（1.457） |
+| rmsnorm | 0.466 ms | 0.311 ms | -71%（1.079） |
+
+折算有效带宽 370 / 380 / 431 GB/s，elementwise 峰值是 424~470 GB/s。
+
+**数值不变**：缓存的 float 与"重新读 f16 再转 float"逐位相同，求和顺序
+也没动。原生探针 v1/v2 对拍 `nbad=0`；真机 conformance 三项 err
+1.2e-7 / 2.4e-7 / 4.8e-7。整包同步后一致性基线更新为
+`executed=165 refused=10 failed=17`（失败全是既有缺口：fp8 / topk /
+bool 归约 / remainder_floor / logical_not）。
+
+**未覆盖**：`layernorm_residual_last` 仍是逐遍重读。训练里带 residual 的
+LN 很常用，同法处理即可（第一遍缓存 `Narrow(x + residual)`，与重算逐位
+相同）。
+
 复测脚本见 `aetherflow_iluvatar/bench/op_bw_probe.py`（f16 各算子带宽表）。
 
 ---

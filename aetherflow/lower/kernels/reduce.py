@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Tuple
 from ..kernel import (
+    ArrayDecl,
     Assign,
     AtomicMin,
     AugAssign,
@@ -736,37 +737,93 @@ def argmin_last() -> Kernel:
     )
 
 
-def softmax_last() -> Kernel:
-    """沿最后一维的 softmax：一个 block 负责一行，两段归约 + 三段重扫。"""
+def softmax_last(cache: int = 0) -> Kernel:
+    """沿最后一维的 softmax：一个 block 负责一行，两段归约 + 三段重扫。
+
+    ``cache`` 非 0 时把每线程负责的 ``cols / block`` 个缩放值留在寄存器里，
+    第二、三段不再重读显存（``exp`` 也只算一遍，结果存进另一个数组）。
+    原生探针实测（32768×1024 f16、block=256）：0.510 → 0.321 ms，输出
+    **逐位一致**（求和顺序不变，``expf`` 是纯函数）。
+    """
 
     def _scan(body: tuple) -> For:
         return For("i", Axis("tid"), Var("cols"), Axis("bdim"), body)
+
+    def _slot() -> Expr:
+        """``tid + k * bdim``：cache 版里第 k 个元素的下标。"""
+        return Bin("+", Axis("tid"), Bin("*", Var("k"), Axis("bdim")))
+
+    def _cache_loop(body: tuple) -> For:
+        return For(
+            "k", Num(0), Num(cache), Num(1), body, incr="++", type_name="int"
+        )
 
     def _scaled(i: Expr) -> Expr:
         """``%LD%(xr[i]) * sc``"""
         return Bin("*", Load("xr", i), Var("sc"))
 
-    return Kernel(
-        name="softmax_last",
-        params=(
-            Tensor("x"),
-            Tensor("out", read_only=False),
-            Scalar("long long", "rows"),
-            Scalar("long long", "cols"),
-            Tensor("scale", type_name="float"),
+    prologue = (
+        Let("long long", "row", Axis("bid")),
+        If(Bin(">=", Var("row"), Var("rows")), (Return(),)),
+        Ptr("xr", "x", Bin("*", Var("row"), Var("cols"))),
+        Ptr(
+            "orow",
+            "out",
+            Bin("*", Var("row"), Var("cols")),
+            const=False,
         ),
-        body=(
-            Let("long long", "row", Axis("bid")),
-            If(Bin(">=", Var("row"), Var("rows")), (Return(),)),
-            Ptr("xr", "x", Bin("*", Var("row"), Var("cols"))),
-            Ptr(
-                "orow",
-                "out",
-                Bin("*", Var("row"), Var("cols")),
-                const=False,
+        Let("const float", "sc", Index("scale", Num("0"))),
+        Shared("float", "smem", REDUCE_SCRATCH),
+    )
+    if cache:
+        tail = (
+            ArrayDecl("float", "xc", cache, None),
+            Let("float", "m", Num("-3.4e38f")),
+            _cache_loop(
+                (
+                    Let("float", "xv", _scaled(_slot())),
+                    Store("xc", Var("k"), Var("xv"), raw=True),
+                    Assign(
+                        Var("m"),
+                        Cond(
+                            Bin(">", Var("xv"), Var("m")),
+                            Var("xv"),
+                            Var("m"),
+                        ),
+                    ),
+                )
             ),
-            Let("const float", "sc", Index("scale", Num("0"))),
-            Shared("float", "smem", REDUCE_SCRATCH),
+            Assign(Var("m"), Call("block_reduce_max", (Var("m"), Var("smem")))),
+            ArrayDecl("float", "xe", cache, None),
+            Let("float", "s", Num("0.f")),
+            _cache_loop(
+                (
+                    Let(
+                        "float",
+                        "e",
+                        Call(
+                            "expf",
+                            (Bin("-", Index("xc", Var("k")), Var("m")),),
+                        ),
+                    ),
+                    Store("xe", Var("k"), Var("e"), raw=True),
+                    AugAssign(Var("s"), "+", Var("e")),
+                )
+            ),
+            Assign(Var("s"), Call("block_reduce_sum", (Var("s"), Var("smem")))),
+            Let("float", "inv", Bin("/", Num("1.f"), Var("s"))),
+            _cache_loop(
+                (
+                    Store(
+                        "orow",
+                        _slot(),
+                        Bin("*", Index("xe", Var("k")), Var("inv")),
+                    ),
+                )
+            ),
+        )
+    else:
+        tail = (
             Let("float", "m", Num("-3.4e38f")),
             _scan(
                 (
@@ -819,5 +876,16 @@ def softmax_last() -> Kernel:
                     ),
                 )
             ),
+        )
+
+    return Kernel(
+        name="softmax_last",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "rows"),
+            Scalar("long long", "cols"),
+            Tensor("scale", type_name="float"),
         ),
+        body=prologue + tail,
     )

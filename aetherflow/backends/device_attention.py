@@ -29,12 +29,17 @@ class _AttentionMixin:
         if x.size == 0:
             return out
         dtype_key = self._kind(x)
+        block = self._reduce_block("softmax", cols)
+        # 整行只读一遍显存：把每线程的 cols/block 个缩放值留在寄存器里，
+        # 后两段直接用（见 ``_reduce_cache``）。
+        cache = self._reduce_cache(cols, block)
         kernel = self._kernel(
-            ("softmax", dtype_key),
-            lambda: self.codegen.render(self.codegen.softmax_source(), x.dtype),
+            ("softmax", dtype_key, cache),
+            lambda: self.codegen.render(
+                self.codegen.softmax_source(cache), x.dtype
+            ),
             "softmax_last",
         )
-        block = self._reduce_block("softmax", cols)
         kernel(
             (rows,),
             (block,),

@@ -38,10 +38,15 @@ class _NormMixin:
         full, of = alloc()
         dtype_key = self._kind(x)
         block = self._reduce_block("layernorm", cols)
+        # 每线程缓存的元素数：cols 能被 block 整除时第一遍扫描就把值留在
+        # 寄存器里，后两遍不再重读显存（见 ``_reduce_cache``）。
+        cache = self._reduce_cache(cols, block)
         if residual is None:
             kernel = self._kernel(
-                ("layernorm", dtype_key),
-                lambda: self.codegen.render(self.codegen.layernorm_source(), x.dtype),
+                ("layernorm", dtype_key, cache),
+                lambda: self.codegen.render(
+                    self.codegen.layernorm_source(cache), x.dtype
+                ),
                 "layernorm_last",
             )
             kernel(
@@ -173,12 +178,15 @@ class _NormMixin:
         xf = prep(x)
         full, of = alloc()
         dtype_key = self._kind(x)
+        block = self._reduce_block("rmsnorm", cols)
+        cache = self._reduce_cache(cols, block)
         kernel = self._kernel(
-            ("rmsnorm", dtype_key),
-            lambda: self.codegen.render(self.codegen.rmsnorm_source(), x.dtype),
+            ("rmsnorm", dtype_key, cache),
+            lambda: self.codegen.render(
+                self.codegen.rmsnorm_source(cache), x.dtype
+            ),
             "rmsnorm_last",
         )
-        block = self._reduce_block("rmsnorm", cols)
         kernel(
             (rows,),
             (block,),

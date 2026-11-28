@@ -2385,9 +2385,12 @@ def mod_source(*, scalar_a: bool = False, scalar_b: bool = False) -> Kernel:
     return ew_mod_int(scalar_a=scalar_a, scalar_b=scalar_b)
 
 
-def softmax_source() -> Kernel:
-    """末维 softmax 的 L2 描述（生产路径）。"""
-    return softmax_last()
+def softmax_source(cache: int = 0) -> Kernel:
+    """末维 softmax 的 L2 描述（生产路径）。
+
+    ``cache`` 非 0 时整行只读一遍显存（见 ``reduce.softmax_last``）。
+    """
+    return softmax_last(cache)
 
 
 def softmax_template() -> str:
@@ -2395,9 +2398,13 @@ def softmax_template() -> str:
     return SOFTMAX_SRC
 
 
-def layernorm_source() -> Kernel:
-    """末维 LayerNorm 的 L2 描述（生产路径）。"""
-    return layernorm_last()
+def layernorm_source(cache: int = 0) -> Kernel:
+    """末维 LayerNorm 的 L2 描述（生产路径）。
+
+    ``cache`` 是每线程缓存的元素数，非 0 时整行只读一遍显存（见
+    ``norm.layernorm_last``）。
+    """
+    return layernorm_last(cache)
 
 
 def layernorm_template() -> str:
@@ -2415,9 +2422,12 @@ def layernorm_residual_template() -> str:
     return LAYERNORM_RESIDUAL_SRC
 
 
-def rmsnorm_source() -> Kernel:
-    """末维 RMSNorm 的 L2 描述（生产路径）。"""
-    return rmsnorm_last()
+def rmsnorm_source(cache: int = 0) -> Kernel:
+    """末维 RMSNorm 的 L2 描述（生产路径）。
+
+    ``cache`` 非 0 时整行只读一遍显存（见 ``norm.rmsnorm_last``）。
+    """
+    return rmsnorm_last(cache)
 
 
 def rmsnorm_template() -> str:
