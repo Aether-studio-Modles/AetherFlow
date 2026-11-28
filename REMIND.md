@@ -1008,6 +1008,25 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   打印器不推断优先级，`o·steps + j/repeats` 这类嵌套 `Bin` 每一层都要显式
   `Paren`，否则 `j / repeats * inner` 会被左结合成 `(j/repeats)*inner` 之外
   的另一种切分。
+- **f16 的像素读取必须走 `Load`**（5.351）：`_tap_at` 只返回 `Index`（下标
+  表达式），裸解引用 `base[...]` 在 f32 下正常，在 f16 下读到的是 16 位存储的
+  位模式（`1.0` → 15360），`verify_cuda` 的 f16 插值用例 ACTUAL 给出 48832
+  这类数。正确写法是 `Load("base", _tap_at(...).index)`（卷积早已如此）。
+  f32 的 conformance 全绿发现不了，只有真机 f16 用例能抓到。
+- **内核局部变量不能与坐标变量重名**（5.351）：双线性权重起初叫
+  `a/b/c/d`，与 `int c = (int)(t % C)` 撞名；L2 DSL 不查重，本地渲染"看起来
+  对"，NVRTC 才报 `redefinition`。权重改 `wa/wb/wc/wd`；新内核命名先避开
+  `c / h / w / idx / total`。
+- **同一内核的两个编译变体共用符号名**（5.351）：`interpolate_bilinear` 的
+  `align_corners` 两套源码都叫 `extern "C" void interpolate_bilinear(...)`，
+  `_kernel(key, render, func)` 里的 `key` 只用于缓存分变体（`_half` / `_ac`），
+  `func` 必须是源码里的真实符号名；把 key 当 func 传会在真机报
+  `CUDA_ERROR_NOT_FOUND: named symbol not found`。
+- **V100 上传脚本的参数**（5.351）：paramiko 连 `223.109.239.36:24432`
+  （备线 `180.127.11.177:24432`），密码 `goobei9s`，远端解到 `/root/afv3`。
+  走 tar.gz + SFTP，排除 `.git/__pycache__/.pytest_cache`；跑
+  `python3 verify_cuda.py` 与 `python3 -m unittest discover -s tests -t .`
+  （后者约 95 秒，tail -n 60 才能看到完整失败段）。
 
 ---
 

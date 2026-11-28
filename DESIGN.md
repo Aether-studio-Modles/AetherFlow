@@ -22409,7 +22409,7 @@ ruff 通过；全量 `3540 通过 / 464 跳过`（GGUF 之前是 3496）。
 **缺口。** 5.349 之后算子面清单上还剩三处高频缺口：`atan2`（复数相位、
 RoPE 的二维旋转、方位角回归）、`remainder`（floor 语义取余，数据增强与周期
 编码里当"回绕"用）、`repeat_interleave`（上采样与掩码扩散，`torch.repeat_interleave`
-在导出图里几乎与 `cat` 同级常见）。`interpolate` 仍未做，见末尾"未声称"。
+在导出图里几乎与 `cat` 同级常见）。`interpolate` 已在 5.351 补齐。
 
 **语义面。**
 
@@ -22505,14 +22505,85 @@ OK`，95 秒（本地无 GPU 是 `3576 / 464 跳过`，差值全部是设备端�
 
 **未声称。**
 
-- `interpolate`（`nearest` / `bilinear` / `bicubic`）仍未做：三种模式的对齐
-  口径（`align_corners` / `half_pixel`）、`antialias`、任意秩输入各不相同，
-  先把语义面钉死再写内核，比先给一种近似实现更省事；目前构图期显式拒绝。
+- `bicubic` / 三线性 / `antialias` / `scale_factor` 仍未做（`nearest` /
+  `bilinear` 见 5.351）：负权重、5D 输入、先模糊再采样、构图期依赖输入尺寸
+  现算输出尺寸，各自是独立的语义面。
 - 三个新算子**没有吞吐数字**：只验数值等价，没做基准对照。
 - `repeat_interleave` 只支持标量 `repeats` 与单轴；`repeats` 为张量、
   多轴一次完成都不支持。
 - `remainder` 的除数为 0 返回 NaN，与 numpy 一致；不提供"钳到最小正规数"
   的选项。
+
+### 5.351　二维插值：nearest / bilinear（前向与反向）
+
+**缺口。** 5.350 之后算子面上最后一块高频缺口是 `interpolate`：检测与分割的
+上采样、视觉 backbone 的 FPN、以及导出图里 `F.interpolate` 的各种写法。
+
+**范围先钉死。** 只接 4D NCHW 的 `mode ∈ {nearest, bilinear}`，`size` 必须是
+显式的 `(OH, OW)`。`bicubic`（负权重、4×4 支撑）、三线性（5D）、`antialias`
+（先模糊再采样，本质是另一个算子）、`scale_factor`（构图期要依赖输入尺寸现算
+输出尺寸，会让同图在不同输入下形状不同）全部在构图期显式拒绝。
+`nearest + align_corners=True` 也拒绝——PyTorch 自己就对这组合发警告。
+
+**坐标口径。** 参考实现与设备内核都用整数分子/分母，不用浮点 `scale`：
+
+- nearest：`ih = oh · H // OH`（下取整，不是四舍五入）；
+- bilinear / `align_corners=False`：`src = ((2·oh+1)·H - OH) / (2·OH)`，再钳到
+  `[0, H-1]`（`H == 1` 时整轴退化）；
+- bilinear / `align_corners=True`：`src = oh·(H-1)/(OH-1)`，`OH == 1` 时取 0。
+
+`i0 = num // den`、`lam = (num - i0·den) / den`、`i1 = min(i0+1, in-1)`。
+两端逐位一致，不受浮点 `scale` 在边界处的舍入抖动影响——这类抖动会让"本地对拍
+通过、真机差一格"变成偶发问题。
+
+**梯度。** 反向是散射：nearest 每个输出格 1 个源点，bilinear 4 个角。缩小
+（`OH < H`）与最近邻的重复采样都会让多个输出格命中同一输入格，必须
+`atomicAdd`，覆盖写会丢梯度。梯度总和恒等于 `dy` 的元素数，作为测试的不变量。
+原子加顺序不固定，conformance 里两条反向用例标 `deterministic=False`（与
+`index_add` / `embedding` 反向同一处理）。
+
+**设备面。** 六份 L2 内核（nearest 前向/反向、bilinear 两种 `align_corners`
+各前向/反向），一个线程一个输出格，复用 `image.py` 的 `_split_output_index` /
+`_image_slice`；`image.py` 新增 `_tap_at(ih, iw)`，接受表达式下标——原 `_tap`
+写死了变量名 `ih / iw`。`align_corners` 是构图期属性，在源码层展开成两套语句，
+执行期不分支；两份变体共用 `extern "C"` 符号名，各自独立编译成模块，缓存键带
+`_half` / `_ac` 后缀避免串用。
+
+**验证。**
+
+- 本地数值梯度（f64，`2×3×4×5 → 7×6`，中心差分 eps=1e-6）：nearest 最大误差
+  1.66e-09、bilinear(False) 3.62e-09、bilinear(True) 2.06e-09；三条梯度的总和
+  都等于输出元素数 252。
+- conformance 新增 6 条：nearest 放大、bilinear 放大、bilinear
+  `align_corners=True`、bilinear 缩小，以及缩小 / 最近邻两条反向。
+- 单测 11 个方法：前向对照独立写的浮点实现（两条不同算法路径，避免"两边都错
+  成同一个公式"）、`align_corners` 必须分岔、数值梯度、最近邻重复计数的解析值
+  （`[[4,2],[2,1]]`）、1×1 输入退化，以及构图期拒绝（4 种非法 mode、2 种秩、
+  整数 dtype、nearest+AC、4 种非法 size）。
+- V100 真机 `verify_cuda.py`：三条 f32（1×1 放大、非整数倍放大、
+  `align_corners=True` 缩小）+ 一条 f16 双线性全部 PASS；
+  `python3 -m unittest discover -s tests -t .` → `3574 / 178 跳过 / OK`。
+
+**踩到的三个坑。**
+
+- **f16 读像素必须走 `Load`**：`Index` 只构造下标，裸解引用在 f16 下拿到的是
+  16 位存储的位模式（`1.0` 的位模式 `0x3C00` 会被当成 15360 参与运算），f32
+  恰好无事。卷积内核早就写成 `Load("base", _tap().index)`，插值初版漏了，只有
+  f16 的真机用例暴露（`ACTUAL` 是 48832 这类位模式量级的数）。
+- **局部变量与坐标变量 `c` 重名**：双线性的四个权重起初叫 `a / b / c / d`，与
+  `int c = (int)(t % C)` 撞名；DSL 不查重、本地渲染看不出问题，NVRTC 报
+  `redefinition`。改名为 `wa / wb / wc / wd`。
+- **`Paren` 不会自动加**：`i1 = i0 + (i0+1 < H ? 1 : 0)` 起初打印成
+  `hi0 + (hi0 + 1) < H ? 1 : 0`，`hi1` 变成布尔值。`Cond` 作为 `Bin` 的右操作数
+  时必须手写 `Paren`。
+
+**未声称。**
+
+- 不支持 `bicubic` / 三线性 / `antialias` / `scale_factor` / 任意秩，也不支持
+  `channels_last` 内存格式（NHWC 只做池化与卷积，见 5.334）。
+- 没有吞吐数字：只验数值等价，没与 PyTorch 的 `upsample` 做基准对照。
+- 反向的原子加顺序不确定（浮点不满足结合律），重复运行时低位可能有 1 ulp
+  差异；这是 scatter-add 的固有性质，不是缺陷。
 
 
 
