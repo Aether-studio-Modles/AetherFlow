@@ -125,7 +125,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3343 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3428 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
@@ -140,7 +140,7 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 | 自动微分 | 62 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；循环级 IR（`LoopIR` / `LoopSplit`，5.332）：单图体的条件 + 体规范形态、循环不变量外提、JSON 往返，嵌套区域仍走 `WhileLoop`；推理解码循环接不进这套形态——判定在主机采样之后（5.278），但 decode 的**状态**可以常驻（5.279） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast）、数据并行（5.331 起库可加载时**默认设备侧归约**：单进程多卡自动 `ncclCommInitAll`、每进程一卡自动 `ncclCommInitRank`；库缺失或显式 `collective="host"` 才经主机中转）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
-| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、**设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`：decode 状态常驻显存、每步只取回 logits，DESIGN 5.279～5.281；空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 cap=8 时 66.1 → 491.6 tok/s）、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制：`PagedCacheManager` / `PagedDecodeScheduler`）、分页 KV 上的贪心生成闭环与自动前缀缓存（`PagedGenerator`：token 进 token 出，5.310 / 5.335）、落盘 / 跨进程前缀缓存（`DiskPrefixCache`，5.337/5.339）、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
+| 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、**设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`：decode 状态常驻显存、每步只取回 logits，DESIGN 5.279～5.281；空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 cap=8 时 66.1 → 491.6 tok/s）、束搜索、连续批处理、分块预填充（`ServingEngine(chunked_prefill=True)`：长 prompt 拆到多个解码步推进，已就绪的请求照常出 token，5.344）、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制：`PagedCacheManager` / `PagedDecodeScheduler`）、分页 KV 上的贪心生成闭环与自动前缀缓存（`PagedGenerator`：token 进 token 出，5.310 / 5.335）、落盘 / 跨进程前缀缓存（`DiskPrefixCache`，5.337/5.339）、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
 | 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb；roofline 式成本模型（六项分解 + 可行性剪枝）先算再测，按估算排序只测前 N 个；配置库经 `SchedulePolicy` 在**执行期按形状签名命中**（显式 `set_tuning` → 构造参数 → 库 → 自动，5.333） |
 | 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、Chrome Trace 导出（`python -m aetherflow.runtime.trace telemetry.json`）、NHWC 布局传播（`LayoutPropagation`）与设备端原生 NHWC 内核（conv2d 分块直算 + 池化前向，5.334）、CI 四作业（含 wheel 构建与安装冒烟）、部署包、zip 硬件包 |
 
@@ -362,7 +362,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   主机态组件、无真机 D2H 与拆页实测；已有 OpenAI
   兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /
   工具调用显式 400），静态单密钥 Bearer 认证与进程内滑动窗口限流（5.285），
-  `stop` 命中后取消请求并腾出槽位；没有多副本与按密钥计量的集群配额；
+  `stop` 命中后取消请求并腾出槽位；连续批处理可选**分块预填充**
+  （`ServingEngine(chunked_prefill=True)`：长 prompt 按 `chunk_size` 拆到多个
+  解码步推进、已就绪请求照常出 token，输出与整段预填充逐位相同，5.344；
+  与 `device_state` 不组合）；没有多副本与按密钥计量的集群配额；
 - **生态**：只吃 `torch.export` 的 aten 子集，无 define-by-run，无采样 profiler（只有把已有遥测导成 Chrome Trace 的离线路径）；
   前端覆盖算子 `torch.export` 的常用面（逐元素数学 / 激活 / 归约 / 形状 / 常量构造 /
   比较 / `where` / 取整 / `topk`），
@@ -388,7 +391,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3343 个用例
+tests/                3428 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```

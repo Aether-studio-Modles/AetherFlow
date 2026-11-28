@@ -36,6 +36,9 @@
   `collective="host"` 才经主机中转）、
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
+  **分块预填充**（`ServingEngine(chunked_prefill=True)`：长 prompt 拆到多个解码步
+  推进，已就绪的请求照常出 token；构图块与每步推进量都是 `chunk_size`，5.344；
+  与 `device_state=True` 不组合，显式拒绝）；
   **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
   decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
@@ -152,7 +155,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3343 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3428 个用例，464 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |

@@ -17181,7 +17181,7 @@ fusion_is_bitwise_identical`（逐位 + 参考对照）。
 | 索引层只覆盖线性化，不覆盖布局决策 | 低 | 5.177 只把"坐标 ↔ 扁平下标"收成 `Layout`，分块 / 向量化 / 跨步仍在各内核与 `plan.py` 里。`concat_copy` 这类带手写括号的下标没有迁移（统一规则不会产生那层括号，强行抽象会退化成一个参数化的 `Bin` 拼装器）；卷积 / attention / scan 的 tiling 偏移也不在这层。新增内核应优先用 `Layout`，旧内核保持原样——逐 token 对照是生产源码的硬约束，不能用改模板的方式"迁就"生成器 |
 | 训练状态存档绑定的是"约定"，不是完整运行时状态 | 低 | 5.180 把未提交梯度、优化器超参、窗口长度、`rng_seed` / `rng_rank` 与 scaler 写进存档，恢复时逐项比对；但换一个优化器类、换 RNG 实现或改 `(seed, step, rank)` 的派生规则，存档无法判断。RNG 只记录种子与秩，不序列化 numpy 生成器的内部状态——逐位可复现的前提仍是每步由三元组派生 key（5.125）。另外 `aux/grad/*` 只覆盖累积窗口，`grad_hook` 里其他自定义状态需调用方自己存 |
 | 入口 dtype 规则只覆盖图输入边界 | 低 | 5.181 在 `Executor` 的入口处拒绝浮点→整数、越界窄化与布尔当整数；图内 `cast` 仍按构图者显式写的语义执行，设备端也不做逐元素下标检查（与 11506 同一条边界：GPU 内核无法抛异常，越界读仍是调用方责任）。要闭合设备侧需要把 `embedding` 接进既有的 `err` 标志，并且只在打开检查时付一次同步 |
-| 语言模型的推理图只在一台机器上标定，且会话状态不进图 | 低 | 5.187 的固定块预填充把 `(块长, head)` 的图在**一次** `generate` 内复用，32K / chunk=256 时 128 块共享 3 张图，但每次调用仍重新构图并（在 `graph_mode="auto"` 下）重新捕获，TTFT 里约 200～250 ms 是这笔固定成本，1K 的 tok/s 反而低于 8K/32K。5.191 的 `LMRunner` 把图缓存与权重驻留移出单次请求：同一 `(块长, head)` 的图跨请求命中，`OrderedDict` 按 `max_graphs` 封顶；M40 上 1K prompt / chunk=256 / 8 token 的重复请求 35.93 ms，无状态 `generate` 387.34 ms（10.78×），输出逐位相等、`close()` 后驻留表清空。5.192 的 `generate_batch` 补上同一次请求里的多样本解码：左侧补 pad + 逐行 reset 让不同长度互不影响，每行独立采样与独立停止。剩余边界：decode 仍是串行执行；5.196 的 `ServingEngine` 补上了请求队列与 continuous batching（以解码步为调度单位、图 batch 固定为 `capacity`、空槽白跑、状态在主机侧按槽位拼/拆、只支持 `spec.batch=1` 的会话、`constraint` 必须每请求一份），`constraint` 自 5.206 起在 `generate_batch` / `LMRunner.generate_batch` 里也**按行接受**（每行一份实例或 `None`，`batch=1` 可直接传单个实例；共享一份实例仍显式拒绝），`ServingEngine` 原本就是 per-request；权重更新必须重建会话（图与驻留都绑定当前参数表）；数字原只来自 M40（1K/8K/32K）与 RX 7650 GRE（1K），与 5.205 同期补上了 HIP 的长上下文实测（`benchmarks.lm_inference --backend hip --lengths 1024,8192,32768 --new-tokens 4`，RX 7650 GRE / `memory_mode="tiered"` / `graph_mode="auto"`、chunk=256）：TTFT 181.3 / 239.5 / 449.3 ms（1K / 8K / 32K），decode 27.6 / 31.3 / 33.1 ms/token，显存峰值三个长度都是 1.63 MB 且不随上下文增长——TTFT 的增长远慢于长度（32K 只有 1K 的 2.48×）说明 5.187 的图复用与固定块预填在 HIP 上同样生效，decode 的主项是每步的 launch 与一次 logits 行 D2H，不是模型算力；批量解码（`generate_batch` / `ServingEngine`）仍只在参考后端上对拍过，HIP 未跑。5.193 的 `prime` 把前缀状态（`state` 与末位置 `logits`）移进会话，后续请求只跑增量：1K prompt 的 768 + 256 切分上，全量预填充 656.287 ms、增量 5.691 ms；参考后端与全量逐位一致，真机只在短序列上逐位相等（64 token 的 48 + 16），32 token 的 24 + 8 已经差 7e-4（随机初始化的大模型上 1.9）——分块边界改变内核形状本身就有 1e-5～1e-2 的舍入差，再被 SSM 递归放大，所以长上下文不承诺逐位相等。前缀缓存另有三条边界：只支持 `batch=1`、生成后自动失效（一次 `prime` 一次 `generate`）、权重更新必须重建会话。5.194 的束搜索把 k 条假设放进图的 batch 维：状态按父假设在主机侧重排（`to_host` 后 gather，再作为下一次 feed 上传），因此每步多一趟 D2H/H2D；只支持单条 prompt（`spec.batch=1`）、不与会话前缀缓存叠加、不接 `constraint`；`num_beams` 的收益在参考后端上验收过（与穷举搜索分数相等），真机未计时 |
+| 语言模型的推理图只在一台机器上标定，且会话状态不进图 | 低 | 5.187 的固定块预填充把 `(块长, head)` 的图在**一次** `generate` 内复用，32K / chunk=256 时 128 块共享 3 张图，但每次调用仍重新构图并（在 `graph_mode="auto"` 下）重新捕获，TTFT 里约 200～250 ms 是这笔固定成本，1K 的 tok/s 反而低于 8K/32K。5.191 的 `LMRunner` 把图缓存与权重驻留移出单次请求：同一 `(块长, head)` 的图跨请求命中，`OrderedDict` 按 `max_graphs` 封顶；M40 上 1K prompt / chunk=256 / 8 token 的重复请求 35.93 ms，无状态 `generate` 387.34 ms（10.78×），输出逐位相等、`close()` 后驻留表清空。5.192 的 `generate_batch` 补上同一次请求里的多样本解码：左侧补 pad + 逐行 reset 让不同长度互不影响，每行独立采样与独立停止。剩余边界：decode 仍是串行执行；5.196 的 `ServingEngine` 补上了请求队列与 continuous batching（以解码步为调度单位、图 batch 固定为 `capacity`、空槽白跑、状态在主机侧按槽位拼/拆、只支持 `spec.batch=1` 的会话、`constraint` 必须每请求一份），`constraint` 自 5.206 起在 `generate_batch` / `LMRunner.generate_batch` 里也**按行接受**（每行一份实例或 `None`，`batch=1` 可直接传单个实例；共享一份实例仍显式拒绝），`ServingEngine` 原本就是 per-request；权重更新必须重建会话（图与驻留都绑定当前参数表）；数字原只来自 M40（1K/8K/32K）与 RX 7650 GRE（1K），与 5.205 同期补上了 HIP 的长上下文实测（`benchmarks.lm_inference --backend hip --lengths 1024,8192,32768 --new-tokens 4`，RX 7650 GRE / `memory_mode="tiered"` / `graph_mode="auto"`、chunk=256）：TTFT 181.3 / 239.5 / 449.3 ms（1K / 8K / 32K），decode 27.6 / 31.3 / 33.1 ms/token，显存峰值三个长度都是 1.63 MB 且不随上下文增长——TTFT 的增长远慢于长度（32K 只有 1K 的 2.48×）说明 5.187 的图复用与固定块预填在 HIP 上同样生效，decode 的主项是每步的 launch 与一次 logits 行 D2H，不是模型算力；批量解码（`generate_batch` / `ServingEngine`）仍只在参考后端上对拍过，HIP 未跑。5.193 的 `prime` 把前缀状态（`state` 与末位置 `logits`）移进会话，后续请求只跑增量：1K prompt 的 768 + 256 切分上，全量预填充 656.287 ms、增量 5.691 ms；参考后端与全量逐位一致，真机只在短序列上逐位相等（64 token 的 48 + 16），32 token 的 24 + 8 已经差 7e-4（随机初始化的大模型上 1.9）——分块边界改变内核形状本身就有 1e-5～1e-2 的舍入差，再被 SSM 递归放大，所以长上下文不承诺逐位相等。前缀缓存另有三条边界：只支持 `batch=1`、生成后自动失效（一次 `prime` 一次 `generate`）、权重更新必须重建会话。5.194 的束搜索把 k 条假设放进图的 batch 维：状态按父假设在主机侧重排（`to_host` 后 gather，再作为下一次 feed 上传），因此每步多一趟 D2H/H2D；只支持单条 prompt（`spec.batch=1`）、不与会话前缀缓存叠加、不接 `constraint`；`num_beams` 的收益在参考后端上验收过（与穷举搜索分数相等），真机未计时。5.344 的分块预填充把长 prompt 拆到多个解码步推进（`chunked_prefill=True`，输出与整段路径逐位相同），但只在参考后端上验证语义、没有计时，也不与 `device_state` 组合 |
 | 跨块 reset 与左填充的代价随 T 增长 | 低 | 5.178 的掩码用 `scan_linear` 表达块内累积和（不新增算子），`with_reset=True` 因此让每层多一条沿时间的递归链与若干逐元素节点；`steps=1` 的 decode 跳过扫描节点，但 prefill 长序列的图节点数与 T 线性相关。5.179 的隔离依赖调用方**正确填写 reset**：续接已有会话时必须清掉第 0 列，否则会丢掉带进来的状态。这两条都只在参考后端与 CUDA 上固定了用例，HIP 走同一份 L2 模板但未单独建 reset 形状用例 |
 | 整数标签损失只有 HIP 真机验证过 | 低 | ~~5.188 的两条损失路径只在 HIP 真机上对拍~~ —— 2026-11-13 已在 3×Tesla M40（`CUDA_VISIBLE_DEVICES=2`）补跑：损失逐位相等、`dlogits` 最大差 1.49e-8，全量 1851 / 104 跳过全绿。剩余边界是"1 ulp"本身：两条路径的反向求和顺序不同，跨后端不承诺逐位一致，只承诺 1 ulp 内；`B*T*V` 超过 int32 上限时在分配前显式报错 |
 | 受约束工具文法只覆盖标量与标量数组、且键顺序固定 | 低 | 5.189 的 `ToolCallGrammar` 支持 string / integer / number / boolean / null 与"标量元素数组"。嵌套对象参数、数组元素为对象都在**构造期**显式拒绝并提示改用 `JsonGrammar`（接受任意合法 JSON，再由 `Tool.check` 校验），不是运行期才发现写不出来。参数顺序固定为"必填在前 + 可选在后"，跳不过中间的某个 optional——只能先把它写出来。`enum` 只在校验期生效，解码期只认类型（取值集合不进 `allowed()`），所以 `{"flag":"maybe"}` 这类值文法放行、`Tool.check` 拒绝。工具名逐字符枚举，名字很多且有公共前缀时每步候选集合会变大（主机侧字典开销，不进图） |
@@ -19109,7 +19109,7 @@ cc 112 段 0.359（6.4%）。
 | 2 | 设备侧归约已是数据并行默认（5.331），主机态已有桶间并发归约（5.302）；仍缺"设备态与反向重叠"与 P2P | 多卡扩展性（设备态反向是整图 capture / replay，准入判据见 5.338） |
 | 3 | 量化精度面已覆盖 int8 / fp8 / 4 bit，仍无 tensor core | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，fp8 线性层见 5.327，1 字节存储与 packed 线性层见 5.328，逐组 scale 与两端打包的 W8A8 见 5.342；4 bit 逐组（AWQ / GPTQ 形态）见 5.343；fp8 / int4 都无 tensor core，解码与反量化仍是标量循环，int4 的线性层还要物化 f32 权重） |
 | 4 | 无调度搜索 / GEMM epilogue（loop IR 见 5.332、原生 NHWC 见 5.334；5.333 只把配置库接进执行路径） | 峰值性能上限 |
-| 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中；前缀缓存的自动匹配见 5.335，跨进程 / 落盘复用见 5.337） |
+| 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率与延迟公平（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中；前缀缓存的自动匹配见 5.335，跨进程 / 落盘复用见 5.337；长 prompt 不再独占一个解码步见 5.344） |
 | 6 | 国产卡后端 | 特定硬件市场（天数 / 沐曦两个硬件包已在各自仓库真机跑通，主仓侧契约验收通过；主仓未跑 conformance，见 5.336） |
 
 第 4 项与"IR 语义简单、数值可验证"的设计约束正面冲突（等于换一套后端），
@@ -22012,6 +22012,51 @@ conformance 新用例。`conformance.py` 新增 5 条（`pack_int4`、`unpack_in
 - `linear_u4_group` 只接未打包的 `(K, N)` 权重，`pack_int4` 与它之间没有
   融合算子；打包存储的线性层留待需要时再加。
 - 设备端只做源码级验证；V100 / gfx1100 上的 conformance 仍待授权执行。
+
+### 5.344　分块预填充：长 prompt 不再独占一个解码步
+
+**缺口。** `ServingEngine` 的 `chunk_size` 一直只是**构图块**：准入的那一步会把
+prompt 按块切好后在同一个 step 里全部算完（5.196 / 5.280 的连续批处理只解决
+"谁进批"，不解决"一步算多少"）。prompt 一长，那一步的耗时就等于整段 prefill，
+槽里已经就绪的请求只能陪着等——首 token 延迟（TTFT）与逐 token 延迟（ITL）
+互相拖累。主流做法（vLLM 的 chunked prefill）是把新请求的 prefill 拆到多个
+step 推进，每步与其它请求的 decode 交错。
+
+**改法。** 只动"什么时候算"，不动"算出来是什么"：
+
+- `_prefill` 新增 `limit`：本步每行最多消费的 token 数。给出时只推进这么多，
+  没走到 prompt 末尾就**不投影末位置**，返回 `(state, None)`；`limit=None` 时
+  `takes == remain`、`reaches_end` 恒真，与旧路径逐位等价。
+- `ServingEngine(chunked_prefill=True)`：准入只占槽、不当步吃完；每步由
+  `_advance_prefill` 对"正在预填充"的每个请求推进一块（`batch=1`），
+  `_ServingRequest.prefilled` 记住已消费的前缀长度。尾块按实际余量构图，
+  不走左填充（pad 会推进状态，reset 又会把历史清掉，与 5.280 同一条约束）。
+- 首块的 `reset=1` 只打在首个真实 token 上，中间块沿用增量路径
+  （`consumed` + `state`），所以重置只发生一次，块与块之间状态连续。
+- 默认 `chunked_prefill=False`：语义与旧版完全一致，既有测试与线上行为不动；
+  分块是显式开关，不静默改变调度。
+- `chunked_prefill=True` 与 `device_state=True` **显式拒绝**（`ValueError`）：
+  分块推进要把常驻的整块状态取出一行回填给 prefill 图，这条设备路径既没写也
+  没验证，不静默退回主机态。
+
+**验证。** `tests/test_lm.py` 新增 4 条（`TestChunkedPrefill`）：三种块大小下
+输出与整段预填充逐位相同（含不同长度 prompt 混在同一容量为 2 的槽里）；长度 5、
+块 2 时前三步不返回结果、第四步才采样，且出的 token 与整段路径相同；块 1 时
+长 prompt 仍在推进而短请求的 3 个 token 先出完（不分块时长请求会先完成，这条
+断言能区分两种语义）；非 bool 与 `chunked_prefill + device_state` 的拒绝面。
+ruff 通过；全量 3428 条通过（464 跳过）。
+
+**未声称。**
+
+- 不把 prefill 与 decode 合并成一次 execute：两者仍是两次 launch，收益是
+  **延迟公平**（decode 不被长 prompt 挡住），不是吞吐。参考后端只能验证语义，
+  真机上的吞吐 / 延迟数字没有测。
+- 同一批新请求在分块模式下逐个推进（各自一次 execute），不做多请求合批——
+  合批会让"每步推进量"受最慢一行支配。
+- 每步推进量就是 `chunk_size`（构图块与推进量是同一个数），没有独立的
+  `prefill_chunk` 旋钮。
+- 设备态（`device_state=True`）未接，调用即拒绝。
+
 
 
 
