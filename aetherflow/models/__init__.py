@@ -40,6 +40,7 @@ from .lm import (
 )
 from .lm_bpe import BpeTokenizer, BpeTokenizerError
 from .lm_text import ByteTokenizer, ChatTemplate
+from .lm_wordpiece import WordPieceTokenizer, WordPieceTokenizerError
 from .lm_tools import JsonGrammar, Tool, ToolRegistry, parse_tool_call
 from .mamba import (
     MambaModelSpec,
@@ -175,6 +176,8 @@ __all__ = [
     "ChatTemplate",
     "BpeTokenizer",
     "BpeTokenizerError",
+    "WordPieceTokenizer",
+    "WordPieceTokenizerError",
     "JsonGrammar",
     "Tool",
     "ToolRegistry",
