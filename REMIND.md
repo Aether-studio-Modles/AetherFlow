@@ -285,8 +285,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   BPE dropout 与 `lstrip` / `rstrip`；没有 offset mapping；用自造小词表逐 id
   对拍，未与 HF 官方实现在真实大词表上做全量对拍（5.314）。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
-  `bool` 只作掩码：比较 / `where` / `masked_fill` / `topk` 的判定端已接，
-  但 `aten.logical_*` 与 bool 的 `to(dtype=...)` 未映射（IR 侧已有，5.330）；
+  `bool` 作为掩码载体：比较 / `logical_and` / `logical_or` / `logical_not`
+  （含 `& | ~` 写法）/ `where` / `masked_fill` / `cast` 双向已接（5.340），
+  浮点 `logical_*` 与整数位运算显式拒绝；
   `sign` / `round` / `floor` / `ceil`、`baddbmm`、原地 `copy_` 无对应语义；
   非整数 `pow` 指数、图内 `clamp` 边界、非零或 reflect 的 `pad`、非默认
   `softplus.threshold` 一律拒绝；常量构造（zeros / ones / full / arange 等）

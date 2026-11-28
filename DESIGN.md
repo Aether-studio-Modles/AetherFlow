@@ -13814,7 +13814,7 @@ WSL HIP `Ran 2285 tests / OK (skipped=369)`（WSL 内无 torch，矩阵相关用
    让入口报出具体越界值"。
 5. `_to_dtype(dtype, row=None)` 接收矩阵行，`import_exported` 把自己拿到的行传进去：
    声明与入口共用同一份事实来源（当时 `bool` 还在 `_TORCH_DTYPE` 之外；
-   5.330 起已映射到 `boolean`，只作掩码用，见 5.330 的"未声称"）。
+   5.330 起映射到 `boolean`，5.340 起逻辑组合与 bool cast 也在导入侧接通）。
 6. `padding_idx` 是 `Value` 时显式报"只支持静态缺省（None / -1）"。
 
 **用例**：`tests/test_resume.py` 新增 `test_user_meta_is_not_confused_with_loader_state`，
@@ -19105,10 +19105,10 @@ cc 112 段 0.359（6.4%）。
 
 | 序 | 缺口 | 挡的是什么 |
 | --- | --- | --- |
-| 1 | bool 张量没有算子产出、后端没有存储路径 | 任何带 mask 的模型都进不来 |
+| 1 | bool 已是一等类型（5.330）且导入侧已接（5.340）；仍缺设备端 bool 归约内核 | 带 mask 的模型能进、参考端能跑逻辑组合；`reduce_all` / `reduce_any` 仍只有参考后端承接 |
 | 2 | 设备侧归约已是数据并行默认（5.331），主机态已有桶间并发归约（5.302）；仍缺"设备态与反向重叠"与 P2P | 多卡扩展性（设备态反向是整图 capture / replay，准入判据见 5.338） |
 | 3 | 量化只到 weight-only int8 | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，但仍无 fp8 GEMM 与存储容器） |
-| 4 | 无 loop IR / 调度搜索 / 原生 NHWC / GEMM epilogue | 峰值性能上限 |
+| 4 | 无调度搜索 / GEMM epilogue（loop IR 见 5.332、原生 NHWC 见 5.334；5.333 只把配置库接进执行路径） | 峰值性能上限 |
 | 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中；前缀缓存的自动匹配见 5.335，跨进程 / 落盘复用见 5.337） |
 | 6 | 国产卡后端 | 特定硬件市场（天数 / 沐曦两个硬件包已在各自仓库真机跑通，主仓侧契约验收通过；主仓未跑 conformance，见 5.336） |
 
@@ -21724,6 +21724,69 @@ mtime、不重写。`generate` 之后紧接 `finish` 会连着走两次 `_persis
   触发点，没有隐式判定"用户不再续写"的办法。
 - 仍是主机态：`gather` 与 `np.savez` 的时延没有真机数据；条目大小随
   `L × T` 线性增长，靠 `max_bytes` 兜底（5.337 的约束不变）。
+
+### 5.340 torch.export 前端接上 bool：逻辑组合、`& | ~` 与显式 cast
+
+**缺口。** 5.330 把 IR 侧的 bool 补齐了（`logical_*`、`reduce_all/any`、`cast`
+双向、设备端 1 字节存储），但导入侧只把 bool 当"已经存在的掩码输入"搬运：比较
+算子已产出 bool，`where` / `masked_fill` 已消费 bool，而**组合**掩码的写法在
+导出图里全部落在拒绝面上——`torch.logical_and/or/not` 没有映射，
+`mask = (x > 0) & (y > 0)` 这种更常见的写法在 FX 图里是
+`aten.__and__.Tensor`，同样没有映射。结果是：带 mask 的模型只要把两个条件
+与在一起，就在导入时断掉。5.330 的"未声称"把 bool 的 `to(dtype=...)` 也记成
+"尚未映射"；实际入口是通用的 `aten.to.dtype` / `aten._to_copy` /
+`aten.type_as`，没有专门拦 bool——它能用，但既没有测试也没有声明。
+
+**实现。** 只改前端，不加 IR 算子、不改设备端。
+
+1. `aten.logical_and` / `aten.logical_or` / `aten.logical_not` 映射到 IR 同名
+   算子；`& | ~` 与 `aten.bitwise_and/or/not` 一并归到这三个算子（bool 上位
+   运算与逻辑运算逐位等价）。家族名按 `target.rsplit(".", 1)[0]` 取，
+   `default` / `Tensor` 两种写法都能接。
+2. 输入校验与 5.330 同口径，但**区分两类非 bool 输入**：
+   - 显式 `logical_*`：torch 允许浮点 / 整数（"非零即真"），而 IR 在 5.330
+     定的口径是"只收 bool"，掩码必须由显式比较落成。前端沿用这条口径，抛
+     `UnsupportedOperatorError` 并给出 `ne(x, 0)` 的写法；不替调用方插入
+     隐式转换——前端只翻译，语义边界留在模型里可见。
+   - `& | ~` / `bitwise_*`：整数上是**位运算**（`2 & 4 == 0`），与逻辑与
+     不等价，IR 没有位运算算子，同样显式拒绝；浮点在 torch 侧本就报错，
+     到不了前端。
+3. bool cast 不改代码：三条入口共用 `_to_dtype`，`bool` 已在 `_TORCH_DTYPE`
+   与兼容矩阵的 dtypes 里，落到 IR 的 `cast`。本次把它纳入验收（f32 ↔ bool
+   往返、bool 输出序列化），并把 5.330 的"未声称"改正为"已接、当时缺测试"。
+4. 边界仍是**导入与参考执行**：设备端 bool 逻辑组合的方言选择是 5.330 的
+   源码级交付，本节没有新增真机数据。
+
+**验证。** `tests/test_frontend.py` 新增 6 条：
+
+1. `test_logical_ops_and_operator_sugar`：`(a & b) | ~a` 与
+   `logical_or(logical_and(a, b), logical_not(a))` 两种写法导入后与 eager
+   逐元素相等（含 `(2,1) × (1,3)` 广播），图里分别是 `logical_and` /
+   `logical_or` / `logical_not`。
+2. `test_compare_and_combine_then_where`：`mask = (x > 0) & (y > 0)` 后接
+   `where`，端到端与 eager 相等，图里出现 `logical_and`。
+3. `test_bool_cast_roundtrip`：`x.bool().float()` 与 eager 逐位相等，输出是
+   f32，图里恰好两个 `cast`。
+4. `test_bool_graph_serializes`：bool 输出图 `dumps` / `loads` 往返后算子序列
+   不变，执行结果仍是 `np.bool_` 且与往返前逐位相等。
+5. `test_float_logical_is_rejected`：`torch.logical_and(f32, f32)` 在 torch 里
+   合法，导入时必须抛 `UnsupportedOperatorError`。
+6. `test_integer_bitwise_is_rejected`：`i64 & i64` 导出后导入必须抛
+   `UnsupportedOperatorError`。
+
+`py -3.14 -m ruff check aetherflow tests` 通过；前端 96 条通过（2 条 GPU
+跳过），全量 3393 条通过 / 461 跳过（5.339 的 3387 加本节 6 条）。
+
+**未声称。**
+
+- 没有 `logical_xor`：IR 没有该算子，torch 会导出
+  `aten.logical_xor.default`，仍显式拒绝。
+- 整数位运算（`bitwise_and/or/not`、整数上的 `& | ~`）不支持：语义与逻辑
+  运算不同，IR 没有位运算算子。
+- 浮点 `logical_*` 不自动降级成 `ne(x, 0)`：前端只翻译，不改写语义边界。
+- 没有 `count_nonzero`；计数先 `cast` 到 f32（5.330 的约束不变）。
+- 设备端 bool 归约仍无内核（`af_add_q` 仍是 stub，`reduce_all/any` 不在
+  `GPU_OPS`）；bool 逻辑组合的设备路径仍是 5.330 的源码级交付，V100 未回归。
 
 
 
