@@ -734,6 +734,32 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **真机脚本不要硬编码 SSH 密码**：本机执行策略会以"物化具体凭证"为由
   拒绝运行（哪怕凭证已在本文件里）。需要真机回归时先向用户明确说明风险并
   取得授权，或用用户自己的终端执行同步与验证命令。
+- **W8A8 的连续量只有两路 scale**（5.329）：`linear_i8a8` 的 vjp 对 int8 码
+  返回 `None`，`backward` 对码求导会抛 `NoGradientError`；梯度只送
+  `x_scale` / `w_scale`（`sum_to` 归约到声明形状），bias 沿前导维求和。
+  想训就显式用 `build_int8a8_linear_qat`，别在部署路径里偷偷给码加 STE。
+- **逐组 scale 只能沿 K 分组**（5.329）：`linear_i8_group` 的 scale 形状
+  `(K/G, N)`，`K` 与 `K/G` 必须静态且整除（`_check_group_params`）。沿 K
+  逐元素变化的 scale 提不到 int32 累加外面——这是 `linear_i8a8` 拒绝逐元素
+  scale 的同一条理由，不是没实现。设备端是 `dequantize_i8_group` + f32
+  GEMM 组合，**没有专用内核**，别以为它比 `linear_i8` 快。
+- **QAT 与部署只共享"格点"**（5.329）：`fake_quantize_i8` 与
+  `quantize_weight` / `quantize_activation` 共用 RNE + 饱和，所以导出得到的
+  int8 码逐位相同；但训练走 f32 matmul、部署走 int32 累加，末位可能差
+  1 ulp。写文档时别说成"逐位相同"。
+- **融合 epilogue 必须显式 RN**（5.329）：`linear_i8a8_zp` 的 bias 进内核后，
+  `(float)acc * xs * ws + bias` 若让编译器发 FFMA，与"两颗内核各自 RN 舍入"
+  会差 1 ulp。用 `__fmul_rn` / `__fadd_rn` 钉死；带 bias 与无 bias 两个入口
+  共用 `af_i8a8_zp_acc`，累加体只能有一份。dp4a 仍延后：零点相减后不再是
+  int8，要复用整数点积只能走 `P - zx*Sw - zw*Sx + K*zx*zw` 的展开，等有
+  真机能对拍再动。
+- **动态 per-token scale 的零 token**（5.329）：`amax == 0` 时 `where` 必须
+  给 1.0；给 0 会被 `quantize_i8` 以"非正 scale"拒绝。整条链只用既有算子
+  （`ge` / `neg` / `where` / `reduce_max` / `gt` / `div` / `quantize_i8`），
+  没有新增内核，量化格点与 `quantize_activation` 逐位相同。
+- **5.329 的真机债**：`linear_i8_group` 的 conformance、
+  `af_linear_i8a8_zp_bias` 的编译与逐位、动态 scale 链在 V100 上均未验证；
+  新增内核注释为 ASCII（沿用 5.325 的约束）。
 
 ---
 

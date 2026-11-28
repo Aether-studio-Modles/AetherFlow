@@ -20848,6 +20848,110 @@ F32 载体与三维权重的拒绝、PyTorch 转置布局的打包读取。confo
   unpack / packed linear 的 conformance）仍待授权执行；设备端只做了源码级
   检查，未经编译验证。
 
+### 5.329 W8A8 的五个缺口：scale 反向、逐组量化、动态 scale、QAT、zp epilogue
+
+**缺口。** 5.309 的 `linear_i8a8` 只定义了前向：`vjp` 缺失，`backward` 直接
+报"没有规则"；逐组量化只有主机侧容器（5.317）与反量化算子（5.321），没有
+融合 GEMM；激活 scale 必须离线校准后作为图输入；QAT 只有裸的假量化算子，
+没有能直接搭层的入口；`linear_i8a8_zp` 的 bias 要在内核之外再发一次 `add`。
+
+**1. W8A8 的反向只对两路 scale。** `out = (x_q * x_s) @ (w_q * w_s) + b` 里
+唯一连续的量是 `x_s` / `w_s`。int8 码继续按冻结常量处理：量化是阶跃函数，
+几乎处处导数为 0，给码返回一个伪造梯度等于把 STE 偷偷塞进部署路径；训练期
+要不要直通，由显式的 QAT 构建器决定（见第 4 点）。梯度推导与手写一致：
+
+```
+dact    = dy @ W^T            W = w_q * w_s
+dweight = X^T @ dy            X = x_q * x_s
+dx_s    = sum_k(dact * x_q)   # 归约到 (…, 1)
+dw_s    = sum_m(dweight * w_q) # 归约到 (N,)
+db      = sum over leading dims dy
+```
+
+实现用 `cast` 把 i8 码升到 f32、`mul` 乘两路 scale、`sum_to` 归约到 scale
+的声明形状，再沿前导维求和送 bias。`fake_quantize_i8_lsq`（5.312）之所以能
+把梯度送给 scale，是因为它的前向在 f32 上做"乘 scale → 舍入 → 除 scale"，
+scale 参与连续运算；`linear_i8a8` 的 scale 只在 epilogue 乘一次，形式不同，
+但归约目标相同。
+
+**2. 逐组量化：`linear_i8_group`。** 签名是
+`(x: f32 (…, K), q_i8: i8 (K, N), scale: f32 (K/G, N)[, bias]) -> f32`。
+参考语义只有一条：
+
+```python
+weight = q.astype(np.float32) * np.repeat(scale, K // G, axis=0)
+out = np.matmul(x, weight) [+ bias]
+```
+
+`infer` 复用 `_check_group_params`（5.321 为 `dequantize_i8_group` 写的
+校验）：`K` 与 `K/G` 必须静态且整除、列数等于 `N`。`vjp` 镜像 `linear_i8`，
+只是权重换成 `dequantize_i8_group`，所以 `dx` 与 `db` 的口径与逐通道版本
+逐位相同。
+
+设备端 `_op_linear_i8_group` 也是镜像：`_op_dequantize_i8_group` →
+`_op_matmul` → 可选 `_binary("add")`。**没有专用内核**——逐组 scale 在 K
+方向变化，无法提到整数累加外面（这正是 `linear_i8a8` 拒绝逐元素 scale 的
+同一条理由），所以它保持 weight-only 形态：反量化后走 f32 GEMM。
+
+主机侧 `quantize_weight_group(weight, group_size)` 每 `G` 行取 abs-max / 127，
+`scale` 形状 `(K/G, N)`，全零组给 1.0；组大小必须整除 `K`。`__all__` 与
+`build_int8_group_linear` 只是把这条路径接到 IR 上。
+
+**3. per-token 动态 scale：`build_int8a8_linear_dynamic`。** 激活 scale 不再
+是图输入，而是在图里现算：
+
+```
+absx    = where(x >= 0, x, neg(x))
+amax    = reduce_max(absx, axis=-1, keepdims=True)
+x_scale = where(amax > 0, amax / 127, 1)
+x_q     = quantize_i8(x, x_scale)
+out     = linear_i8a8(x_q, x_scale, w_q, w_scale[, bias])
+```
+
+全零 token 的 scale 必须是 1 而不是 0：`quantize_i8` 在前向与设备端都拒绝
+非正 scale。整条链只由既有算子组成，**没有新增内核**；量化格点与主机侧的
+`quantize_activation` 逐位相同（测试用 `assert_array_equal` 对拍）。
+
+**4. QAT：`build_int8a8_linear_qat`。** 输入全是 f32
+（`x` / `x_scale` / `w` / `w_scale`[ / `bias`]），前向是
+`matmul(fake(x, x_scale), fake(w, w_scale)) + bias`，图里**没有 i8 张量**。
+`learn_scale=True` 时换成 `fake_quantize_i8_lsq`，量化步长本身可学；否则是
+标准 STE，`x_scale` / `w_scale` 求导显式报 `NoGradientError`（不是返回零）。
+
+"前向格点与部署一致"是有限的承诺：假量化与 `quantize_weight` /
+`quantize_activation` 共用同一份 RNE 与饱和，因此导出权重得到的 int8 码与
+训练时逐位相同；GEMM 的累加顺序不同（训练走 f32 matmul，部署走 int32
+累加），末位可能差 1 ulp。
+
+**5. `linear_i8a8_zp` 的 epilogue 融合，dp4a 仍延后。** bias 直接进内核：
+`af_linear_i8a8_zp_bias` 把 `(float)acc * xs * ws + bias` 一次写完，省掉一次
+launch 与一块 `m*n` 中间张量。两次乘法用 `__fmul_rn`、加法用 `__fadd_rn`：
+不融合时 bias 在另一颗内核里做 f32 加法、各自按 RN 舍入，若让编译器发 FFMA，
+末位会差 1 ulp，"融合前后逐位相同"就不成立。无 bias 入口与融合入口共用同一个
+`__device__ af_i8a8_zp_acc`，累加体只有一份。
+
+dp4a / IMMA 仍不做。零点相减后的差不是 int8，`__dp4a` 吃不下；要复用整数
+点积只能展开成 `P - zx*Sw - zw*Sx + K*zx*zw`（`Sw` / `Sx` 是逐行 / 逐列
+的和）。展开在数学上等价，但要额外做两次轴归约、并重新论证 `P` 的 int32
+上界，得等有真机能对拍时再动，避免"源码看起来更快的版本无法验证"。
+
+**验证。** 本地 3262 条通过 / 460 跳过（较 5.328 增 21），ruff 通过。
+`test_quantize` 新增 21 条：`linear_i8_group` 的数值 / 组数=K 退化 / 反向 /
+JSON 往返 / 8 类拒绝；`quantize_weight_group` 的形状、误差界、逐组优于逐通道、
+全零组、5 类拒绝；`build_int8_group_linear` 构图对拍与参数拒绝；QAT 前向格点、
+STE 无 scale 梯度、LSQ 有 scale 梯度、参数拒绝；动态 scale 与主机口径逐位
+对拍、per-token 而非 per-tensor、无 bias + JSON 往返、参数拒绝。
+conformance 新增 1 条 `linear_i8_group_bias`，参考后端通过。
+
+**未声称。**
+
+- `linear_i8_group` 在设备端没有专用内核，逐组 scale 只是让**权重更细**，
+  不省算力，也不支持逐组 scale 的 W8A8。
+- `linear_i8a8_zp` 仍是标量乘加，没有 dp4a / IMMA。
+- fp8 的逐组 scale 与 packed 激活（5.328 遗留）仍未做，留作独立阶段。
+- 新增 op 的 V100 真机 conformance 仍待授权；设备端只做了源码级检查。
+
+
 
 
 
