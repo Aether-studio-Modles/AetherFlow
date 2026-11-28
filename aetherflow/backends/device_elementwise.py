@@ -269,6 +269,14 @@ class _ElementwiseMixin:
     def _op_neg(self, node, args, attrs):
         return self._unary("neg", args)
 
+    def _op_sin(self, node, args, attrs):
+        """正弦；RoPE 的位置表用它与 cos 按 token 位置生成。"""
+        return self._unary("sin", args)
+
+    def _op_cos(self, node, args, attrs):
+        """余弦；与 sin 配对构成旋转位置编码的旋转矩阵。"""
+        return self._unary("cos", args)
+
     def _op_sign(self, node, args, attrs):
         return self._unary("sign", args)
 

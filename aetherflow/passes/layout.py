@@ -62,6 +62,8 @@ _ELEMENTWISE_OPS: FrozenSet[str] = frozenset(
         "exp",
         "log",
         "sqrt",
+        "sin",
+        "cos",
         "neg",
         "erf",
         "step",

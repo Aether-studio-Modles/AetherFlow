@@ -446,6 +446,8 @@ class DeviceBackend(
         r.register("exp", self._op_exp)
         r.register("log", self._op_log)
         r.register("sqrt", self._op_sqrt)
+        r.register("sin", self._op_sin)
+        r.register("cos", self._op_cos)
         r.register("neg", self._op_neg)
         r.register("tanh", self._op_tanh)
         r.register("sigmoid", self._op_sigmoid)

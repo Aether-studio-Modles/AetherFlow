@@ -127,6 +127,8 @@ class TestElementwiseGrad(_GradTest):
             "exp": (False, 0.5),
             "log": (True, 1.0),
             "sqrt": (True, 1.0),
+            "sin": (False, 1.0),
+            "cos": (False, 1.0),
             "neg": (False, 1.0),
             "tanh": (False, 1.0),
             "sigmoid": (False, 1.0),

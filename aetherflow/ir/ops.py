@@ -755,6 +755,12 @@ for _name, _ref, _doc in (
     ("exp", _ieee_math(np.exp), "自然指数 e^x"),
     ("log", _ieee_math(np.log), "自然对数 ln(x)"),
     ("sqrt", _ieee_math(np.sqrt), "平方根"),
+    # 三角族。RoPE 的位置编码要按位置算 sin / cos，缺了它构建 Llama / Qwen
+    # 的前向就得把整张表退化成"主机算好再喂常量"，图就无法按 seq_len 重建。
+    # 定义域外的 inf 按 IEEE 返回 NaN（与设备端 sinf / cosf 一致），
+    # 因此同样走 _ieee_math，不在宿主上打 RuntimeWarning。
+    ("sin", _ieee_math(np.sin), "正弦"),
+    ("cos", _ieee_math(np.cos), "余弦"),
     ("neg", lambda a, at: -a[0], "取负"),
     ("tanh", lambda a, at: np.tanh(a[0]), "双曲正切"),
     ("sigmoid", _sigmoid_ref, "logistic 函数 1/(1+e^-x)"),

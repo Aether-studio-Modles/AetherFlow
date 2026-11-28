@@ -145,6 +145,9 @@ UNARY_EXPR = {
     "exp": lambda x: Call("expf", (x,)),
     "log": lambda x: Call("logf", (x,)),
     "sqrt": lambda x: Call("sqrtf", (x,)),
+    # 三角族：RoPE 的 sin / cos 表由这两个算子按位置生成。
+    "sin": lambda x: Call("sinf", (x,)),
+    "cos": lambda x: Call("cosf", (x,)),
     "neg": lambda x: Neg(x),
     "tanh": lambda x: Call("tanhf", (x,)),
     "sigmoid": lambda x: Bin(

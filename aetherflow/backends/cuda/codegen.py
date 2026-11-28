@@ -483,6 +483,8 @@ UNARY_EXPR = {
     "exp": "expf(x)",
     "log": "logf(x)",
     "sqrt": "sqrtf(x)",
+    "sin": "sinf(x)",
+    "cos": "cosf(x)",
     "neg": "-x",
     "tanh": "tanhf(x)",
     "sigmoid": "1.f / (1.f + expf(-x))",

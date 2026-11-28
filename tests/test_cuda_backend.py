@@ -4850,6 +4850,8 @@ class TestCudaAutodiff(CudaTestCase):
             ("exp", False),
             ("log", True),
             ("sqrt", True),
+            ("sin", False),
+            ("cos", False),
             ("neg", False),
             ("tanh", False),
             ("sigmoid", False),

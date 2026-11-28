@@ -335,6 +335,20 @@ def _log(ctx):
     return (ctx.b.add_node("div", [ctx.g, ctx.input(0)]),)
 
 
+@vjp("sin")
+def _sin(ctx):
+    """d/dx sin(x) = cos(x)。"""
+    b, g, x = ctx.b, ctx.g, ctx.input(0)
+    return (b.add_node("mul", [g, b.add_node("cos", [x])]),)
+
+
+@vjp("cos")
+def _cos(ctx):
+    """d/dx cos(x) = -sin(x)。"""
+    b, g, x = ctx.b, ctx.g, ctx.input(0)
+    return (b.add_node("mul", [g, b.add_node("neg", [b.add_node("sin", [x])])]),)
+
+
 @vjp("sqrt")
 def _sqrt(ctx):
     b = ctx.b
