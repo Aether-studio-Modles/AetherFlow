@@ -85,7 +85,9 @@ from aetherflow.serve import OpenAIService, serve
 
 支持的可训练构件：MLP、CNN（conv / 转置卷积 / 分组 / depthwise / 池化 / BN）、
 RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）、多层 SNN
-（LIF + 替代梯度 + 稀疏事件）。
+（LIF + 替代梯度 + 稀疏事件）、**Llama / Qwen2 系 decoder-only LLM**
+（`build_llama` + `LlamaSpec`，含 GQA、RoPE、qkv bias；`LlamaSpec.qwen2_5_0_5b()`
+是 Qwen2.5-0.5B 的官方超参，参数名与 HF `state_dict` 同名，DESIGN 5.358）。
 
 ### 装外部权重
 
@@ -419,7 +421,7 @@ aetherflow/           包本体
   backends/           参考 / CUDA / HIP、契约、注册表、硬件包
   runtime/            执行器、图计划、arena、事件池、遥测
   train/  infer/      训练闭环 / 推理会话与服务
-  models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
+  models/             MLP / CNN / RNN / Transformer / Mamba / SNN / Llama 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
 tests/                3602 个用例

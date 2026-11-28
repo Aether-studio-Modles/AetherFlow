@@ -22854,6 +22854,63 @@ PORTABLE 算子（`mul` / `neg` / `sin` / `cos`），反向图在任何能跑前
 
 **数字。** 算子 122 → 124，CUDA 承接 121 → 123，HIP 119 → 121，VJP 70 → 72。
 
+### 5.358　Llama / Qwen2 构建器：真实 LLM 架构只用已有算子建得出来
+
+**为什么做这个。** 训练主线的第一阶段是"Qwen2.5-0.5B 前向闭环"，它同时是一次
+对 IR 抽象层次的检验：一个真实的 decoder-only LLM，如果必须靠新增算子才能
+表达，说明 IR 的粒度选错了。结论是**没有新增一个算子**——`build_llama` 只用
+已有的 `embedding` / `rmsnorm` / `matmul` / `add` / `mul` / `silu` / `attention` /
+`reshape` / `transpose` / `slice` / `concat` / `broadcast_to` 与 5.357 补的
+`sin` / `cos`。
+
+**结构。** 与 HF 的 `Qwen2ForCausalLM` 同构：
+
+```
+embedding → [ rmsnorm → q/k/v → RoPE → attention(GQA) → o_proj → 残差
+              → rmsnorm → gate / up → silu(gate) * up → down → 残差 ] × L
+          → final rmsnorm → lm_head
+```
+
+`LlamaSpec` 只描述形状与口径（`vocab_size` / `d_model` / `num_layers` /
+`num_heads` / `num_kv_heads` / `d_ff` / `seq` / `norm_eps` / `rope_theta` /
+`qkv_bias` / `causal` / `scale`），`__post_init__` 把"能被 HF 加载"的条件全部
+提前拒掉：`seq` 必须是静态正整数、`d_model` 能被头数整除、`head_dim` 为偶数、
+头数是 KV 头数的整数倍。`qwen2_5_0_5b()` 是官方超参的预设（151936 /
+896 / 24 / 14 头 / 2 KV 头 / 4864 / theta=1e6，每头 64 维）。
+
+**参数布局与装载。** 参数名与 HF `state_dict` 同名，形状按 IR 的 `(in, out)`
+布局（`matmul` 是 `x @ W`，而 `nn.Linear.weight` 是 `(out, in)`）。
+`llama_param_shapes` 给出期望形状、`llama_param_transposes` 给出需要转置的集合，
+两者直接喂给 `load_into_store(..., transpose=...)`。**图里不做转置**：`lm_head`
+是 `(d, vocab)`，每步搬一次 136M 元素的转置会把训练拖成内存瓶颈。
+
+**`tie_weights` 的口径。** Qwen2.5-0.5B 的 `lm_head` 与 `embed_tokens` 共享权重，
+但两者形状不同（`(V, d)` 与 `(d, V)`）。构建器选择把 `lm_head.weight` 独立
+声明成 `(d, V)` 的图输入：IR 里没有"同一份内存的转置视图"这种说法，而图内
+转置太贵。加载时把 `embed_tokens.weight` 转置后同时填给两者即可；训练期要不要
+把两份梯度合并，是训练器的事，不属于构建器。
+
+**两个刻意的取舍。**
+
+1. **`seq` 必须静态。** RoPE 频率表与因果 mask 的内容随长度变化，IR 里没有
+   `arange`（前端把 `arange` 折成常量），符号化 `seq` 无法表达这两张表。
+   代价是每换一个长度要重建图；收益是"整段 teacher forcing"这一训练主路径
+   只需一张图。
+2. **GQA 用 `reshape + broadcast_to + reshape` 扩头**，语义等价于 HF 的
+   `repeat_kv`，但不引入 repeat 算子——"复制"发生在广播里，后端可以自由决定
+   是否真的物化。
+
+**验证。** `tests/test_llama.py` 里有一份独立的 float64 numpy 参考实现
+（`rotate_half` / RMSNorm / softmax / repeat_kv 都手写），与 IR 图在参考后端上
+逐点对拍（logits 按 `rtol=atol=1e-4`，因果屏蔽的差按 `1e-6`）：覆盖 MHA 与 GQA
+两种头配置、因果屏蔽是否真的挡住未来 token、`qkv_bias` 有无、`with_logits=False`
+只出 hidden。本地全量 3630 个
+用例通过（464 跳过），ruff 干净。
+
+**刻意不做。** 不做 decode 的 KV cache 变体（那是推理侧，训练只跑整段前向）；
+不把权重转置搬进图；不为架构新增算子——如果哪天需要，应当先怀疑抽象层次。
+
+
 
 
 

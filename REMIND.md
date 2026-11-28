@@ -435,6 +435,20 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   内核（如 `mod`）的类型由 `Tensor(type_name="int")` 钉死，dtype 只为拿同一份
   prelude。这个错误在参考后端的路径上不会触发，只有 HIP 真机跑 conformance
   才暴露，与 5.247 的 `grid_stride` 属同一类"渲染期才炸"的问题。
+
+**阶段进度**
+
+- 阶段 1 第一步（完成）：`sin` / `cos` 一元算子（DESIGN 5.357，124 / CUDA 123 /
+  HIP 121 / VJP 72 / conformance 192）。
+- 阶段 1 第二步（完成）：`aetherflow/models/llama.py` 的 `LlamaSpec` / `build_llama`
+  / `llama_inv_freq` / `llama_param_shapes` / `llama_param_transposes`（DESIGN
+  5.358，提交 3afdf93）；`tests/test_llama.py` 用独立 float64 numpy 实现对拍 13
+  个用例（MHA / GQA / causal / qkv bias / 无 logits），全量 3630 通过（464 跳过）。
+- 阶段 1 剩余：① HF 权重加载器（`llama_param_shapes` + `llama_param_transposes`
+  配 `load_into_store`，`tie_weights` 时把 `embed_tokens.weight` 转置后同时填
+  `lm_head.weight`）；② V100 装 `transformers` / `safetensors`，用 Qwen2.5-0.5B
+  真实权重对拍 logits；③ 公开 examples 前向脚本。
+- 注意：`seq` 静态（无 `arange`），换长度要重建图；图内不做权重转置。
 - **`mod` 必须做 floor 修正**：C 的 `%` 与 Python `%` / `torch.remainder` 在被除数
   为负时结果不同（C 是截断语义）。设备端在 `r = x % y` 之后必须补
   `r != 0 && (r < 0) != (y < 0) ⇒ r += y`，否则负槽位哈希会与参考实现分叉。
