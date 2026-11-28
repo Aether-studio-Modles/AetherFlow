@@ -74,8 +74,8 @@ class _LinearMixin:
             return out
 
         batch = int(np.prod(batch_shape))
-        stride_a = self._batch_stride(a.shape[:-2], batch_shape, m * k, "左操作数")
-        stride_b = self._batch_stride(b.shape[:-2], batch_shape, k * n, "右操作数")
+        a, stride_a = self._batch_operand(a, batch_shape, m, k)
+        b, stride_b = self._batch_operand(b, batch_shape, k, n)
         if f16:
             blas.hgemm_batched(a, b, out, batch, stride_a, stride_b, m * n)
         elif bf16:
@@ -84,21 +84,23 @@ class _LinearMixin:
             blas.sgemm_batched(a, b, out, batch, stride_a, stride_b, m * n)
         return out
 
-    @staticmethod
-    def _batch_stride(shape: tuple, out_shape: tuple, dense: int, what: str) -> int:
-        """批量 GEMM 的步长：形状一致用密集步长，整体只有 1 个 batch 时用 0。
+    def _batch_operand(self, arr, out_shape: tuple, rows: int, cols: int):
+        """批量 GEMM 的操作数：返回能用一个标量 stride 表达的数组与步长。
 
-        部分广播（例如 (2,1) 对 (2,3)）无法用一个标量 stride 表达，
-        明确拒绝而不是悄悄算错。
+        形状与输出批量维一致 → 密集步长；整批只有 1 个 batch（包括没有批量维）
+        → 步长 0，整批复用同一份数据。部分广播（例如 ``(2,1)`` 对 ``(2,3)``）
+        无法用一个标量 stride 表达，cuBLAS 的 strided batched 也没有"逐 batch
+        偏移表"这种入参，于是把广播视角物化成完整批次再走同一条批量路径：
+        代价是 batch 份副本，正确性优先于省这份内存。
         """
+        shape = tuple(arr.shape[:-2])
+        dense = rows * cols
         if shape == out_shape:
-            return dense
+            return arr, dense
         if not shape or all(d == 1 for d in shape):
-            return 0
-        raise BackendCapabilityError(
-            f"matmul {what}的批量维 {shape} 与输出批量维 {out_shape} 不匹配："
-            "cuBLAS 的 strided batched 只能表达“完全一致”或“整体为 1”"
-        )
+            return arr, 0
+        full = self.cp.broadcast_to(arr, out_shape + (rows, cols))
+        return self.cp.ascontiguousarray(full), dense
 
     # ------------------------------------------------------------------
     # 量化（weight-only int8）

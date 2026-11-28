@@ -213,7 +213,6 @@ class TestCudaConformance(unittest.TestCase):
     def test_known_limits_are_explicit_refusals(self):
         refused = {c.name for c in self.report.refused}
         for name in (
-            "matmul_partial_batch",
             "f64_input_relu",
         ):
             self.assertIn(name, refused, self.report.text())

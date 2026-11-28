@@ -1638,7 +1638,7 @@ def default_cases() -> List[Case]:
         _case("matmul_weight_shared", _matmul((3, 4, 8), (8, 6)),
               note="权重对所有 batch 共用"),
         _case("matmul_partial_batch", _matmul((2, 1, 4, 8), (2, 3, 8, 6)),
-              note="批量的部分广播：可用标量 stride 的后端会拒绝"),
+              note="批量的部分广播：广播侧物化成完整批次后走批量 GEMM"),
         # weight-only int8
         _case("quantize_i8_channel", _quantize_i8(),
               note="RNE 舍入 + [-127,127] 饱和；i8 输出必须与参考逐位相同，"

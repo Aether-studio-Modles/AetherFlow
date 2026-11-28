@@ -1068,14 +1068,15 @@ class TestCudaMatmul(CudaTestCase):
         g.output(g.matmul(a, b), "y")
         self.assert_backends_equal(g, {"a": self.rand(3, 4, 8), "b": self.rand(8, 6)})
 
-    def test_partial_batch_broadcast_rejected(self):
-        """(2,1,M,K) @ (2,3,K,N)：一个标量 stride 表达不了部分广播，必须明确失败。"""
+    def test_partial_batch_broadcast(self):
+        """(2,1,M,K) @ (2,3,K,N)：一个标量 stride 表达不了部分广播，广播侧物化后算。"""
         g = Graph()
         a = g.input("a", f32[2, 1, 4, 8])
         b = g.input("b", f32[2, 3, 8, 6])
         g.output(g.matmul(a, b), "y")
-        with self.assertRaises(BackendCapabilityError):
-            self.cuda.execute(g, {"a": self.rand(2, 1, 4, 8), "b": self.rand(2, 3, 8, 6)})
+        self.assert_backends_equal(
+            g, {"a": self.rand(2, 1, 4, 8), "b": self.rand(2, 3, 8, 6)}
+        )
 
 
 class TestCudaGatherCrossEntropy(CudaTestCase):
