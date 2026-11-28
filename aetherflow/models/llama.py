@@ -160,6 +160,41 @@ class LlamaSpec:
         base.update(overrides)
         return cls(**base)
 
+    @classmethod
+    def from_hf_config(
+        cls,
+        config: Mapping,
+        *,
+        seq: int,
+        batch: Dim = "B",
+        qkv_bias: bool = False,
+        **overrides,
+    ) -> "LlamaSpec":
+        """从 HF 的 ``config.json``（dict）反推结构。
+
+        ``qkv_bias`` 必须由调用方给：Qwen2 的 ``Qwen2Attention`` 硬编码
+        ``bias=True``，而 config 里的 ``attention_bias`` 默认是 false——照它读
+        会少加载三组偏置，且直到 loss 对不上才会发现。可靠判据是权重文件里
+        是否存在 ``...self_attn.q_proj.bias``。
+        """
+        base = dict(
+            vocab_size=int(config["vocab_size"]),
+            d_model=int(config["hidden_size"]),
+            num_layers=int(config["num_hidden_layers"]),
+            num_heads=int(config["num_attention_heads"]),
+            num_kv_heads=int(
+                config.get("num_key_value_heads", config["num_attention_heads"])
+            ),
+            d_ff=int(config["intermediate_size"]),
+            seq=seq,
+            batch=batch,
+            norm_eps=float(config.get("rms_norm_eps", 1e-6)),
+            rope_theta=float(config.get("rope_theta", 1e4)),
+            qkv_bias=qkv_bias,
+        )
+        base.update(overrides)
+        return cls(**base)
+
 
 def llama_inv_freq(spec: LlamaSpec) -> np.ndarray:
     """RoPE 的逆频率 ``theta^(-2i/head_dim)``，长度 ``head_dim / 2``。
@@ -234,6 +269,9 @@ def build_llama(
     返回 ``(graph, inputs)``：``inputs`` 里同时有数据输入 ``tokens`` 与全部参数
     的 :class:`Value`，训练器用 ``ParameterStore.from_graph(graph, exclude=("tokens",))``
     即可把参数与数据分开。
+
+    图**不 seal**：与仓库里其他构建器一致，调用方要在这张图上继续接
+    ``masked_lm_loss_indexed`` 之类的损失节点。需要冻结结构时自己调 ``seal()``。
     """
     shapes = llama_param_shapes(spec)
     g = Graph(name)
@@ -263,7 +301,6 @@ def build_llama(
         g.output(g.matmul(x, params["lm_head.weight"]), "logits")
     else:
         g.output(x, "hidden")
-    g.seal()
     return g, {"tokens": tokens, **params}
 
 

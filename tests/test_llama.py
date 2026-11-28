@@ -157,6 +157,22 @@ class TestSpec(unittest.TestCase):
         self.assertEqual(spec.group_size, 7)
         self.assertTrue(spec.qkv_bias)
 
+    def test_from_hf_config_matches_official_preset(self):
+        config = {
+            "vocab_size": 151936,
+            "hidden_size": 896,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 14,
+            "num_key_value_heads": 2,
+            "intermediate_size": 4864,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 1000000.0,
+            "attention_bias": False,
+        }
+        spec = LlamaSpec.from_hf_config(config, seq=16, qkv_bias=True)
+        preset = LlamaSpec.qwen2_5_0_5b(seq=16)
+        self.assertEqual(spec, preset)
+
 
 class TestParamLayout(unittest.TestCase):
     def test_linear_weights_are_transposed_for_ir(self):
