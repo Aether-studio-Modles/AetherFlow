@@ -335,19 +335,25 @@ def flip() -> Kernel:
 
 
 def roll() -> Kernel:
-    """沿单个轴循环右移：``j -> (j + shift) % steps``。
+    """沿单个轴循环右移：``j -> (j - shift) % steps``。
 
-    ``shift`` 由 host 归一化到 ``[0, steps)``：C 的 ``%`` 对负数向零截断，
-    传负值会得到负下标并读到别的 ``o`` 段，所以不在内核里做归一化。
+    方向与 ``np.roll`` 一致：它是**赋值**语义 ``out[j] = x[j - shift]``，不是把
+    元素挪到 ``j + shift``。写成 ``j + shift`` 会让整条轴反向错位，而参考后端
+    走 numpy，本地测试发现不了。
+
+    ``shift`` 由 host 归一化到 ``[0, steps)``：C 的 ``%`` 对负数向零截断，直接
+    算 ``j - shift`` 可能得到负下标并读到别的 ``o`` 段。这里先加一个 ``steps``
+    把被减数抬到非负，``(j + steps - shift) % steps`` 与 ``(j - shift) % steps``
+    同余。
     """
     return _reorder_axis(
         "roll_axis",
         (Scalar("long long", "shift"),),
         lambda j: Bin(
             "%",
-            # ``(j + shift) % steps``：``%`` 优先级高于 ``+``，不括起来会算成
-            # ``j + (shift % steps)``。
-            Paren(Bin("+", j, Var("shift"))),
+            # ``(j + steps - shift) % steps``：``%`` 优先级高于 ``-`` 与 ``+``，
+            # 不括起来会被打印成 ``j + steps - shift % steps``。
+            Paren(Bin("-", Paren(Bin("+", j, Var("steps"))), Var("shift"))),
             Var("steps"),
         ),
     )
