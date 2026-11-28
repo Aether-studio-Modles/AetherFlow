@@ -3,7 +3,43 @@
 按版本记录**对外可见**的变化：能力面、兼容性、已知限制与升级注意事项。
 设计规范、逐项验收与实现历史在 [DESIGN.md](DESIGN.md)，能力速览在 [README.md](README.md)。
 
-当前版本：`v0.1.0`（API 主版本 `1`）
+当前版本：`v0.2.0`（API 主版本 `1`）
+
+---
+
+## v0.2.0
+
+在 v0.1.0 的 IR / 后端 / 训练闭环上补出 **LLM 训练主线**，并给出三后端一致性表。
+主线只做一条（不追 PyTorch 面宽）：小参数开源 LLM（Qwen2.5-0.5B）的
+**从零预训练 → 全参 SFT → LoRA**，每一段都能在 CPU 缩小版与 V100 真机上独立跑通。
+
+### 亮点
+
+- **Llama / Qwen2 结构**：GQA、RoPE、SwiGLU、tied embedding 与 qkv bias 按
+  HF `config.json` 推导；`llama_param_shapes` 是唯一形状事实来源。载入
+  safetensors 后在 V100 上与 torch 逐项对拍（Qwen2.5-0.5B：max abs 8.9e-5 参考 /
+  1.4e-4 CUDA，8/8 样本 top-1 一致）。
+- **从零预训练**：小语料上跑若干步验证 loss 下降、梯度与优化器状态正确
+  （V100 60 步 11.84 → 7.98）；不承诺训出可用模型，验收口径写在示例的退出码里。
+- **全参 SFT**：指令对训练，`mask` 只覆盖回答段（V100 20 步回答段 3.60 → 0.40）。
+- **LoRA**（5.361）：`LoraSpec(rank, alpha, targets)`，图上显式
+  `y = xW + (xAB) · alpha/rank`，`B` 零初始化；冻结基座不靠算子标记，而是
+  `Trainer(trainable=...)` 把反向 `wrt` 收窄到 adapter（与 ZeRO-3、分桶重叠互斥）。
+  Qwen2.5-0.5B 上 rank8 / alpha16 / q、v：0.54M adapter（0.09%），回答段
+  3.47 → 1.03，291 个基座参数逐位不变。adapter 存成 npz，未做合并回基座的导出。
+- **跨卡一致性表**（5.362）：`run_conformance` 在参考 / CUDA / HIP 三后端各跑一遍
+  （192 / 189 / 182 executed，0 failed）；顺带修掉 HIP 上 `topk` axis0 的
+  `DeviceArray.transpose` 缺失。
+- **测试基线**：本地 3644 / 464 跳过、V100 3621 / 81 跳过、WSL HIP 3644 / 468
+  跳过，均 OK；ruff 通过。
+
+### 已知限制
+
+- LoRA 的 adapter 只能存 npz（键 = IR 参数名），没有"合并回基座再导出
+  safetensors"的命令；接真实权重的 SFT 存档 → LoRA 链只在缩小版验证过。
+- tied 的 `lm_head` / `embed_tokens` 未共享梯度，参数计数 630.2M 高于官方
+  494M（不影响前向与训练，后续可合并）。
+- `sort` 没有设备内核；HIP 没有 rocFFT 绑定，FFT 在 HIP 上按契约拒绝（7 条）。
 
 ---
 
@@ -1265,4 +1301,5 @@ err 2.4e-7~3.8e-6。
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v0.2.0 | 2026-11-28 | LLM 训练主线：Llama / Qwen2 结构、从零预训练、全参 SFT、LoRA；跨卡一致性表 |
 | v0.1.0 | 2026-11-20 | 首个版本：IR / 参考执行器 / 自动微分 / 训练与推理闭环 / CUDA 与 HIP 后端 / 一致性套件 |
