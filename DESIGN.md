@@ -86,7 +86,7 @@
 | 目标 | 现状 | 说明 |
 |---|---|---|
 | 一套 IR、可插拔后端 | ✅ | 三个后端：参考（CPU 语义）+ CUDA（NVIDIA 真机）+ HIP（AMD 真机）。插件只需实现 `capabilities` + `execute`，另有五项可选契约（device / codegen / tuning / memory / stream）与一个分配器契约（5.89、5.163）；HIP 是照文档接入的第一个真实实例（5.40） |
-| 完整 CUDA 生态 | 🟡 | 生产路径复用 cuBLAS（含卷积的 GEMM）与 cuSPARSE（5.203 起是 `sparse_linear` 的可选实现，默认不启用）；cuDNN 已在 5.69 接入为**对照物**（ctypes 直调 legacy API，只测量不执行生产图）；cuFFT 自 5.210 起接成 `fft` / `rfft` 的 CUDA 实现（`cufftPlanMany` + 显式归一化），但只有离线验证，真机未跑；cuBLASLt / cuRAND / NCCL 仍未接 |
+| 完整 CUDA 生态 | 🟡 | 生产路径复用 cuBLAS（含卷积的 GEMM）与 cuSPARSE（5.203 起是 `sparse_linear` 的可选实现，默认不启用；5.355 起值类型含 f16）；cuDNN 已在 5.69 接入为**对照物**（ctypes 直调 legacy API，只测量不执行生产图）；cuFFT 自 5.210 起接成 `fft` / `rfft` 的 CUDA 实现（`cufftPlanMany` + 显式归一化），5.354 起支持 1–3 维末尾连续轴并在 V100 上对拍；cuBLASLt / cuRAND 经实测与语义评估后**不接**（5.298、5.356），NCCL 仍未接 |
 | 一套工作流换后端 | ✅ | 同一份 conformance 在 CUDA 与 HIP 上都跑过且 0 failed（111 个用例；参考后端本轮 111 executed / 0 refused / 0 failed；HIP 上一轮 90 executed / 2 refused / 0 failed，本轮未复跑，用例集扩到 111 后不能按差值推算；拒绝项是既有的 f64 与分组 depthwise 形态，加上没有 rocFFT 的 `fft` / `rfft`）；装配层让迁移连 import 与类名都不用改：`get_backend()` 自动挑，或 `AETHERFLOW_BACKEND=hip` 指定（5.40、5.41）。HIP 的运行期面也已与 CUDA 对齐：pinned 暂存、跨流事件依赖与 `Trainer(device_state=True)` 的 SGD / Adam 都在真机跑通（5.156） |
 | 主流模型架构 | 🟡 | 六类构件都有可训练表达（5.22）：MLP ✅；Transformer ✅（单块符号化 + 多层 decoder-only LM）；CNN 🟡（conv（含分组 / depthwise）/ 转置卷积（5.51）/ max-avg-自适应-全局池化 / BN / dropout / 残差块 / 分类网络；cuDNN 对照已做（5.69 首测自研分块核慢 4～12 倍；5.253 按"稳态 + 驻留输入"重读后小通道已同量级甚至更快（1x1_c32 为 0.72×），真实差距只剩宽通道 3x3/5x5；5.260 / 5.268 的 auto 进一步到 c8～c24 的 0.45～0.75×、c32/c64 的 1.02×/1.36×，c64 是唯一还没消掉的 1.36×）；RNN ✅（RNN / LSTM / GRU 时间展开）；SNN 🟡（多层 LIF + 替代梯度；稀疏事件表示与事件驱动的构件已交付（5.35、5.132、5.133），层间压缩自 5.136 起可微（`spike_linear`：脉冲梯度走普通 `matmul`，只有权重梯度走事件散射），5.204 又把 `sparse_linear` 的事件幅度梯度补成 `sparse_linear_values_grad`；剩余边界是 `dspikes` 仍是稠密 GEMM，且 HIP 上事件路径尚未达到加速门槛）；SSM 🟡（完整 Mamba block 第一版，递归收敛为 `scan_linear`；语言模型侧的跨块 reset 与左填充隔离见 5.178 / 5.179，固定块预填充 / 末位置投影 / 权重常驻的推理路径见 5.187，整数标签损失（one-hot 的 `B*T*V` → `B*T` 下标）见 5.188，跨请求复用的推理会话（图缓存 + 权重驻留）见 5.191，批量解码（左填充对齐 + 逐行独立停止）见 5.192，会话前缀缓存（`prime` 预先消费 system prompt、后续只跑增量，batch=1）见 5.193，采样面（top-p / 重复惩罚）与束搜索 `generate_beam`（k 条假设进 batch 维）见 5.194，请求级并发（请求队列 + 连续批处理，以解码步为调度单位、容量固定）见 5.196） |
 | 主流硬件 | 🟡 | NVIDIA（sm_75，RTX 2080 Ti）与 AMD（gfx1100，RX 7650 GRE / ROCm 7.2）各一台，同一套 conformance 全绿（5.40）；两家还各有一次库级对照——cuDNN（5.69 首测；5.260 / 5.268 的 auto 已到 c8～c24 的 0.45～0.75×、c32/c64 的 1.02×/1.36×）与 MIOpen（5.157 测的是自研分块核，慢 4.52×～37.03×；HIP 自 5.238 改走隐式 GEMM 后未对 MIOpen 复测，这个倍数不能当成 HIP 现状）；Intel / Apple / 移动端未接，同厂商多型号未铺开 |
@@ -22755,6 +22755,73 @@ numpy 的形状**同序**——最后一个元素才是连续维；照 cuFFT 文
 - 没有性能数据：多维 plan 的吞吐与同等拆分的一维变换没有对比过。
 - 只走紧凑连续输入；非连续输入要求调用方先 `ascontiguousarray`，本模块
   不求值也不做隐式拷贝。
+
+### 5.355　cuSPARSE：`sparse_linear` 的值类型扩到 f16
+
+**缺口清单的第四项（cuSPARSE 部分）。** SpMM 的库路径在 5.203 就已经接好
+（`sparse_impl="cusparse"`，默认仍是 `"custom"`），当时只登记了 f32 值；
+本次把 f16 补上，并让"存储类型"与"累加类型"分开表达。
+
+**改动只有三处。**
+
+1. 登记表加 f16（`CUDA_R_16F = 2`，与 `cublas.py` 同一组数字）。
+2. 新增 `compute_type(dtype)`：f16 与 f32 都收敛到 `CUDA_R_32F`。f16 做
+   累加会掉有效位，存储可以半精度、累加必须是单精度。
+3. `alpha` / `beta` 的 ctypes 类型跟着 computeType 走（当前恒为
+   `c_float`）。**这条不是形式主义**：`cusparseSpMM` 按 computeType 解释
+   这两个指针，类型不匹配时读到的是位模式的前半段，结果会静默出错。
+
+**刻意不放开的三项。**
+
+| 项 | 原因 |
+|---|---|
+| f64 值 | 自研核的 `sparse_linear` 只承接 f16 / f32；库路径单独支持会让同一张图换个 `sparse_impl` 就从"能跑"变成"报错" |
+| bf16 值 | V100 上没有对拍数据，且它的 SpMM 支持要求较新的 CUDA |
+| i64 索引 | 需要单独的对拍数据；索引类型错配在设备端是越界访问而不是参数错误（见 5.203 的 `index_type` 用例） |
+
+默认仍是 `"custom"`：自研核在设备端记下标越界后由主机侧抛错，库不做逐
+元素检查；这个取舍没有变。
+
+**验证。**
+
+- `tests/test_cusparse.py` 29 个用例：登记表（f16 / f32 映射、`compute_type`
+  收敛、f64 与未登记 dtype 拒绝）、选择逻辑（auto 对 f16 走库、显式
+  cusparse 拒绝未登记类型 / i64 索引 / 捕获期）、回落记账、真机对拍。
+- V100：29 个全部通过，f16 与自研核的最大绝对误差 `<= 5e-3`（受半个精度
+  的表示误差支配），f32 沿用 `1e-5`。
+
+**未声称。**
+
+- 没有性能数据：f16 的 SpMM 与自研核谁快没测过。
+- 捕获期仍不支持库路径（workspace 查询是 host API），f16 也一样。
+
+### 5.356　cuRAND 与 cuBLASLt：判据是"不接"
+
+**缺口清单第四项剩下的两个名字，结论都是不接。** 这一节记录判据，避免以后
+再从头评估一次；它不是待办。
+
+**cuRAND。** dropout 的掩码必须满足"同一 seed + 同一 key → 逐位相同的
+掩码"：参考后端是 numpy，设备端是自研核，两边用同一套整数位运算
+（SplitMix64）才能做跨后端对拍，激活重算也才有"同 key 复现同一位模式"的
+前提（见 `codegen.py` 的 `DROPOUT_MASK_SRC` 注释）。cuRAND 是流式生成器：
+同一 seed 下第 k 个输出取决于调用顺序与偏移，而 cuRAND 的算法也不承诺与
+numpy 的 `Generator` 位级一致。用它替换 SplitMix64，等于把"逐位对拍"降级
+成"统计上近似"，并为两张后端各维护一份流位置账本，收益是零。
+
+若将来确有需求，最小面是给 `dropout` 增一个 `rng_impl="curand"` 的可选档，
+只在显式放弃逐位对拍时启用，默认路径不变。当前没有这样的需求。
+
+**cuBLASLt。** 5.298 已实测过：七种形状（含 `(131072, 8) @ (8, 768)` 这类
+窄 K）上 `cublasLtMatmul` 与 `cublasSgemm_v2` 同速，差异在测量噪声内。Lt 的
+收益来自 fused epilogue（bias / gelu / 残差），而本框架的融合在图层做——
+GEMM 只做乘加，epilogue 是独立节点，Lt 的 epilogue 参数没有用武之地。验证
+结束后绑定已全部回退，`cublas.py` 里没有残留。
+
+重新评估的触发条件（任一成立才值得再看）：出现"GEMM + epilogue 必须在同一
+个 kernel 内完成"的硬需求（例如带宽成为瓶颈的推理链），或 cublas 的启发式
+在这些形状上被实测证明明显落后于 Lt。
+
+
 
 
 

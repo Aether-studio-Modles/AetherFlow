@@ -1065,6 +1065,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   12000 字符，新加的用例排在前面时 `[FAIL]` 会被截掉，只能看到
   `result : FAIL`。定位用 `python3 verify_cuda.py 2>&1 | grep -n -i -B4 -A20 fail`
   （或先 `| head -n 120`），不要只看 stdout 尾部。
+- **`cusparseSpMM` 的 alpha / beta 类型由 computeType 决定**（5.355）：
+  computeType 是 `CUDA_R_32F` 时 alpha / beta 必须是 `ctypes.c_float`，
+  传 `c_double` 会被按前半段位模式读，结果静默错。另外 f16 的**存储**类型是
+  `CUDA_R_16F`、**累加**必须 `CUDA_R_32F`，两者不是同一个枚举，别再合并成
+  一个 `dtype` 表。
+- **库路径不能单独放开自研核不承接的 dtype**（5.355）：`sparse_linear` 的
+  自研核只到 f16 / f32，cuSPARSE 也就不登记 f64——否则同一张图换个
+  `sparse_impl` 会从"能跑"变成"报错"，实现优劣改变了算子承接面。
 
 ---
 
