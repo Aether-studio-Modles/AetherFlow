@@ -218,6 +218,8 @@ class DType(str, Enum):
 
     F16 = "f16"
     BF16 = "bf16"
+    F8E4M3 = "f8e4m3"
+    F8E5M2 = "f8e5m2"
     F32 = "f32"
     F64 = "f64"
     C64 = "c64"
@@ -233,6 +235,10 @@ class DType(str, Enum):
         BF16 在 numpy 中没有原生类型，参考语义借用 float32 承载。载体只是
         存储容器：参考执行器在每次 bf16 边界把数值量化到 bf16 精度
         （``runtime/bf16.py``），所以它不是"精度等于 f32 的别名"。
+
+        fp8（``f8e4m3`` / ``f8e5m2``）同样借用 float32 承载，并在每次边界
+        量化到对应格式的格点（``runtime/fp8.py``）。参考语义**不承诺**字节
+        宽度：8 位打包只出现在存储路径（``pack_fp8`` / ``unpack_fp8``）。
         """
         return _NP_DTYPE[self]
 
@@ -244,7 +250,14 @@ class DType(str, Enum):
     @property
     def is_float(self) -> bool:
         """实数浮点 dtype（不含复数）。"""
-        return self in (DType.F16, DType.BF16, DType.F32, DType.F64)
+        return self in (
+            DType.F16,
+            DType.BF16,
+            DType.F8E4M3,
+            DType.F8E5M2,
+            DType.F32,
+            DType.F64,
+        )
 
     def __getitem__(self, shape: Union[Dim, Iterable[Dim]]) -> "TensorType":
         """``f32["B", "S", 64]`` 语法糖，用于在构图时声明张量类型。"""
@@ -257,6 +270,8 @@ _DTYPE_NAMES = frozenset(d.value for d in DType)
 _NP_DTYPE = {
     DType.F16: "float16",
     DType.BF16: "float32",
+    DType.F8E4M3: "float32",
+    DType.F8E5M2: "float32",
     DType.F32: "float32",
     DType.F64: "float64",
     DType.C64: "complex64",
@@ -337,6 +352,8 @@ class TensorType:
 # 常用 dtype 的短别名，构图时更接近数学写法
 f16 = DType.F16
 bf16 = DType.BF16
+f8e4m3 = DType.F8E4M3
+f8e5m2 = DType.F8E5M2
 f32 = DType.F32
 f64 = DType.F64
 c64 = DType.C64

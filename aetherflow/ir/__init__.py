@@ -38,7 +38,21 @@ from .shape_contract import (
     support_for,
     symbolic_inputs,
 )
-from .types import DType, TensorType, bf16, boolean, c128, c64, f16, f32, f64, i8, i32
+from .types import (
+    DType,
+    TensorType,
+    bf16,
+    boolean,
+    c128,
+    c64,
+    f16,
+    f8e4m3,
+    f8e5m2,
+    f32,
+    f64,
+    i8,
+    i32,
+)
 from .verifier import Issue, VerifierError, require, verify, verify_portable_only
 from .version import (
     IR_VERSION,
@@ -99,6 +113,8 @@ __all__ = [
     "require_static_shapes",
     "f16",
     "bf16",
+    "f8e4m3",
+    "f8e5m2",
     "c64",
     "c128",
     "f32",

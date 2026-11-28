@@ -468,6 +468,31 @@ def _dequantize_i8_group_zp(shape: tuple = (8, 6), groups: int = 4):
     return build
 
 
+def _fp8_cast(kind: str):
+    """fp8 的 cast 形态：边界值一次给齐（RNE 中点、最大有限值、溢出、inf、±0）。
+
+    参考后端把 fp8 的载体当 f32，因此这条用例检验的是"边界处是否真的量化到
+    fp8 格点"，而不是字节宽度。NaN 不进 conformance——``assert_allclose``
+    默认不认 NaN 相等；它在单测里单独校验。
+    """
+    dtype = "f8e4m3" if kind == "e4m3" else "f8e5m2"
+    # e4m3 没有 inf，超出 448 饱和；e5m2 溢出到 inf，需要给一个越过
+    # 57344 与 inf 之间中点（61440）的值才能覆盖到。
+    overflow = 1000.0 if kind == "e4m3" else 100000.0
+
+    def build(rng):
+        g = Graph("cast")
+        x = g.input("x", f32[(8,)])
+        g.output(g.cast(x, dtype=dtype), "y")
+        values = np.array(
+            [0.0, -0.0, 1.0625, 1.1875, 448.0, overflow, np.inf, -np.inf],
+            dtype=np.float32,
+        )
+        return g, {"x": values}
+
+    return build
+
+
 def _linear_i8_zp(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
     def build(rng):
         g = Graph("linear_i8_zp")
@@ -1650,6 +1675,13 @@ def default_cases() -> List[Case]:
                    "不能按逐通道或逐行读"),
         _case("dequantize_i8_group_zp", _dequantize_i8_group_zp(),
               note="逐组非对称：q - zp 在 int32 里算，scale / zp 同形"),
+        # fp8（e4m3 / e5m2）：目前只有参考语义，设备端必须显式拒绝
+        _case("cast_f8e4m3", _fp8_cast("e4m3"),
+              note="fp8 没有 inf：超出 448 饱和；1.0625 / 1.1875 检验 RNE 中点；"
+                   "设备端没有 fp8 的存储与内核，必须显式拒绝"),
+        _case("cast_f8e5m2", _fp8_cast("e5m2"),
+              note="IEEE 溢出按 RNE 到 inf（100000）；次正规最小到 2^-16；"
+                   "设备端必须显式拒绝"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),
@@ -1861,7 +1893,9 @@ def _compare(got: Mapping[str, np.ndarray], expected: Mapping[str, np.ndarray], 
             if got_arr.dtype == np.bool_ or exp_arr.dtype == np.bool_:
                 peak = float(np.count_nonzero(got_arr != exp_arr))
             else:
-                diff = np.abs(got_arr - exp_arr)
+                # inf 与 inf 相减是 NaN：这类输出只要两边一致就不该报警。
+                with np.errstate(invalid="ignore", over="ignore"):
+                    diff = np.abs(got_arr - exp_arr)
                 peak = float(np.nanmax(diff)) if diff.size else 0.0
             return (
                 False,
@@ -1873,7 +1907,8 @@ def _compare(got: Mapping[str, np.ndarray], expected: Mapping[str, np.ndarray], 
             if got_arr.dtype == np.bool_ or exp_arr.dtype == np.bool_:
                 max_error = max(max_error, float(np.count_nonzero(got_arr != exp_arr)))
             else:
-                diff = np.abs(got_arr - exp_arr)
+                with np.errstate(invalid="ignore", over="ignore"):
+                    diff = np.abs(got_arr - exp_arr)
                 max_error = max(max_error, float(np.nanmax(diff)))
     return True, "", max_error
 

@@ -9,6 +9,11 @@ from __future__ import annotations
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from ..ir.graph import Graph as Graph, Node
 from ..ir.types import DType
+
+#: 设备端还没有 fp8 的存储容器与内核：bf16 走 uint16 位模式，fp8 连位模式
+#: 都还没接。参考语义已覆盖（runtime/fp8.py），设备端遇到这些类型必须显式
+#: 拒绝——否则会被 ``np_dtype`` 的 f32 载体悄悄当成 f32 计算。
+_FP8_DTYPES = frozenset({DType.F8E4M3, DType.F8E5M2})
 from ..lower.elementwise import (
     CHAIN_OPS as CHAIN_OPS,
     ElemInput as ElemInput,
@@ -1070,6 +1075,13 @@ class DeviceBackend(
             raise BackendCapabilityError(
                 f"{self._LABEL}未实现算子 {name}（节点 %{node.output.name}）"
             )
+        for item in (*node.inputs, node.output):
+            if item.type.dtype in _FP8_DTYPES:
+                raise BackendCapabilityError(
+                    f"{self._LABEL}还没有 fp8 的存储与内核（节点 "
+                    f"%{node.output.name} 涉及 {item.type.dtype.value}）；"
+                    "fp8 目前只有参考语义，见 DESIGN 5.318"
+                )
         if name in _LAYOUT_OPS and attrs.get("layout", "nchw") != "nchw":
             raise BackendCapabilityError(
                 f"{self._LABEL}的 {name} 只承接 NCHW 布局，收到 layout="

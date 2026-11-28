@@ -19,6 +19,7 @@ import numpy as np
 from ..ir.graph import Graph, Node
 from ..ir.types import DType, SymExpr, TensorType, dim_resolve
 from .bf16 import round_bf16
+from .fp8 import round_fp8
 
 
 class ShapeMismatchError(ValueError):
@@ -225,18 +226,24 @@ class Executor:
         return np.dtype(dtype.np_dtype)
 
     def quantize(self, value: Any, dtype: DType) -> Any:
-        """把声明为 bf16 的值量化到 bf16 精度。
+        """把声明为 bf16 / fp8 的值量化到对应格式的格点。
 
-        bf16 的 numpy 载体是 f32，若只按 ``np_dtype`` 处理，它就会退化成
-        "标签是 bf16、数值却是 f32"——尾数精度凭空多出 3 位。参考语义是
-        **数值**基准，所以每个 bf16 类型的值在离开节点 / 进入图时都必须
-        落到 bf16 的格点上。
+        这些类型的 numpy 载体是 f32，若只按 ``np_dtype`` 处理，它就会退化
+        成"标签是 bf16、数值却是 f32"——尾数精度凭空多出若干位。参考语义是
+        **数值**基准，所以每个这样的值在离开节点 / 进入图时都必须落到目标
+        格式的格点上。
 
         设备后端若用原生容器（CUDA 是 uint16 位模式）驻留 bf16，覆盖这个方法
-        同时完成"舍入 + 打包"即可；执行骨架只需保证每个 bf16 边界都调到这里。
+        同时完成"舍入 + 打包"即可；执行骨架只需保证每个边界都调到这里。
         """
-        if dtype is DType.BF16 and isinstance(value, np.ndarray):
+        if not isinstance(value, np.ndarray):
+            return value
+        if dtype is DType.BF16:
             return round_bf16(value)
+        if dtype is DType.F8E4M3:
+            return round_fp8(value, "e4m3")
+        if dtype is DType.F8E5M2:
+            return round_fp8(value, "e5m2")
         return value
 
     def to_host(self, value: Any) -> Any:
