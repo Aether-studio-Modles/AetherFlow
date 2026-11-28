@@ -149,10 +149,11 @@ class DeviceBackend(
     _LABEL = "后端"
     # 类级能力声明。子类必须覆盖，构造期会与注册表对账。
     _OPS: FrozenSet[str] = frozenset()
-    #: 布局声明：自研卷积 / 池化内核只按 NCHW 寻址。NHWC 的图在
-    #: ``invoke`` 入口被显式拒绝，而不是落进内核按错误步长读内存
-    #: （DESIGN 5.246：布局传播目前只有参考后端承接）。
-    supported_layouts: FrozenSet[str] = frozenset({"nchw"})
+    #: 布局声明。5.334 起自研 conv2d（分块直算）与池化前向也承接 NHWC：
+    #: 输入 ``(N,H,W,C)``、权重仍是 ``(O,C,KH,KW)``、输出 ``(N,HO,WO,O)``。
+    #: 未覆盖的实现（im2col / 隐式 / Winograd / 分组 / cuDNN）在算子入口
+    #: 显式拒绝，不在这里一刀切。
+    supported_layouts: FrozenSet[str] = frozenset({"nchw", "nhwc"})
     # 允许 f16 的算子集；``None`` = 从 ``_OPS`` 推出。attention 也在其中：
     # 它的分块内核是混合精度（存储 f16、点积与在线 softmax 在 float 里累加，
     # 写回时舍入一次），shared 布局不随 dtype 变化。
@@ -1230,12 +1231,14 @@ class DeviceBackend(
                         "目前只有 cast / pack_fp8 / unpack_fp8 与两个 fp8 "
                         "线性层承接，见 DESIGN 5.325 / 5.328"
                     )
-        if name in _LAYOUT_OPS and attrs.get("layout", "nchw") != "nchw":
-            raise BackendCapabilityError(
-                f"{self._LABEL}的 {name} 只承接 NCHW 布局，收到 layout="
-                f"{attrs.get('layout')!r}；自研内核按 NCHW 寻址，"
-                "NHWC 需要显式的布局转换（见 DESIGN 5.246）"
-            )
+        if name in _LAYOUT_OPS:
+            layout = attrs.get("layout", "nchw")
+            if layout not in self.supported_layouts:
+                raise BackendCapabilityError(
+                    f"{self._LABEL}的 {name} 不承接 layout={layout!r}，"
+                    f"声明的布局是 {sorted(self.supported_layouts)}；"
+                    "要么换成声明了的布局，要么插入显式的布局转换（见 DESIGN 5.246）"
+                )
         index_args = _INDEX_ARGS.get(name, frozenset())
         for i, a in enumerate(args):
             if i in index_args:

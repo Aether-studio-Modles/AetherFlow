@@ -11,16 +11,24 @@ class _PoolMixin:
     """池化：最大 / 平均 / 自适应平均，含反向与取值位置。"""
 
     def _op_maxpool2d(self, node, args, attrs):
-        """NCHW 最大池化：一个输出元素一个线程，纯索引运算。
+        """最大池化：一个输出元素一个线程，纯索引运算。
 
         与参考语义一致，padding 区域不参与取 max。空窗口填 ``-INFINITY``，
         而不是 0——否则负值输入会在边界处被"抬"到 0。
+
+        ``layout="nhwc"``（5.334）只换下标公式：输入 ``(N,H,W,C)``、
+        输出 ``(N,HO,WO,C)``，窗口语义与 NCHW 完全一致。
         """
         cp = self.cp
+        layout = attrs.get("layout", "nchw")
+        if layout not in ("nchw", "nhwc"):
+            raise BackendCapabilityError(
+                f"maxpool2d 的 layout 只能是 'nchw' 或 'nhwc'，收到 {layout!r}"
+            )
         x = self._contig(args[0])
         if x.ndim != 4:
             raise BackendCapabilityError(
-                f"{self._LABEL}的 maxpool2d 要求 NCHW 秩 4，收到 {x.shape}"
+                f"{self._LABEL}的 maxpool2d 要求 NCHW/NHWC 秩 4，收到 {x.shape}"
             )
         if "kernel" not in attrs:
             raise BackendCapabilityError(f"{self._LABEL}的 maxpool2d 缺少 kernel 属性")
@@ -36,7 +44,10 @@ class _PoolMixin:
         if ph < 0 or pw < 0:
             raise BackendCapabilityError(f"maxpool2d 的 padding 必须 >= 0，得到 {(ph, pw)}")
 
-        n, c, h, w = (int(v) for v in x.shape)
+        if layout == "nhwc":
+            n, h, w, c = (int(v) for v in x.shape)
+        else:
+            n, c, h, w = (int(v) for v in x.shape)
         ceil_mode, _ = _pool_flags(attrs, "maxpool2d")
         ho = _pool_out_dim(h, kh, sh, ph, ceil_mode)
         wo = _pool_out_dim(w, kw, sw, pw, ceil_mode)
@@ -46,16 +57,19 @@ class _PoolMixin:
                 f"padding {(ph, pw)}、stride {(sh, sw)}、ceil_mode={ceil_mode}"
             )
 
-        out = cp.empty((n, c, ho, wo), dtype=x.dtype)
+        suffix = "_nhwc" if layout == "nhwc" else ""
+        out = cp.empty(
+            (n, ho, wo, c) if layout == "nhwc" else (n, c, ho, wo), dtype=x.dtype
+        )
         total = int(out.size)
         if total == 0:
             return out
 
         dtype_key = self._kind(x)
         kernel = self._kernel(
-            ("maxpool2d", dtype_key),
-            lambda: self.codegen.render(self.codegen.maxpool2d_source(), x.dtype),
-            "maxpool2d",
+            ("maxpool2d" + suffix, dtype_key),
+            lambda: self.codegen.render(self.codegen.maxpool2d_source(layout), x.dtype),
+            "maxpool2d" + suffix,
         )
         block, grid = self._grid("maxpool2d", total)
         kernel(
@@ -139,22 +153,33 @@ class _PoolMixin:
         return out
 
     def _op_avgpool2d(self, node, args, attrs):
-        """NCHW 平均池化：与 maxpool2d 同一套索引，差别在"累加并按分母除"。
+        """平均池化：与 maxpool2d 同一套索引，差别在"累加并按分母除"。
 
         分母是窗口落在 padded 输入里的格数，由内核按 ``count_include_pad``
         与 ``ceil_mode`` 现算（见 ``lower/kernels.py::avgpool2d``）——``ceil``
         的最后一格会越过 padded 输入，固定除以 ``kh * kw`` 会让角落偏小。
+
+        ``layout="nhwc"``（5.334）只换下标公式：输入 ``(N,H,W,C)``、
+        输出 ``(N,HO,WO,C)``。
         """
         cp = self.cp
+        layout = attrs.get("layout", "nchw")
+        if layout not in ("nchw", "nhwc"):
+            raise BackendCapabilityError(
+                f"avgpool2d 的 layout 只能是 'nchw' 或 'nhwc'，收到 {layout!r}"
+            )
         x = self._contig(args[0])
         if x.ndim != 4:
             raise BackendCapabilityError(
-                f"{self._LABEL}的 avgpool2d 要求 NCHW 秩 4，收到 {x.shape}"
+                f"{self._LABEL}的 avgpool2d 要求 NCHW/NHWC 秩 4，收到 {x.shape}"
             )
         (kh, kw), (sh, sw), (ph, pw) = self._pool_geometry(attrs, "avgpool2d")
         ceil_mode, count_include_pad = _pool_flags(attrs, "avgpool2d")
 
-        n, c, h, w = (int(v) for v in x.shape)
+        if layout == "nhwc":
+            n, h, w, c = (int(v) for v in x.shape)
+        else:
+            n, c, h, w = (int(v) for v in x.shape)
         ho = _pool_out_dim(h, kh, sh, ph, ceil_mode)
         wo = _pool_out_dim(w, kw, sw, pw, ceil_mode)
         if ho <= 0 or wo <= 0:
@@ -163,16 +188,19 @@ class _PoolMixin:
                 f"padding {(ph, pw)}、stride {(sh, sw)}、ceil_mode={ceil_mode}"
             )
 
-        out = cp.empty((n, c, ho, wo), dtype=x.dtype)
+        suffix = "_nhwc" if layout == "nhwc" else ""
+        out = cp.empty(
+            (n, ho, wo, c) if layout == "nhwc" else (n, c, ho, wo), dtype=x.dtype
+        )
         total = int(out.size)
         if total == 0:
             return out
 
         dtype_key = self._kind(x)
         kernel = self._kernel(
-            ("avgpool2d", dtype_key),
-            lambda: self.codegen.render(self.codegen.avgpool2d_source(), x.dtype),
-            "avgpool2d",
+            ("avgpool2d" + suffix, dtype_key),
+            lambda: self.codegen.render(self.codegen.avgpool2d_source(layout), x.dtype),
+            "avgpool2d" + suffix,
         )
         block, grid = self._grid("avgpool2d", total)
         kernel(

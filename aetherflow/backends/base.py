@@ -31,8 +31,9 @@ class BackendCapabilityError(RuntimeError):
 #:
 #: 这一点刻意是"默认拒绝"而不是"默认放开"：布局传播 pass
 #: （``passes/layout.py``，DESIGN 5.246）会把卷积 / 池化翻成 NHWC 形态，
-#: 若后端没说自己承接得了，翻出来的图就只能作废。参考后端显式声明了
-#: ``{"nchw", "nhwc"}``；设备后端目前只有 NCHW 内核，因此保持默认值。
+#: 若后端没说自己承接得了，翻出来的图就只能作废。参考后端与自研设备后端
+#: 都已显式声明 ``{"nchw", "nhwc"}``（设备端自 5.334 起有原生 NHWC 内核）；
+#: 这里保留最小承诺作为第三方后端的兜底。
 DEFAULT_SUPPORTED_LAYOUTS: FrozenSet[str] = frozenset({"nchw"})
 
 

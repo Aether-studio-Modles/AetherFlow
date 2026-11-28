@@ -222,8 +222,9 @@ _BOOL_OPS: FrozenSet[str] = frozenset(
     }
 )
 
-# 带 ``layout`` 属性的算子。这些算子的自研内核只按 NCHW 寻址；NHWC 形态
-# 必须显式拒绝（DESIGN 5.246：布局传播由参考后端承接，设备端等待原生内核）。
+# 带 ``layout`` 属性的算子。5.334 起设备端对这三个算子声明了 NHWC：
+# conv2d 只有分块直算承接（其它实现入口显式拒绝），池化只有前向承接
+# （反向与取值位置仍按 NCHW 寻址）。
 _LAYOUT_OPS: FrozenSet[str] = frozenset({"conv2d", "maxpool2d", "avgpool2d"})
 
 # 量化只有两个内核：读权重、写权重。两份源码同时喂给 NVRTC 与 hipRTC——

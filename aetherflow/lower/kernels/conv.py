@@ -542,6 +542,120 @@ def _tiled_weight() -> Expr:
     )
 
 
+def _column_index(index: Expr, scale) -> Expr:
+    """横向坐标的寻址项：NCHW 原样（``scale=None``），NHWC 乘通道数。
+
+    NHWC 下相邻列差 ``C`` 个元素（同一像素的通道连续），因此列下标要先乘
+    ``C`` 再加到行指针上；NCHW 下相邻列本就在内存里相邻，乘 1 等于没乘。
+    """
+    return index if scale is None else Bin("*", Paren(index), scale)
+
+
+def _nhwc_output_ptr() -> Expr:
+    """``out + ((long long)n * HO + ho) * WO * O + wo * O + oc``
+
+    NHWC 的输出像素步长是 ``O``（通道连续），批次步长是 ``HO*WO*O``；
+    同一像素内 ``ROC`` 个累加器只差 1。NCHW 的写法见 ``conv2d_tiled`` 里
+    的分支——两种布局的输出指针形状不同，但都以 ``OC`` 为最内层。
+    """
+    return Bin(
+        "+",
+        Var("out"),
+        Bin(
+            "+",
+            Bin(
+                "+",
+                Bin(
+                    "*",
+                    Paren(
+                        Bin(
+                            "+",
+                            Bin("*", Cast("long long", Var("n")), Var("HO")),
+                            Var("ho"),
+                        )
+                    ),
+                    Bin("*", Var("WO"), Var("O")),
+                ),
+                Bin("*", Var("wo"), Var("O")),
+            ),
+            Var("oc"),
+        ),
+    )
+
+
+def _output_writeback(layout: str = "nchw") -> tuple:
+    """``dst`` 指针 + 写回 ``ROC`` 个累加器的循环（含 bias 融合）。
+
+    两种布局只差两处：``dst`` 怎么算（见 :func:`_nhwc_output_ptr`），以及
+    相邻输出通道之间的步长——NCHW 是 ``HO*WO``，NHWC 是 1。
+    """
+    nhwc = layout == "nhwc"
+    dst = (
+        _nhwc_output_ptr()
+        if nhwc
+        else Bin(
+            "+",
+            Var("out"),
+            Bin(
+                "+",
+                Bin(
+                    "*",
+                    Paren(
+                        Bin(
+                            "+",
+                            Bin("*", Cast("long long", Var("n")), Var("O")),
+                            Var("oc"),
+                        )
+                    ),
+                    Bin("*", Var("HO"), Var("WO")),
+                ),
+                Bin(
+                    "+",
+                    Bin("*", Cast("long long", Var("ho")), Var("WO")),
+                    Var("wo"),
+                ),
+            ),
+        )
+    )
+    step = (
+        Cast("long long", Var("j"))
+        if nhwc
+        else Bin("*", Cast("long long", Var("j")), Bin("*", Var("HO"), Var("WO")))
+    )
+    return (
+        Let("float*", "dst", dst),
+        For(
+            "j",
+            Num("0"),
+            Var("ROC"),
+            Num("1"),
+            (
+                If(
+                    Bin("<", Bin("+", Var("oc"), Var("j")), Var("O")),
+                    (
+                        Assign(
+                            Index("dst", step),
+                            Bin(
+                                "+",
+                                Index("acc", Var("j")),
+                                Paren(
+                                    Cond(
+                                        Var("has_bias"),
+                                        Index("b", Bin("+", Var("oc"), Var("j"))),
+                                        Num("0.f"),
+                                    )
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            incr="++",
+            type_name="int",
+        ),
+    )
+
+
 def _tiled_accumulate() -> tuple:
     """内层：``acc[j] += v * wb[off + j * cb * khkw + kj];``"""
     return (
@@ -582,8 +696,8 @@ def _tiled_accumulate() -> tuple:
     )
 
 
-def conv2d_tiled() -> Kernel:
-    """直接分块卷积（NCHW，互相关）：不物化列矩阵的那条路径。
+def conv2d_tiled(*, layout: str = "nchw") -> Kernel:
+    """直接分块卷积（互相关）：不物化列矩阵的那条路径。
 
     两级复用：块内 ``TOC`` 个输出通道的权重按 ``CB`` 个输入通道分批暂存到
     共享内存（每批一次屏障，而不是每个通道一次）；一个输入值喂 ``ROC`` 个
@@ -597,7 +711,29 @@ def conv2d_tiled() -> Kernel:
     指针并把 ``has_bias`` 置 0，内核不会解引用它（与 attention 的 mask 同法）。
 
     全程 ``float`` 计算：这个内核不做 dtype 参数化，f16 走 im2col + GEMM。
+
+    ``layout="nhwc"``（5.334）只改三处寻址：通道偏移从 ``* H * W`` 变成
+    ``* 1``、行的步长从 ``W`` 变成 ``W*C``、列的步长从 ``1`` 变成 ``C``；
+    写回时同一输出像素的 ``O`` 个通道相邻。权重仍是 ``(O, C, KH, KW)``，
+    分块与共享内存的复用方式完全不变——两种布局共用这一份描述。
     """
+    if layout not in ("nchw", "nhwc"):
+        raise ValueError(f"layout 只能是 'nchw' 或 'nhwc'，收到 {layout!r}")
+    nhwc = layout == "nhwc"
+
+    def _channel_offset(index):
+        """``(long long)(c0+cc)`` 在通道维上的字节偏移倍率。"""
+        if nhwc:
+            return Cast("long long", Paren(index))
+        return Bin(
+            "*",
+            Bin("*", Cast("long long", Paren(index)), Var("H")),
+            Var("W"),
+        )
+
+    row_stride = Bin("*", Var("W"), Var("C")) if nhwc else Var("W")
+    col_scale = Var("C") if nhwc else None
+
     grad = Bin(
         "-",
         Bin("*", Var("ho"), Var("SH")),
@@ -645,7 +781,7 @@ def conv2d_tiled() -> Kernel:
         ),
     )
     return Kernel(
-        name="conv2d_tiled",
+        name="conv2d_tiled_nhwc" if nhwc else "conv2d_tiled",
         params=(
             Tensor("x", type_name="float"),
             Tensor("w", type_name="float"),
@@ -817,23 +953,12 @@ def conv2d_tiled() -> Kernel:
                                         Bin(
                                             "+",
                                             Var("xn"),
-                                            Bin(
-                                                "*",
+                                            _channel_offset(
                                                 Bin(
-                                                    "*",
-                                                    Cast(
-                                                        "long long",
-                                                        Paren(
-                                                            Bin(
-                                                                "+",
-                                                                Var("c0"),
-                                                                Var("cc"),
-                                                            )
-                                                        ),
-                                                    ),
-                                                    Var("H"),
-                                                ),
-                                                Var("W"),
+                                                    "+",
+                                                    Var("c0"),
+                                                    Var("cc"),
+                                                )
                                             ),
                                         ),
                                     ),
@@ -874,7 +999,7 @@ def conv2d_tiled() -> Kernel:
                                                                 )
                                                             ),
                                                         ),
-                                                        Var("W"),
+                                                        row_stride,
                                                     ),
                                                 ),
                                             ),
@@ -910,14 +1035,17 @@ def conv2d_tiled() -> Kernel:
                                                         "v",
                                                         Index(
                                                             "xr",
-                                                            Bin(
-                                                                "+",
-                                                                Var("iw0"),
+                                                            _column_index(
                                                                 Bin(
-                                                                    "*",
-                                                                    Var("kj"),
-                                                                    Var("DW"),
+                                                                    "+",
+                                                                    Var("iw0"),
+                                                                    Bin(
+                                                                        "*",
+                                                                        Var("kj"),
+                                                                        Var("DW"),
+                                                                    ),
                                                                 ),
+                                                                col_scale,
                                                             ),
                                                         ),
                                                     ),
@@ -1016,7 +1144,7 @@ def conv2d_tiled() -> Kernel:
                                                             "long long",
                                                             Var("ih"),
                                                         ),
-                                                        Var("W"),
+                                                        row_stride,
                                                     ),
                                                 ),
                                             ),
@@ -1071,7 +1199,12 @@ def conv2d_tiled() -> Kernel:
                                                     Let(
                                                         "const float",
                                                         "v",
-                                                        Index("xr", Var("iw")),
+                                                        Index(
+                                                            "xr",
+                                                            _column_index(
+                                                                Var("iw"), col_scale
+                                                            ),
+                                                        ),
                                                     ),
                                                 )
                                                 + _tiled_accumulate(),
@@ -1092,72 +1225,7 @@ def conv2d_tiled() -> Kernel:
                 type_name="int",
             ),
             If(Not(Var("active")), (Return(),)),
-            Let(
-                "float*",
-                "dst",
-                Bin(
-                    "+",
-                    Var("out"),
-                    Bin(
-                        "+",
-                        Bin(
-                            "*",
-                            Paren(
-                                Bin(
-                                    "+",
-                                    Bin("*", Cast("long long", Var("n")), Var("O")),
-                                    Var("oc"),
-                                )
-                            ),
-                            Bin("*", Var("HO"), Var("WO")),
-                        ),
-                        Bin(
-                            "+",
-                            Bin("*", Cast("long long", Var("ho")), Var("WO")),
-                            Var("wo"),
-                        ),
-                    ),
-                ),
-            ),
-            For(
-                "j",
-                Num("0"),
-                Var("ROC"),
-                Num("1"),
-                (
-                    If(
-                        Bin("<", Bin("+", Var("oc"), Var("j")), Var("O")),
-                        (
-                            Assign(
-                                Index(
-                                    "dst",
-                                    Bin(
-                                        "*",
-                                        Cast("long long", Var("j")),
-                                        Bin("*", Var("HO"), Var("WO")),
-                                    ),
-                                ),
-                                Bin(
-                                    "+",
-                                    Index("acc", Var("j")),
-                                    Paren(
-                                        Cond(
-                                            Var("has_bias"),
-                                            Index(
-                                                "b",
-                                                Bin("+", Var("oc"), Var("j")),
-                                            ),
-                                            Num("0.f"),
-                                        )
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-                incr="++",
-                type_name="int",
-            ),
+            *_output_writeback(layout),
         ),
     )
 
@@ -1747,72 +1815,7 @@ def conv2d_implicit() -> Kernel:
                 type_name="int",
             ),
             If(Not(Var("active")), (Return(),)),
-            Let(
-                "float*",
-                "dst",
-                Bin(
-                    "+",
-                    Var("out"),
-                    Bin(
-                        "+",
-                        Bin(
-                            "*",
-                            Paren(
-                                Bin(
-                                    "+",
-                                    Bin("*", Cast("long long", Var("n")), Var("O")),
-                                    Var("oc"),
-                                )
-                            ),
-                            Bin("*", Var("HO"), Var("WO")),
-                        ),
-                        Bin(
-                            "+",
-                            Bin("*", Cast("long long", Var("ho")), Var("WO")),
-                            Var("wo"),
-                        ),
-                    ),
-                ),
-            ),
-            For(
-                "j",
-                Num("0"),
-                Var("ROC"),
-                Num("1"),
-                (
-                    If(
-                        Bin("<", Bin("+", Var("oc"), Var("j")), Var("O")),
-                        (
-                            Assign(
-                                Index(
-                                    "dst",
-                                    Bin(
-                                        "*",
-                                        Cast("long long", Var("j")),
-                                        Bin("*", Var("HO"), Var("WO")),
-                                    ),
-                                ),
-                                Bin(
-                                    "+",
-                                    Index("acc", Var("j")),
-                                    Paren(
-                                        Cond(
-                                            Var("has_bias"),
-                                            Index(
-                                                "b",
-                                                Bin("+", Var("oc"), Var("j")),
-                                            ),
-                                            Num("0.f"),
-                                        )
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-                incr="++",
-                type_name="int",
-            ),
+            *_output_writeback(),
         ),
     )
 

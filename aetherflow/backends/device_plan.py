@@ -487,8 +487,8 @@ class _PlanMixin:
         if node.output.type.dtype in FP8_DTYPES and name not in FP8_OPS:
             return None
         if name in _LAYOUT_OPS and node.attrs.get("layout", "nchw") != "nchw":
-            # 布局不匹配要留给 ``invoke`` 报错，不能在这里返回内核——
-            # 否则快路径会拿 NCHW 内核去读 NHWC 的缓冲区。
+            # 快路径是手写的 NCHW 拼接（5.334 的 NHWC 只接在 ``invoke`` 的
+            # 算子实现里），所以这里对非 NCHW 直接弃权，让调用方走慢路径。
             return None
         index_args = _INDEX_ARGS.get(name, frozenset())
         for i, value in enumerate(node.inputs):

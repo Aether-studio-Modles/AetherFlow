@@ -26,7 +26,28 @@ from ..kernel import (
     Var,
 )
 from .common import _flat_loop
-from .image import _image_slice, _split_output_index, _tap
+from .image import (
+    _image_slice,
+    _image_slice_nhwc,
+    _split_output_index,
+    _split_output_index_nhwc,
+    _tap,
+    _tap_nhwc,
+)
+
+
+def _layout_fragments(layout: str) -> tuple:
+    """按布局选"拆下标 / 取指针 / 取样"三个片段。
+
+    前向池化里只有这三处与布局有关：输出是展平的连续缓冲，直接用 ``idx``
+    写回，不需要额外的写回公式。反向与取值位置目前只有 NCHW 版（训练路径
+    不按 NHWC 跑），因此不在本表里。
+    """
+    if layout == "nchw":
+        return _split_output_index, _image_slice, _tap
+    if layout == "nhwc":
+        return _split_output_index_nhwc, _image_slice_nhwc, _tap_nhwc
+    raise ValueError(f"layout 只能是 'nchw' 或 'nhwc'，收到 {layout!r}")
 
 
 def _pool_params(*, adaptive: bool, extra: tuple = ()) -> tuple:
@@ -126,15 +147,20 @@ def _in_image(ih: str = "ih", iw: str = "iw") -> Expr:
     )
 
 
-def maxpool2d() -> Kernel:
-    """2D 最大池化：一个线程一个输出元素，越界采样点不参与比较。"""
+def maxpool2d(*, layout: str = "nchw") -> Kernel:
+    """2D 最大池化：一个线程一个输出元素，越界采样点不参与比较。
+
+    ``layout="nhwc"`` 只改下标公式（通道在末维），窗口语义与 NCHW 完全一致。
+    """
+    split, slice_, tap = _layout_fragments(layout)
+    suffix = "" if layout == "nchw" else "_nhwc"
     return Kernel(
-        name="maxpool2d",
+        name=f"maxpool2d{suffix}",
         params=(Tensor("x"), Tensor("out", read_only=False)) + _pool_params(adaptive=False),
         body=_flat_loop(
-            _split_output_index("wo", "ho", "WO", "HO")
+            split("wo", "ho", "WO", "HO")
             + (
-                _image_slice("x"),
+                slice_("x"),
                 Let(
                     "float",
                     "m",
@@ -142,7 +168,7 @@ def maxpool2d() -> Kernel:
                 ),
                 _window_scan(
                     (
-                        Let("float", "v", Load("base", _tap().index)),
+                        Let("float", "v", Load("base", tap().index)),
                         Assign(
                             Var("m"),
                             Cond(
@@ -300,7 +326,7 @@ def _avgpool_pad_bounds() -> tuple:
     )
 
 
-def avgpool2d() -> Kernel:
+def avgpool2d(*, layout: str = "nchw") -> Kernel:
     """2D 平均池化：分母是窗口落在 **padded 输入** 里的格数。
 
     ``count_include_pad=True`` 时 padding 的位置计入分母（值按 0 算），边界
@@ -313,18 +339,20 @@ def avgpool2d() -> Kernel:
     ``count_include_pad=True``，角落窗口的分母也可能小于 ``KH * KW``；在
     前端的 ``F.avg_pool2d(..., ceil_mode=True)`` 上这直接差出 1.5 倍。
     """
+    split, slice_, tap = _layout_fragments(layout)
+    suffix = "" if layout == "nchw" else "_nhwc"
     return Kernel(
-        name="avgpool2d",
+        name=f"avgpool2d{suffix}",
         params=(Tensor("x"), Tensor("out", read_only=False))
         + _pool_params(
             adaptive=False,
             extra=(Scalar("int", "count_include_pad"),),
         ),
         body=_flat_loop(
-            _split_output_index("wo", "ho", "WO", "HO")
+            split("wo", "ho", "WO", "HO")
             + _avgpool_pad_bounds()
             + (
-                _image_slice("x"),
+                slice_("x"),
                 Let("float", "acc", Num("0.f")),
                 Let("int", "cnt", Num("0")),
                 _window_scan(
@@ -335,7 +363,7 @@ def avgpool2d() -> Kernel:
                             "+",
                             Cond(
                                 _in_image(),
-                                Load("base", _tap().index),
+                                Load("base", tap().index),
                                 Num("0.f"),
                             ),
                         ),

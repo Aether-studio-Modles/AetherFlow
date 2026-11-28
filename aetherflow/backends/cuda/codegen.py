@@ -2518,9 +2518,9 @@ def conv2d_weight_grad_template() -> str:
     return CONV2D_WEIGHT_GRAD_SRC
 
 
-def maxpool2d_source() -> Kernel:
+def maxpool2d_source(layout: str = "nchw") -> Kernel:
     """2D 最大池化的 L2 描述（生产路径）。"""
-    return maxpool2d()
+    return maxpool2d(layout=layout)
 
 
 def maxpool2d_template() -> str:
@@ -2548,9 +2548,9 @@ def maxpool2d_indices_template() -> str:
     return MAXPOOL2D_INDICES_SRC
 
 
-def avgpool2d_source() -> Kernel:
+def avgpool2d_source(layout: str = "nchw") -> Kernel:
     """2D 平均池化的 L2 描述（生产路径）。"""
-    return avgpool2d()
+    return avgpool2d(layout=layout)
 
 
 def avgpool2d_template() -> str:
@@ -2598,13 +2598,14 @@ def im2col_template() -> str:
     return IM2COL_SRC
 
 
-def conv2d_tiled_source() -> Kernel:
+def conv2d_tiled_source(layout: str = "nchw") -> Kernel:
     """直接分块卷积的 L2 描述（生产路径）。
 
     这个内核不做 dtype 参数化（全程 ``float``），模板里的 ``%T%`` 从未出现，
-    因此两种 dtype 打印出的源码相同。
+    因此两种 dtype 打印出的源码相同。``layout="nhwc"`` 只改寻址公式
+    （通道在末维，见 5.334），分块几何与累加顺序不变。
     """
-    return conv2d_tiled()
+    return conv2d_tiled(layout=layout)
 
 
 def conv2d_tiled_template() -> str:

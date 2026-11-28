@@ -36,11 +36,16 @@ def conv2d_signature(
     dilation: Sequence[int] = (1, 1),
     groups: int = 1,
     dtype: Optional[Any] = None,
+    layout: Optional[str] = None,
 ) -> Dict[str, Any]:
     """卷积的规范签名；形状必须已是静态的 4 维。
 
     分组数参与签名：同样的 ``x`` / ``weight`` 形状，分组不同意味着不同的
     内核路径（逐组累加 vs 全额乘加），配置不能跨组复用。
+
+    ``layout`` 只在非 NCHW 时并入（5.334）：两种布局的寻址不同，同一个
+    ``(N,C,H,W)`` 形状测出来的 tile 配置不能直接套到 NHWC 上。NCHW 保持
+    旧签名不变，库里的既有记录继续命中。
     """
     x = tuple(int(value) for value in x_shape)
     weight = tuple(int(value) for value in weight_shape)
@@ -50,6 +55,8 @@ def conv2d_signature(
         raise ValueError(f"conv2d 的权重必须是 4 维，收到 {weight}")
     if isinstance(groups, bool) or not isinstance(groups, int) or groups < 1:
         raise ValueError(f"groups 必须是正整数，收到 {groups!r}")
+    if layout is not None and layout not in ("nchw", "nhwc"):
+        raise ValueError(f"layout 只能是 'nchw' 或 'nhwc'，收到 {layout!r}")
     return canonical_signature(
         dtype=None if dtype is None else str(dtype),
         x=list(x),
@@ -58,6 +65,7 @@ def conv2d_signature(
         padding=_pair("padding", padding),
         dilation=_pair("dilation", dilation),
         groups=groups,
+        layout=None if layout in (None, "nchw") else layout,
     )
 
 

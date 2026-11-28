@@ -16,7 +16,6 @@ import numpy as np
 
 from aetherflow import Graph, ReferenceBackend, backward, f32
 from aetherflow.backends.base import (
-    BackendCapabilityError,
     DEFAULT_SUPPORTED_LAYOUTS,
     supported_layouts_of,
 )
@@ -127,15 +126,18 @@ class TestLayoutSemantics(unittest.TestCase):
 
 
 class TestLayoutDeclaration(unittest.TestCase):
-    """后端布局声明：参考后端两种都接，设备后端只接 NCHW。"""
+    """后端布局声明：参考后端与设备后端都接两种布局。"""
 
     def test_reference_backend_declares_both(self):
         self.assertEqual(
             ReferenceBackend().supported_layouts, frozenset({"nchw", "nhwc"})
         )
 
-    def test_device_backend_declares_nchw_only(self):
-        self.assertEqual(DeviceBackend.supported_layouts, frozenset({"nchw"}))
+    def test_device_backend_declares_both(self):
+        """5.334 起设备端有原生 NHWC（conv2d 分块直算 + 池化前向）。"""
+        self.assertEqual(
+            DeviceBackend.supported_layouts, frozenset({"nchw", "nhwc"})
+        )
 
     def test_undeclared_backend_falls_back_to_nchw(self):
         """没写布局声明的后端按最小承诺处理，而不是"默认什么都行"。"""
@@ -312,23 +314,34 @@ class TestLayoutPropagation(unittest.TestCase):
 
 
 @unittest.skipUnless(HIP_AVAILABLE, "需要 HIP 运行时（ROCm）")
-class TestHipRejectsNHWC(unittest.TestCase):
-    """设备端没有原生 NHWC 内核，必须显式拒绝而不是按 NCHW 读内存。"""
+class TestHipNativeNHWC(unittest.TestCase):
+    """5.334 起设备端有原生 NHWC 内核：与 NCHW 转置后逐位一致。"""
 
-    def test_nhwc_conv_is_a_capability_error(self):
-        g = Graph()
-        x = g.input("x", f32[2, 8, 8, 3])
-        w = g.input("w", f32[4, 3, 3, 3])
-        g.output(g.conv2d(x, w, padding=1, layout="nhwc"), "y")
+    def test_nhwc_conv_matches_nchw(self):
+        feed = _feeds()
+        nchw, _, _ = _conv_graph(activation=False)
+        nhwc, _, _ = _conv_graph(layout="nhwc", activation=False)
         backend = HipBackend()
-        feed = {
-            "x": _RNG.standard_normal((2, 8, 8, 3)).astype(np.float32),
-            "w": _RNG.standard_normal((4, 3, 3, 3)).astype(np.float32),
-        }
-        with self.assertRaises(BackendCapabilityError) as ctx:
-            backend.execute(g, feed)
-        self.assertIn("NHWC", str(ctx.exception))
-        self.assertIn("NCHW", str(ctx.exception))
+        want = backend.execute(nchw, feed)["y"]
+        got = backend.execute(
+            nhwc,
+            {"x": np.transpose(feed["x"], (0, 2, 3, 1)), "w": feed["w"]},
+        )["y"]
+        np.testing.assert_array_equal(np.transpose(got, (0, 3, 1, 2)), want)
+
+    def test_nhwc_maxpool_matches_nchw(self):
+        g_nchw = Graph()
+        x = g_nchw.input("x", f32[2, 3, 8, 8])
+        g_nchw.output(g_nchw.maxpool2d(x, kernel=2, stride=2), "y")
+        g_nhwc = Graph()
+        xh = g_nhwc.input("x", f32[2, 8, 8, 3])
+        g_nhwc.output(g_nhwc.maxpool2d(xh, kernel=2, stride=2, layout="nhwc"), "y")
+
+        data = _RNG.standard_normal((2, 3, 8, 8)).astype(np.float32)
+        backend = HipBackend()
+        want = backend.execute(g_nchw, {"x": data})["y"]
+        got = backend.execute(g_nhwc, {"x": np.transpose(data, (0, 2, 3, 1))})["y"]
+        np.testing.assert_array_equal(np.transpose(got, (0, 3, 1, 2)), want)
 
 
 if __name__ == "__main__":

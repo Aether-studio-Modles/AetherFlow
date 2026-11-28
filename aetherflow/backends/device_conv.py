@@ -46,6 +46,13 @@ class _ConvMixin:
         （见 ``_prepare_plan``）；只有权重来自常量节点的 conv 才有，其余
         情况下为 ``None``，权重变换照旧每次重算。
         """
+        layout = attrs.get("layout", "nchw")
+        if layout == "nhwc":
+            return self._conv2d_nhwc(args[0], args[1], args[2] if len(args) > 2 else None, attrs)
+        if layout != "nchw":
+            raise BackendCapabilityError(
+                f"conv2d 的 layout 只能是 'nchw' 或 'nhwc'，收到 {layout!r}"
+            )
         cp = self.cp
         x, weight = args[0], args[1]
         bias = args[2] if len(args) > 2 else None
@@ -210,6 +217,84 @@ class _ConvMixin:
         if bias is not None and not bias_fused:
             out = self._binary("add", [out, bias.reshape(1, o, 1, 1)])
         return out
+
+    def _conv2d_nhwc(self, x, weight, bias, attrs):
+        """NHWC conv2d（5.334）：只走分块直算，输入 ``(N,H,W,C)``。
+
+        NHWC 的收益来自"同一像素的通道连续"：分块核的内层沿输入通道走，
+        NCHW 下每步跳 ``H*W`` 个元素，NHWC 下是相邻地址。所以这里不需要新
+        算法，只需换寻址——内核描述在 ``lower/kernels/conv.py`` 里由
+        ``conv2d_tiled(layout="nhwc")`` 生成，累加顺序与 NCHW 版逐字相同。
+
+        覆盖面刻意收窄：分组卷积（shared staging 假设"每个输出通道看全部
+        输入通道"）、混合精度（累加器是 float）以及 im2col / 隐式 / Winograd
+        / cuDNN 都没有 NHWC 内核，显式指定时明确失败，不静默换布局或换实现。
+        ``auto`` 在这里等价于 ``tiled``。
+        """
+        cp = self.cp
+        if x.ndim != 4 or weight.ndim != 4:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 NHWC conv2d 要求 x/weight 都是秩 4，收到 {x.shape} 与 {weight.shape}"
+            )
+        groups = int(attrs.get("groups", 1))
+        if groups != 1:
+            raise BackendCapabilityError(
+                f"conv2d 的 NHWC 内核只支持 groups=1，收到 groups={groups}；"
+                "分组卷积请用 layout='nchw'"
+            )
+        if self.conv_impl not in ("auto", "tiled"):
+            raise BackendCapabilityError(
+                "conv2d 的 NHWC 内核只有分块直算（conv_impl='tiled' 或 'auto'），"
+                f"收到 conv_impl={self.conv_impl!r}；请改用 layout='nchw'"
+            )
+        x = self._contig(x)
+        weight = self._contig(weight)
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"conv2d 的 NHWC 内核只支持 float32，收到 {x.dtype}；请改用 layout='nchw'"
+            )
+        n, h, w, c = (int(v) for v in x.shape)
+        o, cw, kh, kw = (int(v) for v in weight.shape)
+        if cw != c:
+            raise BackendCapabilityError(
+                f"conv2d 的 NHWC 输入通道 {c} 与权重通道 {cw} 不一致"
+            )
+        sh, sw = _pair(attrs.get("stride", (1, 1)))
+        ph, pw = _pair(attrs.get("padding", (0, 0)))
+        dh, dw = _pair(attrs.get("dilation", (1, 1)))
+        ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+        wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+        if ho <= 0 or wo <= 0:
+            raise BackendCapabilityError(
+                f"conv2d 输出尺寸非法：输入 {h}x{w}、核 {kh}x{kw}、"
+                f"padding {(ph, pw)}、stride {(sh, sw)}、dilation {(dh, dw)}"
+            )
+        if bias is not None and tuple(bias.shape) != (o,):
+            raise BackendCapabilityError(f"conv2d 的 bias 必须是 ({o},)，收到 {bias.shape}")
+        if n * o * ho * wo == 0:
+            return cp.empty((n, ho, wo, o), dtype=x.dtype)
+        return self._conv2d_tiled(
+            x,
+            weight,
+            bias,
+            n=n,
+            c=c,
+            h=h,
+            w=w,
+            o=o,
+            kh=kh,
+            kw=kw,
+            ho=ho,
+            wo=wo,
+            sh=sh,
+            sw=sw,
+            ph=ph,
+            pw=pw,
+            dh=dh,
+            dw=dw,
+            k=c * kh * kw,
+            layout="nhwc",
+        )
 
     def _use_tiled_conv(self, *, n, o, k, kh, kw, ho, wo, **_ignored) -> bool:
         """是否走分块核。
@@ -714,7 +799,28 @@ class _ConvMixin:
         return out
 
     def _conv2d_tiled(
-        self, x, weight, bias, *, n, c, h, w, o, kh, kw, ho, wo, sh, sw, ph, pw, dh, dw, k
+        self,
+        x,
+        weight,
+        bias,
+        *,
+        n,
+        c,
+        h,
+        w,
+        o,
+        kh,
+        kw,
+        ho,
+        wo,
+        sh,
+        sw,
+        ph,
+        pw,
+        dh,
+        dw,
+        k,
+        layout="nchw",
     ):
         """分块直算：一个线程算 ROC 个输出通道，权重按输入通道流式 staging。
 
@@ -726,10 +832,14 @@ class _ConvMixin:
         三个旋钮（``tile_w`` / ``roc`` / ``cb``）都可以被调优覆盖，为 ``None``
         的项仍由计划推导。
 
+        ``layout="nhwc"`` 只换输出形状 ``(N,HO,WO,O)``、内核名与寻址（5.334），
+        线程铺法与 launch 参数不变。
+
         ``bias`` 可以传 ``None``：内核只用 ``has_bias`` 决定要不要读那个指针，
         所以这里传一个有效的已有指针占位即可，不需要额外分配。
         """
         cp = self.cp
+        nhwc = layout == "nhwc"
         tile_w, roc, cb = self._conv_tile, self._conv_roc, self._conv_cb
         # 三个旋钮都还是"自动"时才查配置库：调用方手动调过其中任意一项，
         # 说明正在做 A/B，此时再叠库里的值会分不清"这次改的到底起没起作用"。
@@ -744,6 +854,7 @@ class _ConvMixin:
                     padding=(ph, pw),
                     dilation=(dh, dw),
                     dtype=x.dtype,
+                    layout=layout,
                 ),
             )
             if cfg is not None:
@@ -761,11 +872,12 @@ class _ConvMixin:
             cb=cb,
         )
 
-        out = cp.empty((n, o, ho, wo), dtype=x.dtype)
+        out = cp.empty((n, ho, wo, o) if nhwc else (n, o, ho, wo), dtype=x.dtype)
+        name = "conv2d_tiled_nhwc" if nhwc else "conv2d_tiled"
         kernel = self._kernel(
-            ("conv2d_tiled", self._kind(x)),
-            lambda: self.codegen.render(self.codegen.conv2d_tiled_source(), x.dtype),
-            "conv2d_tiled",
+            (name, self._kind(x)),
+            lambda: self.codegen.render(self.codegen.conv2d_tiled_source(layout), x.dtype),
+            name,
         )
         bp = x if bias is None else self._contig(bias)
         kernel(
