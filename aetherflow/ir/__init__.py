@@ -17,6 +17,14 @@ from .control import (
     to_spec,
 )
 from .grad import GradCtx, backward
+from .loop import (
+    LoopIR,
+    LoopIRError,
+    LoopSplit,
+    loop_from_spec,
+    loop_to_spec,
+    optimize_loop,
+)
 from .second_order import hessian_vector_product
 from .graph import Graph, Node, Value
 from .liveness import ALIGNMENT, Footprint, MemoryBudget, plan_memory
@@ -101,6 +109,12 @@ __all__ = [
     "WhileLoop",
     "to_spec",
     "from_spec",
+    "LoopIR",
+    "LoopSplit",
+    "LoopIRError",
+    "loop_to_spec",
+    "loop_from_spec",
+    "optimize_loop",
     "Portability",
     "get_op",
     "register",
