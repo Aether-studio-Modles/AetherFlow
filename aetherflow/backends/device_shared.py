@@ -113,6 +113,12 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "dequantize_fp8_group",
         "linear_fp8_group",
         "linear_fp8a8_packed",
+        # 5.343：4 bit 打包 / 解包（逐元素位操作）与逐组非对称反量化；
+        # ``linear_u4_group`` 由反量化与既有 GEMM 组合。
+        "pack_int4",
+        "unpack_int4",
+        "dequantize_u4_group",
+        "linear_u4_group",
         "conv2d",
         "maxpool2d",
         "maxpool2d_indices",
@@ -210,6 +216,12 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "dequantize_fp8_group": frozenset({0}),
     "linear_fp8_group": frozenset({1}),
     "linear_fp8a8_packed": frozenset({0, 2}),
+    # 5.343：pack / unpack 的输入输出都是 i8 承载的 4 bit 值（0..15），
+    # 逐组反量化的 q 与线性层的权重同理；scale / zero_point 仍是 f32。
+    "pack_int4": frozenset({0}),
+    "unpack_int4": frozenset({0}),
+    "dequantize_u4_group": frozenset({0}),
+    "linear_u4_group": frozenset({1}),
     # 整数取模：两侧都是**整数数据**，不是下标。
     "mod": frozenset({0, 1}),
 }
@@ -349,6 +361,52 @@ extern "C" __global__ void af_dequantize_i8_group_zp(
   long long col = i - row * cols;
   long long si = (row / group) * cols + col;
   out[i] = (float)((int)q[i] - (int)zp[si]) * s[si];
+}
+"""
+
+# 4 bit（5.343）：值仍由 i8 字节承载（0..15），pack / unpack 只搬位、不做
+# 数值转换。位序与参考实现一致：低 4 位 → 偶数下标，高 4 位 → 奇数下标。
+_PACK_INT4_SRC = r"""
+extern "C" __global__ void af_pack_int4(
+    const signed char* __restrict__ q,
+    signed char* __restrict__ out,
+    long long n) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int lo = (int)(unsigned char)q[2 * i] & 0x0f;
+  int hi = (int)(unsigned char)q[2 * i + 1] & 0x0f;
+  out[i] = (signed char)(lo | (hi << 4));
+}
+"""
+
+_UNPACK_INT4_SRC = r"""
+extern "C" __global__ void af_unpack_int4(
+    const signed char* __restrict__ p,
+    signed char* __restrict__ out,
+    long long n) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int byte = (int)(unsigned char)p[i >> 1];
+  out[i] = (signed char)((i & 1) ? ((byte >> 4) & 0x0f) : (byte & 0x0f));
+}
+"""
+
+# 逐组非对称反量化：q 是 (K, N) 的 4 bit 值（i8 承载），zero_point 与 scale
+# 同形、都是 f32。减法留在 f32 里做——q 与 zp 都是精确整数，与参考实现的
+# ``float(q) - zp`` 顺序逐位一致；组大小由 ``K / scale.shape[0]`` 推出。
+_DEQUANTIZE_U4_GROUP_SRC = r"""
+extern "C" __global__ void af_dequantize_u4_group(
+    const signed char* __restrict__ q,
+    const float* __restrict__ s,
+    const float* __restrict__ zp,
+    float* __restrict__ out,
+    long long n, long long cols, long long group) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long row = i / cols;
+  long long col = i - row * cols;
+  long long si = (row / group) * cols + col;
+  out[i] = ((float)(int)q[i] - zp[si]) * s[si];
 }
 """
 

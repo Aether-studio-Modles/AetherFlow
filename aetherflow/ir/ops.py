@@ -2255,6 +2255,274 @@ register(
 )
 
 
+# --------------------------------------------------------------------------
+# int4 逐组量化（5.343）
+# --------------------------------------------------------------------------
+#
+# 4 bit 的承载方式与 fp8 一致：**值**用 i8 张量装（值域 0..15），**打包后的
+# 字节**也用 i8 装位模式。不新增 u4 dtype 的理由：IR 的 dtype 决定存储宽度与
+# 内核签名，加一个 0.5 字节类型会让所有既有内核都要多一条分支，而"4 bit
+# 打包"本质是存储形态（与 5.328 的 fp8 pack / unpack 同构），放在算子层更
+# 清楚。
+#
+# 语义是非对称逐组：``w ≈ (q - zp) * scale``，``q ∈ [0, 15]``。对称是
+# ``zp = 8`` 的特例，不做成两个算子：AWQ / GPTQ 的 4 bit 导出普遍逐组带
+# 零点，而对称在这里没有可复用的数值结构（缩放不是 2 的幂）。
+#
+# 这一版同样**不承诺算力**：``linear_u4_group`` 是"反量化成 f32 再 GEMM"，
+# 省的是权重占用（打包后 0.5 字节 / 权重）与读带宽，不是 int4 tensor core。
+
+_U4_MAX = 15
+
+
+def _check_u4_values(q: np.ndarray, what: str) -> None:
+    """4 bit 值域检查。越界值多半意味着把 i8 权重误喂给了 u4 算子。"""
+    lo = float(np.min(q))
+    hi = float(np.max(q))
+    if lo < 0.0 or hi > float(_U4_MAX):
+        raise ValueError(
+            f"{what} 的 4 bit 值必须在 [0, 15] 内，得到 [{lo}, {hi}]；"
+            "越界值通常意味着误用了 i8 量化权重"
+        )
+
+
+def _infer_pack_int4(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"pack_int4 只接受 1 个输入，得到 {len(inputs)}")
+    q = inputs[0]
+    if q.dtype != DType.I8:
+        raise TypeError(
+            f"pack_int4 的输入必须是 i8（承载 0..15 的 4 bit 值），"
+            f"得到 {q.dtype.value}"
+        )
+    if q.rank < 1:
+        raise ValueError(f"pack_int4 至少需要 1 维，得到秩 {q.rank}")
+    n = q.shape[-1]
+    if not isinstance(n, int):
+        raise ValueError(
+            f"pack_int4 的最后一维必须是静态的（打包要求偶数长度），得到 {q.shape}"
+        )
+    if n % 2 != 0:
+        raise ValueError(
+            f"pack_int4 要求最后一维为偶数，得到 {n}：每个字节要装两个 4 bit 值"
+        )
+    return TensorType(DType.I8, q.shape[:-1] + (n // 2,))
+
+
+def _ref_pack_int4(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    # 位序约定：偶数下标进低 4 位，奇数下标进高 4 位。与 unpack_int4 互为逆。
+    q = np.asarray(args[0], dtype=np.int8)
+    _check_u4_values(q, "pack_int4")
+    u = q.astype(np.uint8)
+    packed = np.ascontiguousarray(
+        (u[..., 0::2] | ((u[..., 1::2] << 4) & 0xF0)).astype(np.uint8)
+    )
+    return packed.view(np.int8)
+
+
+register(
+    Op(
+        name="pack_int4",
+        infer=_infer_pack_int4,
+        reference=_ref_pack_int4,
+        doc="把 i8 承载的 4 bit 值 (..., N) 打包成 (..., N/2) 个字节的 i8 位模式："
+        "偶数下标存低 4 位、奇数下标存高 4 位。N 必须为偶数；输入值域 0..15",
+    )
+)
+
+
+def _infer_unpack_int4(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"unpack_int4 只接受 1 个输入，得到 {len(inputs)}")
+    packed = inputs[0]
+    if packed.dtype != DType.I8:
+        raise TypeError(
+            f"unpack_int4 的输入必须是 i8 位模式，得到 {packed.dtype.value}"
+        )
+    if packed.rank < 1:
+        raise ValueError(f"unpack_int4 至少需要 1 维，得到秩 {packed.rank}")
+    n = packed.shape[-1]
+    if not isinstance(n, int):
+        raise ValueError(
+            f"unpack_int4 的最后一维必须是静态的，得到 {packed.shape}"
+        )
+    return TensorType(DType.I8, packed.shape[:-1] + (2 * n,))
+
+
+def _ref_unpack_int4(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    p = np.asarray(args[0], dtype=np.int8).astype(np.uint8)
+    out = np.empty(p.shape[:-1] + (2 * p.shape[-1],), dtype=np.uint8)
+    out[..., 0::2] = p & 0x0F
+    out[..., 1::2] = (p >> 4) & 0x0F
+    return out.view(np.int8)
+
+
+register(
+    Op(
+        name="unpack_int4",
+        infer=_infer_unpack_int4,
+        reference=_ref_unpack_int4,
+        doc="把 i8 位模式 (..., N/2) 解成 i8 承载的 4 bit 值 (..., N)："
+        "低 4 位回偶数下标、高 4 位回奇数下标，输出值域 0..15",
+    )
+)
+
+
+def _infer_dequantize_u4_group(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 3:
+        raise ValueError(
+            "dequantize_u4_group 需要 (q, scale, zero_point) 三个输入，"
+            f"得到 {len(inputs)}"
+        )
+    q, scale, zp = inputs
+    if q.dtype != DType.I8:
+        raise TypeError(
+            f"dequantize_u4_group 的 q 必须是 i8（承载 0..15），得到 {q.dtype.value}"
+        )
+    if q.rank != 2:
+        raise ValueError(
+            f"dequantize_u4_group 的 q 必须是二维 (K, N)，得到秩 {q.rank}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"dequantize_u4_group 的 scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+    if zp.dtype != DType.F32:
+        raise TypeError(
+            f"dequantize_u4_group 的 zero_point 必须是 f32（4 bit 零点 0..15），"
+            f"得到 {zp.dtype.value}"
+        )
+    _check_group_params(q, scale, "dequantize_u4_group", "scale")
+    if tuple(zp.shape) != tuple(scale.shape):
+        raise ValueError(
+            f"dequantize_u4_group 的 zero_point 形状 {zp.shape} "
+            f"必须与 scale {scale.shape} 相同（同一组共用一对参数）"
+        )
+    return TensorType(DType.F32, q.shape)
+
+
+def _ref_dequantize_u4_group(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    q, scale, zp = args
+    _check_u4_values(q, "dequantize_u4_group")
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"dequantize_u4_group 的 scale 必须严格为正，"
+            f"得到最小值 {float(np.min(scale))}"
+        )
+    if float(np.min(zp)) < 0.0 or float(np.max(zp)) > float(_U4_MAX):
+        raise ValueError(
+            f"dequantize_u4_group 的 zero_point 必须在 [0, 15] 内，"
+            f"得到 [{float(np.min(zp))}, {float(np.max(zp))}]"
+        )
+    g = q.shape[0] // scale.shape[0]
+    # 减法留在 f32 里做：q 只有 0..15，与 zp 都是精确可表示的整数，
+    # 因此与设备内核 ``(float)q - zp`` 的顺序逐位一致。
+    diff = q.astype(np.float32) - np.repeat(zp, g, axis=0)
+    return diff * np.repeat(scale, g, axis=0)
+
+
+register(
+    Op(
+        name="dequantize_u4_group",
+        infer=_infer_dequantize_u4_group,
+        reference=_ref_dequantize_u4_group,
+        doc="逐组非对称 4 bit 反量化：(q - zero_point) * scale，q (K, N) 值域 "
+        "0..15，scale / zero_point 形状都是 (K/G, N)，组内共用。"
+        "对称 4 bit 是 zero_point=8 的特例；组大小由形状推出，不另设 attr",
+    )
+)
+
+
+def _infer_linear_u4_group(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) not in (4, 5):
+        raise ValueError(
+            "linear_u4_group 需要 (x, qweight, scale, zero_point[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    x, qweight, scale, zp = inputs[0], inputs[1], inputs[2], inputs[3]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_u4_group 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加，混精度入口不在这一版"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_u4_group 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype != DType.I8:
+        raise TypeError(
+            f"linear_u4_group 的权重必须是 i8（承载 0..15），"
+            f"得到 {qweight.dtype.value}"
+        )
+    if qweight.rank != 2:
+        raise ValueError(
+            f"linear_u4_group 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(f"linear_u4_group 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    if zp.dtype != DType.F32:
+        raise TypeError(
+            f"linear_u4_group 的 zero_point 必须是 f32，得到 {zp.dtype.value}"
+        )
+    _check_group_params(qweight, scale, "linear_u4_group", "scale")
+    if tuple(zp.shape) != tuple(scale.shape):
+        raise ValueError(
+            f"linear_u4_group 的 zero_point 形状 {zp.shape} "
+            f"必须与 scale {scale.shape} 相同（同一组共用一对参数）"
+        )
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_u4_group 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_u4_group 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    _check_bias(inputs, 4, n, "linear_u4_group")
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_u4_group(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, qweight, scale, zp = args[0], args[1], args[2], args[3]
+    _check_u4_values(qweight, "linear_u4_group")
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"linear_u4_group 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    if float(np.min(zp)) < 0.0 or float(np.max(zp)) > float(_U4_MAX):
+        raise ValueError(
+            f"linear_u4_group 的 zero_point 必须在 [0, 15] 内，"
+            f"得到 [{float(np.min(zp))}, {float(np.max(zp))}]"
+        )
+    g = qweight.shape[0] // scale.shape[0]
+    w = (qweight.astype(np.float32) - np.repeat(zp, g, axis=0)) * np.repeat(
+        scale, g, axis=0
+    )
+    out = np.matmul(x, w)
+    if len(args) > 4:
+        out = out + args[4]
+    return out
+
+
+register(
+    Op(
+        name="linear_u4_group",
+        infer=_infer_linear_u4_group,
+        reference=_ref_linear_u4_group,
+        doc="weight-only 4 bit 线性层，权重按组共用 (scale, zero_point)："
+        "(..., K) x i8(K, N) -> (..., N)，语义等于 "
+        "``matmul(x, (qweight - zp) * scale) [+ bias]``，参数形状 (K/G, N)。"
+        "与 ``linear_i8_group`` 的差别只有权重位宽与是否需要零点；"
+        "反量化后仍是 f32 GEMM，不承诺 int4 tensor core",
+    )
+)
+
+
 def _infer_linear_i8a8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (4, 5):
         raise ValueError(

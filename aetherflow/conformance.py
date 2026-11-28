@@ -796,6 +796,94 @@ def _linear_fp8a8_packed(
     return build
 
 
+def _pack_int4_case():
+    """pack_int4：位序逐字节对拍。
+
+    载荷覆盖 0 / 15 两个端点与"低半字节大、高半字节小"的组合，任何一端
+    写错位序都会得到不同的字节。
+    """
+    values = [0, 15, 1, 14, 15, 0, 7, 8, 3, 12, 5, 10]
+
+    def build(rng):
+        g = Graph("pack_int4")
+        q = g.input("q", i8[(3, 4)])
+        g.output(g.add_node("pack_int4", [q]), "p")
+        return g, {"q": np.array(values, dtype=np.int8).reshape(3, 4)}
+
+    return build
+
+
+def _unpack_int4_case():
+    """unpack_int4：直接给打包字节。
+
+    0x00 / 0xFF / 0x0F / 0xF0 覆盖两半字节不对称，0x5A / 0xA5 两端都非零
+    且高 4 位 >= 0x8——此时 i8 是负数，解码必须先转无符号。
+    """
+    codes = [0x00, 0xFF, 0x0F, 0xF0, 0x5A, 0xA5]
+
+    def build(rng):
+        g = Graph("unpack_int4")
+        p = g.input("p", i8[(2, 3)])
+        g.output(g.add_node("unpack_int4", [p]), "q")
+        return g, {"p": np.array(codes, dtype=np.uint8).view(np.int8).reshape(2, 3)}
+
+    return build
+
+
+def _dequantize_u4_group(shape: tuple = (8, 6), groups: int = 4):
+    """逐组非对称 4 bit 反量化：q 值域 0..15，zero_point 是 f32 的整数。
+
+    组数取在 1 与 K 之间，组内每行共用一对参数；q 取满 0..15 才能同时走到
+    "等于 zp"（差为 0）与两端饱和这两类值。
+    """
+
+    def build(rng):
+        k, n = shape
+        if k % groups != 0:
+            raise ValueError(f"逐组形态要求 K={k} 能被组数 {groups} 整除")
+        g = Graph("dequantize_u4_group")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(groups, n)])
+        zp = g.input("zp", f32[(groups, n)])
+        g.output(g.add_node("dequantize_u4_group", [q, s, zp]), "w")
+        scale = (np.abs(_f32(rng, (groups, n), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {
+            "q": rng.integers(0, 16, size=shape, dtype=np.int8),
+            "s": scale,
+            "zp": rng.integers(0, 16, size=(groups, n)).astype(np.float32),
+        }
+
+    return build
+
+
+def _linear_u4_group(
+    x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6), groups: int = 4
+):
+    """逐组 weight-only 4 bit 线性层：整数 4 bit 权重 + 逐组 (scale, zp)。"""
+
+    def build(rng):
+        k, n = w_shape
+        if k % groups != 0:
+            raise ValueError(f"逐组形态要求 K={k} 能被组数 {groups} 整除")
+        g = Graph("linear_u4_group")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(groups, n)])
+        zp = g.input("zp", f32[(groups, n)])
+        b = g.input("b", f32[(n,)])
+        g.output(g.add_node("linear_u4_group", [x, q, s, zp, b]), "y")
+        scale = (np.abs(_f32(rng, (groups, n), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": rng.integers(0, 16, size=w_shape, dtype=np.int8),
+            "s": scale,
+            "zp": rng.integers(0, 16, size=(groups, n)).astype(np.float32),
+            "b": _f32(rng, (n,), scale=0.1),
+        }
+
+    return build
+
+
 def _softmax(axis: int = -1, scaled: bool = False, shape: tuple = (6, 11)):
     def build(rng):
         g = Graph("softmax")
@@ -1994,6 +2082,21 @@ def default_cases() -> List[Case]:
         _case("linear_fp8a8_packed_e5m2_rank2",
               _linear_fp8a8_packed("e5m2", x_shape=(4, 8)),
               note="秩 2 激活 + e5m2 位模式：与 e4m3 共用同一条内核"),
+        # int4 逐组量化（5.343）
+        _case("pack_int4", _pack_int4_case(),
+              note="4 bit 值 -> 一个字节装两个：低 4 位是偶数下标、高 4 位是奇数下标；"
+                   "端点 0 / 15 与两侧不对称的组合逐字节对拍位模式"),
+        _case("unpack_int4", _unpack_int4_case(),
+              note="打包字节 -> 4 bit 值：0x5A / 0xA5 的高 4 位 >= 0x8，i8 是负数，"
+                   "解码必须先转无符号再取半字节"),
+        _case("dequantize_u4_group", _dequantize_u4_group(),
+              note="逐组非对称反量化：K=8 分 4 组，(q - zp) * scale 组内共用；"
+                   "q 取满 0..15，同时走到「等于 zp」与两端饱和"),
+        _case("linear_u4_group_bias", _linear_u4_group(),
+              note="weight-only 4 bit：反量化后仍是 f32 GEMM；与 linear_i8_group "
+                   "的差别只有位宽与 zero_point，不是 int4 tensor core"),
+        _case("linear_u4_group_rank2", _linear_u4_group(x_shape=(4, 8), groups=2),
+              note="秩 2 激活 + 2 组：组数由形状推出，与秩 3 共用同一条实现"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

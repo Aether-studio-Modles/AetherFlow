@@ -46,6 +46,7 @@ from aetherflow.models.quantize import (
     quantize_weight,
     quantize_weight_asymmetric,
     quantize_weight_fp8,
+    quantize_weight_int4_group,
     quantize_weight_fp8_group,
     quantize_weight_group,
 )
@@ -2466,6 +2467,286 @@ class TestFP8GroupAndPackedActivation(unittest.TestCase):
         self.assertEqual(_INDEX_ARGS["linear_fp8_group"], frozenset({1}))
 
 
+class TestInt4GroupQuantization(unittest.TestCase):
+    """5.343：4 bit 逐组非对称量化（AWQ / GPTQ 的 4 bit 形态）。
+
+    钉住四件事：
+
+    1. pack / unpack 的**位序**：偶数下标进低 4 位、奇数下标进高 4 位，
+       且 i8 位模式为负时解码必须先转无符号（0x5A / 0xA5 那组）；
+    2. 逐组反量化与线性层是手推公式 ``(q - zp) * scale``，组边界不能串用
+       邻组参数；
+    3. 主机 helper 的误差界 ``scale / 2``、全零组退化（scale=1, zp=0）与
+       拒绝面（形状 / 类型 / NaN / 不整除 K）;
+    4. 图能构图 → 执行 → JSON 往返 → 再执行，结果逐位相同。
+    """
+
+    def _pack_graph(self, shape):
+        g = Graph("pack_int4")
+        q = g.input("q", i8[shape])
+        g.output(g.add_node("pack_int4", [q]), "p")
+        return g
+
+    def _unpack_graph(self, shape):
+        g = Graph("unpack_int4")
+        p = g.input("p", i8[shape])
+        g.output(g.add_node("unpack_int4", [p]), "q")
+        return g
+
+    def _dequantize_graph(self, shape, groups):
+        g = Graph("dequantize_u4_group")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(groups, shape[-1])])
+        zp = g.input("zp", f32[(groups, shape[-1])])
+        g.output(g.add_node("dequantize_u4_group", [q, s, zp]), "w")
+        return g
+
+    def _linear_graph(self, x_shape, w_shape, groups, bias=True):
+        g = Graph("linear_u4_group")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(groups, w_shape[-1])])
+        zp = g.input("zp", f32[(groups, w_shape[-1])])
+        args = [x, q, s, zp]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_u4_group", args), "y")
+        return g
+
+    def test_pack_bit_order_and_roundtrip(self):
+        q = np.array(
+            [[0, 15, 1, 14], [15, 0, 7, 8], [3, 12, 5, 10]], dtype=np.int8
+        )
+        packed = _run(self._pack_graph((3, 4)), {"q": q})["p"]
+        # 手推位模式：低 4 位是偶数下标，高 4 位是奇数下标。
+        want = np.array(
+            [[0x00 | (15 << 4), 1 | (14 << 4)], [15 | (0 << 4), 7 | (8 << 4)],
+             [3 | (12 << 4), 5 | (10 << 4)]],
+            dtype=np.uint8,
+        ).view(np.int8)
+        np.testing.assert_array_equal(packed, want)
+        # 高 4 位 >= 0x8 时字节是负的 i8；解码要先转无符号再取半字节。
+        np.testing.assert_array_equal(
+            _run(self._unpack_graph((3, 2)), {"p": packed})["q"], q
+        )
+
+    def test_unpack_handles_negative_bytes(self):
+        codes = np.array([0x00, 0xFF, 0x0F, 0xF0, 0x5A, 0xA5], dtype=np.uint8)
+        got = _run(
+            self._unpack_graph((2, 3)), {"p": codes.view(np.int8).reshape(2, 3)}
+        )["q"]
+        want = np.array(
+            [[0, 0, 15, 15, 15, 0], [0, 15, 10, 5, 5, 10]], dtype=np.int8
+        )
+        np.testing.assert_array_equal(got, want)
+
+    def test_dequantize_group_matches_manual(self):
+        rng = np.random.default_rng(3430)
+        q = rng.integers(0, 16, size=(8, 3), dtype=np.int8)
+        scale = np.array([[0.5, 0.25, 0.125], [1.0, 0.75, 0.0625]], np.float32)
+        zp = np.array([[8, 0, 15], [3, 8, 11]], np.float32)
+        got = _run(
+            self._dequantize_graph((8, 3), 2), {"q": q, "s": scale, "zp": zp}
+        )["w"]
+        want = (q.astype(np.float32) - np.repeat(zp, 4, axis=0)) * np.repeat(
+            scale, 4, axis=0
+        )
+        np.testing.assert_array_equal(got, want)
+        # 组边界：前 4 行只减 / 乘第 0 组，后 4 行只减 / 乘第 1 组。
+        np.testing.assert_array_equal(got[:4], (q[:4].astype(np.float32) - zp[0]) * scale[0])
+        np.testing.assert_array_equal(got[4:], (q[4:].astype(np.float32) - zp[1]) * scale[1])
+
+    def test_linear_matches_dequantized_matmul(self):
+        rng = np.random.default_rng(3431)
+        x_shape, w_shape, groups = (2, 3, 8), (8, 6), 4
+        x = rng.standard_normal(x_shape).astype(np.float32)
+        q = rng.integers(0, 16, size=w_shape, dtype=np.int8)
+        scale = (np.abs(rng.standard_normal((groups, 6))).astype(np.float32) * 0.5 + 0.125)
+        zp = rng.integers(0, 16, size=(groups, 6)).astype(np.float32)
+        b = rng.standard_normal(6).astype(np.float32)
+        got = _run(
+            self._linear_graph(x_shape, w_shape, groups),
+            {"x": x, "q": q, "s": scale, "zp": zp, "b": b},
+        )["y"]
+        w = (q.astype(np.float32) - np.repeat(zp, 2, axis=0)) * np.repeat(scale, 2, axis=0)
+        np.testing.assert_array_equal(got, np.matmul(x, w) + b)
+
+    def test_rejects_bad_forms(self):
+        with self.subTest(case="pack_odd_last_dim"):
+            with self.assertRaises(ValueError):
+                self._pack_graph((2, 3))
+        with self.subTest(case="pack_symbolic_last_dim"):
+            g = Graph("pack_int4")
+            q = g.input("q", i8[2, "N"])
+            with self.assertRaises(ValueError):
+                g.add_node("pack_int4", [q])
+        with self.subTest(case="pack_not_i8"):
+            g = Graph("pack_int4")
+            q = g.input("q", f32[2, 4])
+            with self.assertRaises(TypeError):
+                g.add_node("pack_int4", [q])
+        with self.subTest(case="unpack_not_i8"):
+            g = Graph("unpack_int4")
+            p = g.input("p", f32[2, 2])
+            with self.assertRaises(TypeError):
+                g.add_node("unpack_int4", [p])
+        with self.subTest(case="group_does_not_divide_k"):
+            with self.assertRaises(ValueError):
+                self._dequantize_graph((8, 3), 3)
+        with self.subTest(case="zero_point_shape_mismatch"):
+            g = Graph("dequantize_u4_group")
+            q = g.input("q", i8[8, 3])
+            s = g.input("s", f32[2, 3])
+            zp = g.input("zp", f32[3])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_u4_group", [q, s, zp])
+        with self.subTest(case="linear_x_not_f32"):
+            g = Graph("linear_u4_group")
+            x = g.input("x", f16[2, 8])
+            q = g.input("q", i8[8, 3])
+            s = g.input("s", f32[2, 3])
+            zp = g.input("zp", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_u4_group", [x, q, s, zp])
+        with self.subTest(case="linear_weight_not_i8"):
+            g = Graph("linear_u4_group")
+            x = g.input("x", f32[2, 8])
+            q = g.input("q", f32[8, 3])
+            s = g.input("s", f32[2, 3])
+            zp = g.input("zp", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_u4_group", [x, q, s, zp])
+
+    def test_rejects_bad_values(self):
+        rng = np.random.default_rng(3432)
+        q = rng.integers(0, 16, size=(8, 3), dtype=np.int8)
+        s = np.ones((2, 3), np.float32)
+        zp = np.full((2, 3), 8.0, np.float32)
+        with self.subTest(case="non_positive_scale"):
+            for bad in (0.0, -0.5):
+                with self.assertRaises(ValueError):
+                    _run(
+                        self._dequantize_graph((8, 3), 2),
+                        {"q": q, "s": np.full((2, 3), bad, np.float32), "zp": zp},
+                    )
+        with self.subTest(case="zero_point_out_of_range"):
+            for bad in (-1.0, 16.0):
+                with self.assertRaises(ValueError):
+                    _run(
+                        self._dequantize_graph((8, 3), 2),
+                        {"q": q, "s": s, "zp": np.full((2, 3), bad, np.float32)},
+                    )
+        with self.subTest(case="q_out_of_4bit_range"):
+            bad_q = q.copy()
+            bad_q[0, 0] = 16
+            with self.assertRaises(ValueError):
+                _run(self._dequantize_graph((8, 3), 2), {"q": bad_q, "s": s, "zp": zp})
+
+    def test_helper_error_bound_and_degenerate_groups(self):
+        rng = np.random.default_rng(3433)
+        w = rng.standard_normal((8, 6)).astype(np.float32)
+        q, scale, zp = quantize_weight_int4_group(w, 4)
+        self.assertEqual(q.dtype, np.int8)
+        self.assertEqual((q.shape, scale.shape, zp.shape), ((8, 6), (2, 6), (2, 6)))
+        self.assertTrue(int(q.min()) >= 0 and int(q.max()) <= 15)
+        self.assertTrue(float(zp.min()) >= 0.0 and float(zp.max()) <= 15.0)
+        restored = (q.astype(np.float32) - np.repeat(zp, 4, axis=0)) * np.repeat(
+            scale, 4, axis=0
+        )
+        self.assertLessEqual(
+            float(np.max(np.abs(restored - w) - np.repeat(scale / 2.0, 4, axis=0))),
+            1e-6,
+        )
+        # 全零组退化成 scale=1、zp=0：零必须能被精确表示，且不触发非正 scale。
+        zeros = np.zeros((8, 3), np.float32)
+        zq, zs, zz = quantize_weight_int4_group(zeros, 4)
+        np.testing.assert_array_equal(zq, np.zeros((8, 3), np.int8))
+        np.testing.assert_array_equal(zs, np.ones((2, 3), np.float32))
+        np.testing.assert_array_equal(zz, np.zeros((2, 3), np.float32))
+        # 组内常数（非零）：扩展值域到 0 之后端点恰好落在格点上，误差为 0。
+        const = np.full((8, 1), 0.5, np.float32)
+        cq, cs, cz = quantize_weight_int4_group(const, 4)
+        np.testing.assert_array_equal(
+            (cq.astype(np.float32) - np.repeat(cz, 4, axis=0)) * np.repeat(cs, 4, axis=0),
+            const,
+        )
+
+    def test_helper_rejects(self):
+        w = np.ones((8, 3), np.float32)
+        for bad in (0, -4):
+            with self.subTest(group_size=bad):
+                with self.assertRaises(ValueError):
+                    quantize_weight_int4_group(w, bad)
+        with self.subTest(case="does_not_divide_k"):
+            with self.assertRaises(ValueError):
+                quantize_weight_int4_group(w, 3)
+        with self.subTest(case="not_two_dim"):
+            with self.assertRaises(ValueError):
+                quantize_weight_int4_group(np.ones((8,), np.float32), 4)
+        with self.subTest(case="not_float"):
+            with self.assertRaises(TypeError):
+                quantize_weight_int4_group(np.ones((8, 3), np.int32), 4)
+        with self.subTest(case="nan"):
+            bad = np.ones((8, 3), np.float32)
+            bad[0, 0] = np.nan
+            with self.assertRaises(ValueError):
+                quantize_weight_int4_group(bad, 4)
+
+    def test_graph_survives_json_roundtrip(self):
+        rng = np.random.default_rng(3434)
+        q = rng.integers(0, 16, size=(8, 3), dtype=np.int8)
+        feed = {
+            "q": q,
+            "q4": (np.arange(24, dtype=np.int8) % 16).reshape(6, 4),
+            "p": np.array([[0x5A, 0xA5]], np.uint8).view(np.int8),
+            "s": np.array([[0.5, 0.25, 0.125], [1.0, 0.75, 0.0625]], np.float32),
+            "zp": np.array([[8, 0, 15], [3, 8, 11]], np.float32),
+            "x": rng.standard_normal((2, 8)).astype(np.float32),
+            "b": np.zeros(3, np.float32),
+        }
+        graphs = {
+            "pack_int4": (self._pack_graph((6, 4)), ["q4"], "p"),
+            "unpack_int4": (self._unpack_graph((1, 2)), ["p"], "q"),
+            "dequantize_u4_group": (
+                self._dequantize_graph((8, 3), 2), ["q", "s", "zp"], "w"
+            ),
+            "linear_u4_group": (
+                self._linear_graph((2, 8), (8, 3), 2),
+                ["x", "q", "s", "zp", "b"],
+                "y",
+            ),
+        }
+        for name, (g, keys, out_key) in graphs.items():
+            with self.subTest(op=name):
+                # pack 图的输入名固定是 q，这里用 q4 的载荷喂它。
+                sub = {("q" if k == "q4" else k): feed[k] for k in keys}
+                again = loads(dumps(g))
+                np.testing.assert_array_equal(
+                    _run(g, sub)[out_key], _run(again, sub)[out_key]
+                )
+
+    def test_device_kernels_and_tables_declared(self):
+        from aetherflow.backends.device_shared import (
+            GPU_OPS,
+            _DEQUANTIZE_U4_GROUP_SRC,
+            _INDEX_ARGS,
+            _PACK_INT4_SRC,
+            _UNPACK_INT4_SRC,
+        )
+
+        self.assertIn("af_pack_int4", _PACK_INT4_SRC)
+        self.assertIn("af_unpack_int4", _UNPACK_INT4_SRC)
+        self.assertIn("af_dequantize_u4_group", _DEQUANTIZE_U4_GROUP_SRC)
+        self.assertIn("0x0f", _PACK_INT4_SRC)
+        self.assertIn("0x0f", _UNPACK_INT4_SRC)
+        for name in ("pack_int4", "unpack_int4", "dequantize_u4_group", "linear_u4_group"):
+            self.assertIn(name, GPU_OPS)
+        self.assertEqual(_INDEX_ARGS["pack_int4"], frozenset({0}))
+        self.assertEqual(_INDEX_ARGS["unpack_int4"], frozenset({0}))
+        self.assertEqual(_INDEX_ARGS["dequantize_u4_group"], frozenset({0}))
+        self.assertEqual(_INDEX_ARGS["linear_u4_group"], frozenset({1}))
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
@@ -2497,6 +2778,11 @@ class TestConformanceCases(unittest.TestCase):
             "linear_fp8_group_e5m2_rank2",
             "linear_fp8a8_packed_e4m3_bias",
             "linear_fp8a8_packed_e5m2_rank2",
+            "pack_int4",
+            "unpack_int4",
+            "dequantize_u4_group",
+            "linear_u4_group_bias",
+            "linear_u4_group_rank2",
         }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)

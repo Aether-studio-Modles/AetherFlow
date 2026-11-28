@@ -10,15 +10,18 @@ from .device_shared import (
     _DEQUANTIZE_I8_GROUP_ZP_SRC,
     _DEQUANTIZE_I8_SRC,
     _DEQUANTIZE_I8_ZP_SRC,
+    _DEQUANTIZE_U4_GROUP_SRC,
     _LINEAR_FP8A8_PACKED_SRC,
     _LINEAR_FP8_PACKED_SRC,
     _LINEAR_I8A8_DP4A_SRC,
     _LINEAR_I8A8_SRC,
     _LINEAR_I8A8_ZP_SRC,
     _PACK_FP8_SRC,
+    _PACK_INT4_SRC,
     _QUANTIZE_I8_SRC,
     _QUANTIZE_I8_ZP_SRC,
     _UNPACK_FP8_SRC,
+    _UNPACK_INT4_SRC,
 )
 
 
@@ -471,6 +474,154 @@ class _LinearMixin:
         out = self._op_matmul(node, [x, weight], {})
         if len(args) > 3:
             out = self._binary("add", [out, args[3]])
+        return out
+
+    def _op_pack_int4(self, node, args, attrs):
+        """i8 承载的 4 bit 值 (..., N) -> (..., N/2) 个打包字节。
+
+        只搬位、不做数值转换：偶数下标进低 4 位、奇数下标进高 4 位。每个线程
+        产出一个字节，线程数取输出元素数（= 输入元素数 / 2）。
+        """
+        cp = self.cp
+        q = args[0]
+        if q.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 pack_int4 要求输入是 i8（承载 0..15），收到 {q.dtype}"
+            )
+        if int(q.shape[-1]) % 2 != 0:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 pack_int4 要求最后一维为偶数，收到 {q.shape}"
+            )
+        qq = self._contig(q)
+        out = cp.empty(qq.shape[:-1] + (int(qq.shape[-1]) // 2,), np.int8)
+        n = int(out.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(("pack_int4",), _PACK_INT4_SRC, "af_pack_int4")
+        block, grid = self._grid("pack_int4", n)
+        kernel((grid,), (block,), (qq, out, np.int64(n)))
+        return out
+
+    def _op_unpack_int4(self, node, args, attrs):
+        """(..., N/2) 个打包字节 -> i8 承载的 4 bit 值 (..., N)。"""
+        cp = self.cp
+        p = args[0]
+        if p.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 unpack_int4 要求输入是 i8 位模式，收到 {p.dtype}"
+            )
+        pp = self._contig(p)
+        out = cp.empty(pp.shape[:-1] + (2 * int(pp.shape[-1]),), np.int8)
+        n = int(out.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(("unpack_int4",), _UNPACK_INT4_SRC, "af_unpack_int4")
+        block, grid = self._grid("unpack_int4", n)
+        kernel((grid,), (block,), (pp, out, np.int64(n)))
+        return out
+
+    def _op_dequantize_u4_group(self, node, args, attrs):
+        """逐组非对称 4 bit 反量化：``(q - zero_point) * scale``。
+
+        q 是 4 bit 值（i8 承载，0..15），zero_point / scale 同形、都是 f32。
+        减法留在 f32 里做：q 与 zp 都是精确整数，与参考实现的
+        ``float(q) - zp`` 顺序逐位一致。非正 scale 与越界 zero_point 读回
+        主机判定，与 fp8 逐组反量化同一口径。
+        """
+        cp = self.cp
+        q, scale, zp = args
+        if q.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_u4_group 要求 q 是 i8（承载 0..15），"
+                f"收到 {q.dtype}"
+            )
+        if scale.dtype != cp.float32 or zp.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_u4_group 要求 scale 与 zero_point "
+                f"都是 f32，收到 {scale.dtype} 与 {zp.dtype}"
+            )
+        if tuple(zp.shape) != tuple(scale.shape):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_u4_group 的 zero_point 必须与 scale "
+                f"同形，收到 {zp.shape} 与 {scale.shape}"
+            )
+        cols, group = self._group_shape("dequantize_u4_group", q, scale)
+        if float(np.min(self.to_host(scale))) <= 0.0:
+            raise BackendCapabilityError(
+                "dequantize_u4_group 的 scale 必须严格为正；"
+                "非正 scale 的反量化为未定义"
+            )
+        zp_host = self.to_host(zp)
+        if float(np.min(zp_host)) < 0.0 or float(np.max(zp_host)) > 15.0:
+            raise BackendCapabilityError(
+                f"dequantize_u4_group 的 zero_point 必须在 [0, 15] 内，收到 "
+                f"[{float(np.min(zp_host))}, {float(np.max(zp_host))}]"
+            )
+        qq = self._contig(q)
+        ss = self._contig(scale)
+        zz = self._contig(zp)
+        out = cp.empty(qq.shape, np.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("dequantize_u4_group",), _DEQUANTIZE_U4_GROUP_SRC, "af_dequantize_u4_group"
+        )
+        block, grid = self._grid("dequantize_u4_group", n)
+        kernel(
+            (grid,),
+            (block,),
+            (qq, ss, zz, out, np.int64(n), np.int64(cols), np.int64(group)),
+        )
+        return out
+
+    def _op_linear_u4_group(self, node, args, attrs):
+        """逐组 weight-only 4 bit 线性层：按组反量化权重后走既有 f32 GEMM。
+
+        与 ``linear_i8_group`` 同构，只多了 zero_point、权重只有 16 个格点。
+        反量化会物化一份 f32 权重副本，收益是"权重驻留 0.5 字节 + 更细的
+        量化粒度"，**不是**算力：int4 tensor core 不在本版声称范围内。
+        """
+        cp = self.cp
+        x, qweight, scale, zp = args[0], args[1], args[2], args[3]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_u4_group 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if qweight.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_u4_group 要求权重是 i8（承载 0..15），"
+                f"收到 {qweight.dtype}"
+            )
+        if scale.dtype != cp.float32 or zp.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_u4_group 要求 scale 与 zero_point "
+                f"都是 f32，收到 {scale.dtype} 与 {zp.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2 or scale.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_u4_group 要求 x 秩 >= 2、权重秩 2、"
+                f"scale 秩 2，收到 {x.shape} / {qweight.shape} / {scale.shape}"
+            )
+        if int(qweight.shape[0]) != int(x.shape[-1]):
+            raise BackendCapabilityError(
+                f"linear_u4_group 的内维不匹配：{x.shape} @ {qweight.shape}"
+            )
+        if tuple(zp.shape) != tuple(scale.shape):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_u4_group 的 zero_point 必须与 scale 同形，"
+                f"收到 {zp.shape} 与 {scale.shape}"
+            )
+        weight = self._op_dequantize_u4_group(node, [qweight, scale, zp], attrs)
+        out = self._op_matmul(node, [x, weight], {})
+        if len(args) > 4:
+            bias = args[4]
+            if bias.dtype != cp.float32 or int(bias.size) != int(qweight.shape[-1]):
+                raise BackendCapabilityError(
+                    f"linear_u4_group 的 bias 必须是长度 {int(qweight.shape[-1])} 的 f32，"
+                    f"收到 {bias.dtype} {bias.shape}"
+                )
+            out = self._binary("add", [out, bias])
         return out
 
     def _op_linear_i8a8(self, node, args, attrs):

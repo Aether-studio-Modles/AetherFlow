@@ -69,6 +69,7 @@ __all__ = [
     "build_int8_linear_zp",
     "build_int8a8_linear_zp",
     "quantize_weight_group",
+    "quantize_weight_int4_group",
     "build_int8_group_linear",
     "build_int8a8_linear_qat",
     "build_int8a8_linear_dynamic",
@@ -420,6 +421,53 @@ def quantize_weight_group(
     # (K/G, 1, N) 与 (K/G, G, N) 广播：组内共用同一份 scale。
     q = get_op("quantize_i8").reference([grouped, scale[:, None, :]], {})
     return q.reshape(k, n), scale
+
+
+def quantize_weight_int4_group(
+    weight: np.ndarray, group_size: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """把 ``(K, N)`` 的 f32 权重按组量化成 **4 bit**（AWQ / GPTQ 的 4 bit 形态）。
+
+    返回 ``(q, scale, zero_point)``：``q`` 与权重同形、值域 ``0..15``（仍由
+    ``i8`` 承载，可直接交给 ``pack_int4`` 压成一半存储）；``scale`` /
+    ``zero_point`` 都是 ``(K // group_size, N)``、按组共用。
+
+    口径与 ``dequantize_u4_group`` 一致：``w ≈ (q - zp) * scale``。组内先取
+    min/max 并**扩到包含 0**（理由同 :func:`_asymmetric_params`：4 bit 的零点
+    必须落在 ``[0, 15]``，全正的组若不舍入到 0 附近会让负端格子永远用不上），
+    再令 ``scale = (hi - lo) / 15``、``zp = clip(rint(-lo / scale), 0, 15)``。
+    全零组给 ``scale = 1, zp = 0``：零在任意 scale 下都量化为 zp，但
+    ``scale = 0`` 会触发"非正 scale"拒绝。
+
+    舍入用 RNE（``np.rint``，与其它量化入口同一口径），非饱和点的误差不超过
+    ``scale / 2``；两端点落在 ``lo`` / ``hi`` 本身，误差同样不超过半步。
+    """
+    w = np.asarray(weight)
+    if w.ndim != 2:
+        raise ValueError(
+            f"quantize_weight_int4_group 只接受 (K, N) 的线性层权重，得到 {w.shape}"
+        )
+    if w.dtype.kind != "f":
+        raise TypeError(f"quantize_weight_int4_group 需要浮点权重，得到 {w.dtype}")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("权重里有 NaN / Inf：量化会把这些值传播到整条推理链")
+
+    gs = int(group_size)
+    if gs <= 0:
+        raise ValueError(f"group_size 必须为正，得到 {group_size}")
+    k, n = w.shape
+    if k % gs != 0:
+        raise ValueError(f"group_size={gs} 不能整除 K={k}：逐组量化要求整组切分")
+
+    grouped = w.astype(np.float32).reshape(k // gs, gs, n)
+    lo = np.minimum(np.min(grouped, axis=1), 0.0)
+    hi = np.maximum(np.max(grouped, axis=1), 0.0)
+    span = (hi - lo).astype(np.float32)
+    scale = np.where(span > 0, span / 15.0, 1.0).astype(np.float32)
+    zero = np.clip(np.rint(-lo / scale), 0.0, 15.0).astype(np.float32)
+    q = np.rint(grouped / scale[:, None, :] + zero[:, None, :])
+    q = np.clip(q, 0.0, 15.0).astype(np.int8)
+    return q.reshape(k, n), scale, zero
 
 
 def build_int8_group_linear(

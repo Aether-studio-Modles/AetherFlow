@@ -481,6 +481,12 @@ class DeviceBackend(
         r.register("dequantize_fp8_group", self._op_dequantize_fp8_group)
         r.register("linear_fp8_group", self._op_linear_fp8_group)
         r.register("linear_fp8a8_packed", self._op_linear_fp8a8_packed)
+        # 5.343：4 bit 的 pack / unpack 是逐元素位操作；逐组非对称反量化有
+        # 自己的内核；线性层复用它再走 sgemm（与 linear_i8_group 同构）。
+        r.register("pack_int4", self._op_pack_int4)
+        r.register("unpack_int4", self._op_unpack_int4)
+        r.register("dequantize_u4_group", self._op_dequantize_u4_group)
+        r.register("linear_u4_group", self._op_linear_u4_group)
         r.register("conv2d", self._op_conv2d)
         r.register("maxpool2d", self._op_maxpool2d)
         r.register("maxpool2d_indices", self._op_maxpool2d_indices)
