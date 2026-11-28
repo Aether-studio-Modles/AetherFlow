@@ -125,7 +125,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3178 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3194 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
@@ -283,7 +283,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   QAT 到假量化算子（`fake_quantize_i8`：f32 进出，前向等同量化-反量化，
   反向是直通估计器，5.311）与可学步长的 LSQ 版本（`fake_quantize_i8_lsq`：
   前向逐位相同，反向按非饱和区直通、并把 `sum(g * (v_hat - v))` 送给
-  scale，5.312），但没有 fp8、没有 int8 tensor core 级的矩阵乘；非对称零点
+  scale，5.312）；fp8（e4m3 / e5m2）有参考语义与单字节位模式编解码
+  （`cast(dtype="f8e4m3")` + `runtime/fp8.py`，e4m3 无 inf 并饱和到 ±448、
+  e5m2 溢出到 inf，5.318），但设备端没有存储容器与内核、显式拒绝；
+  没有 int8 tensor core 级的矩阵乘；非对称零点
   已有主机侧语义与构图入口（`quantize_i8_zp` / `dequantize_i8_zp` /
   `linear_i8_zp` / `linear_i8a8_zp`，5.315），逐组（per-group，GPTQ / AWQ 的
   `group_size` 形态）weight-only 反量化有 `dequantize_i8_group` /
@@ -339,7 +342,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3178 个用例
+tests/                3194 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
