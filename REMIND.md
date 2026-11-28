@@ -399,8 +399,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 ### 维护者备注
 
 - 临时脚本（`_tmp_*.py` 等）用完即删；结论写进 DESIGN 对应小节，凭证不落盘。
-- **算子总数以注册表为准**：5.355 后实测 `len(OPS) == 122`、`len(GPU_OPS) == 119`
-  （HIP 的 `HIP_OPS` 直接继承；CUDA 再额外承接 `fft` / `rfft`，即 121 个）。
+- **算子总数以注册表为准**：5.357 后实测 `len(OPS) == 124`、`len(GPU_OPS) == 121`
+  （HIP 的 `HIP_OPS` 直接继承；CUDA 再额外承接 `fft` / `rfft`，即 123 个）。
   不在 `GPU_OPS` 的三个是 `fft` / `rfft`（CUDA 由 cuFFT 承接）与 `sort`
   （设备端刻意不承接）。改算子面时同步 README 第 4 节，并以
   `py -3.14 -c "from aetherflow.ir.ops import OPS; from aetherflow.backends.device_shared import GPU_OPS; print(len(OPS), len(GPU_OPS))"` 复核。
@@ -408,6 +408,26 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   （表现为 `git diff` 里只有"删除已提交内容"）：用 `git checkout HEAD -- <file>`
   逐个恢复，再在其上继续编辑，不要重写整份文件。
 - 代码与文档（DESIGN / 本文件 / README）分开提交。
+
+### LLM 训练主线（2026-11-28 确认）
+
+目标：训练栈要能真用（不是 demo），并且对外开源替公司打名气。主线只走一条，
+不追 PyTorch 的面宽。
+
+- **顺序**：预训练 → 全参 SFT → LoRA。
+  - 预训练口径：**从零**训练 Qwen2.5-0.5B 结构，小语料跑若干步，只要 loss
+    下降、梯度与优化器行为正确；不承诺训出可用模型，也不拿开源权重掩盖问题。
+  - SFT：指令对，只对回答段算 loss（loss mask）。
+  - LoRA：在 SFT 之后，只训 adapter，adapter 可单独存取。
+- **不是三套工程**：三者共用同一条训练闭环（前向 / 反向 / 优化器 / 数据流 /
+  checkpoint），差异只有三处——可训练参数集合、数据集、loss 掩码。
+- **共同前置**：Qwen2.5-0.5B 前向闭环——Llama/Qwen2 构建器（embedding +
+  rmsnorm + qkv + RoPE + attention(GQA) + o_proj + SwiGLU + final norm +
+  lm_head）、HF 名称映射与 `nn.Linear` 转置表、V100 上对拍 transformers 的
+  logits。
+- **明确不做**：追 aten 算子面、vLLM 级推理优化、tensor core 量化、通用编译器、
+  DataLoader / ONNX。
+- 推理由另一个框架负责，本仓只负责训练侧与交接，对接方式未定、不阻塞训练。
 - PowerShell 5.1 不支持 `&&` 与 heredoc：用 `;` 串联，`git commit` 用多个 `-m`。
 - **整数内核渲染**：`render(kernel, dtype)` 的 `_dtype_key` 按 `dtype.name` 取
   `f32` / `f16`，所以必须传 `np.dtype` 实例。传 `np.float32`（类）或 `DType`

@@ -87,7 +87,7 @@
 |---|---|---|
 | 一套 IR、可插拔后端 | ✅ | 三个后端：参考（CPU 语义）+ CUDA（NVIDIA 真机）+ HIP（AMD 真机）。插件只需实现 `capabilities` + `execute`，另有五项可选契约（device / codegen / tuning / memory / stream）与一个分配器契约（5.89、5.163）；HIP 是照文档接入的第一个真实实例（5.40） |
 | 完整 CUDA 生态 | 🟡 | 生产路径复用 cuBLAS（含卷积的 GEMM）与 cuSPARSE（5.203 起是 `sparse_linear` 的可选实现，默认不启用；5.355 起值类型含 f16）；cuDNN 已在 5.69 接入为**对照物**（ctypes 直调 legacy API，只测量不执行生产图）；cuFFT 自 5.210 起接成 `fft` / `rfft` 的 CUDA 实现（`cufftPlanMany` + 显式归一化），5.354 起支持 1–3 维末尾连续轴并在 V100 上对拍；cuBLASLt / cuRAND 经实测与语义评估后**不接**（5.298、5.356）；NCCL / RCCL 自 5.331 起接进数据并行默认路径（单进程多卡 `ncclCommInitAll`、每进程一卡 `ncclCommInitRank`，真机只到 `world=1`，多卡数值未实测） |
-| 一套工作流换后端 | ✅ | 同一份 conformance 在 CUDA 与 HIP 上都跑过且 0 failed（当前 190 张图；参考后端本轮 190 executed / 0 refused / 0 failed；CUDA 真机在 V100 上 PASS；HIP 本轮未复跑，用例集自 5.40 的 111 条扩到 190 条，不能按差值推算；拒绝项来自各后端声明的能力面——既有的 f64 与分组 depthwise 形态，加上没有 rocFFT 的 `fft` / `rfft`，全部是 `BackendCapabilityError`）；装配层让迁移连 import 与类名都不用改：`get_backend()` 自动挑，或 `AETHERFLOW_BACKEND=hip` 指定（5.40、5.41）。HIP 的运行期面也已与 CUDA 对齐：pinned 暂存、跨流事件依赖与 `Trainer(device_state=True)` 的 SGD / Adam 都在真机跑通（5.156） |
+| 一套工作流换后端 | ✅ | 同一份 conformance 在 CUDA 与 HIP 上都跑过且 0 failed（当前 192 张图；参考后端本轮 192 executed / 0 refused / 0 failed；CUDA 真机在 V100 上 PASS；HIP 本轮未复跑，用例集自 5.40 的 111 条扩到 190 条，不能按差值推算；拒绝项来自各后端声明的能力面——既有的 f64 与分组 depthwise 形态，加上没有 rocFFT 的 `fft` / `rfft`，全部是 `BackendCapabilityError`）；装配层让迁移连 import 与类名都不用改：`get_backend()` 自动挑，或 `AETHERFLOW_BACKEND=hip` 指定（5.40、5.41）。HIP 的运行期面也已与 CUDA 对齐：pinned 暂存、跨流事件依赖与 `Trainer(device_state=True)` 的 SGD / Adam 都在真机跑通（5.156） |
 | 主流模型架构 | 🟡 | 六类构件都有可训练表达（5.22）：MLP ✅；Transformer ✅（单块符号化 + 多层 decoder-only LM）；CNN 🟡（conv（含分组 / depthwise）/ 转置卷积（5.51）/ max-avg-自适应-全局池化 / BN / dropout / 残差块 / 分类网络；cuDNN 对照已做（5.69 首测自研分块核慢 4～12 倍；5.253 按"稳态 + 驻留输入"重读后小通道已同量级甚至更快（1x1_c32 为 0.72×），真实差距只剩宽通道 3x3/5x5；5.260 / 5.268 的 auto 进一步到 c8～c24 的 0.45～0.75×、c32/c64 的 1.02×/1.36×，c64 是唯一还没消掉的 1.36×）；RNN ✅（RNN / LSTM / GRU 时间展开）；SNN 🟡（多层 LIF + 替代梯度；稀疏事件表示与事件驱动的构件已交付（5.35、5.132、5.133），层间压缩自 5.136 起可微（`spike_linear`：脉冲梯度走普通 `matmul`，只有权重梯度走事件散射），5.204 又把 `sparse_linear` 的事件幅度梯度补成 `sparse_linear_values_grad`；剩余边界是 `dspikes` 仍是稠密 GEMM，且 HIP 上事件路径尚未达到加速门槛）；SSM 🟡（完整 Mamba block 第一版，递归收敛为 `scan_linear`；语言模型侧的跨块 reset 与左填充隔离见 5.178 / 5.179，固定块预填充 / 末位置投影 / 权重常驻的推理路径见 5.187，整数标签损失（one-hot 的 `B*T*V` → `B*T` 下标）见 5.188，跨请求复用的推理会话（图缓存 + 权重驻留）见 5.191，批量解码（左填充对齐 + 逐行独立停止）见 5.192，会话前缀缓存（`prime` 预先消费 system prompt、后续只跑增量，batch=1）见 5.193，采样面（top-p / 重复惩罚）与束搜索 `generate_beam`（k 条假设进 batch 维）见 5.194，请求级并发（请求队列 + 连续批处理，以解码步为调度单位、容量固定）见 5.196） |
 | 主流硬件 | 🟡 | NVIDIA（sm_70 V100 / sm_75 RTX 2080 Ti）与 AMD（gfx1100，RX 7650 GRE / ROCm 7.2）各一台，同一套 conformance 全绿（5.40）；两家还各有一次库级对照——cuDNN（5.69 首测；5.260 / 5.268 的 auto 已到 c8～c24 的 0.45～0.75×、c32/c64 的 1.02×/1.36×）与 MIOpen（5.157 测的是自研分块核，慢 4.52×～37.03×；HIP 自 5.238 改走隐式 GEMM 后未对 MIOpen 复测，这个倍数不能当成 HIP 现状）；Intel / Apple / 移动端未接，同厂商多型号未铺开 |
 
@@ -98,7 +98,7 @@
 | 静态图导入 | ✅ | torch.export → IR，覆盖 Transformer 与 CNN 的 aten 子集（代码里出现 116 个 `aten.*` 名字，含拒绝面的提示名，不等于全部承接）；未知算子明确报错 |
 | 动态图导入 | 🟡 | 不做 tape 式 define-by-run 执行：图必须静态，才能做构图期后端能力预检、让反向图自包含可序列化、并满足 CUDA Graph 的固定路径要求。补的是**构图手感**——`EagerGraph` / `Tensor` 用运算符直接写图，产物仍是同一份静态 IR（5.25）；数据相关的分支与循环由 `Conditional` / `WhileLoop` 显式表达，控制流是子图之间的关系、子图仍是普通静态图（5.201）；逐算子即时求值仍未做 |
 | 形状推导（含符号维） | ✅ | 编译期推导 + 运行期回校；空间维可以是 `floor((S + 2p - k) / s) + 1` 形式的派生表达式，一次构图多分辨率执行（5.53） |
-| 自动微分（含 SNN 非标准反传） | 🟡 | 语义 IR 层反向展开：70 条 VJP 规则，反向图仍是可序列化、可执行的普通 PORTABLE 图（5.17）；eager 前端可直接 `loss.backward()`，但它仍是这张图而不是 tape（5.77）；激活检查点由 `train/recompute.py` 的分段重算补上（5.75）；二阶导数由 `hessian_vector_product` 补上（对反向图再求导，判据是解析值 / 中心差分 / 二次目标一步 Newton，5.198），但只对具备 VJP 的算子成立；反向图专用优化自 5.207 起有两条：`backward(minimize=True)` 按求导目标限定 vjp 范围（无关分支不再建反向节点，梯度逐位不变），`backward_pipeline()` 用交换律 CSE + DCE 且不含融合；SNN 替代梯度只需替换算子 `vjp`，路已铺好 |
+| 自动微分（含 SNN 非标准反传） | 🟡 | 语义 IR 层反向展开：72 条 VJP 规则，反向图仍是可序列化、可执行的普通 PORTABLE 图（5.17）；eager 前端可直接 `loss.backward()`，但它仍是这张图而不是 tape（5.77）；激活检查点由 `train/recompute.py` 的分段重算补上（5.75）；二阶导数由 `hessian_vector_product` 补上（对反向图再求导，判据是解析值 / 中心差分 / 二次目标一步 Newton，5.198），但只对具备 VJP 的算子成立；反向图专用优化自 5.207 起有两条：`backward(minimize=True)` 按求导目标限定 vjp 范围（无关分支不再建反向节点，梯度逐位不变），`backward_pipeline()` 用交换律 CSE + DCE 且不含融合；SNN 替代梯度只需替换算子 `vjp`，路已铺好 |
 | 前端逻辑对所有后端一致 | ✅ | 执行骨架统一符号绑定与形状校验 |
 | 高层语义 IR | ✅ | 类型系统、verifier、可移植性标注 |
 | 中层优化 IR | ✅ | 独立一层：`passes/` 有八个可组合 pass（DCE / CSE / 交换律 CSE / simplify / 常量折叠 / 三个融合）、`PassManager` 在每个 pass 之后过 verifier、`registry.py` 提供注册表与按名入口（`run_pass` / `run_passes` / `build_pipeline`），三条管线（默认 / 融合 / 反向图）的名字序列只在 `DEFAULT_PASS_NAMES` / `FUSED_PASS_NAMES` / `BACKWARD_PASS_NAMES` 定义一处（5.36、5.197、5.207） |
@@ -22820,6 +22820,40 @@ GEMM 只做乘加，epilogue 是独立节点，Lt 的 epilogue 参数没有用�
 重新评估的触发条件（任一成立才值得再看）：出现"GEMM + epilogue 必须在同一
 个 kernel 内完成"的硬需求（例如带宽成为瓶颈的推理链），或 cublas 的启发式
 在这些形状上被实测证明明显落后于 Lt。
+
+### 5.357　`sin` / `cos`：让 RoPE 的位置表能进图
+
+**为什么现在补。** Llama / Qwen 系的位置编码不是可学参数，而是按 token 位置
+算出来的 `sin` / `cos` 表。缺这两个算子时，构建器只有一条退路：在主机上把整张
+表算好，再作为 `constant` 喂进图。那条路会把图**按 seq_len 绑死**——decode
+每换一个长度就要重建一张图，前缀缓存与连续批处理都失去"同一张图反复执行"的
+前提。补成一元算子后，位置表由 IR 自己算，图只随"最大长度"这个静态维变化。
+
+**语义。** 参考实现走 `_ieee_math`：`sin(inf)` / `cos(inf)` 按 IEEE 返回 NaN，
+且不在宿主上打 numpy 的 `RuntimeWarning`。这与设备端 `sinf` / `cosf` 的行为
+一致（C 标准同样返回 NaN），因此参考后端与设备后端不会出现"日志差异"。
+
+**设备端。** 走既有一元模板，表达式就是 `sinf(x)` / `cosf(x)`；HIP 通过共享
+模板自动跟随，不存在两份实现。`bf16` 与逐元素调优面同步放开：bf16 的存取是
+纯位操作，模板没有引入新的精度假设。**没有真机性能数据**，这里只声明语义承接。
+
+**反向。** `d/dx sin(x) = cos(x)`、`d/dx cos(x) = -sin(x)`；两条规则只组合已有
+PORTABLE 算子（`mul` / `neg` / `sin` / `cos`），反向图在任何能跑前向的后端上
+都能跑，不需要新增反向内核。
+
+**刻意不做。** 没有引入 `sincos` 合并算子：RoPE 在同一层里对同一张位置表复用
+两次，复用属于构建器的常量/子图复用，不该由新增算子承担；也没有把三角族扩到
+`asin` / `atan` 等——当前没有图需要它们。
+
+**验证。**
+
+- `conformance` 补 `sin` / `cos` 两条用例（190 → 192 张图），输入覆盖负值，
+  与参考语义逐点比对。
+- 本地全量 3617 个用例通过（464 跳过），ruff 干净；V100 真机待随阶段 1 的
+  logits 对拍一起跑。
+
+**数字。** 算子 122 → 124，CUDA 承接 121 → 123，HIP 119 → 121，VJP 70 → 72。
+
 
 
 
