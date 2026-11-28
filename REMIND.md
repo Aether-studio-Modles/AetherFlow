@@ -39,7 +39,8 @@
   decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
   分页 KV cache（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制，以及
-  token→token 的贪心生成闭环 `PagedGenerator` 与自动前缀缓存，5.310 / 5.335）
+  token→token 的贪心生成闭环 `PagedGenerator` 与自动前缀缓存，5.310 / 5.335；
+  跨进程 / 落盘前缀缓存 `DiskPrefixCache`，5.337）
   与贪心投机
   解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：
   `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
@@ -249,7 +250,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   词表头、EOS 停止）；5.335 起 `generate` 默认做**自动前缀缓存**——不传
   `fork_from` 时扫描驻留序列挑最长严格前缀（跳过换出态与等长序列），fork 后
   只 prefill 剩余 token，命中统计在 `stats()` 的 `prefix_hits` /
-  `prefix_reused_tokens` / `prefix_misses`。这些组件都是主机态，没有真机
+  `prefix_reused_tokens` / `prefix_misses`。5.337 把同一判据接到盘上：
+  `DiskPrefixCache` 一条序列一个 `.npz`（token 序列 + 每层 K/V，文件名与 meta
+  都带 `model_id + tokens` 摘要），内存未命中时查盘、命中就整段导入 KV，
+  `generate` 结束把全长落盘；指纹 / 形状 / dtype / 页宽失配与盘上损坏都只算
+  "没有条目"并退回 prefill。这些组件都是主机态，没有真机
   D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机解码走
   `LMRunner.generate_speculative`（5.303），只支持贪心验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
