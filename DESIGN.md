@@ -231,11 +231,11 @@ GPU 作业仍未接上真实 runner。
 | 维度 | AetherFlow | 其它框架的典型做法 | 可比性 |
 |---|---|---|---|
 | 执行模型 | 静态语义 IR：构图 → 校验 → 优化 → 后端预检 → 执行；`EagerGraph` 只改构图手感，产物仍是静态图 | PyTorch define-by-run + Dynamo 捕获；JAX 函数式 trace + `jit`；ONNX Runtime 解释 / 编译 ONNX 图；TVM 编译 Relay / Relax 图 | 都是"图或程序 → 后端"，但我们在构图期就把能力不足报掉 |
-| 微分 | IR 层展开成普通图（49 条 VJP），反向图可序列化、可执行、可再优化；二阶导只对具备 VJP 的算子成立 | PyTorch autograd 引擎按算子注册反向；JAX `vjp` / `jvp` 可任意阶；ONNX Runtime 以推理为主；TVM 的自动微分生态较小 | 不提供 tape，也不承诺"任意算子可导" |
+| 微分 | IR 层展开成普通图（66 条 VJP），反向图可序列化、可执行、可再优化；二阶导只对具备 VJP 的算子成立 | PyTorch autograd 引擎按算子注册反向；JAX `vjp` / `jvp` 可任意阶；ONNX Runtime 以推理为主；TVM 的自动微分生态较小 | 不提供 tape，也不承诺"任意算子可导" |
 | 动态形状 | 前端拒绝 SymInt；执行器支持一次构图多形状（5.217）；训练循环与分段重算要求静态 | PyTorch / JAX 原生支持（JAX 按形状重编译） | 我们是"多形状绑定"，不是"动态图" |
 | 控制流 | `Conditional` / `WhileLoop` 是子图关系，判定回主机；设备端循环每次读一次谓词（5.245） | PyTorch 用 TorchScript / Dynamo 表达分支；JAX 的 `lax.cond` / `lax.while_loop` 编译进设备端 | 我们的控制流不追求设备端无同步 |
 | 后端接入 | 两个必需方法 + 六个可选契约；新硬件写一个包即可（HIP 为证），IR / 前端 / 优化零改动 | PyTorch 需 PrivateUse1 / dispatch key；JAX 需 PJRT plugin；ONNX Runtime 需 Execution Provider；TVM 需 BYOC | 接入面更窄，代价是生态工具要自己写 |
-| 算子覆盖 | 78 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
+| 算子覆盖 | 117 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），对称与非对称零点两套主机侧语义（非对称见 5.315、量化 / 反量化内核见 5.322、融合线性层见 5.323；逐组的非对称 `dequantize_i8_group_zp` 见 5.321），逐组（per-group）weight-only 反量化（`dequantize_i8_group` / `_zp`，5.317 语义、5.321 设备内核），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），fp8 的 cast 已落到设备端（5.325，载体仍是 f32、不省带宽），但没有 fp8 GEMM |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
 | 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）与 GGUF（5.348，v2/v3 + 主流 ggml 量化块）、文本能过 ByteLevel BPE（5.314）、WordPiece（5.345）与 Unigram / SentencePiece（5.347，含 `Metaspace` 与 precompiled 字符映射），但没有内置 HF 权重转换表、不解 IQ / TQ 量化 |
@@ -22299,6 +22299,98 @@ ruff 通过；全量 `3540 通过 / 464 跳过`（GGUF 之前是 3496）。
 - 只读，不写 GGUF；不做张量名到图输入名的映射，也不推断布局（与 5.313 的
   `load_into_store` 一样，名字与转置都要显式给）。
 - `Q8_K` 的 `bsums` 按规范跳过，不做反量化时的整块校核。
+
+
+
+### 5.349　算子面补齐：sort / argmin / cumprod / flip / roll / logsumexp
+
+**缺口。** 这六个算子在 `torch.export` 导出的真实模型里都很常见，此前只能靠
+"导出期拒绝"绕开：`sort` 服务于 top-k 之前的排名与阈值选取，`argmin` 服务于
+量化校准与贪心路径，`cumprod` 是概率连乘与累积分布，`flip` / `roll` 是窗口反转
+与位置编码的搬运，`logsumexp` 是"不溢出"的归一化分母。缺一个，整张图就进不来。
+
+**语义面。**
+
+- `sort(axis, descending)`：只输出**值**，不输出下标。numpy 的 `argsort` 在并列
+  时的次序不是跨后端可复现的承诺，把下标放进 IR 等于把"稳定排序"这件事变成
+  后端义务；只给值就没有这类歧义。`descending` 必须是 bool（`1` / `"true"` 一律
+  拒绝，避免"到底哪个方向"要靠猜）。
+- `argmin(axis, keepdims)`：输出 **i32**（与 `argmax` 同口径），并列最小值取
+  **第一次出现**的位置（numpy / PyTorch 的约定）。`axis` 单轴，空轴显式拒绝。
+- `cumprod(axis)`：单轴前缀积。f16 输入在 f32 里累乘再写回——前缀积的每一步都是
+  最终输出，逐项在 f16 里乘会先溢出再失真，没有"最后 cast 一次"能补救；这与
+  `cumsum` 的处理一致。
+- `flip(axis)` / `roll(shift, axis)`：单轴搬运。`shift` 必须是 int 且非 bool；
+  负值与超过一圈的移位在**主机侧**先归一化到 `[0, steps)`，内核里只做
+  `(j + shift) % steps`——C 的 `%` 对负数向零截断，把归一化留在内核里会读到
+  别的 `o` 段。
+- `logsumexp(axis, keepdims)`：只接受浮点。参考实现在 f32 里做
+  `m + log(Σ exp(x - m))`，所以 ±1000 量级的输入不会在 `exp` 处溢出——这是它的
+  全部意义，直接 `log(Σ exp(x))` 在 f32 上大于约 88 就变成 `inf`。
+
+**梯度。**
+
+- `cumprod`：`dx_i = (∏_{s<i} x_s) · Σ_{t≥i} g_t ∏_{s=i+1..t} x_s`。后半是
+  `scan_linear_backward` 的伴随，前半用"前面补 1、做一次 `cumprod`、切掉末尾"
+  构造（`concat([ones, x])` → `cumprod` → `slice(0, T)`）。**刻意不做 `y/x`
+  的闭式解**：`x` 含零时那是 `0/0`，而含零的前缀积本身是合法输入（测试里手算
+  了 `[9, 0, 0]` 这一组）。
+- `flip` 自伴：`dx = flip(g, axis)`；`roll` 反向是反方向同圈数：`dx = roll(g, -shift, axis)`。
+- `logsumexp`：`dx = g · softmax(x, axis)`。`keepdims=False` 时先把 `g` 在归约轴
+  上插回长度 1 再广播到 `x.shape`——直接 `broadcast_to` 会因为秩少一维而失败。
+- `sort` / `argmin` **不注册** VJP：排序与取下标在数学上不可导。`backward` 遇到
+  它们抛 `NoGradientError`，而不是静默给零梯度（那会让"对 mask 求梯度"看起来
+  合法）。5.346 之前 `cumsum` 规则上的注释也一并更新：`flip` 现在可用，但那条
+  规则保持原写法，因为它不依赖新原语，反向图形状已被既有测试钉住。
+
+**设备面。** 5 个进设备端（`sort` 不进）：
+
+- `cumprod` 与 `cumsum` 同一套 `(outer, steps, inner)` 铺法，一个线程一条链，
+  只有累加器换成累乘、初值换成 1。
+- `flip` / `roll` 共用 `_reorder_axis`：输出线性下标拆成 `(o, j, i)`，只把 `j`
+  换掉，读写都在连续路径上，不需要 shared。
+- `argmin` 不新增块内 min 归约：每线程最小值取负后过既有的 `block_reduce_max`，
+  得到的 `-m` 就是全局最小值（IEEE 取负精确，含 `±0`），并列交给 `atomicMin`
+  取最小下标；非末轴先 perm 到末轴再复用同一内核。
+- `logsumexp` 一个线程扫一整行（行在内存里不连续），两遍扫描求 `m` 与
+  `Σ exp(x-m)`，输出少一维。
+- **`sort` 显式不承接**：设备端排序要 bitonic（需要 shared + 多趟同步）或库内核，
+  写一个 O(n²) 的冒泡"先跑起来"比拒绝更糟——它会在大轴上慢到不可用，还会让人
+  以为能力已经在了。`GPU_OPS` 里不声明它，构图期就能报 `BackendCapabilityError`。
+
+**一个实现坑（已修）。** L2 的内核 DSL 打印二元表达式时**不自动补括号**
+（`lower/cstyle.py::_expr` 按 `lhs op rhs` 直接展开），而 `/` 与 `*`、`%` 与 `+`
+优先级不同、`/` 与 `*` 又同优先级左结合。`idx / (steps * inner)` 会被打印成
+`idx / steps * inner`（即 `(idx / steps) * inner`），`(j + shift) % steps` 会被
+打印成 `j + shift % steps`。这两处都必须显式 `Paren`。这不是新引入的限制，
+既有内核里比较条件都手写了 `Paren`，只是沿用约定时容易漏。
+
+**验证。** `tests/test_ops_extra.py` 新增 5 个测试类共 23 条：`TestSort`（升序
+中间轴、降序等于升序反转且含并列值、无梯度规则、错误 attrs）、`TestArgMin`
+（对齐 numpy、并列取首个、axis0 + keepdims、无梯度规则）、`TestCumProd`（前向、
+中间轴梯度对差分、含零手算 `[9, 0, 0]`、axis0 秩 3 梯度、多轴拒绝）、
+`TestFlipRoll`（flip 前向与自伴梯度、roll 正负与整圈移位、roll 梯度、错误 attrs）、
+`TestLogSumExp`（稳定公式、±1000 不溢出、丢轴梯度等于 softmax、中间轴 keepdims
+梯度、整数输入拒绝）。`conformance.default_cases()` 增 11 条用例（`cumprod` /
+`flip` / `roll` / `roll_negative` / `sort_ascending` / `sort_descending_axis0` /
+`argmin_last` / `argmin_keepdims` / `argmin_axis0` / `logsumexp_last` /
+`logsumexp_axis1_keepdims`；argmin 类整数输出要求 `rtol=atol=0`）。
+
+`tests/test_kernel_registry.py` 的静态对账（`CUDA_OPS == {name[4:] ...}`）随之
+把 5 个新内核纳入核对，20 条通过。ruff 通过；全量 `3563 通过 / 464 跳过`
+（5.348 之后是 3540，新增 23 条）。
+
+**未声称。**
+
+- 5 个新设备内核只做了**源码级渲染核对**与静态对账，**没在真机上跑过**：
+  `cumprod` / `flip_axis` / `roll_axis` / `argmin_last` / `logsumexp_axis` 的
+  数值一致性与吞吐都还没有 V100 结论，等跑批回填。这里不给性能数字。
+- `sort` 只给值、不给下标，也没有 `stable` 参数；需要"值 + 原位置"的模型仍会在
+  导出期被拒。
+- `argmin` 只支持单轴，空轴拒绝；全归约请先 `flip` / `reshape` 把轴并过来。
+- `flip` / `roll` / `cumprod` 都是单轴；多轴要么链式调用，要么显式 reshape。
+- `roll` 的移位在主机侧归一化，符号口径与 numpy 一致（正数向高下标方向），
+  但没有对 `shift` 是张量的情形做支持——它必须是构图期常量。
 
 
 

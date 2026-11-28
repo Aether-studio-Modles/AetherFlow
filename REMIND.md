@@ -16,11 +16,17 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：111 个 IR 算子，CUDA 承接 111 个（含 cuFFT 的
-  `fft` / `rfft`）、HIP 承接 109 个；
+- **一份语义 IR，多个硬件后端**：117 个 IR 算子，CUDA 承接 116 个（含 cuFFT 的
+  `fft` / `rfft`）、HIP 承接 114 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
+- **算子面补齐**（5.349）：`sort` / `argmin` / `cumprod` / `flip` / `roll` /
+  `logsumexp` 进 IR；除 `sort` 外都有设备内核，`sort` 设备端刻意不承接
+  （排序要 bitonic 或库内核，不写 O(n²) 凑合实现）。`cumprod` / `flip` / `roll` /
+  `logsumexp` 有 VJP，`sort` / `argmin` 不注册——`backward` 遇到它们报
+  `NoGradientError`，不静默给零。`argmin` 输出 i32、并列取首个；`logsumexp` 在
+  f32 里稳定化求值，±1000 量级不溢出。
 - **循环级 IR**（5.332）：`LoopIR` 把 `WhileLoop` 收敛成"单图条件 + 单图体 +
   carried"的规范形态，`split_invariants` 把每轮重算但不变的纯计算搬进
   preheader（`LoopSplit`），数值与原循环逐位相同；带 RNG / STATE / IO 的节点
@@ -29,7 +35,7 @@
   形状签名` 查配置库，命中后覆盖逐元素 / 归约的 block 与 conv2d 的
   tile/roc/cb。优先级是"显式 `set_tuning` → 构造参数 → 库 → 自动"；未命中
   统计可查，库里的坏值（如非 2 的幂的 block）当场报错而不是静默回退。
-- **自动微分**：49 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
+- **自动微分**：66 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行
   （5.331 起 NCCL / RCCL 可加载时**默认设备侧归约**：单进程多卡自动
   `ncclCommInitAll`、每进程一卡自动 `ncclCommInitRank`；库缺失或显式
@@ -171,7 +177,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3540 个用例，464 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3563 个用例，464 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -261,6 +267,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   一次状态；束搜索的状态重排已并进 decode 图（5.282 / 5.283：状态输入是
   `embedding(上一状态, parents)`，每步一次 replay；A800 同机同口径
   `num_beams=1/2/4` 各快 5.5% / 4.2% / 4.5%），投机解码仍走宿主路径。
+- **算子面**：`sort` 只给值、不给下标，也没有 `stable` 参数，设备端不承接
+  （构图期报 `BackendCapabilityError`）；`argmin` / `flip` / `roll` / `cumprod`
+  都是单轴，空轴显式拒绝，全归约请先 reshape；`roll` 的 `shift` 只能是构图期常量。
+  5.349 新增的 5 个设备内核只做了源码级渲染核对与静态对账，**没有真机数值一致性
+  与吞吐结论**（5.349）。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
