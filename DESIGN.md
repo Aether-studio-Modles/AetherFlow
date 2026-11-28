@@ -238,7 +238,7 @@ GPU 作业仍未接上真实 runner。
 | 算子覆盖 | 78 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），对称与非对称零点两套主机侧语义（非对称见 5.315、量化 / 反量化内核见 5.322、融合线性层见 5.323；逐组的非对称 `dequantize_i8_group_zp` 见 5.321），逐组（per-group）weight-only 反量化（`dequantize_i8_group` / `_zp`，5.317 语义、5.321 设备内核），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），fp8 的 cast 已落到设备端（5.325，载体仍是 f32、不省带宽），但没有 fp8 GEMM |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
-| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314）与 WordPiece（5.345），但没有内置 HF 权重转换表、无 GGUF、无 Unigram / SentencePiece |
+| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314）、WordPiece（5.345）与 Unigram / SentencePiece（5.347，含 `Metaspace` 与 precompiled 字符映射），但没有内置 HF 权重转换表、无 GGUF |
 | 生态 | 能读 safetensors（5.313，按需读取 + 名字 / 布局显式映射）与 HF `tokenizer.json` 的 ByteLevel BPE 谱系（5.314），无预训练权重分发、无 Hub、无第三方算子库 | 各自有完整生态 | 权重与分词入口已通，分发仍然缺位 |
 | 失败语义 | 能力未覆盖即显式报错（构图期拒绝或 `BackendCapabilityError`），捕获期登记、replay 后复查 | 常见做法是回落或静默降级 | 这是设计差异，不是能力差异 |
 
@@ -19946,9 +19946,9 @@ transpose=(), strict=True, allow_downcast=False)`：
 - `decoder`：null / `ByteLevel` / `Sequence`（`Replace` 不参与解码，ByteLevel
   已经能还原字节）。
 
-拒绝 WordPiece（另起 `WordPieceTokenizer`，见 5.345）/ Unigram、SentencePiece 的 `byte_fallback` /
-`end_of_word_suffix` / `continuing_subword_prefix`、`Metaspace`、以及 `Split`
-预分词。`Split` 这一条最值得说：它的 `pattern` 会改切分边界（Llama-3 把数字按
+拒绝 WordPiece（另起 `WordPieceTokenizer`，见 5.345）/ Unigram（另起
+`UnigramTokenizer`，见 5.347）、SentencePiece 的 `end_of_word_suffix` /
+`continuing_subword_prefix`、`Metaspace`、以及 `Split` 预分词。`Split` 这一条最值得说：它的 `pattern` 会改切分边界（Llama-3 把数字按
 1～3 位一组切），忽略 pattern 就是把别的分词器当成自己的用——拼出来的 id 每个
 都"合法"，只是不是训练时的那串。
 
@@ -20007,9 +20007,10 @@ added 与 vocab 之间、added 与 added 之间都查——两个 added 共用 i
 - 不解析 `tokenizer_config.json` 与 `special_tokens_map.json`：`eos` / `pad` 从
   added token 的候选名推断，或由调用方显式传入；chat 模板仍用 `ChatTemplate`
   手写，没有"读模板字符串"的能力。
-- 不支持 Llama-3 的 `Split` 预分词、SentencePiece（Llama-2 系）、Unigram
-  （T5 系）、BPE dropout、`lstrip` / `rstrip`；BERT 系的 WordPiece 不走本模块，
-  由 5.345 的 `WordPieceTokenizer` 承接。
+- 不支持 Llama-3 的 `Split` 预分词、SentencePiece 的 `byte_fallback`、BPE dropout、
+  `lstrip` / `rstrip`；BERT 系的 WordPiece 不走本模块，由 5.345 的
+  `WordPieceTokenizer` 承接；T5 系的 Unigram 由 5.347 的 `UnigramTokenizer`
+  承接；`Metaspace` 预分词与 precompiled 字符映射也只在 5.347 里。
 - 不做 offset mapping（char → token 的 span），因此没有"把生成结果定位回原文"
   的能力。
 - 用自造小词表逐 id 对拍，没有与 HF 官方实现在真实 15 万级词表上做全量对拍，
@@ -22105,7 +22106,8 @@ eos 与 pad 同 id 时先停；`vocab.txt` 的行号即 id、中间空行 / 重�
 - `decode` 的语义是"空格连接 + 拼回 `##`"，不是逐字节还原原文——标点与空白不会
   贴回去。这与 HF `BertTokenizer.decode` 一致，但与 5.314 的 BPE 解码不同。
 - 不解析 `tokenizer_config.json` / `special_tokens_map.json`（同 5.314）；
-  Unigram / SentencePiece / `Metaspace` 仍然显式拒绝；不做自定义 normalizer。
+  Unigram / SentencePiece / `Metaspace` 在本模块显式拒绝，由 5.347 的
+  `UnigramTokenizer` 承接；不做自定义 normalizer。
 - 只在参考实现上验证语义，没有拿真实 BERT 权重跑端到端。
 
 ### 5.346　真机复测（V100）：源码必须 ASCII，两处设备态 bug
@@ -22153,6 +22155,73 @@ OK (skipped=178)`（比本地少 14 条，是那台机 torch 2.5.1 不在兼容�
   没有重跑，前面那些数字仍是上一轮的。
 - 第 3 条的修复靠"拷贝与前向同流"成立，没有加显式的跨流事件；如果以后
   有别的路径把损失值再拷一次到另一条流上，同样的滞后会以另一种形式回来。
+
+### 5.347　文本入口补 Unigram：T5 系词表与 SentencePiece 的字符映射
+
+**缺口。** 5.314 只吃 ByteLevel BPE，5.345 只吃 WordPiece；T5 / ALBERT / 一大批
+多语模型发布的 `tokenizer.json` 是 `model.type == "Unigram"`，词表是
+`[[piece, log_prob], ...]`。这条入口不通，那些模型的权重读进来、文本仍然过不去。
+它跟 BPE 的差别不是"合并顺序"而是**切分目标**：BPE 按合并秩贪心，Unigram 求整句
+总分最大的切分（Viterbi），未知字符也不是退一个 `[UNK]` 就完事——SentencePiece
+的 `byte_fallback` 会把它拆成逐字节的 `<0xXX>`，`precompiled_charsmap` 还会在
+切分前先把文本按双数组 trie 改写一遍。这些都不是近似能糊过去的：糊过去拼出来的
+id 每个都合法，只是不是训练时的那串。
+
+**为什么不塞进已有类。** 三个类的预分词、词表形态、切分算法都不同（见 5.314 /
+5.345 的理由），塞进一处会让三边都变糊。另起
+`aetherflow/models/lm_unigram.py`，接口与 `ByteTokenizer` / `BpeTokenizer` /
+`WordPieceTokenizer` 对齐（`encode` / `decode` / `vocab_size` / `spec` /
+`from_dict` / `from_file`），仍然只用标准库。
+
+**实现面。**
+
+- 词表：`[[piece, score], ...]` 与 `piece -> score` 两种都认；分数是 log 概率
+  （负数）。构造期校验：词表为空、id 重复、缺分数、多余分数、非有限分数、
+  `unk_id` 越界、added token 不在词表或 id 对不上、`special_ids` 越界，全部
+  显式拒绝。`vocab_size = max(id) + 1`，与 added token 一致。
+- Viterbi：在**字节**上做，`best[end] = max(score + piece_score)`，只在严格更优时
+  覆盖回边，所以平局保留先写入的（较长）片段，与 HF 一致；`_utf8_step` 逐字符
+  前进，非法 / 截断字节按 1 字节推进。
+- 未知：`unk_score = min_score - 10.0`。`byte_fallback=True` 时，没有单词片
+  可用的字符按字节展开成 `<0xXX>` 链（每个节点记自己的 `piece_id`，不是 unk），
+  缺任何一个字节 token 就在**编码时**报错；`fuse_unk=True`（默认）只合并真正
+  未命中的片段，byte 回退的片段不动。
+- 预分词：`Metaspace`（`replacement` 默认 `▁`，`prepend_scheme` 取
+  always/never/first，`split` 控制是否按 `▁` 分块；每块补回前缀 `▁`，空块也
+  输出一个 `▁`），null，或 `Sequence`。`ByteLevel` / `Split` 显式拒绝。
+- normalizer：null / NFC / NFD / NFKC / NFKD / `Sequence` / `Precompiled`。
+  `Precompiled` 按 SentencePiece 的格式解：4 字节小端 trie 长度 + darts-clone
+  双数组（uint32 小端）+ NUL 分隔的替换串；长度必须 ≥1024 且是 1024 的整数倍。
+  匹配是 darts-clone 的 `commonPrefixSearch`（`has_leaf = (u>>8)&1`，
+  `value = u & 0x7FFFFFFF`，`offset = (u>>10) << ((u & 0x200) >> 6)`，
+  `node ^= b` 后用 `label == b` 确认），取最长匹配替换；无匹配消费一个完整
+  UTF-8 字符，非法字节输出 U+FFFD 并只消费 1 字节。其它 normalizer 显式拒绝。
+- added token：先按首字符分桶、同桶长度降序做字面匹配，命中即整体成一个 id，
+  不参与 Viterbi（与 HF 的处理顺序一致）；`special_ids` 显式给出时优先用它。
+- `decode`：到 eos 停止、跳过 pad、`<0xXX>` 拼回字节、`Metaspace` 还原空格并
+  去掉前导空格；`skip_special_tokens` 按 `special_tokens` 字符面过滤。
+- `spec()` 复用 `LMSpec`；`pad_id` 缺省取 `<pad>`，`eos_id` 取 `</s>` 或
+  `<eos>`，都没有时**显式报错**；`from_file` 只接受 `.json`，`.model` 明文拒绝。
+
+**验证。** `tests/test_lm_unigram.py` 38 条：Viterbi 的"两短胜一长" / "一长胜两短"
+/ 平局保留长片 / 中文词 / 空串；未知单字符、`fuse_unk` 开与关、unk 夹在词中间、
+`byte_fallback` 拆一个中文字为三字节、真词更便宜时仍选真词、缺字节 token 报错；
+`Metaspace` 的前缀 / 不前缀 / 不切分 / 多空格；added token 整体匹配与幽灵 added
+token 拒绝；precompiled 字符映射的替换与未命中、长度校验、其它 normalizer 拒绝；
+`decode` 的 metaspace 往返、eos 停止与 pad 跳过、字节拼接、越界 id、`skip_special_tokens`；
+构造期校验与 `spec()`、`from_dict` 的 list 词表、`from_file` 的 JSON 与二进制拒绝。
+ruff 通过；全量 `3496 通过 / 464 跳过`。
+
+**未声称。**
+
+- 不做 SentencePiece 的其它组件：`Split` 预分词、`treat_whitespace_as_suffix`、
+  `remove_extra_whitespaces`、自定义 normalizer 规则串都不读；遇到就拒绝而不是
+  按缺省值凑。
+- `precompiled_charsmap` 用自造的双数组对拍，没有拿 T5 真实的 200KB 字符映射
+  做全量对拍；darts-clone 的 `validate` 也只按 SentencePiece 的长度判据做。
+- 没有与 HF / sentencepiece 官方实现在真实词表上做全量对拍，也没有分词吞吐数字。
+- `.model`（protobuf 二进制）不读：只吃 `tokenizer.json`。
+
 
 
 
