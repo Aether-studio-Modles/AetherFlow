@@ -10,10 +10,9 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from ..ir.graph import Graph as Graph, Node
 from ..ir.types import DType
 
-#: 设备端还没有 fp8 的存储容器与内核：bf16 走 uint16 位模式，fp8 连位模式
-#: 都还没接。参考语义已覆盖（runtime/fp8.py），设备端遇到这些类型必须显式
-#: 拒绝——否则会被 ``np_dtype`` 的 f32 载体悄悄当成 f32 计算。
-_FP8_DTYPES = frozenset({DType.F8E4M3, DType.F8E5M2})
+#: 设备端还没有 fp8 的存储容器与内核（见 device_shared.FP8_DTYPES）。
+#: 参考语义在 runtime/fp8.py；设备端遇到这些类型必须显式拒绝，
+#: 否则会被 np_dtype 的 f32 载体悄悄当成 f32 计算。
 from ..lower.elementwise import (
     CHAIN_OPS as CHAIN_OPS,
     ElemInput as ElemInput,
@@ -69,6 +68,7 @@ from contextlib import nullcontext
 from weakref import ref
 import numpy as np
 from .device_shared import (
+    FP8_DTYPES as _FP8_DTYPES,
     GPU_OPS as GPU_OPS,
     _ALL_TUNABLE_OPS as _ALL_TUNABLE_OPS,
     _BOOL_OPS as _BOOL_OPS,

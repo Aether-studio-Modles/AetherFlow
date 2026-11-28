@@ -6,7 +6,8 @@
   溢出到 inf；
 - 解码：全部 256 个位模式都能解释，非 NaN 位模式 ``pack ∘ unpack`` 往返恒等；
 - 执行：fp8 的图输入与节点输出都量化到格式格点，参与算术时每个边界都量化；
-- 拒绝：未知格式、非 uint8 位模式、控制流谓词不接受 f8。
+- 拒绝：未知格式、非 uint8 位模式、控制流谓词不接受 f8，设备端的计划期
+  不把 fp8 输出预绑定进批量派发快路径。
 """
 
 import unittest
@@ -23,6 +24,7 @@ from aetherflow import (
     f32,
     loads,
 )
+from aetherflow.backends.device_plan import _PlanMixin
 from aetherflow.conformance import default_cases, run_conformance
 from aetherflow.runtime.fp8 import (
     FP8_KINDS,
@@ -181,6 +183,44 @@ class TestFp8Executor(unittest.TestCase):
         # 没有可比较的确定性存储。
         with self.assertRaises(TypeError):
             Conditional(pred, then, otherwise)
+
+
+class _PlanStub(_PlanMixin):
+    """只够跑 ``_planned_kernel`` 的替身：不建任何设备上下文。
+
+    真实后端的 ``kernels`` 是注册表，这里只需要 ``get`` 返回一个非 ``None``
+    的对象，代表"算子已注册"。
+    """
+
+    kernels = {"cast": object(), "add": object()}
+    _f16_ops = frozenset()
+    _bf16_ops = frozenset()
+
+
+class TestFp8DevicePlan(unittest.TestCase):
+    """计划期不得把 fp8 预绑定进快路径。
+
+    ``invoke`` 同时检查节点输入与输出，但 ``_planned_kernel`` 曾经只扫输入：
+    ``cast`` 的输入是 f32 载体、fp8 只出现在输出上，于是它被预绑定，批量
+    派发快路径绕过了唯一的 fp8 检查，f8 被当成 f32 算掉（真机 conformance
+    上表现为 ``cast_f8e4m3`` / ``cast_f8e5m2`` 两个 failed，而不是 refused）。
+    """
+
+    def _cast_node(self, dtype):
+        g = Graph("cast")
+        x = g.input("x", f32[(2,)])
+        g.output(g.cast(x, dtype=dtype), "y")
+        return g.nodes[-1]
+
+    def test_fp8_output_is_not_prebound(self):
+        stub = _PlanStub()
+        self.assertIsNone(stub._planned_kernel(self._cast_node("f8e4m3")))
+        self.assertIsNone(stub._planned_kernel(self._cast_node("f8e5m2")))
+
+    def test_plain_cast_is_still_prebound(self):
+        # 只拒绝 fp8：f32 的 cast 仍然走预绑定快路径。
+        stub = _PlanStub()
+        self.assertIsNotNone(stub._planned_kernel(self._cast_node("f32")))
 
 
 class TestFp8Conformance(unittest.TestCase):

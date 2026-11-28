@@ -24,6 +24,14 @@ from ..lower.plan import (
 from .base import BackendCapabilityError
 
 
+#: 设备端还没有 fp8 的存储容器与内核：bf16 走 uint16 位模式，fp8 连位模式
+#: 都还没接。参考语义已覆盖（runtime/fp8.py），设备端遇到这些类型必须显式
+#: 拒绝——否则会被 ``np_dtype`` 的 f32 载体悄悄当成 f32 计算。
+#: 放在共享层是因为两条路径都要用它：逐节点的 ``invoke`` 与计划构建期的
+#: ``_planned_kernel``（后者预绑定内核后就不再经过 ``invoke`` 的检查）。
+FP8_DTYPES: FrozenSet[DType] = frozenset({DType.F8E4M3, DType.F8E5M2})
+
+
 # 同一批自研内核模板（NVRTC / hipRTC 各编译一份）承接的算子面。它是声明，
 # 与当前接入了哪家硬件无关；各后端在自己的文件里把它取成自己的名字。
 # 存在的唯一理由：**不建任何设备上下文也能读到**。
