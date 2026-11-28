@@ -1463,6 +1463,54 @@ def _concat(ctx):
     return tuple(grads)
 
 
+@vjp("repeat_interleave")
+def _repeat_interleave(ctx):
+    """反向把相邻的 ``repeats`` 个梯度加起来。
+
+    ``reshape`` 把重复轴拆成 ``(n, repeats)``，再沿新轴 ``reduce_sum``——
+    两个算子都已是 PORTABLE 语义，不需要新增 scatter。被重复的轴必须静态，
+    这由 ``repeat_interleave`` 的 infer 在构图期保证，所以这里直接按形状拆。
+    """
+    b = ctx.b
+    shape = _static(ctx.input(0), "repeat_interleave")
+    axis = int(ctx.attrs.get("axis", -1)) % len(shape)
+    repeats = int(ctx.attrs["repeats"])
+    split = list(shape[:axis]) + [shape[axis], repeats] + list(shape[axis + 1 :])
+    grouped = b.add_node("reshape", [ctx.g], {"shape": split})
+    return (
+        b.add_node("reduce_sum", [grouped], {"axis": axis + 1, "keepdims": False}),
+    )
+
+
+@vjp("atan2")
+def _atan2(ctx):
+    """``atan2(a, b)``：``d/da = b/(a²+b²)``，``d/db = -a/(a²+b²)``。
+
+    在 ``(0, 0)`` 处分母为 0，梯度是 nan——这是数学事实（该点方向未定义），
+    与 torch / numpy 一致，不做保护性截断。
+    """
+    b = ctx.b
+    a, other = ctx.input(0), ctx.input(1)
+    g = ctx.g
+    denom = b.add(b.mul(a, a), b.mul(other, other))
+    return (
+        b.div(b.mul(g, other), denom),
+        b.neg(b.div(b.mul(g, a), denom)),
+    )
+
+
+@vjp("remainder")
+def _remainder(ctx):
+    """``d/da = 1``，``d/db = -floor(a/b)``（torch.remainder 的口径）。
+
+    ``floor(a/b)`` 在 ``b == 0`` 处是 inf，梯度随之为 inf/nan；这与 PyTorch
+    的行为一致，不做额外拦截。
+    """
+    b = ctx.b
+    a, other = ctx.input(0), ctx.input(1)
+    return (ctx.g, b.mul(ctx.g, b.neg(b.floor(b.div(a, other)))))
+
+
 @vjp("embedding")
 def _embedding(ctx):
     table = ctx.input(0)

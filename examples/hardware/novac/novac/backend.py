@@ -150,13 +150,25 @@ __device__ __forceinline__ int block_scan_sum(int v, int* smem) {
 }
 """
 
+# L2 表达式会直接调用的函数（不是按存储宽度读写的那三个），与 dtype 无关，
+# 所以 f32 / f16 的 prelude 都要带上；缺了它 remainder 内核编不过。
+_NOVAC_REM = r"""
+// Floor-semantics modulo: fmodf truncates (sign follows the dividend), while
+// numpy.mod / torch.remainder let it follow the divisor.
+__device__ __forceinline__ float nv_rem(float a, float b) {
+    float r = fmodf(a, b);
+    if (r != 0.f && ((r < 0.f) != (b < 0.f))) { r += b; }
+    return r;
+}
+"""
+
 # f32 的四个辅助函数是恒等映射；f16 存储为 unsigned short，算术在 float 里做。
 # NOTE: 交给设备编译器的源码必须是 ASCII，所以 raw string 里的注释也用英文。
 _NOVAC_F32_HELPERS = r"""
 __device__ __forceinline__ float nv_ld_f(float v) { return v; }
 __device__ __forceinline__ float nv_st_f(float v) { return v; }
 __device__ __forceinline__ float nv_add_f(float* p, float v) { return atomicAdd(p, v); }
-"""
+""" + _NOVAC_REM
 
 # 假定 Nova C 的工具链提供 __half 与 cuda_fp16.h 同名的转换函数。
 _NOVAC_F16_HELPERS = r"""
@@ -175,7 +187,7 @@ __device__ __forceinline__ float nv_add_h(unsigned short* p, float v) {
     } while (assumed != old);
     return nv_ld_h(old);
 }
-"""
+""" + _NOVAC_REM
 
 
 NOVAC_DIALECT = CStyleDialect(

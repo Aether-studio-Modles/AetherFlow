@@ -49,6 +49,7 @@ def _normalize(src: str) -> str:
         ("nv_ld_f", "af_ld_f"),
         ("nv_st_f", "af_st_f"),
         ("nv_add_f", "af_add_f"),
+        ("nv_rem", "af_rem"),
     ):
         src = src.replace(new, old)
     return _squash(src)

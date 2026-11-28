@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-from ..kernel import Axis, Bin, Cast, Expr, For, Let, Stmt, Var
+from ..kernel import Axis, Bin, Call, Cast, Expr, For, Let, Stmt, Var
 
 
 BINARY_OP = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+
+#: 不是中缀运算符的二元算子：表达式是一个函数调用。
+#: 与 ``BINARY_OP`` 刻意分开——后者同时驱动逐元素融合的元数判断
+#: （``arity = 2 if name in BINARY_OP else 1``）与中缀拼装，把调用塞进去会让
+#: 融合把 ``atan2`` 当成 ``+`` 一类的算子。因此这两个算子不参与融合，
+#: 单独走"一算子一内核"。
+BINARY_CALL = {
+    "atan2": lambda a, b: Call("atan2f", (a, b)),
+    # ``af_rem`` 是 floor 语义的浮点取余（见 cuda/codegen.py 的 f32 辅助函数）：
+    # ``fmodf`` 是截断取余，``-7 % 3`` 会得到 -1 而不是 2。
+    "remainder": lambda a, b: Call("af_rem", (a, b)),
+}
 
 # 比较算符：与 BINARY_OP 分开，因为它们唯一的产出类型是 bool，设备端的存储
 # 与归一化（`af_st_q` 把任意非零写成 1）也和算术不同。

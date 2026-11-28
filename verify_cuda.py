@@ -487,6 +487,55 @@ def _extra_cases() -> list:
             "ws": np.abs(_rand(rng, 32)) + 0.01,
         }
 
+    def atan2_quadrants_broadcast():
+        """四象限 + 广播：``y`` 是 (3, 4)、``x`` 是 (4)。
+
+        只要 x 全正，截断式实现（``atan(y/x)``）也能蒙对；这里 x、y 都有负值，
+        且 x 走广播路径。
+        """
+        g = Graph("atan2_extra")
+        a = g.input("a", f32[3, 4])
+        b = g.input("b", f32[4])
+        g.output(g.atan2(a, b), "y")
+        return g, {
+            "a": np.array([[1.0, -1.0, 2.0, -2.0]] * 3, dtype=np.float32),
+            "b": np.array([1.5, -1.5, 1.5, -1.5], dtype=np.float32),
+        }
+
+    def remainder_both_signs():
+        """四种符号组合 + 非整数商：截断式 ``fmodf`` 在异号时符号错。"""
+        g = Graph("remainder_extra")
+        a = g.input("a", f32[3, 4])
+        b = g.input("b", f32[3, 4])
+        g.output(g.remainder(a, b), "y")
+        av = np.array(
+            [[-7.5, 7.5, -7.5, 7.5],
+             [0.25, -0.25, 11.0, -11.0],
+             [5.5, -5.5, 1.0, -1.0]],
+            dtype=np.float32,
+        )
+        bv = np.array(
+            [[3.0, 3.0, -3.0, -3.0],
+             [0.75, 0.75, -0.75, -0.75],
+             [-2.5, 2.5, -2.5, 2.5]],
+            dtype=np.float32,
+        )
+        return g, {"a": av, "b": bv}
+
+    def repeat_interleave_axis0():
+        """首轴重复：outer=1，源下标就是 ``j / repeats`` 本身。"""
+        g = Graph("repeat_interleave_axis0")
+        x = g.input("x", f32[3, 2])
+        g.output(g.repeat_interleave(x, repeats=2, axis=0), "y")
+        return g, {"x": _rand(rng, 3, 2)}
+
+    def repeat_interleave_last_wide():
+        """末轴重复 4 次：inner=1 的退化情形，输出轴长是输入的 4 倍。"""
+        g = Graph("repeat_interleave_last")
+        x = g.input("x", f32[2, 3])
+        g.output(g.repeat_interleave(x, repeats=4, axis=-1), "y")
+        return g, {"x": _rand(rng, 2, 3)}
+
     return [
         ("gelu_saturation", gelu),
         ("rmsnorm_rank3", rmsnorm),
@@ -525,6 +574,10 @@ def _extra_cases() -> list:
         ("linear_i8a8_no_bias", linear_i8a8_no_bias),
         ("silu_gate_odd_length", silu_gate_odd),
         ("layernorm_residual_odd_cols", layernorm_residual_odd),
+        ("atan2_quadrants_broadcast", atan2_quadrants_broadcast),
+        ("remainder_both_signs", remainder_both_signs),
+        ("repeat_interleave_axis0", repeat_interleave_axis0),
+        ("repeat_interleave_last_wide", repeat_interleave_last_wide),
     ]
 
 

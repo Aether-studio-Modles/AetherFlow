@@ -540,6 +540,123 @@ register(
 )
 
 
+_FLOAT_DTYPES = (DType.F32, DType.F16, DType.BF16, DType.F64)
+
+
+def _infer_atan2(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """``atan2(a, b)``：四象限反正切，``a`` 是 y、``b`` 是 x。
+
+    与 ``torch.atan2(input, other)`` / ``np.arctan2`` 的参数顺序一致。刻意
+    不接受整数：``atan2`` 的输出是浮点，而 IR 的二元算子要求两侧同 dtype，
+    允许整数输入就必须在构图期插入隐式提升，那会让"这一维到底是 i32 还是
+    f32"变得不可见。整数请显式 ``cast``。
+    """
+    a, b = inputs
+    if a.dtype != b.dtype:
+        raise TypeError(
+            f"atan2 要求两侧 dtype 一致，得到 {a.dtype.value} 与 {b.dtype.value}；"
+            "请显式插入 cast"
+        )
+    if a.dtype not in _FLOAT_DTYPES:
+        raise TypeError(f"atan2 只承接浮点，得到 {a.dtype.value}；整数请先 cast")
+    return TensorType(a.dtype, _broadcast_shape(a.shape, b.shape))
+
+
+def _atan2_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    with np.errstate(all="ignore"):
+        return np.arctan2(args[0], args[1])
+
+
+register(
+    Op(
+        name="atan2",
+        infer=_infer_atan2,
+        reference=_atan2_ref,
+        doc="四象限反正切 atan2(a, b)，a 为 y、b 为 x，支持 numpy 广播",
+    )
+)
+
+
+def _infer_remainder(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """浮点取余，floor 语义（结果与除数同号）。
+
+    与 ``mod`` 的关系：``mod`` 是 i32 的整数取余（哈希用），这里是浮点域，
+    语义都是"向负无穷取整后的余数"，也就是 ``torch.remainder`` / Python
+    ``%``。两者不能合并——``mod`` 的内核走整数 ``%`` 加修正，浮点走
+    ``fmod`` 加修正，合并会把一条很短的语义绑到两套设备实现上。
+    """
+    a, b = inputs
+    if a.dtype != b.dtype:
+        raise TypeError(
+            f"remainder 要求两侧 dtype 一致，得到 {a.dtype.value} 与 {b.dtype.value}；"
+            "请显式插入 cast"
+        )
+    if a.dtype not in _FLOAT_DTYPES:
+        raise TypeError(
+            f"remainder 只承接浮点，得到 {a.dtype.value}；整数取余请用 mod"
+        )
+    return TensorType(a.dtype, _broadcast_shape(a.shape, b.shape))
+
+
+def _remainder_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    # numpy 的 ``mod`` 就是 floor 语义；除数为 0 时按 IEEE 给 nan，
+    # 与 torch.remainder 一致，不在宿主上打警告。
+    with np.errstate(all="ignore"):
+        return np.mod(args[0], args[1])
+
+
+register(
+    Op(
+        name="remainder",
+        infer=_infer_remainder,
+        reference=_remainder_ref,
+        doc="浮点取余：floor 语义（结果与除数同号），与 torch.remainder / Python % 一致",
+    )
+)
+
+
+def _infer_repeat_interleave(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    """沿单轴逐元素重复 ``repeats`` 次，``repeats`` 是构图期常量。
+
+    只支持"每个元素重复同样次数"这一种形态：``torch.repeat_interleave``
+    还接受长度等于该轴的张量作为逐元素次数，那需要按输入张量做前缀和，
+    与这里"静态常量"的内核完全不同，等有真实模型需要时再单独加。
+    """
+    (t,) = inputs
+    repeats = attrs.get("repeats")
+    if isinstance(repeats, bool) or not isinstance(repeats, int):
+        raise TypeError(
+            f"repeat_interleave 的 repeats 必须是正整数，得到 {repeats!r}"
+        )
+    if repeats <= 0:
+        raise ValueError(f"repeat_interleave 的 repeats 必须大于 0，得到 {repeats}")
+    axis = _norm_axes(attrs.get("axis", -1), t.rank)[0]
+    dim = t.shape[axis]
+    if not isinstance(dim, int):
+        raise ValueError(
+            f"repeat_interleave 要求 axis={axis} 是静态维，得到符号维 {dim}；"
+            "请先把该维固定成具体长度"
+        )
+    shape = list(t.shape)
+    shape[axis] = dim * repeats
+    return TensorType(t.dtype, tuple(shape))
+
+
+def _repeat_interleave_ref(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    return np.repeat(args[0], attrs["repeats"], axis=attrs.get("axis", -1))
+
+
+register(
+    Op(
+        name="repeat_interleave",
+        infer=_infer_repeat_interleave,
+        reference=_repeat_interleave_ref,
+        attrs_schema=("repeats", "axis"),
+        doc="沿单轴把每个元素重复 repeats 次（对应 torch.repeat_interleave 的常量形态）",
+    )
+)
+
+
 def _infer_silu(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (1, 2):
         raise ValueError(f"silu 需要 (x) 或 (x, gate) 输入，得到 {len(inputs)}")

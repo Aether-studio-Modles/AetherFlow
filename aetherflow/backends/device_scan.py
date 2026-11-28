@@ -154,6 +154,52 @@ class _ScanMixin:
             )
         return self._reorder(self.codegen.roll_source, "roll_axis", x, axis, shift)
 
+    def _op_repeat_interleave(self, node, args, attrs):
+        """沿单轴逐元素重复 ``repeats`` 次：该轴长度变成 ``dim * repeats``。
+
+        铺法与 ``flip`` / ``roll`` 相同（一个线程搬一个元素），差别只在下标：
+        ``steps`` / ``inner`` 取自**输入**，而 ``work`` 与线性下标的拆分按
+        **输出**形状（内核里算 ``steps * repeats``）。
+        """
+        cp = self.cp
+        x = self._contig(args[0])
+        axis = self._axis_of(attrs, x.ndim, "repeat_interleave")
+        repeats = attrs.get("repeats")
+        if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats <= 0:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 repeat_interleave 的 repeats 必须是正整数，"
+                f"收到 {repeats!r}"
+            )
+        shape = tuple(int(d) for d in x.shape)
+        steps = shape[axis]
+        inner = int(np.prod(shape[axis + 1 :], dtype=np.int64))
+        out_shape = shape[:axis] + (steps * repeats,) + shape[axis + 1 :]
+        out = cp.empty(out_shape, dtype=x.dtype)
+        work = int(np.prod(out_shape, dtype=np.int64))
+        if work == 0 or steps == 0:
+            return out
+        kernel = self._kernel(
+            ("repeat_interleave", self._kind(x)),
+            lambda: self.codegen.render(
+                self.codegen.repeat_interleave_source(), x.dtype
+            ),
+            "repeat_interleave",
+        )
+        block, grid = self._grid("repeat_interleave", work)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                x,
+                out,
+                np.int64(work),
+                np.int64(steps),
+                np.int64(inner),
+                np.int64(repeats),
+            ),
+        )
+        return out
+
 
     def _op_tril(self, node, args, attrs):
         """最后两维保留下三角、其余置零：一个线程一个元素。

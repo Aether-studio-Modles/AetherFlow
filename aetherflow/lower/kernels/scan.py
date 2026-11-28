@@ -359,6 +359,64 @@ def roll() -> Kernel:
     )
 
 
+def repeat_interleave() -> Kernel:
+    """沿单轴把每个元素连续重复 ``repeats`` 次。
+
+    ``out[o, j, i] = x[o, j / repeats, i]``：输出的线性下标按
+    ``(outer, steps * repeats, inner)`` 拆分，源下标只把输出轴的 ``j`` 换成
+    ``j / repeats``，其余与 ``flip`` / ``roll`` 同一套扁平铺法。
+
+    所有括号都是必需的：打印器不推断优先级，``steps * repeats * inner``
+    不括起来会与 ``idx / (...)`` 结合错，``o * steps + j / repeats`` 也会被
+    打印成 ``(o * steps) + (j / repeats)`` 之外的样子。
+    """
+    out_steps = Paren(Bin("*", Var("steps"), Var("repeats")))
+    plane = Paren(Bin("*", out_steps, Var("inner")))
+    return Kernel(
+        name="repeat_interleave",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "work"),
+            Scalar("long long", "steps"),
+            Scalar("long long", "inner"),
+            Scalar("long long", "repeats"),
+        ),
+        body=_flat_loop(
+            (
+                Let("const long long", "o", Bin("/", Var("idx"), plane)),
+                Let("const long long", "rem", Bin("%", Var("idx"), plane)),
+                Let("const long long", "j", Bin("/", Var("rem"), Var("inner"))),
+                Let("const long long", "i", Bin("%", Var("rem"), Var("inner"))),
+                Let(
+                    "const long long",
+                    "src",
+                    Bin(
+                        "+",
+                        Bin(
+                            "*",
+                            # ``(o * steps + (j / repeats))`` 必须先成组再乘 inner。
+                            Paren(
+                                Bin(
+                                    "+",
+                                    Bin("*", Var("o"), Var("steps")),
+                                    Paren(Bin("/", Var("j"), Var("repeats"))),
+                                )
+                            ),
+                            Var("inner"),
+                        ),
+                        Var("i"),
+                    ),
+                ),
+                Store("out", Var("idx"), Load("x", Var("src"))),
+            ),
+            index="idx",
+            count="work",
+            stride="step",
+        ),
+    )
+
+
 def tril() -> Kernel:
     """最后两维的下三角掩码：一个线程一个元素。
 

@@ -27,7 +27,25 @@ from ..kernel import (
     Tensor,
     Var,
 )
-from .common import BINARY_OP, COMPARE_OP, grid_stride
+from .common import BINARY_CALL, BINARY_OP, COMPARE_OP, grid_stride
+
+
+def _binary_value(kind: str, a, b, *, compare: bool = False):
+    """二元表达式的统一入口：比较 / 中缀算术 / 函数调用三种形态。
+
+    ``a`` / ``b`` 是已经取好值的操作数表达式。中缀形态显式加 ``Paren``
+    （打印器不推断优先级），函数调用的实参本来就是自定界的，不加括号。
+    """
+    if compare:
+        return Bin(COMPARE_OP[kind], Paren(a), Paren(b))
+    if kind in BINARY_OP:
+        return Bin(BINARY_OP[kind], Paren(a), Paren(b))
+    if kind in BINARY_CALL:
+        return BINARY_CALL[kind](a, b)
+    label = "比较" if compare else "二元"
+    table = COMPARE_OP if compare else BINARY_OP
+    known = sorted(set(table) | set(BINARY_CALL))
+    raise ValueError(f"未知的{label}运算 {kind!r}；已支持: {known}")
 
 
 def ew_binary(
@@ -43,7 +61,7 @@ def ew_binary(
     1 字节的 bool。算术与比较共用同一份循环骨架，差异只有这两处。
     """
     table = COMPARE_OP if compare else BINARY_OP
-    if kind not in table:
+    if kind not in table and kind not in BINARY_CALL:
         label = "比较" if compare else "二元"
         raise ValueError(f"未知的{label}运算 {kind!r}；已支持: {sorted(table)}")
 
@@ -51,11 +69,8 @@ def ew_binary(
     # 也会让整张图无法被捕获。
     a_index = Num("0") if scalar_a else Var("i")
     b_index = Num("0") if scalar_b else Var("i")
-    # 括号显式写进 L2（模板原本是 "(A) op (B)"），打印器不推断优先级。
-    value = Bin(
-        table[kind],
-        Paren(Load("a", a_index)),
-        Paren(Load("b", b_index)),
+    value = _binary_value(
+        kind, Load("a", a_index), Load("b", b_index), compare=compare
     )
 
     out = Tensor("out", read_only=False, type_name="bool") if compare else Tensor(
@@ -487,14 +502,12 @@ def ew_broadcast(kind: str, *, compare: bool = False) -> Kernel:
     所以那条路径已经删除，见 DESIGN 5.300。
     """
     table = COMPARE_OP if compare else BINARY_OP
-    if kind not in table:
+    if kind not in table and kind not in BINARY_CALL:
         label = "比较" if compare else "二元"
         raise ValueError(f"未知的{label}运算 {kind!r}；已支持: {sorted(table)}")
 
-    value = Bin(
-        table[kind],
-        Paren(Load("a", Var("oa"))),
-        Paren(Load("b", Var("ob"))),
+    value = _binary_value(
+        kind, Load("a", Var("oa")), Load("b", Var("ob")), compare=compare
     )
 
     def _dims(prefix: str) -> tuple:

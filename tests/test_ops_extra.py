@@ -1632,5 +1632,143 @@ class TestLogSumExp(unittest.TestCase):
             g.logsumexp(x)
 
 
+class TestAtan2(unittest.TestCase):
+    """``atan2(y, x)``：四象限反正切。"""
+
+    def test_forward_matches_numpy_in_all_quadrants(self):
+        rng = np.random.default_rng(21)
+        ys = rng.standard_normal((4, 5))
+        xs = rng.standard_normal((4, 5))
+        # 四个象限都要被覆盖：全在第一象限时 atan(y/x) 也能算对
+        self.assertTrue((ys > 0).any() and (ys < 0).any())
+        g = Graph("atan2")
+        y = g.input("y", f64[4, 5])
+        x = g.input("x", f64[4, 5])
+        g.output(g.atan2(y, x), "out")
+        np.testing.assert_allclose(
+            _run(g, {"y": ys, "x": xs})["out"], np.arctan2(ys, xs), rtol=1e-12
+        )
+
+    def test_forward_broadcasts(self):
+        g = Graph("atan2_bcast")
+        y = g.input("y", f64[3, 4])
+        x = g.input("x", f64[4])
+        g.output(g.atan2(y, x), "out")
+        ys = np.array([[1.0, -1.0, 2.0, -2.0]] * 3)
+        xs = np.array([1.0, 1.0, -1.0, -1.0])
+        np.testing.assert_allclose(
+            _run(g, {"y": ys, "x": xs})["out"], np.arctan2(ys, xs), rtol=1e-12
+        )
+
+    def test_gradient_matches_numeric(self):
+        rng = np.random.default_rng(22)
+        ys = rng.standard_normal((3, 4)) + 0.5
+        xs = rng.standard_normal((3, 4)) - 0.5
+        g = Graph("atan2_grad")
+        y = g.input("y", f64[3, 4])
+        x = g.input("x", f64[3, 4])
+        g.output(g.atan2(y, x), "out")
+        dy, dx = _analytic_grad(g, {"y": ys, "x": xs}, ["y", "x"])
+        denom = xs * xs + ys * ys
+        np.testing.assert_allclose(dy, xs / denom, rtol=1e-12)
+        np.testing.assert_allclose(dx, -ys / denom, rtol=1e-12)
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"y": ys, "x": xs}, "x"), atol=1e-6)
+
+    def test_rejects_integer_input(self):
+        g = Graph("atan2_int")
+        a = g.input("a", i32[3])
+        b = g.input("b", i32[3])
+        with self.assertRaises(TypeError):
+            g.atan2(a, b)
+
+    def test_rejects_mixed_dtypes(self):
+        g = Graph("atan2_mixed")
+        a = g.input("a", f32[3])
+        b = g.input("b", f64[3])
+        with self.assertRaises(TypeError):
+            g.atan2(a, b)
+
+
+class TestRemainder(unittest.TestCase):
+    """浮点取余：floor 语义（结果与除数同号）。"""
+
+    def test_floor_semantics_on_both_signs(self):
+        g = Graph("remainder")
+        a = g.input("a", f64[4])
+        b = g.input("b", f64[4])
+        g.output(g.remainder(a, b), "y")
+        av = np.array([-7.0, 7.0, -7.0, 7.0])
+        bv = np.array([3.0, 3.0, -3.0, -3.0])
+        got = _run(g, {"a": av, "b": bv})["y"]
+        # 截断取余（fmod）会给出 -1/1/-1/1；floor 语义是 2/1/-1/-2
+        np.testing.assert_allclose(got, np.mod(av, bv), rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(got, np.array([2.0, 1.0, -1.0, -2.0]), rtol=0.0, atol=0.0)
+
+    def test_gradient_matches_numeric(self):
+        rng = np.random.default_rng(23)
+        av = rng.standard_normal((3, 4)) * 4.0
+        bv = rng.standard_normal((3, 4)) + 2.5
+        g = Graph("remainder_grad")
+        a = g.input("a", f64[3, 4])
+        b = g.input("b", f64[3, 4])
+        g.output(g.remainder(a, b), "y")
+        da, db = _analytic_grad(g, {"a": av, "b": bv}, ["a", "b"])
+        np.testing.assert_allclose(da, np.ones_like(av), rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(db, -np.floor(av / bv), rtol=1e-12)
+        np.testing.assert_allclose(db, _numeric_grad(g, {"a": av, "b": bv}, "b"), atol=1e-6)
+
+    def test_integer_points_at_mod(self):
+        g = Graph("remainder_int")
+        a = g.input("a", i32[3])
+        b = g.input("b", i32[3])
+        with self.assertRaises(TypeError) as ctx:
+            g.remainder(a, b)
+        self.assertIn("mod", str(ctx.exception))
+
+
+class TestRepeatInterleave(unittest.TestCase):
+    """沿单轴逐元素重复。"""
+
+    def test_forward_middle_axis(self):
+        rng = np.random.default_rng(24)
+        xs = rng.standard_normal((2, 3, 4))
+        g = Graph("repeat_interleave")
+        x = g.input("x", f64[2, 3, 4])
+        g.output(g.repeat_interleave(x, repeats=3, axis=1), "y")
+        got = _run(g, {"x": xs})["y"]
+        self.assertEqual(got.shape, (2, 9, 4))
+        np.testing.assert_allclose(got, np.repeat(xs, 3, axis=1), rtol=0.0, atol=0.0)
+
+    def test_gradient_sums_each_group(self):
+        rng = np.random.default_rng(25)
+        xs = rng.standard_normal((2, 3, 4))
+        g = Graph("repeat_interleave_grad")
+        x = g.input("x", f64[2, 3, 4])
+        g.output(g.repeat_interleave(x, repeats=2, axis=1), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        # 前向把每个元素写了 repeats 份，反向就是把同组梯度加起来
+        np.testing.assert_allclose(dx, np.full_like(xs, 2.0), rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-6)
+
+    def test_default_axis_is_last(self):
+        g = Graph("repeat_interleave_default_axis")
+        x = g.input("x", f64[2, 3])
+        g.output(g.repeat_interleave(x, repeats=2), "y")
+        self.assertEqual(g.outputs[0].type.shape, (2, 6))
+
+    def test_rejects_bad_repeats(self):
+        for bad in (0, -1, 1.5, True):
+            g = Graph(f"repeat_bad_{bad!r}")
+            x = g.input("x", f64[2, 3])
+            with self.assertRaises((TypeError, ValueError)):
+                g.repeat_interleave(x, repeats=bad)
+
+    def test_rejects_symbolic_axis(self):
+        g = Graph("repeat_symbolic")
+        x = g.input("x", f64["B", 3])
+        with self.assertRaises(ValueError):
+            g.repeat_interleave(x, repeats=2, axis=0)
+
+
 if __name__ == "__main__":
     unittest.main()

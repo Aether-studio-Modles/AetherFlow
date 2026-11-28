@@ -1352,6 +1352,46 @@ def _logsumexp(shape: tuple = (3, 4, 5), axis: int = -1, keepdims: bool = False)
     return build
 
 
+def _atan2(shape: tuple = (5, 7)):
+    def build(rng):
+        g = Graph("atan2")
+        y = g.input("y", f32[shape])
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("atan2", [y, x]), "out")
+        # 四个象限都要出现：只要 x 全正，截断式实现（用 atan）也能蒙对
+        return g, {"y": _f32(rng, shape, scale=2.0), "x": _f32(rng, shape, scale=2.0)}
+
+    return build
+
+
+def _remainder(shape: tuple = (6, 5)):
+    def build(rng):
+        g = Graph("remainder")
+        a = g.input("a", f32[shape])
+        b = g.input("b", f32[shape])
+        g.output(g.add_node("remainder", [a, b]), "y")
+        feed = {"a": _f32(rng, shape, scale=6.0), "b": _f32(rng, shape, scale=2.0)}
+        # 除数远离 0（避免 nan），且正负混合：截断取余与 floor 取余只在异号时分岔
+        feed["b"] = np.where(np.abs(feed["b"]) < 0.5, 1.5, feed["b"]).astype(np.float32)
+        return g, feed
+
+    return build
+
+
+def _repeat_interleave(shape: tuple = (2, 3, 4), axis: int = 1, repeats: int = 3):
+    def build(rng):
+        g = Graph("repeat_interleave")
+        x = g.input("x", f32[shape])
+        g.output(
+            g.add_node("repeat_interleave", [x], {"axis": axis, "repeats": repeats}),
+            "y",
+        )
+        # 中间轴 + repeats>2：输出该轴是 dim*repeats，源下标必须整除回段首
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
 def _clamp(lo=None, hi=None, shape: tuple = (5, 7)):
     def build(rng):
         g = Graph("clamp")
@@ -2267,6 +2307,12 @@ def default_cases() -> List[Case]:
               note="幅度 8：不减最大值的朴素 exp 会溢出，稳定化必须生效"),
         _case("logsumexp_axis1_keepdims", _logsumexp(shape=(3, 4, 5), axis=1, keepdims=True),
               note="中间轴 + keepdims：输出该维为 1，展平顺序不变"),
+        _case("atan2_quadrants", _atan2(),
+              note="四象限反正切：只覆盖第一象限时 atan(y/x) 也能蒙对，必须两侧都有负值"),
+        _case("remainder_floor", _remainder(),
+              note="浮点 floor 取余：截断式 fmodf 在异号时符号错，必须与 numpy.mod 一致"),
+        _case("repeat_interleave_middle", _repeat_interleave(),
+              note="中间轴重复 3 次：输出轴长 dim*repeats，源下标 = 输出下标 / repeats"),
         _case("topk_mask_last", _topk_mask(), rtol=0.0, atol=0.0,
               note="路由掩码：输出 0/1，必须精确相等；同值按下标小者优先（稳定排序）"),
         _case("topk_mask_axis0", _topk_mask(k=1, axis=0, shape=(4, 3)),

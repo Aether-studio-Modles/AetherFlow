@@ -21,7 +21,9 @@ HIP_DIALECT = CStyleDialect(
     store={DType.F32: "af_st_f", DType.F16: "af_st_h"},
     atomic={DType.F32: "af_add_f", DType.F16: "af_add_h"},
     helpers={
-        DType.F32: _cuda._F32_HELPERS,
+        # f32 的 helper 块不带表达式级 helper（af_rem），这里补一份；
+        # HIP 的 f16 块（``_HIP_F16_HELPERS``）自带。
+        DType.F32: _cuda._F32_HELPERS + _cuda._EXPR_HELPERS,
         DType.F16: codegen._HIP_F16_HELPERS,
     },
     reduce_helpers=_cuda._REDUCE,

@@ -24,9 +24,9 @@ CUDA_DIALECT = CStyleDialect(
     store={DType.F32: "af_st_f", DType.F16: "af_st_h", DType.BF16: "af_st_b"},
     atomic={DType.F32: "af_add_f", DType.F16: "af_add_h", DType.BF16: "af_add_b"},
     helpers={
-        DType.F32: codegen._F32_HELPERS,
-        DType.F16: codegen._F16_HELPERS,
-        DType.BF16: codegen._BF16_HELPERS,
+        DType.F32: codegen._F32_HELPERS + codegen._EXPR_HELPERS,
+        DType.F16: codegen._F16_HELPERS + codegen._EXPR_HELPERS,
+        DType.BF16: codegen._BF16_HELPERS + codegen._EXPR_HELPERS,
     },
     reduce_helpers=codegen._REDUCE,
 )
@@ -37,7 +37,12 @@ CUDA_DIALECT = CStyleDialect(
 # ``CUDA_DIALECT``——那会让所有内核的源码多出几十行，而 5.42 起有"生产源码
 # 与手写模板逐 token 相等"的对照用例盯着每一个字。
 _CAST_HELPERS = (
-    codegen._F32_HELPERS + codegen._F16_HELPERS + codegen._BF16_HELPERS
+    codegen._F32_HELPERS
+    + codegen._F16_HELPERS
+    + codegen._BF16_HELPERS
+    # 表达式级 helper（af_rem）与 dtype 无关：三块拼起来只追加一次，
+    # 否则同一个生成单元里会重复定义。
+    + codegen._EXPR_HELPERS
 )
 
 CAST_DIALECT = CStyleDialect(

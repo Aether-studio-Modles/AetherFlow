@@ -37,7 +37,7 @@ __device__ __forceinline__ float af_add_h(unsigned short* p, float v) {
     } while (assumed != old);
     return af_ld_h(old);
 }
-"""
+""" + _cuda._EXPR_HELPERS
 
 
 def render(template, dtype) -> str:

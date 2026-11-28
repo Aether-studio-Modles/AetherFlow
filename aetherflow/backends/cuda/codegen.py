@@ -66,6 +66,7 @@ from ...lower.kernels import (
     reduce_axis_tiled,
     rmsnorm_last,
     roll,
+    repeat_interleave,
     scan_linear,
     softmax_axis,
     scan_linear_backward,
@@ -213,6 +214,26 @@ __device__ __forceinline__ int block_scan_sum(int v, int* smem) {
     if (tid == 0) { smem[n] = total; }
     __syncthreads();
     return pre;
+}
+"""
+
+# 表达式级辅助函数：不是"按存储宽度读写"，而是内核表达式里直接调用的函数，
+# 与 dtype 无关（实参与返回值都是 float）。**不**拼进下面三个 dtype 块，
+# 而由使用方按"每个生成单元恰好一次"追加：``CUDA_DIALECT`` 的每个 dtype 各
+# 追加一次，``_CAST_HELPERS`` / ``_BOOL_HELPERS`` 这类把三块拼在一起的组合
+# 只追加一次。三块各自带一份会让组合方言里 ``af_rem`` 重复定义（NVRTC 报
+# "has already been defined"）。
+# NOTE: ASCII only -- this text goes to NVRTC.
+_EXPR_HELPERS = r"""
+// Floor-semantics modulo for floats. fmodf truncates, so its result takes the
+// sign of the dividend; numpy.mod / torch.remainder take the sign of the
+// divisor. Adding one divisor when the signs differ fixes that. NaN and a zero
+// divisor propagate as-is (fmodf returns NaN), matching the IEEE result numpy
+// produces.
+__device__ __forceinline__ float af_rem(float a, float b) {
+    float r = fmodf(a, b);
+    if (r != 0.f && ((r < 0.f) != (b < 0.f))) { r += b; }
+    return r;
 }
 """
 
@@ -366,9 +387,9 @@ __device__ __forceinline__ float af_add_q(unsigned char* p, float v) { return 0.
 """
 
 _HELPERS = {
-    "f32": _F32_HELPERS,
-    "f16": _F16_HELPERS,
-    "bf16": _BF16_HELPERS,
+    "f32": _F32_HELPERS + _EXPR_HELPERS,
+    "f16": _F16_HELPERS + _EXPR_HELPERS,
+    "bf16": _BF16_HELPERS + _EXPR_HELPERS,
     "bool": _BOOL_HELPERS,
 }
 
@@ -2585,6 +2606,11 @@ def flip_source() -> Kernel:
 def roll_source() -> Kernel:
     """单轴循环移位的 L2 描述（5.349）：一个线程搬一个元素，``shift`` 由 host 归一化。"""
     return roll()
+
+
+def repeat_interleave_source() -> Kernel:
+    """单轴逐元素重复的 L2 描述（5.350）：输出轴长是输入的 ``repeats`` 倍。"""
+    return repeat_interleave()
 
 
 def tril_source() -> Kernel:

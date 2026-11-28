@@ -28,6 +28,14 @@ class _ElementwiseMixin:
     def _op_div(self, node, args, attrs):
         return self._binary("div", args)
 
+    # 函数调用形态的二元算子（5.350）：表达式是 ``atan2f`` / ``af_rem``，
+    # 与算术共用同一套同形 / 标量 / 多维广播三条路径。
+    def _op_atan2(self, node, args, attrs):
+        return self._binary("atan2", args)
+
+    def _op_remainder(self, node, args, attrs):
+        return self._binary("remainder", args)
+
     # 比较算子：与二元算术共用广播骨架，只把输出换成 bool、运算符换成比较。
     def _op_eq(self, node, args, attrs):
         return self._binary("eq", args, compare=True)
