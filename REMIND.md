@@ -53,7 +53,9 @@
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
   分页 KV cache（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制，以及
   token→token 的贪心生成闭环 `PagedGenerator` 与自动前缀缓存，5.310 / 5.335；
-  跨进程 / 落盘前缀缓存 `DiskPrefixCache`，5.337/5.339）
+  跨进程 / 落盘前缀缓存 `DiskPrefixCache`，5.337/5.339；5.353 起池内 K/V 可
+  int8 存储——`quantize="i8"`，逐 token 逐头对称量化 + f32 scale，换出副本同存
+  int8，解码图经 `dequantize_i8_group` 读回）
   与贪心投机
   解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：
   `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
@@ -300,7 +302,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   都带 `model_id + tokens` 摘要），内存未命中时查盘、命中就整段导入 KV，
   `generate` 结束与 `finish` 释放前把全长落盘（5.339：换出态跳过、空序列
   不留条目、`disk_stores` 只在真写入时自增）；指纹 / 形状 / dtype / 页宽失配与盘上损坏都只算
-  "没有条目"并退回 prefill。这些组件都是主机态，没有真机
+  "没有条目"并退回 prefill。5.353 起缓存池可按 int8 存储（`quantize="i8"`）：
+  逐 token、逐头对称量化，换出副本同样存 int8，解码图用 `dequantize_i8_group`
+  读回；边界是只支持 i8 对称、要求静态整数 batch、展平必须在主机侧（设备
+  reshape / transpose 不承接 i8），落盘仍 f32。这些组件都是主机态，没有真机
   D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机解码走
   `LMRunner.generate_speculative`（5.303），只支持贪心验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /
@@ -1035,6 +1040,21 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   走 tar.gz + SFTP，排除 `.git/__pycache__/.pytest_cache`；跑
   `python3 verify_cuda.py` 与 `python3 -m unittest discover -s tests -t .`
   （后者约 95 秒，tail -n 60 才能看到完整失败段）。
+- **设备端的 `reshape` / `transpose` 都不承接 int8**（5.353）：CUDA 后端对 i8
+  张量直接拒绝 reshape 与 transpose（"不做隐式降级：请在前端显式插入 cast"），
+  而 `cast` 的源类型白名单里没有 i8。结论：int8 张量在图上**只能被
+  `dequantize_i8_group` 消费**。要展平就在主机侧做
+  （`np.ascontiguousarray(x.transpose(0, 2, 1)).reshape(...)`，1 字节/元素一次
+  拷贝），图内只留反量化与 f32 的 reshape / transpose。
+- **逐 token 逐头的 scale 要靠"组大小 = head_dim"承载**（5.353）：
+  `dequantize_i8_group` 要求 q 是 `(K, N)`、scale 是 `(K/G, N)`，列方向必须
+  完整给出。缓存按 `(T*D, H)`（D = head_dim、H = 头数）喂入，组大小取 D，
+  正好让一行 scale 覆盖"一个 token 的一个头"的 D 个元素；换成 `(T, H*D)` 的
+  布局找不到可用的组大小。
+- **cuda 与 ref 的量化路径不逐位**（5.353）：两条路径的 f32 乘加次序不同，
+  `cached_forward(quantize="i8")` 实测最大绝对差 `4.77e-07`（相对 `3.33e-05`），
+  用 `assert_allclose(rtol=1e-5, atol=1e-5)`；写 `assert_array_equal` 会得到
+  35/48 不匹配的假失败。
 
 ---
 

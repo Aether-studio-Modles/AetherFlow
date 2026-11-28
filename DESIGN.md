@@ -22628,6 +22628,80 @@ layernorm 改读 a、b 两个张量而不是 x1，多一遍张量读。换来的
   参考后端只是语义真值，不代表性能。
 
 
+### 5.353　分页 KV cache 的 int8 量化存储
+
+**缺口清单的第三项。** 5.310 / 5.335 的分页缓存一直把 K/V 按 `dtype`（f32）
+存：物理页 4 字节/元素，换出副本同样 4 字节。清单要求把缓存也做量化，且不能
+只做"存成 int8 再读回 f32"的表面文章——换出、`fork` 写时复制、解码图读回
+都得走同一条量化口径。
+
+**口径：对称、逐 token、逐头。** 一行 = 一个 token 的一个头：
+
+| 项 | 定义 |
+|---|---|
+| scale | `max(|x|) / 127`；全零行取 `1.0`（反量化仍是 0） |
+| 量化 | `q = clip(rint(x / scale), -127, 127)`，存 int8 |
+| 反量化 | `q * scale` |
+| scale 形状 | `(num_blocks, block_size, num_heads)` 的 f32，K / V 各一份 |
+
+物理页因此从 4 字节/元素降到 1 字节（另加 `4 / head_dim` 的 scale 开销）。
+`quantize="i8"` 只允许 `dtype=float32`（反量化输出按 f32），未知方案
+`ValueError`。**换出副本同样保存 int8 + scale**——换出不再引入第二次量化误差；
+`fork` 的写时复制把 scale 一起拷贝；`swap_out` / `swap_in` / `truncate`
+统一按 `(key, key_scale, value, value_scale)` 四元组走。
+
+**读回与解码图。** `gather` 仍返回反量化后的 `dtype`（调用方不用改）；
+新增 `gather_quantized` 返回 `(q, scale)`，供设备解码把 int8 直接搬进图。
+`build_cached_decoder_step(quantized_cache=True)` 的输入契约变成：
+
+| 输入 | 形状 / 类型 |
+|---|---|
+| `l{i}_k` / `l{i}_v` | i8 `(B*cache_steps*D, H)`，主机侧展平 |
+| `l{i}_k_scale` / `l{i}_v_scale` | f32 `(B*cache_steps, H)` |
+
+图内 `dequantize_i8_group`（组大小取 `D`：一行 scale 正好覆盖同一个 token、
+同一个头的 D 个元素）→ `reshape(B, L, D, H)` → f32 `transpose` 得
+`(B, H, L, D)`，之后走与非量化路径**同一套**注意力节点。量化只改"缓存怎么存、
+怎么读回"，不改解码语义。
+
+**为什么展平在主机侧。** 设备端两条硬约束（V100 实测）：`reshape` 与
+`transpose` 对 i8 一律拒绝（不做隐式降级），`cast` 的源类型白名单也不含 i8。
+于是 int8 张量在图上只能被 `dequantize_i8_group` 消费；展平（每元素 1 字节的
+一次拷贝）放主机侧，图内只保留一次反量化与 f32 的 reshape / transpose。
+代价是量化缓存要求**静态整数 batch**（reshape 需要具体维长），符号维显式
+`TypeError`。
+
+**入口。** `cached_forward(..., quantize="i8")`、
+`PagedDecodeScheduler(quantize="i8")`、`PagedGenerator(quantize="i8")` 逐层
+透传；落盘的 `DiskPrefixCache` 仍存 f32（量化只作用于池内与换出副本）。
+
+**验证。**
+
+- `tests/test_paged_cache.py` 的 `TestQuantizedStorage`（9 个用例）：`gather`
+  误差 `<= 0.5 * scale`、`gather_quantized` 与手工量化逐位一致且
+  `gather == q*scale`、全零行 scale 为 1.0、`pad_to` 补零、`fork` 的写时复制
+  把 scale 一起拷贝、`swap_out/in` 逐位、未量化时 `gather_quantized` 拒绝、
+  `PagedCacheManager` 自动换入。
+- `tests/test_attention_cache.py`：量化解码与 dense 差 `< 0.05` 且与未量化
+  路径不全等；未知方案拒绝；调度器的量化路径误差与长度。
+- `verify_cuda.py`：`kv_i8_dequant_4d`（图形态对拍）、
+  `cached_forward_i8_matches_reference`（cuda 与 ref 的量化路径
+  `rtol = atol = 1e-5`）、`cached_forward_i8_error`（V100 实测 `6.518e-03`，
+  阈值 0.05）。
+- 本地全量 3602 / 464 跳过 / OK；V100 真机 `verify_cuda.py` 全部通过，
+  全量 3588 / 178 跳过 / OK。
+
+**未声称。**
+
+- 没有吞吐与峰值显存实测：只有"物理页 4 → 1 字节"的存储口径与误差界，
+  没有端到端加速数字。
+- 只支持对称 int8、逐 token 逐头；非对称零点、逐组、4 bit 都没接到分页缓存。
+- 误差界是单配置的经验值（V100 上 `6.518e-03`），不是对所有层数 / 模型规模的
+  保证。
+- `DiskPrefixCache` 的落盘仍是 f32，量化不省盘。
+
+
+
 
 
 

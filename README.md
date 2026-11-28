@@ -151,8 +151,8 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3590 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
-V100 真机 3574 个用例 / 178 跳过 / OK（差值都是只在本地跳过的设备端测试）。
+当前基线：**3602 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
+V100 真机 3588 个用例 / 178 跳过 / OK（差值都是只在本地跳过的设备端测试）。
 
 ## 4. 第一代版本的能力面
 
@@ -384,7 +384,12 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   `stats`），5.337 又把这条判据接到盘上（`DiskPrefixCache`：一条序列一个
   `.npz`，存 token 序列 + 每层 K/V，文件名与 meta 都带 `model_id + tokens` 的
   sha256；指纹 / 形状 / dtype / 页宽失配或盘上文件损坏都当作"没有条目"退回
-  prefill，`generate` 结束与 `finish` 释放前把全长落盘，5.339），新进程首次请求即可复用；但仍是
+  prefill，`generate` 结束与 `finish` 释放前把全长落盘，5.339），新进程首次请求即可复用；
+  5.353 起池内 K/V 可**按 int8 存储**（`cached_forward` / `PagedDecodeScheduler` /
+  `PagedGenerator` 的 `quantize="i8"`：逐 token、逐头对称量化，物理页 4 → 1
+  字节/元素、另配 f32 scale，换出副本同样存 int8 不二次量化；解码图用
+  `dequantize_i8_group` 读回，要求静态整数 batch，int8 展平放在主机侧——设备
+  的 reshape / transpose 不承接 i8；落盘仍是 f32）；但仍是
   主机态组件、无真机 D2H 与拆页实测；已有 OpenAI
   兼容子集（`/v1/completions`、`/v1/chat/completions`、SSE；`logprobs` / `n>1` /
   工具调用显式 400），静态单密钥 Bearer 认证与进程内滑动窗口限流（5.285），
@@ -417,7 +422,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3590 个用例
+tests/                3602 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
