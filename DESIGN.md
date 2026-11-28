@@ -21236,6 +21236,76 @@ block 报错、`clear_schedule` 回到自动、`set_schedule` 作废计划缓存
 - 同一份配置的收益仍以真机测量为准；本轮只保证"库里的答案会被用上、用错
   会报错"，不声称任何加速比。
 
+### 5.334 设备端原生 NHWC：conv2d 分块直算与池化前向
+
+**缺口。** 布局传播 pass（5.246）能把 conv / maxpool / avgpool 区域翻成 NHWC
+并在区域边界插转置，但设备端声明的是 `supported_layouts = {"nchw"}`——翻好的
+图到 `invoke` 入口被整体拒绝，只能在参考后端跑。也就是说"布局决策"在设备上
+从来没有兑现过：要么不翻转，要么翻完报错。
+
+**1. 参数化内核描述，而不是复制一套数学。** NHWC 改变的只有**寻址**：
+NCHW 的通道偏移每步跳 `H*W`，NHWC 是相邻地址。所以 `lower/kernels/` 里没有
+第二套卷积：
+
+- `image.py` 增加 NHWC 三片段：`_split_output_index_nhwc`（把展平下标拆成
+  `(n, h, w, c)`，`c` 在最后一段）、`_image_slice_nhwc`（只加
+  `n * H*W*C + c`，窗口偏移交给 tap）、`_tap_nhwc`（`(ih*W + iw) * C`）。
+- `pool.py` 用 `_layout_fragments(layout)` 在这三片段与 NCHW 版之间选，
+  `maxpool2d(layout=...)` / `avgpool2d(layout=...)` 的内核名带 `_nhwc` 后缀。
+  窗口、越界判断、`count_include_pad` 的分母逻辑一行未改。
+- `conv.py` 的 `conv2d_tiled(layout=...)` 只换 6 处寻址：输入通道偏移
+  （`Cast("long long", index)` vs `((long long)index * H) * W`）、行步长
+  （`W` vs `W * C`）、列步长（`1` vs `C`）、输出指针、输出通道步长。dst 与
+  写回抽成 `_output_writeback(layout)` 供 tiled / implicit 共用；NHWC 版
+  implicit 只在下标处调用默认参数，不产生第二份代码。
+
+命名后缀是刻意的：同一个进程里两种布局要能各占一个内核缓存槽
+（`("conv2d_tiled", kind)` 与 `("conv2d_tiled_nhwc", kind)`），否则先跑的
+那版会被复用去算另一种布局。
+
+**2. 后端只放行真正有内核的覆盖面。** `supported_layouts` 改成
+`{"nchw", "nhwc"}`，但 NHWC 的承接面收窄在 `device_conv` / `device_pool`
+的入口：
+
+- conv2d：只走分块直算。`groups != 1`、`conv_impl` 显式指定
+  im2col / implicit / winograd / grouped / cudnn、非 f32，都抛
+  `BackendCapabilityError` 并给出"改用 `layout='nchw'`"的建议。`auto` 在这里
+  等价于 `tiled`——NHWC 的收益来自通道连续，而 tiled 的内层正好沿通道走。
+- 池化：`maxpool2d` / `avgpool2d` 只加前向分支；反向与 `maxpool2d_indices`
+  没有 `layout` 属性（不在 `_LAYOUT_OPS` 里），训练图仍按 NCHW 构造，因此
+  不需要也不应该在这里假装支持。
+- 输出形状：`(N,HO,WO,O)` 与 `(N,HO,WO,C)`；权重保持 `(O,C,KH,KW)`，与
+  参考后端的 NHWC 约定一致（不引入 OHWI 之类的第二套权重布局）。
+
+**3. 闸门从"只认 NCHW"改成"按声明判断"。** `invoke` 与
+`device_plan._prepare_plan` 原来是硬编码 `layout != "nchw"` 就拒绝。前者改为
+`layout not in self.supported_layouts`，第三方后端只要不改代码就仍是"只接
+NCHW"；后者对非 NCHW 直接弃权返回 `None`——快路径是手写的 NCHW 拼接，NHWC
+走 `invoke` 的算子实现。
+
+**4. 签名区分布局。** `conv2d_signature(..., layout=...)` 只在非 NCHW 时并入
+`layout` 字段：NHWC 的 `(1,8,8,3)` 不能套用 NCHW 同形状测出的 tile 配置，
+但 NCHW 的旧签名必须一字不变，否则库里既有记录全部失效。
+
+**验证。** `tests/test_nhwc_native.py` 13 条（无 GPU）：两版内核名与源码的
+寻址差异（通道偏移、输出写回、池化 base / tap）、非法 layout 在内核层与签名
+层都报错、NCHW 签名不含 `layout`、入口拒绝（im2col / groups=2 / f16 /
+通道数不一致）。`tests/test_layout.py` 原有"设备端只声明 NCHW"改为声明两种，
+并把"HIP 拒绝 NHWC"换成两条真机一致性用例（NHWC 与 NCHW 转置后逐位相等，
+conv 与 maxpool 各一条，无 ROCm 时跳过）。全量 3357 条通过，ruff 通过。
+
+**未声称。**
+
+- 不做声明式转换：图里写 `layout="nchw"` 不会偷偷按 NHWC 执行，反之亦然。
+  翻转仍由 `LayoutPropagation` 决定。
+- 没有 NHWC 的 im2col / implicit / Winograd / 分组 / cuDNN，也没有池化反向；
+  这些请求显式失败，不静默换实现。
+- 不声称加速比。NHWC 只保证"翻好的图能在设备端跑出与 NCHW 逐位相同的结果"，
+  收益取决于形状与访存模式，要以真机测量为准。
+- 配置库没有 NHWC 记录：新签名要重新测过才有命中，本轮不生成。参数化版本
+  也没有进 `plan_conv_tiled` 的成本模型（几何仍按 NCHW 同一套预算判定）。
+
+
 
 
 

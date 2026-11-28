@@ -142,7 +142,7 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast）、数据并行（5.331 起库可加载时**默认设备侧归约**：单进程多卡自动 `ncclCommInitAll`、每进程一卡自动 `ncclCommInitRank`；库缺失或显式 `collective="host"` 才经主机中转）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
 | 推理 | 固定块预填充、跨请求图缓存与权重驻留、前缀缓存、批量解码、**设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`：decode 状态常驻显存、每步只取回 logits，DESIGN 5.279～5.281；空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 cap=8 时 66.1 → 491.6 tok/s）、束搜索、连续批处理、采样面（top-p / 重复惩罚）、分页 KV cache + 增量注意力解码（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制：`PagedCacheManager` / `PagedDecodeScheduler`）、分页 KV 上的贪心生成闭环（`PagedGenerator`：token 进 token 出，5.310）、贪心投机解码、OpenAI 兼容 HTTP 接口（`aetherflow.serve`：`/v1/completions`、`/v1/chat/completions`、SSE 流式） |
 | 调优 | 与后端无关的参数空间 / 搜索 / 配置库；逐元素 block、归约 block、conv2d 的 tile/roc/cb；roofline 式成本模型（六项分解 + 可行性剪枝）先算再测，按估算排序只测前 N 个；配置库经 `SchedulePolicy` 在**执行期按形状签名命中**（显式 `set_tuning` → 构造参数 → 库 → 自动，5.333） |
-| 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、Chrome Trace 导出（`python -m aetherflow.runtime.trace telemetry.json`）、NHWC 布局传播（`LayoutPropagation`，仅参考后端承接）、CI 四作业（含 wheel 构建与安装冒烟）、部署包、zip 硬件包 |
+| 工程 | conformance 套件、模糊测试、边界值用例、趋势聚合、Chrome Trace 导出（`python -m aetherflow.runtime.trace telemetry.json`）、NHWC 布局传播（`LayoutPropagation`）与设备端原生 NHWC 内核（conv2d 分块直算 + 池化前向，5.334）、CI 四作业（含 wheel 构建与安装冒烟）、部署包、zip 硬件包 |
 
 ## 5. 性能现状（同机口径，不跨机外推）
 
@@ -282,8 +282,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   （配置库已能按形状在执行期命中 block 与 conv2d 分块旋钮，5.333；但仍不参与
   编译流水线，im2col / implicit / Winograd / matmul 的选型也未接库），
   融合是规则表而非通用策略；
-- **布局**：有 NHWC 传播 pass（conv / pool 的 `layout` 属性 + 区域边界转置）与后端布局声明，
-  但只有参考后端承接 NHWC，设备后端显式拒绝（无原生 NHWC 内核），也没有 GEMM epilogue；
+- **布局**：有 NHWC 传播 pass（conv / pool 的 `layout` 属性 + 区域边界转置）与后端布局声明；
+  设备端自 5.334 起有原生 NHWC 内核（conv2d 只走分块直算，maxpool2d / avgpool2d
+  只覆盖前向；f32、groups=1）。im2col / 隐式 / Winograd / 分组 / cuDNN 与池化反向
+  仍只有 NCHW，越界请求在算子入口显式报错；也没有 GEMM epilogue；
 - **量化推理**：weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
   权重驻留 1 字节、GEMM 仍走 f32 反量化）与 W8A8（`linear_i8a8`：int8 激活 ×
   int8 权重在 int32 里累加后再乘两个 scale，CUDA 的内核走 `__dp4a`、HIP 走标量

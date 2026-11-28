@@ -68,7 +68,8 @@
   读带宽降到 f32 载体的 1/4，但不省算力；主机侧入口
   `FP8Weight.pack()` / `load_fp8_linear(packed=True)`），其它算子遇到 fp8
   仍显式拒绝；
-  NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
+  NHWC 布局传播 pass 与后端布局声明（设备端自 5.334 起原生承接 conv2d 分块直算
+  与 maxpool2d / avgpool2d 前向）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
   支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8（e4m3 / e5m2）
   按位模式解码成 f32 载体（5.318 / 5.319）；
@@ -197,8 +198,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   f32 输出）；逐组反量化已有设备内核（5.321，只做反量化、不融合 GEMM，
   融合成 `linear_i8_group` 仍未做），但没有主机侧的逐组量化 helper
   （写侧由导出器负责）。
-- **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
-  显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
+- **布局**：NHWC 传播 pass 已交付；设备端自 5.334 起有原生 NHWC 内核——conv2d
+  只走分块直算（f32、groups=1），maxpool2d / avgpool2d 只覆盖前向。im2col /
+  隐式 / Winograd / 分组 / cuDNN 遇到 `layout="nhwc"` 在入口显式报错；
+  池化反向与取值位置（`maxpool2d_indices`）没有 layout 属性，训练图仍是 NCHW
+  （NHWC 无反向规则）。配置库的 conv2d 签名在 NHWC 下多一个 `layout` 字段，
+  NCHW 保持旧签名。
 - **循环级 IR**（5.332）：`LoopIR` / `LoopSplit` 只接受单图体，嵌套控制区域
   显式抛 `LoopIRError`；只做循环不变量外提，不做循环融合 / 分块 / 软件流水，
   也未接进 schedule 搜索或编译流水线。条件图不参与外提（每轮必须求值）；
