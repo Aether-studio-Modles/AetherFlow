@@ -347,6 +347,67 @@ class TestGeneratorDiskCache(unittest.TestCase):
         self.assertEqual(info["disk_misses"], 1)
         self.assertEqual(info["prefix_misses"], 1)
 
+    def test_finish_persists_manual_sequence(self):
+        """手工 feed / prefill 的序列在 finish 释放前落盘，并可被新实例复用。"""
+        disk = self._disk()
+        gen = self._generator(disk)
+        prompt = [1, 4, 7]
+        gen.submit(1)
+        gen.prefill(1, prompt)
+        self.assertEqual(len(disk), 0)
+        gen.finish(1)
+        self.assertEqual(gen.stats()["disk_stores"], 1)
+        self.assertEqual(len(disk), 1)
+        self.assertNotIn(1, gen)
+
+        second = self._generator(self._disk())
+        longer = prompt + [2]
+        got = second.generate(longer, max_new_tokens=2, rid=1)
+        self.assertEqual(got, _dense_greedy(self.params, self.spec, longer, 2))
+        info = second.stats()
+        self.assertEqual(info["disk_hits"], 1)
+        self.assertEqual(info["disk_reused_tokens"], len(prompt))
+
+    def test_finish_after_generate_does_not_rewrite(self):
+        """generate 已落过盘，紧接着 finish 只刷新 mtime，不重复计落盘次数。"""
+        disk = self._disk()
+        gen = self._generator(disk)
+        gen.generate([1, 4, 7], max_new_tokens=1, rid=1)
+        self.assertEqual(gen.stats()["disk_stores"], 1)
+        gen.finish(1)
+        self.assertEqual(gen.stats()["disk_stores"], 1)
+        self.assertEqual(len(disk), 1)
+
+    def test_finish_skips_persist_when_swapped(self):
+        """换出态 KV 不在池里：finish 跳过落盘，但仍能正常释放。"""
+        disk = self._disk()
+        gen = self._generator(disk)
+        gen.submit(1)
+        gen.prefill(1, [1, 4, 7])
+        gen.suspend(1, evict=True)
+        self.assertTrue(gen.is_swapped(1))
+        gen.finish(1)
+        self.assertEqual(gen.stats()["disk_stores"], 0)
+        self.assertEqual(len(disk), 0)
+        self.assertNotIn(1, gen)
+
+    def test_finish_without_tokens_stores_nothing(self):
+        disk = self._disk()
+        gen = self._generator(disk)
+        gen.submit(1)
+        gen.finish(1)
+        self.assertEqual(gen.stats()["disk_stores"], 0)
+        self.assertEqual(len(disk), 0)
+
+    def test_finish_respects_disabled_prefix_cache(self):
+        disk = self._disk()
+        gen = self._generator(disk, prefix_cache=False)
+        gen.submit(1)
+        gen.prefill(1, [1, 4, 7])
+        gen.finish(1)
+        self.assertEqual(gen.stats()["disk_stores"], 0)
+        self.assertEqual(len(disk), 0)
+
     def test_mismatched_disk_is_rejected_at_construction(self):
         with self.assertRaises(ValueError):
             self._generator(self._disk(num_heads=self.spec.num_heads + 1))

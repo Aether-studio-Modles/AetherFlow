@@ -143,6 +143,11 @@ class DiskPrefixCache:
     def __len__(self) -> int:
         return len(self._entries)
 
+    @property
+    def stores(self) -> int:
+        """真正写入（新增或重写）的条目数；同 key 等长的重复 ``store`` 不计。"""
+        return self._stores
+
     def __contains__(self, tokens: object) -> bool:
         """这个 token 序列是否**恰好**已有一条可用的落盘条目。"""
         if isinstance(tokens, (str, bytes)):

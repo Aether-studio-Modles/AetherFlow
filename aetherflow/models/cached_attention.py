@@ -605,7 +605,8 @@ class PagedGenerator:
     **落盘前缀缓存**（5.337，``disk_cache`` 非 ``None`` 时开启）：内存里没
     命中时去 :class:`aetherflow.runtime.DiskPrefixCache` 查同一判据的最长严格
     前缀，命中就把条目 KV 直接 ``append`` 进池，省掉整个 prefill；``generate``
-    结束时再把这条序列已解码的全长落盘，新进程首次请求就能复用。命中数、
+    结束与 ``finish`` 释放前再把这条序列已解码的全长落盘（手工 ``feed`` /
+    ``prefill`` 驱动的序列以后者为准），新进程首次请求就能复用。命中数、
     被复用的 token 数与落盘次数记在 :meth:`stats` 的 ``disk_hits`` /
     ``disk_reused_tokens`` / ``disk_misses`` / ``disk_stores`` 里。条目装不进
     池（``PagedCacheFullError``）时退回普通 prefill；``prefix_cache=False``
@@ -814,7 +815,12 @@ class PagedGenerator:
         return length
 
     def _persist(self, rid: int) -> None:
-        """把这条序列已解码的全长落盘；没有盘缓存或关闭自动复用时什么都不做。"""
+        """把这条序列已解码的全长落盘；没有盘缓存或关闭自动复用时什么都不做。
+
+        ``generate`` 结束与 ``finish`` 释放前都走这里——后者让手工 ``feed`` /
+        ``prefill`` 驱动的序列也有落盘机会。调用方保证序列当前驻留：换出态的
+        KV 不在池里，``gather`` 取不到。
+        """
         if self._disk_cache is None or not self._prefix_cache:
             return
         seen = self._tokens.get(rid)
@@ -825,8 +831,10 @@ class PagedGenerator:
             key, value = self._scheduler.cache.gather(rid, layer)
             keys.append(key)
             values.append(value)
+        before = self._disk_cache.stores
         self._disk_cache.store(seen, keys=keys, values=values)
-        self._disk_stats["disk_stores"] += 1
+        if self._disk_cache.stores > before:
+            self._disk_stats["disk_stores"] += 1
 
     def suspend(self, rid: int, *, evict: bool = False) -> bool:
         return self._scheduler.suspend(rid, evict=evict)
@@ -835,8 +843,16 @@ class PagedGenerator:
         return self._scheduler.resume(rid)
 
     def finish(self, rid: int) -> None:
+        """结束请求：释放页，并在此之前把驻留序列落盘。
+
+        ``feed`` / ``prefill`` 手工驱动的序列没有 ``generate`` 的结束点，
+        ``finish`` 就是它们的结束信号。换出态跳过落盘：KV 已不在池里，
+        ``gather`` 取不到；为一次释放先换入再落盘等于多付一次换入。
+        """
         if rid not in self._tokens:
             raise KeyError(f"序列 {rid!r} 没有提交；先 submit(rid)")
+        if not self._scheduler.is_swapped(rid):
+            self._persist(rid)
         self._scheduler.finish(rid)
         del self._tokens[rid]
 
