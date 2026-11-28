@@ -20,8 +20,10 @@ from aetherflow.models.llama import (
     llama_inv_freq,
     llama_param_shapes,
     llama_param_transposes,
+    load_llama_weights,
 )
 from aetherflow.models.transformer import causal_mask_bias
+from aetherflow.train.params import ParameterStore
 
 
 def _small(**overrides) -> LlamaSpec:
@@ -242,6 +244,73 @@ class TestForward(unittest.TestCase):
         got = ReferenceBackend().execute(graph, {**params, "tokens": tokens})["logits"]
         want = reference_forward(spec, params, tokens)
         np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
+
+class TestLoadWeights(unittest.TestCase):
+    """HF 形态的权重（``nn.Linear`` 是 ``(out, in)``、tied lm_head 缺省）装进 store。"""
+
+    def _store(self, spec):
+        graph, _ = build_llama(spec)
+        return ParameterStore.from_graph(graph, exclude=("tokens",))
+
+    def _hf_tensors(self, spec, *, tied: bool, seed: int = 0) -> dict:
+        rng = np.random.default_rng(seed)
+        transposed = llama_param_transposes(spec)
+        tensors = {}
+        for name, shape in llama_param_shapes(spec).items():
+            if tied and name == "lm_head.weight":
+                continue
+            hf_shape = tuple(reversed(shape)) if name in transposed else shape
+            tensors[name] = rng.standard_normal(hf_shape).astype(np.float32)
+        return tensors
+
+    def test_tied_head_falls_back_to_embedding(self):
+        spec = _small()
+        store = self._store(spec)
+        tensors = self._hf_tensors(spec, tied=True)
+
+        unused = load_llama_weights(spec, store, tensors)
+
+        self.assertEqual(unused, ())
+        embed = tensors["model.embed_tokens.weight"]
+        np.testing.assert_array_equal(store["model.embed_tokens.weight"], embed)
+        np.testing.assert_array_equal(store["lm_head.weight"], embed.T)
+        np.testing.assert_array_equal(
+            store["model.layers.0.self_attn.q_proj.weight"],
+            tensors["model.layers.0.self_attn.q_proj.weight"].T,
+        )
+
+    def test_untied_head_uses_file_tensor(self):
+        spec = _small()
+        store = self._store(spec)
+        tensors = self._hf_tensors(spec, tied=False)
+
+        load_llama_weights(spec, store, tensors)
+
+        np.testing.assert_array_equal(
+            store["lm_head.weight"], tensors["lm_head.weight"].T
+        )
+
+    def test_explicit_tie_overrides_file(self):
+        """文件里同时给了 lm_head 时，显式 tie 仍以 embed 为准（Qwen2.5-0.5B 口径）。"""
+        spec = _small()
+        store = self._store(spec)
+        tensors = self._hf_tensors(spec, tied=False)
+
+        load_llama_weights(spec, store, tensors, tie_weights=True)
+
+        np.testing.assert_array_equal(
+            store["lm_head.weight"], tensors["model.embed_tokens.weight"].T
+        )
+
+    def test_tied_without_embedding_raises(self):
+        spec = _small()
+        store = self._store(spec)
+        tensors = self._hf_tensors(spec, tied=True)
+        del tensors["model.embed_tokens.weight"]
+
+        with self.assertRaisesRegex(KeyError, "embed_tokens"):
+            load_llama_weights(spec, store, tensors)
 
 
 if __name__ == "__main__":

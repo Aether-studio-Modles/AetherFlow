@@ -53,7 +53,7 @@ IR 图，而不是靠新增算子。当前覆盖的结构（Qwen2.5-0.5B 与 Lla
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -61,9 +61,13 @@ from ..ir.graph import Graph, Value
 from ..ir.types import Dim, f32, i32
 from .transformer import causal_mask_bias
 
+if TYPE_CHECKING:  # 只为类型注解：weights 会反过来导入本包的运行期模块
+    from ..train.params import ParameterStore
+
 __all__ = [
     "LlamaSpec",
     "build_llama",
+    "load_llama_weights",
     "llama_inv_freq",
     "llama_param_shapes",
     "llama_param_transposes",
@@ -261,6 +265,48 @@ def build_llama(
         g.output(x, "hidden")
     g.seal()
     return g, {"tokens": tokens, **params}
+
+
+def load_llama_weights(
+    spec: LlamaSpec,
+    store: "ParameterStore",
+    tensors: Mapping[str, np.ndarray],
+    *,
+    tie_weights: Optional[bool] = None,
+    strict: bool = True,
+    allow_downcast: bool = False,
+) -> Tuple[str, ...]:
+    """把 HF 形态的张量装进 ``ParameterStore``，返回没用到的张量名。
+
+    与 ``load_into_store`` 的区别只有一处：**`tie_weights`**。Qwen2.5-0.5B 的
+    ``lm_head`` 与 ``embed_tokens`` 共享权重，而两者在 IR 里是形状不同的两个
+    参数（``(d, V)`` 与 ``(V, d)``）。HF 存 safetensors 时会把 tied 的那份去掉，
+    文件里只剩 ``model.embed_tokens.weight``；这里把它映射给 ``lm_head.weight``，
+    转置仍由 ``llama_param_transposes`` 统一处理——两个参数共用一个来源数组，
+    依次转置成各自的形状。
+
+    ``tie_weights=None`` 时按文件内容判断（缺 ``lm_head.weight`` 即视为 tied），
+    因为"文件里有什么"是唯一不会骗人的依据；显式传布尔值则覆盖该判断。
+    """
+    from ..weights import load_into_store
+
+    tied = "lm_head.weight" not in tensors if tie_weights is None else bool(tie_weights)
+    mapping: Dict[str, str] = {}
+    if tied:
+        if "model.embed_tokens.weight" not in tensors:
+            raise KeyError(
+                "按 tied 权重加载，但张量里既没有 'lm_head.weight' 也没有 "
+                "'model.embed_tokens.weight'：无法确定 lm_head 的来源"
+            )
+        mapping["lm_head.weight"] = "model.embed_tokens.weight"
+    return load_into_store(
+        store,
+        tensors,
+        mapping=mapping,
+        transpose=llama_param_transposes(spec),
+        strict=strict,
+        allow_downcast=allow_downcast,
+    )
 
 
 # --------------------------------------------------------------------------

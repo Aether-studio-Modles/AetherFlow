@@ -49,6 +49,7 @@ from .llama import (
     llama_inv_freq,
     llama_param_shapes,
     llama_param_transposes,
+    load_llama_weights,
 )
 from .mamba import (
     MambaModelSpec,
@@ -201,6 +202,7 @@ __all__ = [
     "greedy_draft",
     "LlamaSpec",
     "build_llama",
+    "load_llama_weights",
     "llama_inv_freq",
     "llama_param_shapes",
     "llama_param_transposes",
