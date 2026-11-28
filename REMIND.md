@@ -16,7 +16,7 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：78 个 IR 算子，CUDA / HIP 各自承接 71 个；
+- **一份语义 IR，多个硬件后端**：80 个 IR 算子，CUDA / HIP 各自承接 71 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
@@ -40,13 +40,17 @@
   `fake_quantize_i8_lsq`（前向逐位相同，反向按非饱和区直通并给 scale 梯度，
   5.312）；非对称零点的主机侧语义（`quantize_i8_zp` / `dequantize_i8_zp` /
   `linear_i8_zp` / `linear_i8a8_zp`，值域扩到含 0、W8A8 的 int32 上界收到
-  `K*255*255`，5.315），设备端暂无内核、显式拒绝；
+  `K*255*255`，5.315）与逐组 weight-only 反量化（`dequantize_i8_group` /
+  `dequantize_i8_group_zp`：组大小由 `K / K_g` 推出，不另设 attr，5.317），
+  设备端都暂无内核、显式拒绝；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
   支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8 显式拒绝；
   `load_into_store` 把外部张量装进参数容器——名字映射、PyTorch `nn.Linear` 布局
   转置、有损 dtype 转换都要显式声明，先全量校验再原地写，失败不留半装状态
-  （5.313）。
+  （5.313）；`load_quantized_linear` / `QuantizedWeight` 读量化权重——int8 强制、
+  scale 与零点的形状 / 值域 / 正值校验、逐通道与逐组、metadata 自描述
+  （`quantization` / `quantization.group_size`）与张量一致（5.317）。
 - **文本入口**：`BpeTokenizer` 读 HF `tokenizer.json` 的 ByteLevel BPE 谱系
   （GPT-2 / Qwen2 / Qwen3），不引 `tokenizers`；支持 merges 两种写法、added /
   special token 整体匹配、NFC 系 normalizer、`use_regex` / `add_prefix_space`；
@@ -107,7 +111,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3153 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3178 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
@@ -143,8 +147,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   QAT 到假量化算子（`fake_quantize_i8`，5.311）与 LSQ 的可学步长版本
   （`fake_quantize_i8_lsq`，5.312）——后者要求 scale 作为图输入才能收到梯度，
   没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；此外无 fp8，
-  W8A8 也尚无反向（bias 除外）。非对称零点只有参考语义与构图入口（5.315），
-  CUDA / HIP 没有内核、遇到即显式拒绝，因此非对称路径目前不能用于真机推理。
+  W8A8 也尚无反向（bias 除外）。非对称零点与逐组反量化只有参考语义与构图入口
+  （5.315 / 5.317），CUDA / HIP 没有内核、遇到即显式拒绝，因此这两条路径目前
+  不能用于真机推理；也没有主机侧的逐组量化 helper（写侧由导出器负责）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
   显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
@@ -187,9 +192,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   完整命中为止。流式仍由每个请求轮询 `ServingEngine.progress()` 快照，并发很大
   时应改成调度器推送增量。
 - **权重入口**：只读 `safetensors` 容器（不读 GGUF / PyTorch `.bin` / `.pt` / TF
-  检查点）；fp8 / fp4、稀疏张量与量化元数据不支持（fp8 显式报错，不复用成 u8）；
-  没有内置任何具体模型的转换表——名字映射与 `nn.Linear` 转置由调用方声明；
-  大模型按需读取的接口已就位，但没有 GB 级权重的实机加载耗时与内存峰值数字（5.313）。
+  检查点）；fp8 / fp4 与稀疏张量不支持（fp8 显式报错，不复用成 u8）；量化权重
+  支持本仓库自己的 `quantization` / `quantization.group_size` 约定（5.317），
+  **不声称兼容 GPTQ / AWQ 原始检查点**（它们的 int32 交织打包与 `qzeros` 的
+  +1 偏移是另一套约定）；没有内置任何具体模型的转换表——名字映射与
+  `nn.Linear` 转置由调用方声明；大模型按需读取的接口已就位，但没有 GB 级权重
+  的实机加载耗时与内存峰值数字（5.313）。
 - **文本入口**：只支持 ByteLevel BPE，且不解析 `tokenizer_config.json` /
   `special_tokens_map.json`——`eos` / `pad` 靠 added token 的候选名推断或调用方
   显式传入，chat 模板仍用 `ChatTemplate` 手写。不支持 WordPiece（BERT 系）、
@@ -251,9 +259,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 ### 维护者备注
 
 - 临时脚本（`_tmp_*.py` 等）用完即删；结论写进 DESIGN 对应小节，凭证不落盘。
-- **文档里的算子总数长期滞后**：本轮实测 `len(OPS) == 91`、`len(GPU_OPS) == 85`，
-  而 DESIGN / README / 本文件正文明面上的 74 / 71 是 5.312 时的快照，之后新增的
-  算子没有同步（本轮只按增量改成 78 / 71）。下次统一校准一次，以
+- **文档里的算子总数长期滞后**：本轮实测 `len(OPS) == 93`、`len(GPU_OPS) == 85`，
+  而 DESIGN / README / 本文件正文明面上的 80 / 71 是 5.312 起的增量口径（5.315、
+  5.317 各加 2 个，设备端都没加），与实际值仍差 13 / 14。下次统一校准一次，以
   `py -3.14 -c "from aetherflow.ir.ops import OPS; print(len(OPS))"` 与
   `device_shared.GPU_OPS` 为准，并把"68 个自研内核"这类分项一起重数，不要只改总数。
 - 提交后用 `git status` / `git diff --stat` 核对。曾出现工作区文件被旧版覆盖
