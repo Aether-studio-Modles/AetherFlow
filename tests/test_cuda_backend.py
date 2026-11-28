@@ -5394,12 +5394,14 @@ class TestCudaTuning(unittest.TestCase):
         """
         self.assertIsNone(self.backend.block)
         self.assertEqual(self.backend._reduce_block("softmax", 100), 128)
-        self.assertEqual(self.backend._reduce_block("softmax", 5000), 1024)
+        # 归约类默认上限是 REDUCE_BLOCK=256（b689554：1024 时每 SM 只驻 2 行、
+        # 归约树 10 级 barrier，实测慢 2.4~2.6x），列数再多也不往上铺
+        self.assertEqual(self.backend._reduce_block("softmax", 5000), 256)
         try:
             self.backend.set_tuning("softmax", {"block": 128})
             self.assertEqual(self.backend._reduce_block("softmax", 5000), 128)
             # 只影响被覆盖的那个算子
-            self.assertEqual(self.backend._reduce_block("layernorm", 5000), 1024)
+            self.assertEqual(self.backend._reduce_block("layernorm", 5000), 256)
         finally:
             self.backend.clear_tuning("softmax")
 
