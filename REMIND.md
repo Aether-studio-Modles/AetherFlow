@@ -45,6 +45,12 @@
   `load_into_store` 把外部张量装进参数容器——名字映射、PyTorch `nn.Linear` 布局
   转置、有损 dtype 转换都要显式声明，先全量校验再原地写，失败不留半装状态
   （5.313）。
+- **文本入口**：`BpeTokenizer` 读 HF `tokenizer.json` 的 ByteLevel BPE 谱系
+  （GPT-2 / Qwen2 / Qwen3），不引 `tokenizers`；支持 merges 两种写法、added /
+  special token 整体匹配、NFC 系 normalizer、`use_regex` / `add_prefix_space`；
+  解码先把连续字节拼回再解 UTF-8。WordPiece / Unigram / SentencePiece /
+  Llama-3 的 `Split` 预分词显式拒绝——近似实现产出的 id 每个都合法，但不是训练
+  时那串（5.314）。
 
 ### 安装
 
@@ -98,7 +104,7 @@ python -m benchmarks.run --backend ref        # 性能基准（另有 hip / cuda
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3078 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3131 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
@@ -180,6 +186,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   检查点）；fp8 / fp4、稀疏张量与量化元数据不支持（fp8 显式报错，不复用成 u8）；
   没有内置任何具体模型的转换表——名字映射与 `nn.Linear` 转置由调用方声明；
   大模型按需读取的接口已就位，但没有 GB 级权重的实机加载耗时与内存峰值数字（5.313）。
+- **文本入口**：只支持 ByteLevel BPE，且不解析 `tokenizer_config.json` /
+  `special_tokens_map.json`——`eos` / `pad` 靠 added token 的候选名推断或调用方
+  显式传入，chat 模板仍用 `ChatTemplate` 手写。不支持 WordPiece（BERT 系）、
+  Unigram（T5 系）、SentencePiece（Llama-2 系）、Llama-3 的 `Split` 预分词、
+  BPE dropout 与 `lstrip` / `rstrip`；没有 offset mapping；用自造小词表逐 id
+  对拍，未与 HF 官方实现在真实大词表上做全量对拍（5.314）。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
   无 `bool` 张量，因此 `where` / `masked_fill` / 比较算子 / `topk` 显式拒绝；
   `sign` / `round` / `floor` / `ceil`、`baddbmm`、原地 `copy_` 无对应语义；
@@ -617,6 +629,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `(in, out)`。猜错的后果不是崩溃，是静默训出一个错模型——所以映射、转置、
   有损 dtype 都必须显式声明。另：先全量校验再 `dst[...] = ...` 原地写，
   避免失败时留下"一半新权重、一半旧初始化"。
+- **分词器的分歧不会报错，只会让模型变笨**（5.314）：预分词边界偏一位、BPE
+  合并顺序换了、特殊 token 被拆成字节，产出的 id 都"合法"，只是不是训练时那串。
+  所以判据必须是 id 级对拍（往返、rank 顺序、`"  hello"` 的空白切法、`it's`
+  的后缀），而不是"encode 出来看着像"。规则里 `\p{L}` 别用 Python `re` 近似成
+  `[A-Za-z]`——那会让中文整段错位；用 `unicodedata.category` 的 `L*` / `N*`。
+- **窄支持面优于近似实现**（5.314）：Llama-3 的 `Split` 预分词带一个会改切分
+  边界的正则（数字按 1～3 位分组），忽略它就是拿别的分词器当自己的用。宁可
+  显式报"不支持 Split"，也不静默产出"看起来能用"的 id。
 - **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
   移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
   账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100
