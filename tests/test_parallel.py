@@ -668,14 +668,19 @@ class TestCollectiveSeam(unittest.TestCase):
     拉回主机一次。
     """
 
-    def test_support_declares_host_only_without_provider(self):
-        """没有 provider 时：设备归约不可用、重叠不可用，原因点名 NCCL / RCCL。
+    def test_support_declares_host_only_without_library(self):
+        """库加载不到时：设备归约不可用、重叠不可用，原因点名 NCCL / RCCL。
 
-        5.244 起理由按本机真实加载到的库命名：HIP 机器上是 RCCL，CUDA 机器
-        上是 NCCL，两套都加载不到时是「NCCL / RCCL」。判据只要求点名，不
-        要求点名哪一家——写死一家在另一种卡上必红。
+        5.331 起判据是"库能不能加载"，所以这里必须把 ``vendor`` 固定成失败，
+        不能依赖本机恰好没有 NCCL——否则有库的机器上这条必红。理由按厂商命名
+        的部分由 ``test_nccl.TestCollectiveCapability`` 覆盖。
         """
-        support = collective_support(_FakeDevices(2))
+        from aetherflow.train import nccl
+
+        with mock.patch.object(
+            nccl, "vendor", side_effect=nccl.NcclUnavailable("没有库")
+        ):
+            support = collective_support(_FakeDevices(2))
         self.assertFalse(support.device_allreduce)
         self.assertFalse(support.overlap)
         self.assertIsNone(support.provider)
@@ -692,17 +697,75 @@ class TestCollectiveSeam(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "provider"):
             collective_support(_FakeDevices(2), provider=3)
 
-    def test_device_mode_without_provider_is_explicit(self):
-        """请求设备路径但没有实现：抛能力错误并带原因，不静默退回主机。"""
-        with self.assertRaisesRegex(DeviceCollectiveUnavailable, "NCCL|RCCL"):
-            DataParallelTrainer(
-                _linear_graph(),
-                _linear_store(),
-                SGD(_linear_store().arrays(), lr=0.1),
+    def test_device_mode_without_library_is_explicit(self):
+        """请求设备路径但库加载不到：抛能力错误并带原因，不静默退回主机。"""
+        with mock.patch(
+            "aetherflow.train.parallel.collective_support",
+            return_value=SimpleNamespace(
+                device_allreduce=False,
+                overlap=False,
+                provider=None,
+                reason="NCCL / RCCL 加载不到",
+            ),
+        ):
+            with self.assertRaisesRegex(DeviceCollectiveUnavailable, "NCCL|RCCL"):
+                DataParallelTrainer(
+                    _linear_graph(),
+                    _linear_store(),
+                    SGD(_linear_store().arrays(), lr=0.1),
+                    backend=_FakeDevices(2),
+                    devices=[0, 1],
+                    collective="device",
+                )
+
+    def test_auto_picks_device_when_library_is_available(self):
+        """5.331：默认 auto 在有库时自建 provider，调用方不必再注入。
+
+        这条用 mock 证明"默认"确实落在设备侧：只声明 ``device_allreduce=True``，
+        构造就应当调用 ``nccl_device_collective`` 并把结果挂到实例上。
+        """
+        store = _linear_store()
+        fake = _mean_provider([])
+        with mock.patch(
+            "aetherflow.train.parallel.collective_support",
+            return_value=SimpleNamespace(
+                device_allreduce=True, overlap=False, provider="nccl", reason=""
+            ),
+        ), mock.patch(
+            "aetherflow.train.parallel.nccl_device_collective", return_value=fake
+        ) as built:
+            trainer = DataParallelTrainer(
+                _linear_graph(batch=4),
+                store,
+                SGD(store.arrays(), lr=0.1),
                 backend=_FakeDevices(2),
                 devices=[0, 1],
-                collective="device",
             )
+        built.assert_called_once()
+        self.assertEqual(trainer.collective, "device")
+        self.assertIs(trainer.device_collective, fake)
+
+    def test_auto_falls_back_to_host_when_library_is_missing(self):
+        """缺库时 auto 落到主机中转，且不尝试建 communicator。"""
+        store = _linear_store()
+        with mock.patch(
+            "aetherflow.train.parallel.collective_support",
+            return_value=SimpleNamespace(
+                device_allreduce=False, overlap=False, provider=None, reason="没有库"
+            ),
+        ), mock.patch(
+            "aetherflow.train.parallel.nccl_device_collective"
+        ) as built:
+            trainer = DataParallelTrainer(
+                _linear_graph(batch=4),
+                store,
+                SGD(store.arrays(), lr=0.1),
+                backend=_FakeDevices(2),
+                devices=[0, 1],
+            )
+        built.assert_not_called()
+        self.assertEqual(trainer.collective, "host")
+        self.assertIsNone(trainer.device_collective)
 
     def test_inconsistent_collective_arguments_are_rejected(self):
         """非法 collective 取值、注入了 provider 却选 host、provider 不可调用。"""
@@ -724,6 +787,7 @@ class TestCollectiveSeam(unittest.TestCase):
                 SGD(store.arrays(), lr=0.1),
                 backend=_FakeDevices(2),
                 devices=[0, 1],
+                collective="host",
                 device_collective=_mean_provider([]),
             )
         store = _linear_store()

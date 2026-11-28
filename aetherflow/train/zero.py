@@ -655,6 +655,24 @@ class NcclHostCollective:
         return recv
 
 
+class _LocalComm:
+    """``world_size = 1`` 的直通通信对象：不需要 NCCL，也没有可交换的对方。
+
+    存在的理由是让单卡调试与"一进程一卡"的运行形态共用同一条构造路径：
+    ``NcclDeviceCollective.from_env`` 在 world_size == 1 时返回它，调用方
+    不必为"只有一张卡"写特判，也不必为了跑通单卡去装 NCCL。
+    """
+
+    rank = 0
+    world_size = 1
+
+    def all_reduce(self, array: Any, *, op: str = "sum", stream: Any = None) -> Any:
+        return array
+
+    def synchronize(self) -> None:
+        return None
+
+
 class NcclDeviceCollective:
     """把 NCCL 包成"设备数组进、设备数组出"的集合通信（每个 rank 一个进程）。
 
@@ -682,9 +700,71 @@ class NcclDeviceCollective:
         self.world_size = int(getattr(comm, "world_size"))
         self.device = int(self.rank if device is None else device)
 
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+        device: Optional[int] = None,
+        timeout: float = 60.0,
+    ) -> "NcclDeviceCollective":
+        """按 ``AF_*`` 环境变量自建 communicator，不需要调用方先建好 ``comm``。
+
+        ``rank`` / ``world_size`` 缺省读 ``AF_RANK`` / ``AF_WORLD_SIZE``（兼容
+        ``RANK`` / ``WORLD_SIZE``）。unique id 由 rank 0 生成、经
+        ``AF_MASTER_ADDR`` / ``AF_MASTER_PORT`` 分发给其余 rank，协议与
+        :func:`train.distributed.spawn` 完全一致——也就是说用
+        ``train.distributed.spawn`` 或 ``torchrun`` 拉起来的进程直接就能用。
+
+        ``world_size == 1`` 不建 NCCL：组大小为 1 时归约本就是恒等，返回一个
+        直通对象即可。这避免"单卡调试也必须先装好 NCCL 库"。
+
+        ``device`` 缺省取 ``rank``（一进程一卡），切卡与初始化由
+        :func:`train.nccl.init_rank` 一起完成。库缺失时抛
+        :class:`train.nccl.NcclUnavailable`，不静默退回主机中转。
+        """
+        from . import distributed, nccl
+
+        rank = distributed.env_rank() if rank is None else int(rank)
+        world = (
+            distributed.env_world_size() if world_size is None else int(world_size)
+        )
+        if world < 1:
+            raise ValueError(f"world_size 必须 >= 1，收到 {world}")
+        if not 0 <= rank < world:
+            raise ValueError(f"rank {rank} 越界：world_size={world}")
+        if world == 1:
+            return cls(_LocalComm(), device=rank if device is None else device)
+
+        host = distributed.env_master_addr()
+        port = distributed.env_master_port()
+        if rank == 0:
+            uid = nccl.unique_id()
+            # 先把分发线程挂起来再初始化自己：init 会阻塞到所有 rank 到齐，
+            # 反过来的顺序会让其余 rank 在 fetch 上白等到超时。
+            server = distributed.UniqueIdServer(world, host=host, port=port,
+                                                timeout=timeout)
+            server.serve(uid.to_bytes())
+            try:
+                comm = nccl.init_rank(uid, rank, world, device=device)
+            except BaseException:
+                server.close()
+                raise
+            # 不调 wait()：init_rank 已经等到全员到齐，说明 uid 都分发完了；
+            # 线程里若还有异常，会被首次集合调用暴露成"对方没来"。
+        else:
+            payload = distributed.fetch_unique_id(host, port, rank, timeout=timeout)
+            comm = nccl.init_rank(
+                nccl.NcclUniqueId.from_bytes(payload), rank, world, device=device
+            )
+        return cls(comm, device=device)
+
     def all_reduce(self, array: Any, *, op: str = "sum") -> Any:
         if op not in ("sum", "mean"):
             raise ValueError(f"op 必须是 sum / mean，收到 {op!r}")
+        if self.world_size == 1:
+            return array
         import cupy as cp
 
         on_device = hasattr(array, "__cuda_array_interface__")

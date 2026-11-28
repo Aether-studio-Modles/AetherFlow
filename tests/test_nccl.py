@@ -101,6 +101,43 @@ class TestCommValidation(unittest.TestCase):
         self.assertIn("NCCL", str(caught.exception))
 
 
+class TestInitRank(unittest.TestCase):
+    """``init_rank`` 的价值只在"先切卡"：漏了这一步，第一次集合调用才炸。"""
+
+    def _cupy(self, used):
+        class _Device:
+            def __init__(self, index):
+                self.index = index
+
+            def __enter__(self):
+                used.append(self.index)
+
+            def __exit__(self, *exc):
+                return None
+
+        return SimpleNamespace(cuda=SimpleNamespace(Device=_Device))
+
+    def test_switches_to_requested_device_before_initializing(self):
+        used = []
+        with mock.patch.dict(sys.modules, {"cupy": self._cupy(used)}), \
+                mock.patch.object(nccl, "NcclComm") as comm_cls:
+            comm = nccl.init_rank(b"u" * 128, 1, 2, device=3)
+        self.assertIs(comm, comm_cls.return_value)
+        self.assertEqual(used, [3])
+        comm_cls.assert_called_once_with(1, 2, b"u" * 128)
+
+    def test_defaults_device_to_rank(self):
+        used = []
+        with mock.patch.dict(sys.modules, {"cupy": self._cupy(used)}), \
+                mock.patch.object(nccl, "NcclComm"):
+            nccl.init_rank(b"u" * 128, 1, 2)
+        self.assertEqual(used, [1])
+
+    def test_rejects_negative_device(self):
+        with self.assertRaises(ValueError):
+            nccl.init_rank(b"u" * 128, 0, 2, device=-1)
+
+
 class _FakeBuffer:
     """只有 ``.data.ptr`` / ``.size`` / ``.dtype`` / ``.flags`` 的假设备数组。"""
 
@@ -226,16 +263,17 @@ class _FakeMultiDevice:
 
 
 class TestCollectiveCapability(unittest.TestCase):
-    """声明仍是 False（路径没接线），但理由要说出本机的真实情况。"""
+    """声明跟着"库能不能加载"走：能 ⇒ 设备侧默认可用，不能 ⇒ 主机中转。"""
 
     def test_reason_names_the_loaded_library(self):
         with mock.patch.object(nccl, "vendor", return_value="hip"), mock.patch.object(
             nccl, "version_string", return_value="2.27.7"
         ):
             support = collective_support(_FakeMultiDevice())
-        self.assertFalse(support.device_allreduce)
+        self.assertTrue(support.device_allreduce)
+        self.assertEqual(support.provider, "nccl")
         self.assertIn("RCCL 2.27.7", support.reason)
-        self.assertIn("主机中转", support.reason)
+        self.assertIn("NcclDeviceCollective.from_env", support.reason)
 
     def test_reason_says_when_library_is_absent(self):
         with mock.patch.object(
@@ -243,6 +281,7 @@ class TestCollectiveCapability(unittest.TestCase):
         ):
             support = collective_support(_FakeMultiDevice())
         self.assertFalse(support.device_allreduce)
+        self.assertIsNone(support.provider)
         self.assertIn("加载不到", support.reason)
 
     def test_cuda_vendor_keeps_nccl_name(self):

@@ -18,13 +18,16 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import numpy as np
 
+import aetherflow.train.distributed as distributed
 from aetherflow.backends.cuda import CUDA_AVAILABLE
 from aetherflow.train import (
     SGD,
     LoopbackWorld,
+    NcclDeviceCollective,
     NcclHostCollective,  # noqa: F401  （导出面的一部分，真机 worker 用）
     ShardedOptimizer,
     ZeroRank,
@@ -363,6 +366,69 @@ class ZeroRankOnDeviceTest(unittest.TestCase):
         self.assertEqual(metas[0]["assignments"], metas[1]["assignments"])
         owned = [meta["owned_bytes"] for meta in metas]
         self.assertEqual(sum(owned), sum(optimizer.slot_bytes_by_shard()))
+
+
+class NcclDeviceCollectiveFromEnvTest(unittest.TestCase):
+    """5.331：DDP 默认自建设备侧 communicator，不再要求调用方先建 ``comm``。
+
+    rank 0 生成 uid 并挂分发线程，其余 rank 从 ``AF_MASTER_ADDR`` /
+    ``AF_MASTER_PORT`` 取回；组大小为 1 时连 NCCL 都不导入。
+    """
+
+    class _Comm:
+        def __init__(self, rank, world_size):
+            self.rank = rank
+            self.world_size = world_size
+
+    def test_single_rank_is_passthrough_without_nccl(self):
+        collective = NcclDeviceCollective.from_env(rank=0, world_size=1)
+        self.assertEqual((collective.rank, collective.world_size), (0, 1))
+        value = np.array([1.0, 2.0], np.float32)
+        # 组大小为 1：归约是恒等，也不需要导入 cupy
+        self.assertIs(collective.all_reduce(value), value)
+
+    def test_rank_zero_publishes_uid_then_initializes(self):
+        from types import SimpleNamespace
+
+        payload = b"u" * 128
+        uid = SimpleNamespace(to_bytes=lambda: payload)
+        server = mock.Mock()
+        with mock.patch.object(nccl, "unique_id", return_value=uid), mock.patch.object(
+            nccl, "init_rank", return_value=self._Comm(0, 2)
+        ) as init, mock.patch.object(
+            distributed, "UniqueIdServer", return_value=server
+        ) as server_cls, mock.patch.object(
+            distributed, "env_master_addr", return_value="127.0.0.1"
+        ), mock.patch.object(distributed, "env_master_port", return_value=29500):
+            collective = NcclDeviceCollective.from_env(rank=0, world_size=2, device=0)
+
+        server_cls.assert_called_once_with(
+            2, host="127.0.0.1", port=29500, timeout=60.0
+        )
+        server.serve.assert_called_once_with(payload)
+        init.assert_called_once_with(uid, 0, 2, device=0)
+        self.assertEqual(collective.device, 0)
+
+    def test_worker_fetches_uid_over_master_endpoint(self):
+        payload = b"v" * 128
+        with mock.patch.object(
+            distributed, "fetch_unique_id", return_value=payload
+        ) as fetch, mock.patch.object(
+            nccl, "init_rank", return_value=self._Comm(1, 2)
+        ) as init, mock.patch.object(
+            distributed, "env_master_addr", return_value="10.0.0.7"
+        ), mock.patch.object(distributed, "env_master_port", return_value=1234):
+            collective = NcclDeviceCollective.from_env(rank=1, world_size=2, device=1)
+
+        fetch.assert_called_once_with("10.0.0.7", 1234, 1, timeout=60.0)
+        self.assertEqual(init.call_args[0][0].to_bytes(), payload)
+        self.assertEqual((collective.rank, collective.world_size), (1, 2))
+
+    def test_rejects_inconsistent_rank_and_world(self):
+        with self.assertRaises(ValueError):
+            NcclDeviceCollective.from_env(rank=2, world_size=2)
+        with self.assertRaises(ValueError):
+            NcclDeviceCollective.from_env(rank=0, world_size=0)
 
 
 if __name__ == "__main__":

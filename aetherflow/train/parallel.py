@@ -18,15 +18,18 @@
 拆开了：数值对了，再谈重叠。
 
 **集合通信到哪一级，写在声明里。** :func:`collective_support` 返回
-``CollectiveSupport``：未注入 provider 时，跨卡归约一律经主机中转；``overlap``
-恒为 False。单进程多卡的设备侧归约由 ``nccl_device_collective(backend,
-devices)`` 提供（``ncclCommInitAll`` + 每卡原地 AllReduce），显式注入给
-``DataParallelTrainer(collective="device")``。不注入时抛
+``CollectiveSupport``：5.331 起判据是"NCCL / RCCL 能不能加载"——能就声明
+``device_allreduce=True``，数据并行默认走设备侧；加载不到才经主机中转。
+``overlap`` 仍恒为 False。单进程多卡的设备侧归约由
+``nccl_device_collective(backend, devices)`` 提供（``ncclCommInitAll`` +
+每卡原地 AllReduce），``DataParallelTrainer(collective="auto")`` 在库可用时
+自动调用它，不再要求注入。库缺失却显式要 ``collective="device"`` 时抛
 ``DeviceCollectiveUnavailable`` 并带上"为什么不行"——不静默降级回主机路径，
 否则调用方会以为通信留在设备上。provider 契约见 ``DeviceAllReduce``：
 归约留在设备上，只把结果拉回主机一次，D2H 的字节数从"每卡一份整梯度"降到
-"一份整梯度"。多进程 DDP 的集合通信仍由调用方注入（每 rank 一个进程，
-不能用 ``ncclCommInitAll`` 的那组 communicator）。
+"一份整梯度"。每 rank 一个进程的 DDP 由 ``NcclDeviceCollective.from_env``
+自建 ``ncclCommInitRank``（``world_size == 1`` 走直通对象），不能用
+``ncclCommInitAll`` 的那组 communicator。
 
 **代价如实写在接口上。** ``set_device`` 是丢弃而不是迁移旧卡缓存（5.169），
 所以每切一次卡，旧卡上的编译产物与捕获计划都会作废。这个循环因此不适合
@@ -51,7 +54,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import queue
 import threading
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -174,10 +177,12 @@ def collective_support(
 ) -> CollectiveSupport:
     """查询后端能提供到哪一级集合通信。
 
-    参考后端与 CUDA / HIP 后端都没有接入设备侧集合通信（NCCL / RCCL）：
-    跨卡归约一律经主机中转。把这件事变成**可查询的声明**，而不是让调用方
-    从性能曲线里猜。注入 ``provider`` 时声明随之变化——这条路径由调用方
-    保证实现，本层只负责把契约校验住。
+    5.331 起设备侧归约是数据并行的**默认路径**：本机加载得到 NCCL / RCCL 时
+    声明 ``device_allreduce=True``（单进程多卡由
+    :func:`nccl_device_collective` 自建 ``ncclCommInitAll``，每进程一卡由
+    :meth:`NcclDeviceCollective.from_env` 自建 ``ncclCommInitRank``）。库缺失
+    才退回主机中转，并在这里如实说明。注入 ``provider`` 时声明随之变化——
+    这条路径由调用方保证实现，本层只负责把契约校验住。
     """
     _check_multi_device_backend(backend)
     if provider is not None:
@@ -195,21 +200,23 @@ def collective_support(
                 "执行器同步、切卡串行，进程内没有重叠窗口"
             ),
         )
+    available, reason = _device_collective_reason()
     return CollectiveSupport(
-        device_allreduce=False,
+        device_allreduce=available,
         overlap=False,
-        provider=None,
-        reason=_device_collective_reason(),
+        provider="nccl" if available else None,
+        reason=reason,
     )
 
 
-def _device_collective_reason() -> str:
-    """说清"为什么仍走主机中转"，并把本机的真实情况带出来。
+def _device_collective_reason() -> Tuple[bool, str]:
+    """说清本机能不能走设备侧归约，并把真实情况带出来。
 
     5.228 起 ``train/nccl.py`` 已经能加载 NCCL，5.244 起同一份绑定也认 RCCL；
-    但**数据并行路径没有接它**（``DeviceDataParallel`` 的归约仍是每卡拉回主机
-    求和再传回去）。因此能力声明必须保持 ``device_allreduce=False``，理由里
-    再区分"本机连库都没有"与"库在、只是没接线"——这两种情况该做的事不同。
+    5.331 起数据并行默认接它（单进程多卡 ``ncclCommInitAll``、每进程一卡
+    ``ncclCommInitRank``）。所以判据只剩"库能不能加载"：能 ⇒ 设备侧可用；
+    不能 ⇒ 才经主机中转。理由里区分这两种情况，因为该做的事不同（装库 vs
+    什么都不用做）。
     """
     from . import nccl
 
@@ -218,15 +225,17 @@ def _device_collective_reason() -> str:
         version = nccl.version_string()
     except nccl.NcclUnavailable:
         return (
+            False,
             "设备侧集合通信（NCCL / RCCL）未接入：本机也加载不到这两套库；"
             "跨卡归约一律经主机中转（D2H → 主机求和 → H2D）；"
-            "计算/通信重叠也未实现"
+            "计算/通信重叠也未实现",
         )
     return (
-        f"{label} {version} 已绑定调用面；单进程多卡可用 "
-        "parallel.nccl_device_collective(backend, devices) 作为 "
-        "device_collective 显式注入（ncclCommInitAll + 每卡原地 AllReduce），"
-        "未注入时仍经主机中转；计算/通信重叠也未实现"
+        True,
+        f"{label} {version} 已接入数据并行默认路径：单进程多卡用 "
+        "ncclCommInitAll（collective='device' 自动建），每进程一卡用 "
+        "NcclDeviceCollective.from_env()（rank 0 分发 uid）；"
+        "计算/通信重叠仍未实现",
     )
 
 
@@ -484,7 +493,7 @@ class DataParallelTrainer:
         devices: Sequence[int],
         output: Optional[str] = None,
         reduction: str = "mean",
-        collective: str = "host",
+        collective: str = "auto",
         device_collective: Optional[DeviceAllReduce] = None,
     ) -> None:
         if not isinstance(graph, Graph):
@@ -501,26 +510,29 @@ class DataParallelTrainer:
             raise ValueError(
                 f"reduction 必须是 {_REDUCTIONS} 之一，收到 {reduction!r}"
             )
-        if collective not in ("host", "device"):
+        if collective not in ("host", "device", "auto"):
             raise ValueError(
-                f"collective 必须是 'host' 或 'device'，收到 {collective!r}"
+                f"collective 必须是 'host' / 'device' / 'auto'，收到 {collective!r}"
             )
         if device_collective is not None and not callable(device_collective):
             raise TypeError(
                 f"device_collective 必须是可调用对象，"
                 f"得到 {type(device_collective).__name__}"
             )
+        if collective == "auto":
+            # 默认往设备侧走：能建 communicator 就不该把梯度搬回主机。
+            # 注入 provider 说明调用方已经准备好设备侧实现，直接用它。
+            if device_collective is not None:
+                collective = "device"
+            else:
+                collective = (
+                    "device" if collective_support(backend).device_allreduce
+                    else "host"
+                )
         if collective == "host" and device_collective is not None:
             raise ValueError(
                 "注入了 device_collective 却选了 collective='host'："
                 "两种归约路径只能选一条，不猜"
-            )
-        if collective == "device" and device_collective is None:
-            support = collective_support(backend)
-            raise DeviceCollectiveUnavailable(
-                f"collective='device' 需要设备侧归约实现，当前没有：{support.reason}；"
-                "请显式改用 collective='host'（经主机中转），或注入 "
-                "device_collective=nccl_device_collective(backend, devices)"
             )
 
         if isinstance(devices, (str, bytes)) or not isinstance(devices, Sequence):
@@ -533,6 +545,17 @@ class DataParallelTrainer:
             picked.append(value)
         if not picked:
             raise ValueError("devices 不能为空：数据并行至少需要一块设备")
+
+        if collective == "device" and device_collective is None:
+            support = collective_support(backend)
+            if not support.device_allreduce:
+                raise DeviceCollectiveUnavailable(
+                    f"collective='device' 需要设备侧归约实现，当前没有："
+                    f"{support.reason}；请显式改用 collective='host'（经主机中转）"
+                )
+            # 5.331：不再要求调用方注入 provider。NCCL / RCCL 可用时这里直接
+            # 建 ncclCommInitAll，删掉"设备侧能力存在但入口要自己拼"的门槛。
+            device_collective = nccl_device_collective(backend, picked)
 
         symbolic = [v.name for v in graph.inputs if not v.type.is_static]
         if symbolic:
@@ -900,26 +923,57 @@ class DistributedDataParallel:
         trainer: Trainer,
         *,
         collective: Optional[Any] = None,
+        device: Optional[bool] = None,
         reduction: str = "mean",
-        bucket_bytes: int = DEFAULT_BUCKET_BYTES,
-        threads: int = 2,
+        bucket_bytes: Optional[int] = None,
+        threads: Optional[int] = None,
         overlap: bool = False,
     ) -> "DistributedDataParallel":
-        """从 ``AF_RANK`` / ``AF_WORLD_SIZE`` 读 rank 与规模，配一个最小启动器。
+        """从 ``AF_RANK`` / ``AF_WORLD_SIZE`` 读 rank 与规模，默认把归约留在设备上。
 
-        环境变量与 :func:`train.distributed.spawn` / :func:`train.host_collective.launch`
-        同源：启动器负责注入，训练脚本只读。``collective`` 缺省是
-        ``HostCollective.from_env()``（连父进程的中转端口）；设备态要显式传入
-        ``NcclDeviceCollective(comm)``——每个 rank 的 communicator 必须由调用方
-        建立，本层不替你猜 ``init_rank`` 的参数。
+        环境变量与 :func:`train.distributed.spawn` /
+        :func:`train.host_collective.launch` 同源：启动器负责注入，训练脚本只读。
+
+        ``device`` 决定归约发生在哪一侧，缺省跟随 ``trainer.device_state``：
+        设备态的梯度本来就在显存里，搬回主机求和再传回去才是异常的那一侧，
+        所以 5.331 起默认走设备侧。``device=True`` 时由
+        :meth:`NcclDeviceCollective.from_env` 自建 communicator（rank 0 生成
+        uid，经 ``AF_MASTER_ADDR`` / ``AF_MASTER_PORT`` 分发，其余 rank 取回后
+        ``ncclCommInitRank``），**不再要求调用方先建好 ``comm``**。库缺失时抛
+        ``DeviceCollectiveUnavailable``，不静默采纳主机中转。
+
+        ``device=False`` 仍走 :class:`HostCollective`（socket 中转）：跨机且没有
+        NCCL 时唯一可用的路。
+
+        ``bucket_bytes`` / ``threads`` 缺省也随形态走：设备态 0 / 1（设备态不
+        拼桶，NCCL 调用必须各 rank 同序），主机态 ``DEFAULT_BUCKET_BYTES`` / 2。
         """
         from .distributed import env_rank, env_world_size
         from .host_collective import HostCollective
 
         rank = env_rank()
         world = env_world_size()
+        use_device = bool(trainer.device_state) if device is None else bool(device)
         if collective is None:
-            collective = HostCollective.from_env(rank=rank, world_size=world)
+            if use_device:
+                from .nccl import NcclUnavailable
+                from .zero import NcclDeviceCollective
+
+                try:
+                    collective = NcclDeviceCollective.from_env(
+                        rank=rank, world_size=world
+                    )
+                except NcclUnavailable as exc:
+                    raise DeviceCollectiveUnavailable(
+                        f"设备态训练默认走设备侧归约，但当前不可用：{exc}；"
+                        "装好 NCCL / RCCL，或显式传 device=False 走主机中转"
+                    ) from exc
+            else:
+                collective = HostCollective.from_env(rank=rank, world_size=world)
+        if bucket_bytes is None:
+            bucket_bytes = 0 if use_device else DEFAULT_BUCKET_BYTES
+        if threads is None:
+            threads = 1 if use_device else 2
         return cls(
             trainer,
             collective,

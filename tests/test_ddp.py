@@ -592,6 +592,77 @@ class TestDeviceSideDistributed(unittest.TestCase):
         self.assertEqual(ddp.world_size, 2)
 
 
+class TestDistributedFromEnvBindsDevice(unittest.TestCase):
+    """5.331：设备态 DDP 默认自建设备侧 communicator，不再要求调用方注入。
+
+    "默认"必须能被证明：设备态构造不传 ``collective`` / ``bucket_bytes`` /
+    ``threads`` 时，应当走 ``NcclDeviceCollective.from_env``，且桶与线程数
+    落在设备态唯一合法的取值上；显式 ``device=False`` 才回到主机中转，并
+    恢复主机侧的默认值。NCCL 缺失时抛错——静默采纳主机中转等于骗调用方。
+    """
+
+    def _trainer(self, device_state=True):
+        store = _linear_store()
+        return Trainer(
+            _linear_graph(4),
+            store,
+            SGD(store.arrays(), lr=0.1),
+            backend=_CaptureBackend(),
+            device_state=device_state,
+            rng_rank=0,
+            rng_world_size=2,
+        )
+
+    def test_device_state_defaults_to_device_collective(self):
+        import aetherflow.train.distributed as distributed
+        import aetherflow.train.zero as zero
+
+        fake = _DeviceCollective(0, 2)
+        with mock.patch.object(
+            zero.NcclDeviceCollective, "from_env", return_value=fake
+        ) as built, mock.patch.object(
+            distributed, "env_rank", return_value=0
+        ), mock.patch.object(distributed, "env_world_size", return_value=2):
+            ddp = DistributedDataParallel.from_env(self._trainer())
+        built.assert_called_once_with(rank=0, world_size=2)
+        # 设备态不拼桶、NCCL 调用必须各 rank 同序：两个默认值随形态走
+        self.assertEqual(ddp.bucket_bytes, 0)
+        self.assertEqual(ddp.threads, 1)
+
+    def test_explicit_host_mode_keeps_host_bucketing(self):
+        import aetherflow.train.distributed as distributed
+        import aetherflow.train.host_collective as host_collective
+
+        fake = LoopbackWorld(2).collective(0)
+        with mock.patch.object(
+            host_collective.HostCollective, "from_env", return_value=fake
+        ) as built, mock.patch.object(
+            distributed, "env_rank", return_value=0
+        ), mock.patch.object(distributed, "env_world_size", return_value=2):
+            ddp = DistributedDataParallel.from_env(
+                self._trainer(device_state=False), device=False
+            )
+        built.assert_called_once_with(rank=0, world_size=2)
+        self.assertGreater(ddp.bucket_bytes, 0)
+        self.assertEqual(ddp.threads, 2)
+
+    def test_missing_nccl_raises_instead_of_falling_back(self):
+        import aetherflow.train.distributed as distributed
+        import aetherflow.train.zero as zero
+        from aetherflow.train import DeviceCollectiveUnavailable
+        from aetherflow.train.nccl import NcclUnavailable
+
+        with mock.patch.object(
+            zero.NcclDeviceCollective, "from_env",
+            side_effect=NcclUnavailable("没有库"),
+        ), mock.patch.object(
+            distributed, "env_rank", return_value=0
+        ), mock.patch.object(distributed, "env_world_size", return_value=2):
+            with self.assertRaises(DeviceCollectiveUnavailable) as raised:
+                DistributedDataParallel.from_env(self._trainer())
+        self.assertIn("device=False", str(raised.exception))
+
+
 def _norm(grads):
     return float(
         np.sqrt(sum(float(np.sum(np.asarray(value) ** 2)) for value in grads.values()))

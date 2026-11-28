@@ -9,7 +9,9 @@
 ``ncclCommInitRank`` 会阻塞到全部 rank 都进来为止。因此同一次训练里"每块卡
 一个进程"是它的使用前提，本模块不提供"单进程内多 comm"的包装：那种做法要
 靠线程同时进入初始化，还会把 cupy 的"当前设备"变成线程局部状态，失败时
-很难判断是哪一层没设对。单进程多卡的路径仍走 5.190 的主机中转。
+很难判断是哪一层没设对。单进程多卡的设备侧归约由
+``parallel.nccl_device_collective``（``ncclCommInitAll``）承接；本模块的
+``init_rank`` 服务"每进程一卡"的 DDP。
 
 **同一份绑定也用于 RCCL。** AMD 的 RCCL 实现了同一套 ``nccl*`` C 接口
 （函数名、枚举值、``ncclUniqueId`` 的 128 字节布局都一致），所以这里不写第二份
@@ -274,6 +276,35 @@ def unique_id() -> NcclUniqueId:
     value = NcclUniqueId()
     _check(lib.ncclGetUniqueId(ctypes.byref(value)), "ncclGetUniqueId")
     return value
+
+
+def init_rank(
+    uid: Any,
+    rank: int,
+    world_size: int,
+    *,
+    device: Optional[int] = None,
+) -> NcclComm:
+    """单进程单卡的 communicator：``ncclCommInitRank``。
+
+    与直接构造 :class:`NcclComm` 的唯一差别是**先把当前设备切到 ``device``**。
+    communicator 与设备在 ``ncclCommInitRank`` 里绑定；设错卡当场不报错，
+    要到第一次集合调用才以超时或非法地址暴露。把切卡和初始化合成一个入口，
+    调用方就没有漏切的机会。``device`` 缺省取 ``rank``（一进程一卡的约定）。
+
+    ``uid`` 接受 :class:`NcclUniqueId` 或 128 字节。
+    """
+    target = int(rank if device is None else device)
+    if target < 0:
+        raise ValueError(f"device 必须 >= 0，收到 {target}")
+    try:
+        import cupy as cp
+    except ImportError as exc:  # pragma: no cover - 没有 cupy 就没有设备侧路径
+        raise NcclUnavailable(
+            "init_rank 需要 cupy 来切卡；没有 cupy 无法确定 communicator 绑在哪张卡上"
+        ) from exc
+    with cp.cuda.Device(target):
+        return NcclComm(rank, world_size, uid)
 
 
 def init_all(devices: Any) -> list:

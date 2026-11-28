@@ -8,10 +8,12 @@
 这里的做法是最朴素的一种：父进程开一个 TCP 服务，W 个子进程各连一条连接，
 同一 ``seq`` 的消息收齐后求和、按原路回发。
 
-**为什么是主机中转，而不是设备侧。** 它不追求性能。``collective_support``
-早已声明设备侧集合通信（NCCL / RCCL）未接入、跨卡归约一律经主机；这里把
-同一条语义在跨进程里实现一遍，是为了让 :class:`DistributedDataParallel`
-的数值判据（与单进程全 batch 逐步对拍）在没有显卡的机器上也能成立。
+**为什么是主机中转，而不是设备侧。** 它不追求性能。5.331 起
+``collective_support`` 在 NCCL / RCCL 可加载时默认走设备侧，这里保留为
+"没有显卡 / 没有 NCCL 的机器（本地 CPU、CI、WSL 未挂 GPU）"以及显式
+``device=False`` / ``collective="host"`` 时的路径，把同一条语义在跨进程里
+实现一遍，让 :class:`DistributedDataParallel` 的数值判据（与单进程全 batch
+逐步对拍）在没有显卡的机器上也能成立。
 
 **协议。** 客户端先发 1 字节 rank 握手。之后每次集合调用发一帧
 ``struct("!QQ8s")`` = (seq, count, dtype 字符串左对齐 8 字节) + ``count`` 个
