@@ -1022,6 +1022,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `_kernel(key, render, func)` 里的 `key` 只用于缓存分变体（`_half` / `_ac`），
   `func` 必须是源码里的真实符号名；把 key 当 func 传会在真机报
   `CUDA_ERROR_NOT_FOUND: named symbol not found`。
+- **融合用例里的"否定结论"要和判据一起改**（5.352）：5.36 曾把"pre-norm 残差
+  fanout == 2 因此不命中"写成结构断言钉在 `TestFusedPipelineOnBlockExtended`
+  里；5.352 放开判据后这条用例立刻 FAIL。改融合判据前先 grep `fanout` /
+  `不命中`，把断言改成新边界（只融合 norm、add 不吸收），否则旧结论会伪装成
+  实现 bug。
+- **fanout == 2 的"另一个消费者"必须排除自身**（5.352）：`_consumers` 只给
+  引用计数，"另一个是 add"的判断要另建 id → 使用者列表的映射并 `u is not node`；
+  只靠计数会把 layernorm 自己算成第二个消费者。
 - **V100 上传脚本的参数**（5.351）：paramiko 连 `223.109.239.36:24432`
   （备线 `180.127.11.177:24432`），密码 `goobei9s`，远端解到 `/root/afv3`。
   走 tar.gz + SFTP，排除 `.git/__pycache__/.pytest_cache`；跑

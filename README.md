@@ -151,7 +151,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3588 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3590 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
 V100 真机 3574 个用例 / 178 跳过 / OK（差值都是只在本地跳过的设备端测试）。
 
 ## 4. 第一代版本的能力面
@@ -417,7 +417,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3588 个用例
+tests/                3590 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```

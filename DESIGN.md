@@ -104,7 +104,7 @@
 | 中层优化 IR | ✅ | 独立一层：`passes/` 有八个可组合 pass（DCE / CSE / 交换律 CSE / simplify / 常量折叠 / 三个融合）、`PassManager` 在每个 pass 之后过 verifier、`registry.py` 提供注册表与按名入口（`run_pass` / `run_passes` / `build_pipeline`），三条管线（默认 / 融合 / 反向图）的名字序列只在 `DEFAULT_PASS_NAMES` / `FUSED_PASS_NAMES` / `BACKWARD_PASS_NAMES` 定义一处（5.36、5.197、5.207） |
 | 底层硬件 IR | 🟡 | `aetherflow/lower` 的**语法级 L2**（29 个表达式 / 语句节点 + C 语法打印器 + 方言数据）已接管**全部**内核模板的生产路径：9 份字符串模板逐份迁完，CUDA 与 HIP 共用同一份 `Kernel` 描述，与手写模板逐 token 相等（5.42–5.49）；归约族补到 max / mean / argmax 后仍是同一份骨架（5.50）。**语义级 L2** 已有第一版（5.52）：同形相邻逐元素算子融成一条链、中间值不物化，f32 在长度与对齐条件满足时走 `float4` 四通道；索引 / 布局抽象自 5.177 起有 `Layout`，5.209 把它铺到生产内核的 19 处二维行主序线性化（源码逐字节不变），但带括号前缀乘积、64 位提升与跨步不连续的形态仍手写；block 的取值已改为按规模推导的纯函数（5.65，归约类与分块卷积不在其内） |
 | 常量折叠 | ✅ | `ConstantFolding` 求值"输入全是常量"的子图，结果写成 `constant` 的 `data` 属性；符号维、带种子的随机算子与超大常量不折（5.36） |
-| 算子融合 | 🟡 | 3 条规则：softmax 吸收缩放、LayerNorm 吸收残差、SwiGLU 门控——全部是 ADR-010 的"已有算子输入扩展"，不新增融合算子（5.36）。pre-norm Block 的残差 add fanout=2，因此不命中。另有后端侧的逐元素链融合（5.52）：相邻同形算子合成一个内核，中间值不物化 |
+| 算子融合 | 🟡 | 3 条规则：softmax 吸收缩放、LayerNorm 吸收残差、SwiGLU 门控——全部是 ADR-010 的"已有算子输入扩展"，不新增融合算子（5.36）。pre-norm Block 的残差 add fanout=2 时只把 norm 换成 4 输入形态、保留 add（5.352）。另有后端侧的逐元素链融合（5.52）：相邻同形算子合成一个内核，中间值不物化 |
 | 死代码消除 | ✅ | `passes/dce.py` |
 | IR 作为标准协议 | ✅ | 类型 + verifier + JSON 序列化 + 版本治理 + 跨版本迁移（结构化改写、单出边路径、`Graph.migrated_from`，5.162）+ conformance 准入 |
 | 设备管理器接口 | ✅ | `device_info()` 为可选契约 `DeviceContract`（5.10）；stream 管理已提为独立契约 `StreamContract`（5.89，CUDA 与 HIP 都实现）；多设备枚举与切换在 5.164 补齐：HIP 的 `runtime` 绑上 `hipGetDeviceCount` / `hipGetDevice` / `hipSetDevice`，属性与 SM 数按设备索引缓存，CUDA 侧去掉写死的 0 号卡，两边共同实现 `DeviceManagerContract`（`enumerate_devices` / `current_device` / `set_device`，非法索引当场拒绝）；跨卡拷贝与数据并行最小闭环在 5.190 补齐（`copy_across_devices` 经主机中转、`allreduce` 主机侧归约、`DataParallelTrainer` 逐卡前向反向）；5.205 补了优化器状态分片（ZeRO-1，`ShardedOptimizer` 与整份优化器逐位一致）与 GPipe 式流水（`PipelineTrainer`：段间激活跨卡、micro-batch 顺序流转、参数梯度按份数加权），仍无 peer-to-peer、也没有前向与反向的重叠执行 |
@@ -2695,12 +2695,12 @@ FuseLayerNormResidual → FuseSiLU → DCE`。
 `models/mamba.py` 的 `mul(y, silu(z))` 上真实命中。`layernorm` 的第 4 个输入在
 归一化之前相加，于是 add 的输出从不物化——这是"整段融合"在语义层的准确表达。
 
-**诚实的否定结论**：pre-norm Transformer Block 里 `x1 = add(x, ...)` 同时被
-`layernorm(x1)` 和 `out = add(x1, ff)` 使用，fanout == 2，因此
-`FuseLayerNormResidual` **不命中**。这不是实现缺陷，而是残差在 pre-norm 结构里
-天然被共享；强行融合需要跨节点维护"残差流"，那已经是另一个 IR。测试
-`TestFusedPipelineOnBlockExtended` 把这条否定结论钉住，避免后人误以为 Block
-被融合了。
+**最初的否定结论**：pre-norm Transformer Block 里 `x1 = add(x, ...)` 同时被
+`layernorm(x1)` 和 `out = add(x1, ff)` 使用，fanout == 2，最初版本的
+`FuseLayerNormResidual` 因此**不命中**。这里记下当时的判断：吸收 add 省不掉
+`x1` 的物化（下游残差还要读），强行合并只会多读一遍。5.352 把这条边界推进了
+一格：**保留 add、只把 layernorm 换成 4 输入形态**，用"多一遍张量读"换"少一次
+launch"；跨节点维护残差流仍然不做。
 
 CUDA 侧新增两个内核：`LAYERNORM_RESIDUAL_SRC`（先按存储类型舍入做加法、再读成
 float 归约）与 `SILU_GATE_SRC`（跨步循环），f16 走同一模板。反向规则同步扩展：
@@ -2741,7 +2741,7 @@ d_ff=64）静态预算 6656 B，捕获期实测 8192 B。两者不要求相等�
 | 折叠正确性 | 标量填充 / 任意 `data` / 链式折叠 / 与 DCE 协同后节点数 / 序列化往返 |
 | 折叠边界 | 符号维不折、`dropout_mask` 不折、超大常量不折（`max_elements` 小上限） |
 | 融合语义 | 融合前后参考后端逐位一致；`layernorm` 4 输入与 `silu` 2 输入的梯度对照 |
-| 融合判据 | fanout == 2 不命中（pre-norm Block）、add 生产者不是 add 不命中、类型不同不命中 |
+| 融合判据 | fanout == 2 时只融合 norm、保留 add（pre-norm Block，5.352）；其余 fanout、add 生产者不是 add、类型不同不命中 |
 | 融合后端承接 | f32 / f16 的 residual 形态、SwiGLU 门控；长度不整除与列数非 2 的幂的边界 |
 | 折叠后端承接 | 折叠出的 `data` 常量在 CUDA 上直接物化并参与计算 |
 | 静态预算 | 线性链 / 分支 / 复用比 / 生命周期 / 512B 对齐 / 符号维绑定 / 零元素 / `as_dict` / 两种 `release` 口径 / 事件扫描对暴力扫描（5.105） |
@@ -2757,7 +2757,8 @@ d_ff=64）静态预算 6656 B，捕获期实测 8192 B。两者不要求相等�
 
 **明确没做的**
 
-- **跨节点的残差流融合**：pre-norm Block 的 fanout == 2 是结构性的，不做。
+- **跨节点的残差流融合**：pre-norm Block 的 fanout == 2 时只融合 norm（5.352），
+  跨节点维护残差流不做。
 - **GEMM epilogue 融合**：cuBLAS 必须物化输出，已被实验否定，不再列为待办。
 - **折叠结果的内存驻留**：折叠出的常量仍走普通 `constant` 路径，没有和
   `resident_parameters` 合并；小常量重复物化的成本没有测。
@@ -17082,8 +17083,8 @@ fusion_is_bitwise_identical`（逐位 + 参考对照）。
   **编译期静态预算**也已补齐：`plan_memory` 直接从 IR 的 liveness 算出峰值与复用
   倍数，不执行、不需要 GPU；与捕获期峰值同量级（真机 8192 / 6656 B，见 5.36）。
 - **深层融合 ✅ 已交付**：LayerNorm+残差与 SwiGLU 门控都表达为已有算子的输入扩展，
-  CUDA 侧各有一个内核（含 f16）。pre-norm Block 的残差 add fanout == 2，因此
-  LayerNorm 残差规则在那里不命中——这是结构性的，已写成测试的否定结论。
+  CUDA 侧各有一个内核（含 f16）。pre-norm Block 的残差 add fanout == 2，5.352 起的
+  规则保留 add、只把 norm 换成 4 输入形态（少一次 launch，多一遍张量读）。
   GEMM epilogue 已被实验否定（cuBLAS 必须物化输出），不再列为待办。见 5.36。
 
 ### M3.5　CI 与性能回归　🟡 第一版
@@ -22584,6 +22585,47 @@ OK`，95 秒（本地无 GPU 是 `3576 / 464 跳过`，差值全部是设备端�
 - 没有吞吐数字：只验数值等价，没与 PyTorch 的 `upsample` 做基准对照。
 - 反向的原子加顺序不确定（浮点不满足结合律），重复运行时低位可能有 1 ulp
   差异；这是 scatter-add 的固有性质，不是缺陷。
+
+### 5.352　融合规则：pre-norm 残差块命中，只融合 norm
+
+**缺口清单的第二项。** 5.36 交付的三条融合规则里，`FuseLayerNormResidual`
+要求 add 的 fanout == 1；而 pre-norm Transformer Block 的真实形态是
+`x1 = add(x, attn)`、`norm(x1)`、`out = add(x1, ff)`，fanout == 2，规则永远
+不命中。此前把这一点写成"诚实的否定结论"（5.36），代价是整张 Block 上
+LayerNorm 残差内核一次都用不上。
+
+**改法：把"吸收 add"和"融合 norm"拆成两件事。** fanout == 2 且第二个消费者
+也是 `add` 时，保留 add 节点、只把 layernorm 换成 4 输入形态：
+
+| 形态 | 判据 | 结果 |
+|---|---|---|
+| fanout == 1、非图输出 | 原规则 | 吸收 add，x1 不物化 |
+| fanout == 2、另一消费者是 add | 新增 | 保留 add，norm 改读 add 的两个输入 |
+| fanout >= 3、或另一消费者不是 add | — | 不命中（吸收会造成重复计算） |
+
+**取舍写清楚。** pre-norm 块里 x1 仍被下游残差读取，物化省不掉；融合后
+layernorm 改读 a、b 两个张量而不是 x1，多一遍张量读。换来的是归约与残差加法
+进同一个内核、少一次 launch。按"少一次 launch"算账，而不是按"少一遍读"——
+这是有意的取舍，不是免费的收益。
+
+**收益边界。** 真实 Block（B=2, S=5, d_model=32, d_ff=64）上第二个 layernorm
+从 3 输入变 4 输入，add 节点数不变；前向与反向在参考后端与未融合图**逐位相同**
+（实测最大差 0.0，含全部参数梯度）。第一个 layernorm 作用在输入 x 上，不命中。
+
+**验证。**
+
+- `tests/test_passes.py`：`test_prenorm_residual_fuses_norm_only`（结构 + 逐位对拍）、
+  `test_three_fanouts_block_fusion`（fanout=3 不命中）；`TestFusedPipelineOnBlockExtended`
+  里原先钉住"pre-norm 不命中"的用例改写为"只融合 norm、add 不吸收"。
+- 本地全量 3590 / 464 跳过 / OK；V100 真机 `verify_cuda.py` 全部 PASS，
+  全量 3576 / 178 跳过 / OK。
+
+**未声称。**
+
+- 没有吞吐数字：只验语义等价与 launch 次数减少，没测端到端加速。
+- 不吸收广播（add 两侧必须与 layernorm 第 0 输入同类型）、不跨节点维护残差流。
+- 融合结果的收益依赖后端把 4 输入 layernorm 真的实现成"一次读入 + 寄存器加法"；
+  参考后端只是语义真值，不代表性能。
 
 
 
