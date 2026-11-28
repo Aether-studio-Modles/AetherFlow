@@ -485,7 +485,7 @@ class CudaBackend(DeviceBackend):
     def _pick_cusparse(self, values, indices, offsets) -> bool:
         """这一次 ``sparse_linear`` 走不走 cuSPARSE。
 
-        只覆盖登记过的形态：f32 值 + i32 的 ``indices`` / ``offsets``。
+        只覆盖登记过的形态：f16 / f32 值 + i32 的 ``indices`` / ``offsets``。
         ``auto`` 在捕获期与库缺失时回落到自研核；显式 ``cusparse`` 则把
         这两种情况变成明确错误，而不是"悄悄换了个实现"。
 
@@ -494,14 +494,14 @@ class CudaBackend(DeviceBackend):
         默认值仍是 ``custom`` 的原因。
         """
         supported = (
-            np.dtype(values.dtype) == np.dtype("float32")
+            np.dtype(values.dtype) in (np.dtype("float16"), np.dtype("float32"))
             and np.dtype(indices.dtype) == np.dtype("int32")
             and np.dtype(offsets.dtype) == np.dtype("int32")
         )
         if self.sparse_impl == "cusparse":
             if not supported:
                 raise BackendCapabilityError(
-                    "sparse_impl='cusparse' 只支持 float32 值 + int32 索引，"
+                    "sparse_impl='cusparse' 只支持 float16/float32 值 + int32 索引，"
                     f"收到 values={np.dtype(values.dtype)}、"
                     f"indices={np.dtype(indices.dtype)}、"
                     f"offsets={np.dtype(offsets.dtype)}"

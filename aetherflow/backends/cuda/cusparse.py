@@ -15,10 +15,15 @@
 2. 5.173 的实测在四个形状上都是自研核更快；把库路径设成默认，等于用
    一个"可能更慢、且少一道检查"的实现替换已验证的路径。
 
-覆盖范围刻意收窄：**f32 值 + i32 索引 + 行主序稠密矩阵**。f16 与 f64
-不登记（``CusparseUnsupported``），索引只认 i32。这三条都是"没有真机
-验证过的形态不放开"，而不是"库不支持"：cuSPARSE 本身支持 f16/f64 与
-i64，放开它们需要各自的对拍数据，当前的 CPU-only 环境给不出。
+覆盖范围：**f16 / f32 值 + i32 索引 + 行主序稠密矩阵**。f16 在 V100 上与
+自研核同形状对拍过；索引只认 i32（i64 索引需要单独的对拍数据）。f64 不
+放开——自研核的 ``sparse_linear`` 只承接 f16 / f32，若库路径单独支持 f64，
+同一张图换个 ``sparse_impl`` 就会从"能跑"变成"报错"，实现优劣不该改变
+算子的承接面。表外形态一律 ``CusparseUnsupported``。
+
+计算类型（``computeType``）跟着值的 dtype 走，但**不总等于存储类型**：f16
+的存储类型是 ``CUDA_R_16F``，累加必须用 ``CUDA_R_32F``（半个精度做累加会
+掉有效位），alpha / beta 的 ctypes 类型必须与 computeType 一致。
 
 与 ``cudnn.py`` 同一个定位：它仍然属于 ADR-004 的范畴——IR 里的
 ``sparse_linear`` 依旧是语义完整的 PORTABLE 算子，"用 cuSPARSE 实现它"
@@ -38,11 +43,14 @@ __all__ = [
     "CusparseUnsupported",
     "available",
     "data_type",
+    "compute_type",
     "index_type",
     "CusparseSpMM",
 ]
 
-# cudaDataType_t
+# cudaDataType_t（与 cublas.py 同一组数字，见 /usr/local/cuda/include/
+# library_types.h：16F=2 / 32F=0）
+_CUDA_R_16F = 2
 _CUDA_R_32F = 0
 # cusparseIndexType_t：16U=1 / 32I=2 / 64I=3 / 8I=4。写成 1 会被当成 uint16
 # 去读 int32 的 rowOffsets，越界读在真机上就是 cudaErrorIllegalAddress。
@@ -59,7 +67,10 @@ _CUSPARSE_SPMM_ALG_DEFAULT = 0
 _CUSPARSE_STATUS_SUCCESS = 0
 
 # 这张表就是本模块的覆盖声明：不在这里的 dtype / 索引类型显式拒绝。
-_DATA_TYPES = {np.dtype("float32"): _CUDA_R_32F}
+_DATA_TYPES = {
+    np.dtype("float16"): _CUDA_R_16F,
+    np.dtype("float32"): _CUDA_R_32F,
+}
 _INDEX_TYPES = {np.dtype("int32"): _CUSPARSE_INDEX_32I}
 
 _CANDIDATES = (
@@ -93,6 +104,17 @@ def data_type(dtype: Any) -> int:
             f"cuSPARSE 快路径只登记了 {sorted(str(k) for k in _DATA_TYPES)}，"
             f"收到 {key}；请改用 sparse_impl='custom'"
         ) from None
+
+
+def compute_type(dtype: Any) -> int:
+    """值的 dtype → ``computeType``：f16 / f32 都收敛到 ``CUDA_R_32F``。
+
+    与 ``data_type`` 分开是因为两者不总是同一个枚举：f16 的**存储**类型是
+    ``CUDA_R_16F``，但**累加**必须用 ``CUDA_R_32F``。未登记的值类型在这里
+    就拒绝，不等到 `cusparseSpMM` 返回参数错误。
+    """
+    data_type(dtype)
+    return _CUDA_R_32F
 
 
 def index_type(dtype: Any) -> int:
@@ -303,6 +325,7 @@ class CusparseSpMM:
         import cupy as cp
 
         dtype = data_type(values.dtype)
+        compute = compute_type(values.dtype)
         index_type(indices.dtype)
         index_type(offsets.dtype)
         nnz = int(values.size)
@@ -318,6 +341,8 @@ class CusparseSpMM:
         try:
             key = self.plan_key(steps, rows, cols, nnz, values.dtype)
             width = self._sizes.get(key)
+            # alpha / beta 的 ctypes 类型必须与 computeType 一致：compute 是
+            # CUDA_R_32F 时只能是 c_float（传 double 会被按 32 位截断读）。
             alpha = ctypes.c_float(1.0)
             beta = ctypes.c_float(0.0)
             if width is None:
@@ -328,7 +353,7 @@ class CusparseSpMM:
                         _CUSPARSE_OPERATION_NON_TRANSPOSE,
                         _CUSPARSE_OPERATION_NON_TRANSPOSE,
                         ctypes.byref(alpha), a, b, ctypes.byref(beta), c,
-                        _CUDA_R_32F, _CUSPARSE_SPMM_ALG_DEFAULT,
+                        compute, _CUSPARSE_SPMM_ALG_DEFAULT,
                         ctypes.byref(size),
                     ),
                     "cusparseSpMM_bufferSize",
@@ -343,7 +368,7 @@ class CusparseSpMM:
                     _CUSPARSE_OPERATION_NON_TRANSPOSE,
                     ctypes.byref(alpha), a, b,
                     ctypes.byref(beta), c,
-                    _CUDA_R_32F, _CUSPARSE_SPMM_ALG_DEFAULT,
+                    compute, _CUSPARSE_SPMM_ALG_DEFAULT,
                     ctypes.c_void_p(0) if workspace is None
                     else ctypes.c_void_p(int(workspace.data.ptr)),
                 ),

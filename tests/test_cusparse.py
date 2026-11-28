@@ -4,8 +4,8 @@
 
 - **离线**：dtype / 索引类型的登记表、库缺失时的错误、``sparse_impl`` 的
   选择逻辑、失败回落与"只试一次"。这些都不需要 GPU，也不加载库。
-- **真机**：与自研核同形状对拍（含空步与重复行）、f16 / f64 的显式拒绝、
-  捕获期拒绝。没有 CUDA 或没有 libcusparse 时整组跳过。
+- **真机**：与自研核同形状对拍（含空步与重复行）、f16 / f32 / f64 三种
+  值的 dtype、捕获期拒绝。没有 CUDA 或没有 libcusparse 时整组跳过。
 """
 
 import unittest
@@ -21,6 +21,7 @@ from aetherflow.backends.cuda.cusparse import (
     CusparseSpMM,
     CusparseUnavailable,
     CusparseUnsupported,
+    compute_type,
     data_type,
     index_type,
 )
@@ -33,13 +34,24 @@ class TestCusparseRegistry(unittest.TestCase):
         self.assertEqual(data_type(np.float32), 0)
         self.assertEqual(data_type("float32"), 0)
 
-    def test_float16_and_float64_are_refused(self):
-        for dtype in (np.float16, np.float64):
+    def test_float16_maps_to_cuda_r_16f(self):
+        """16F=2（``library_types.h``，与 cublas.py 同一组数字）。"""
+        self.assertEqual(data_type(np.float16), 2)
+
+    def test_compute_type_accumulates_f16_in_f32(self):
+        """f16 用 32F 累加：半个精度做累加会掉有效位。"""
+        self.assertEqual(compute_type(np.float16), 0)
+        self.assertEqual(compute_type(np.float32), 0)
+
+    def test_unregistered_dtype_is_refused(self):
+        for dtype in (np.int8, np.complex64):
             with self.assertRaises(CusparseUnsupported) as caught:
                 data_type(dtype)
             message = str(caught.exception)
             self.assertIn("sparse_impl='custom'", message)
             self.assertIn(str(np.dtype(dtype)), message)
+            with self.assertRaises(CusparseUnsupported):
+                compute_type(dtype)
 
     def test_int32_index_maps_to_32i(self):
         """``cusparseIndexType_t``：16U=1 / 32I=2 / 64I=3 / 8I=4。
@@ -115,14 +127,22 @@ class TestSparseImplSelection(unittest.TestCase):
             )
         )
 
-    def test_auto_never_tries_library_for_f16(self):
-        """f16 不在登记表里：auto 直接走自研核，不去碰库。"""
+    def test_float64_is_refused_with_reason(self):
+        """f64 不放开：自研核只承接 f16 / f32，库路径不能单独越界。"""
+        with self.assertRaises(CusparseUnsupported) as caught:
+            data_type(np.float64)
+        self.assertIn("sparse_impl='custom'", str(caught.exception))
+
+    def test_auto_uses_library_for_f16_and_f32(self):
+        """两种值的 dtype 都在登记表里：auto 在有库时直接走库。"""
         backend = _fake_backend("auto", engine=object())
-        self.assertFalse(
-            backend._pick_cusparse(
-                np.zeros(4, np.float16), np.zeros(2, np.int32), np.zeros(3, np.int32)
+        for dtype in (np.float16, np.float32):
+            self.assertTrue(
+                backend._pick_cusparse(
+                    np.zeros(4, dtype), np.zeros(2, np.int32),
+                    np.zeros(3, np.int32),
+                )
             )
-        )
 
     def test_auto_never_uses_library_while_capturing(self):
         backend = _fake_backend("auto", capturing=True, engine=object())
@@ -140,13 +160,13 @@ class TestSparseImplSelection(unittest.TestCase):
             )
         )
 
-    def test_explicit_cusparse_rejects_f64(self):
+    def test_explicit_cusparse_rejects_unregistered_value_dtype(self):
         backend = _fake_backend("cusparse", engine=object())
         with self.assertRaises(BackendCapabilityError) as caught:
             backend._pick_cusparse(
-                np.zeros(4, np.float64), np.zeros(2, np.int32), np.zeros(3, np.int32)
+                np.zeros(4, np.int8), np.zeros(2, np.int32), np.zeros(3, np.int32)
             )
-        self.assertIn("float32", str(caught.exception))
+        self.assertIn("float16", str(caught.exception))
 
     def test_explicit_cusparse_rejects_i64_index(self):
         backend = _fake_backend("cusparse", engine=object())
@@ -294,17 +314,16 @@ class TestCudaSparseCusparse(unittest.TestCase):
             rtol=1e-5, atol=1e-5,
         )
 
-    def test_float16_is_refused_explicitly(self):
-        g, feed = _sparse_graph(6, 5, 4, (2, 0, 2, 1), dtype=f16)
-        with self.assertRaises(BackendCapabilityError) as caught:
-            self.fast.execute(g, feed)
-        self.assertIn("float32", str(caught.exception))
+    def test_matches_custom_float16(self):
+        """f16 值 + f32 累加：与自研核的差值受半个精度的表示误差支配。"""
+        self._check(6, 5, 4, (2, 0, 2, 1), dtype=f16, tol=5e-3)
 
     def test_float64_is_refused_explicitly(self):
+        """f64 的 sparse_linear 整体不在承接面内：错误来自后端的 dtype 门禁。"""
         g, feed = _sparse_graph(6, 5, 4, (2, 0, 2, 1), dtype=f64)
         with self.assertRaises(BackendCapabilityError) as caught:
             self.fast.execute(g, feed)
-        self.assertIn("float32", str(caught.exception))
+        self.assertIn("float64", str(caught.exception))
 
     def test_capture_is_refused_explicitly(self):
         g, feed = _sparse_graph(6, 5, 4, (2, 0, 2, 1))
