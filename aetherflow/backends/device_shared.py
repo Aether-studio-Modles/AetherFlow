@@ -112,6 +112,9 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "reduce_sum",
         "reduce_max",
         "reduce_mean",
+        # 5.341：bool 归约，按"数真值个数"求和后判定，输出仍是 bool。
+        "reduce_any",
+        "reduce_all",
         "argmax",
         "topk_values",
         "topk_indices",
@@ -218,6 +221,9 @@ _BOOL_OPS: FrozenSet[str] = frozenset(
         "logical_and",
         "logical_or",
         "logical_not",
+        # 5.341：bool 归约输入输出都是 bool（1 字节存储，见 BOOL_DIALECT）。
+        "reduce_any",
+        "reduce_all",
         "cast",
     }
 )

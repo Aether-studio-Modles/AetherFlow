@@ -13,7 +13,7 @@ from unittest import mock
 
 import numpy as np
 
-from aetherflow import Graph, ReferenceBackend, backward, bf16, f16, f32, f64, i8, i32
+from aetherflow import Graph, ReferenceBackend, backward, bf16, boolean, f16, f32, f64, i8, i32
 from aetherflow.backends.base import BackendCapabilityError
 from aetherflow.backends.cuda import CUDA_AVAILABLE, CudaBackend
 from aetherflow.backends.device_backend import _group_elementwise, _mask_shared_over_heads
@@ -2622,6 +2622,48 @@ class TestCudaReductions(CudaTestCase):
         x = g.input("x", f32[4, 7])
         g.output(g.reduce_mean(x, axis=-1, keepdims=False), "y")
         self.assert_backends_equal(g, {"x": self.rand(4, 7)})
+
+    def _assert_bool_equal(self, g, feed):
+        """bool 输出逐位比较：allclose 会把 True/False 当 0/1 容忍误差。"""
+        expected = self.ref.execute(g, feed)
+        got = self.cuda.execute(g, feed)
+        for name in expected:
+            self.assertEqual(got[name].dtype, np.dtype(bool))
+            np.testing.assert_array_equal(got[name], expected[name])
+
+    def test_reduce_any_all_last_dim(self):
+        """bool 归约（5.341）：末维数真值后判定，全真 / 全假 / 混合都要覆盖。"""
+        g = Graph()
+        x = g.input("x", boolean[5, 7])
+        g.output(g.reduce_any(x, axis=-1, keepdims=False), "any")
+        g.output(g.reduce_all(x, axis=-1, keepdims=False), "all")
+        mask = np.random.default_rng(341).random((5, 7)) > 0.5
+        mask[0, :] = True
+        mask[1, :] = False
+        self._assert_bool_equal(g, {"x": mask})
+
+    def test_reduce_any_all_other_axes(self):
+        """非末维 / 多轴 / keepdims：判定语义与末维路径同一份（5.341）。"""
+        for shape, axis, keepdims in (
+            ((4, 5), 0, False),
+            ((3, 4, 5), 1, True),
+            ((2, 3, 4), (0, 2), False),
+        ):
+            with self.subTest(shape=shape, axis=axis, keepdims=keepdims):
+                g = Graph()
+                x = g.input("x", boolean[shape])
+                g.output(g.reduce_any(x, axis=axis, keepdims=keepdims), "any")
+                g.output(g.reduce_all(x, axis=axis, keepdims=keepdims), "all")
+                mask = np.random.default_rng(341).random(shape) > 0.5
+                self._assert_bool_equal(g, {"x": mask})
+
+    def test_reduce_any_all_empty_axis(self):
+        """空轴单位元：any→False、all→True（与 numpy 一致，5.341）。"""
+        g = Graph()
+        x = g.input("x", boolean[3, 0])
+        g.output(g.reduce_any(x, axis=-1), "any")
+        g.output(g.reduce_all(x, axis=-1), "all")
+        self._assert_bool_equal(g, {"x": np.zeros((3, 0), dtype=bool)})
 
     def test_argmax(self):
         g = Graph()

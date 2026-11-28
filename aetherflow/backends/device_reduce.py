@@ -10,6 +10,19 @@ import numpy as np
 class _ReduceMixin:
     """归约：末维 / 非末维 / 多轴，以及 argmax / topk。"""
 
+    def _check_bool_reduce_len(self, op: str, length: int) -> None:
+        """bool 归约的轴长上限（5.341）。
+
+        ``all`` 的判定是"和恰好等于长度"：bool 元素是 0/1，求和必须精确，
+        而 float 只能精确表示 2^24 以内的整数。超长时明确拒绝，而不是给出
+        一个依赖累加顺序的答案。``any`` 只看和是否非零，本可以放宽，但与
+        ``all`` 共用同一内核与同一份说明，保持口径一致。
+        """
+        if op in ("reduce_any", "reduce_all") and length > (1 << 24):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 一次最多归约 {1 << 24} 个元素，收到 {length}"
+            )
+
     def _use_tiled_reduce(self, inner: int, total: int) -> bool:
         """非末维归约该不该走两维铺法（5.174）。
 
@@ -23,7 +36,7 @@ class _ReduceMixin:
         """
         return inner < REDUCE_TILE_X or total < self.sm_count * BLOCK_DEFAULT
 
-    def _reduce_any_axis(self, node, args, axis: int, attrs, op: str):
+    def _reduce_any_axis(self, node, args, axis: int, attrs, op: str, pred=None):
         """非末维归约：reshape 成 ``(outer, reduce, inner)`` 交给通用内核。
 
         两条路，按"输出平面能不能自己把活干完"选：
@@ -40,6 +53,10 @@ class _ReduceMixin:
         两条路的数值语义相同：读入转 float、f16 只在写回时舍入一次。
 
         输入先取连续视图：通用内核按展平下标读，转置视图会让下标语义错位。
+
+        ``pred`` 是 bool 归约（``any`` / ``all``）的判定方式（5.341）：此时
+        ``op`` 仍是求和，判定由内核在累加之后做。超长轴拒绝——``all`` 要求
+        "和恰好等于长度"，float 只能精确表示 2^24 以内的整数。
         """
         cp = self.cp
         x = self._contig(args[0])
@@ -55,6 +72,7 @@ class _ReduceMixin:
         for dim in shape[axis + 1 :]:
             inner *= dim
         total = outer * inner
+        self._check_bool_reduce_len(op, reduce_len)
         target = shape[:axis] + ((1,) if keepdims else ()) + shape[axis + 1 :]
         out = cp.empty(total, dtype=x.dtype)
         if out.size == 0:
@@ -63,12 +81,17 @@ class _ReduceMixin:
             "reduce_sum": "sum",
             "reduce_max": "max",
             "reduce_mean": "mean",
+            # bool 归约按"数真值个数"求和，判定交给 pred（5.341）。
+            "reduce_any": "sum",
+            "reduce_all": "sum",
         }[op]
         if self._use_tiled_reduce(inner, total):
             tx, ty = plan_reduce_tiled(inner, reduce_len)
             kernel = self._kernel(
-                (f"reduce_{kind}_axis_tiled", self._kind(x)),
-                lambda: self.codegen.render(self.codegen.reduce_axis_tiled_source(kind), x.dtype),
+                (f"reduce_{kind}_axis_tiled", self._kind(x), pred),
+                lambda: self.codegen.render(
+                    self.codegen.reduce_axis_tiled_source(kind, pred), x.dtype
+                ),
                 f"reduce_{kind}_axis_tiled",
             )
             kernel(
@@ -78,8 +101,10 @@ class _ReduceMixin:
             )
             return out.reshape(target)
         kernel = self._kernel(
-            (f"reduce_{kind}_axis", self._kind(x)),
-            lambda: self.codegen.render(self.codegen.reduce_axis_source(kind), x.dtype),
+            (f"reduce_{kind}_axis", self._kind(x), pred),
+            lambda: self.codegen.render(
+                self.codegen.reduce_axis_source(kind, pred), x.dtype
+            ),
             f"reduce_{kind}_axis",
         )
         block = self._reduce_block(op, total)
@@ -90,13 +115,14 @@ class _ReduceMixin:
         )
         return out.reshape(target)
 
-    def _reduce_multi_axis(self, node, args, axes, attrs, op, source_fn, func):
+    def _reduce_multi_axis(self, node, args, axes, attrs, op, source_fn, func, pred=None):
         """多轴归约：``[keep..., reduce...]`` 置换后合并成末维，复用单轴内核。
 
         归约与轴顺序无关，所以"先把要归约的轴挪到最后、乘成一个轴"是等价
         变换；代价是一次转置拷贝（输入本身已连续且轴本来就在末尾时为零）。
         空归约轴按 numpy 的语义返回单位元：sum 是 0、mean 是 NaN（numpy 会
-        同时发 warning）、max 没有单位元因而拒绝。
+        同时发 warning）、max 没有单位元因而拒绝；bool 归约里 any 是 False、
+        all 是 True。
         """
         cp = self.cp
         x = self._contig(args[0])
@@ -119,19 +145,21 @@ class _ReduceMixin:
                 raise BackendCapabilityError(
                     f"{self._LABEL}的 {op} 不能对空轴归约（形状 {x.shape}，轴 {axes}）"
                 )
-            if op == "reduce_sum":
+            if op in ("reduce_sum", "reduce_any"):
                 return cp.zeros(rows, dtype=x.dtype).reshape(target)
+            if op == "reduce_all":
+                return cp.ones(rows, dtype=x.dtype).reshape(target)
             return cp.full(rows, np.nan, dtype=x.dtype).reshape(target)
         perm = keep + tuple(axes)
         if perm != tuple(range(x.ndim)):
             x = cp.ascontiguousarray(cp.transpose(x, perm))
         flat = x.reshape(rows, cols)
         out = self._reduce_last_dim(
-            node, [flat], {"axis": -1, "keepdims": False}, op, source_fn, func
+            node, [flat], {"axis": -1, "keepdims": False}, op, source_fn, func, pred
         )
         return out.reshape(target)
 
-    def _reduce_last_dim(self, node, args, attrs, op: str, source_fn, func: str):
+    def _reduce_last_dim(self, node, args, attrs, op: str, source_fn, func: str, pred=None):
         """归约的公共骨架：末维走块内归约，其余轴走通用路径，多轴先合并。
 
         sum / max / mean 只在"用哪个内核"上不同；keepdims 的形状恢复、空输入
@@ -139,6 +167,9 @@ class _ReduceMixin:
 
         多个轴先**置换到末尾再合并成一个轴**（``_reduce_multi_axis``）：归约
         结果与轴顺序无关，而合并后就能复用同一份单轴内核，不需要第二套内核。
+
+        ``pred`` 只用于 bool 归约（``any`` / ``all``，5.341）：这几个算子的
+        骨架与 sum 完全相同（数真值个数），差别只在累加后的判定。
         """
         cp = self.cp
         x = args[0]
@@ -154,15 +185,24 @@ class _ReduceMixin:
         if len(set(norm)) != len(norm):
             raise BackendCapabilityError(f"{self._LABEL}的 {op} 有重复的轴: {axes}")
         if len(norm) > 1:
-            return self._reduce_multi_axis(node, args, norm, attrs, op, source_fn, func)
+            return self._reduce_multi_axis(
+                node, args, norm, attrs, op, source_fn, func, pred
+            )
         axis = norm[0]
         if axis != x.ndim - 1:
-            return self._reduce_any_axis(node, args, axis, attrs, op)
+            return self._reduce_any_axis(node, args, axis, attrs, op, pred)
         rows, cols = self._last_dim_2d(x, op)
+        self._check_bool_reduce_len(op, cols)
         keepdims = bool(attrs.get("keepdims", False))
         target = x.shape[:-1] + ((1,) if keepdims else ())
         out = cp.empty(rows, dtype=x.dtype)
         if x.size == 0:
+            # 空轴（cols == 0 且还有输出行）：sum 的 0 已经在 empty 的语义之外，
+            # 这里按 numpy 给 bool 归约的单位元——any 是 False、all 是 True。
+            if rows and op == "reduce_any":
+                return cp.zeros(rows, dtype=x.dtype).reshape(target)
+            if rows and op == "reduce_all":
+                return cp.ones(rows, dtype=x.dtype).reshape(target)
             return out.reshape(target)
         dtype_key = self._kind(x)
         if op == "reduce_sum" and cols <= 32:
@@ -218,6 +258,38 @@ class _ReduceMixin:
             "reduce_mean",
             self.codegen.reduce_mean_source,
             "reduce_mean_last",
+        )
+
+    def _op_reduce_any(self, node, args, attrs):
+        """bool 归约：任一为真即真（5.341）。
+
+        与 sum 共用内核骨架（数真值个数），判定放在块内归约之后；输出是
+        bool，写回由 ``af_st_q`` 归一成 0/1。
+        """
+        return self._reduce_last_dim(
+            node,
+            args,
+            attrs,
+            "reduce_any",
+            self.codegen.reduce_any_source,
+            "reduce_any_last",
+            "any",
+        )
+
+    def _op_reduce_all(self, node, args, attrs):
+        """bool 归约：全为真才真（5.341）。
+
+        判定是"和恰好等于长度"，因此轴长超过 2^24 时拒绝（float 的整数
+        精确区间），见 ``_check_bool_reduce_len``。
+        """
+        return self._reduce_last_dim(
+            node,
+            args,
+            attrs,
+            "reduce_all",
+            self.codegen.reduce_all_source,
+            "reduce_all_last",
+            "all",
         )
 
     def _op_argmax(self, node, args, attrs):

@@ -14,7 +14,7 @@ import unittest
 import numpy as np
 
 from aetherflow.backends.cuda import codegen as cuda_codegen
-from aetherflow.backends.cuda.dialect import CUDA_DIALECT
+from aetherflow.backends.cuda.dialect import BOOL_DIALECT, CUDA_DIALECT
 from aetherflow.backends.hip import codegen as hip_codegen
 from aetherflow.backends.hip.dialect import HIP_DIALECT
 from aetherflow.ir.types import DType
@@ -47,6 +47,8 @@ from aetherflow.lower import (
     maxpool2d_indices,
     maxpool2d_backward,
     argmax_last,
+    reduce_all_last,
+    reduce_any_last,
     reduce_max_last,
     reduce_mean_last,
     reduce_sum_last,
@@ -67,6 +69,7 @@ from aetherflow.lower import (
 # L2 按 IR 的 DType 认类型。两边在这里各用各的，比较的是产出的源码。
 _F32 = np.dtype("float32")
 _F16 = np.dtype("float16")
+_BOOL = np.dtype("bool")
 
 
 def _squash(src: str) -> str:
@@ -170,6 +173,56 @@ class TestReduceFamily(unittest.TestCase):
         for dtype in (DType.F32, DType.F16):
             src = emit(argmax_last(), CUDA_DIALECT, dtype)
             self.assertIn("int* __restrict__ out", src)
+
+
+class TestReduceBool(unittest.TestCase):
+    """bool 归约（5.341）：判定在块内归约之后，输出仍是 1 字节 bool。
+
+    prelude 不参与比较：生产路径走 ``BOOL_DIALECT``（带全部存储类型的辅助
+    函数），手写模板只带 bool 自己的那几个；要固定下来的是内核本体。
+    """
+
+    def _check(self, kernel, template, pred):
+        expected = cuda_codegen.render(template, _BOOL)
+        actual = emit(kernel, BOOL_DIALECT, DType.BOOL)
+        self.assertEqual(
+            _squash(_kernel_part(actual)), _squash(_kernel_part(expected)), pred
+        )
+
+    def test_any_matches_handwritten_template(self):
+        self._check(reduce_any_last(), cuda_codegen.REDUCE_ANY_SRC, "any")
+
+    def test_all_matches_handwritten_template(self):
+        self._check(reduce_all_last(), cuda_codegen.REDUCE_ALL_SRC, "all")
+
+    def test_any_tests_nonzero_sum(self):
+        src = emit(reduce_any_last(), BOOL_DIALECT, DType.BOOL)
+        self.assertIn(
+            "s = block_reduce_sum(s, smem) != 0.f ? 1.f : 0.f", src
+        )
+
+    def test_all_compares_sum_against_column_count(self):
+        src = emit(reduce_all_last(), BOOL_DIALECT, DType.BOOL)
+        self.assertIn(
+            "s = block_reduce_sum(s, smem) == (float)cols ? 1.f : 0.f", src
+        )
+
+    def test_bool_storage_is_one_byte(self):
+        src = emit(reduce_any_last(), BOOL_DIALECT, DType.BOOL)
+        self.assertIn("unsigned char* __restrict__ out", src)
+        self.assertIn("af_st_q(s)", src)
+
+    def test_axis_predicates_are_emitted(self):
+        """非末维与两维铺法：判定落在累加（或树归约）之后。"""
+        flat = cuda_codegen.render(
+            cuda_codegen.reduce_axis_source("sum", "all"), _BOOL
+        )
+        self.assertIn("acc == (float)reduce_len ? 1.f : 0.f", flat)
+        tiled = cuda_codegen.render(
+            cuda_codegen.reduce_axis_tiled_source("sum", "any"), _BOOL
+        )
+        self.assertIn("acc = block_reduce_sum_y(acc, smem)", tiled)
+        self.assertIn("acc != 0.f ? 1.f : 0.f", tiled)
 
 
 class TestReduceAxisTiled(unittest.TestCase):

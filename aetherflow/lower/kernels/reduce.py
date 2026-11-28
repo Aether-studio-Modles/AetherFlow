@@ -35,7 +35,13 @@ from ..plan import REDUCE_SCRATCH
 
 
 def _reduce_last(
-    name: str, reduce_fn: str, *, mean: bool = False, init: str = "0.f", combine: str = "add"
+    name: str,
+    reduce_fn: str,
+    *,
+    mean: bool = False,
+    init: str = "0.f",
+    combine: str = "add",
+    pred: str | None = None,
 ) -> Kernel:
     """末维归约内核的骨架：一个 block 负责一行，块内归约。
 
@@ -44,6 +50,12 @@ def _reduce_last(
     的初值，``combine`` 决定逐元素那一步是求和还是取较大。四者是归约族之间
     唯一的差别，其余（网格步进、越界退出、共享内存声明、只让 0 号线程写回）
     逐字相同。
+
+    ``pred`` 是 bool 归约的判定方式（``any`` / ``all``）：bool 存储在设备上是
+    0/1 的 1 字节，求和后 ``any`` 看"是否非零"、``all`` 看"是否等于列数"。
+    判定必须在块内归约**之后**做——逐元素阶段只有"和为 0"能确定全假，
+    而"和等于列数"要等全部元素加完才成立。写回仍交给 ``af_st_q`` 归一成
+    0/1，因此 ``result`` 这里给 float。
     """
     load = Load("xr", Var("i"))
     if combine == "add":
@@ -58,6 +70,14 @@ def _reduce_last(
     result: Expr = Call(reduce_fn, (Var("s"), Var("smem")))
     if mean:
         result = Bin("/", result, Cast("float", Var("cols")))
+    elif pred == "any":
+        result = Cond(Bin("!=", result, Num("0.f")), Num("1.f"), Num("0.f"))
+    elif pred == "all":
+        result = Cond(
+            Bin("==", result, Cast("float", Var("cols"))), Num("1.f"), Num("0.f")
+        )
+    elif pred is not None:
+        raise ValueError(f"未知的 bool 归约判定 {pred!r}；已支持: any / all")
     return Kernel(
         name=name,
         params=(
@@ -175,6 +195,24 @@ def reduce_mean_last() -> Kernel:
     return _reduce_last("reduce_mean_last", "block_reduce_sum", mean=True)
 
 
+def reduce_any_last() -> Kernel:
+    """沿最后一维求逻辑或：任一为真即真。
+
+    bool 在设备上是 0/1 的 1 字节，求和等价于"数真值个数"；块内归约之后
+    再看和是否非零。空轴（``cols == 0``）由调用侧按 numpy 语义返回 False。
+    """
+    return _reduce_last("reduce_any_last", "block_reduce_sum", pred="any")
+
+
+def reduce_all_last() -> Kernel:
+    """沿最后一维求逻辑与：全为真才真。
+
+    "全真"等价于"和等于列数"——bool 元素只可能是 0 或 1，因此这个等式在
+    浮点里是精确的（``cols`` 超过 2^24 时求和本身会丢精度，调用侧拒绝）。
+    """
+    return _reduce_last("reduce_all_last", "block_reduce_sum", pred="all")
+
+
 _AXIS_REDUCE_INIT = {
     "sum": "0.f",
     "mean": "0.f",
@@ -183,7 +221,7 @@ _AXIS_REDUCE_INIT = {
 }
 
 
-def reduce_axis(kind: str) -> Kernel:
+def reduce_axis(kind: str, pred: str | None = None) -> Kernel:
     """任意单轴归约：一个线程负责一个输出元素。
 
     末维归约走 ``reduce_*_last``（一个 block 一行、块内归约），快得多；非末维
@@ -228,6 +266,16 @@ def reduce_axis(kind: str) -> Kernel:
     result = Var("acc")
     if kind == "mean":
         result = Bin("/", Var("acc"), Cast("float", Var("reduce_len")))
+    elif pred == "any":
+        result = Cond(Bin("!=", Var("acc"), Num("0.f")), Num("1.f"), Num("0.f"))
+    elif pred == "all":
+        result = Cond(
+            Bin("==", Var("acc"), Cast("float", Var("reduce_len"))),
+            Num("1.f"),
+            Num("0.f"),
+        )
+    elif pred is not None:
+        raise ValueError(f"未知的 bool 归约判定 {pred!r}；已支持: any / all")
     return Kernel(
         name=f"reduce_{kind}_axis",
         params=(
@@ -272,7 +320,7 @@ _AXIS_REDUCE_TILE_FN = {
 }
 
 
-def reduce_axis_tiled(kind: str) -> Kernel:
+def reduce_axis_tiled(kind: str, pred: str | None = None) -> Kernel:
     """非末维归约的两维铺法：x 沿 inner、y 切 reduce 轴。
 
     一维铺法（``reduce_axis``）的瓶颈不是访存合并，而是并行度：输出只有
@@ -308,6 +356,16 @@ def reduce_axis_tiled(kind: str) -> Kernel:
     result = Var("acc")
     if kind == "mean":
         result = Bin("/", Var("acc"), Cast("float", Var("reduce_len")))
+    elif pred == "any":
+        result = Cond(Bin("!=", Var("acc"), Num("0.f")), Num("1.f"), Num("0.f"))
+    elif pred == "all":
+        result = Cond(
+            Bin("==", Var("acc"), Cast("float", Var("reduce_len"))),
+            Num("1.f"),
+            Num("0.f"),
+        )
+    elif pred is not None:
+        raise ValueError(f"未知的 bool 归约判定 {pred!r}；已支持: any / all")
     return Kernel(
         name=f"reduce_{kind}_axis_tiled",
         params=(

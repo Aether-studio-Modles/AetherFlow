@@ -52,6 +52,8 @@ from ...lower.kernels import (
     maxpool2d,
     maxpool2d_backward,
     maxpool2d_indices,
+    reduce_all_last,
+    reduce_any_last,
     reduce_max_last,
     reduce_mean_last,
     reduce_sum_last,
@@ -923,6 +925,46 @@ extern "C" __global__ void reduce_mean_last(const %T%* __restrict__ x,
     float s = 0.f;
     for (long long i = threadIdx.x; i < cols; i += blockDim.x) { s += %LD%(xr[i]); }
     s = block_reduce_sum(s, smem) / (float)cols;
+    if (threadIdx.x == 0) { out[row] = %ST%(s); }
+}
+"""
+)
+
+
+# bool 归约（5.341）：存储是 0/1 的 1 字节，求和等价于"数真值个数"。
+# ``any`` 看和是否非零，``all`` 看和是否等于列数；判定放在块内归约之后。
+REDUCE_ANY_SRC = (
+    PRELUDE
+    + r"""
+extern "C" __global__ void reduce_any_last(const %T%* __restrict__ x,
+                                           %T%* __restrict__ out,
+                                           long long rows, long long cols) {
+    long long row = blockIdx.x;
+    if (row >= rows) { return; }
+    const %T%* xr = x + row * cols;
+    __shared__ float smem[1024];
+    float s = 0.f;
+    for (long long i = threadIdx.x; i < cols; i += blockDim.x) { s += %LD%(xr[i]); }
+    s = block_reduce_sum(s, smem) != 0.f ? 1.f : 0.f;
+    if (threadIdx.x == 0) { out[row] = %ST%(s); }
+}
+"""
+)
+
+
+REDUCE_ALL_SRC = (
+    PRELUDE
+    + r"""
+extern "C" __global__ void reduce_all_last(const %T%* __restrict__ x,
+                                           %T%* __restrict__ out,
+                                           long long rows, long long cols) {
+    long long row = blockIdx.x;
+    if (row >= rows) { return; }
+    const %T%* xr = x + row * cols;
+    __shared__ float smem[1024];
+    float s = 0.f;
+    for (long long i = threadIdx.x; i < cols; i += blockDim.x) { s += %LD%(xr[i]); }
+    s = block_reduce_sum(s, smem) == (float)cols ? 1.f : 0.f;
     if (threadIdx.x == 0) { out[row] = %ST%(s); }
 }
 """
@@ -2108,18 +2150,33 @@ def reduce_mean_source() -> Kernel:
     return reduce_mean_last()
 
 
-def reduce_axis_source(kind: str) -> Kernel:
+def reduce_any_source() -> Kernel:
+    """末维逻辑或的 L2 描述：bool 输入，求和后判非零（5.341）。
+
+    输出也是 bool，写回由 ``af_st_q`` 归一成 0/1——``render`` 按 dtype 自动
+    选 1 字节容器的方言，调用点只需要把 bool 张量传进来。
+    """
+    return reduce_any_last()
+
+
+def reduce_all_source() -> Kernel:
+    """末维逻辑与的 L2 描述：bool 输入，和等于列数才算全真（5.341）。"""
+    return reduce_all_last()
+
+
+def reduce_axis_source(kind: str, pred: str | None = None) -> Kernel:
     """非末维单轴归约的 L2 描述：一个线程一个输出元素（5.153）。
 
     ``kind`` 取 ``sum`` / ``max`` / ``min`` / ``mean``，四者的内核骨架相同，
-    只有初值、合并方式与是否除以长度不同。
+    只有初值、合并方式与是否除以长度不同。``pred`` 是 bool 归约的判定方式
+    （``any`` / ``all``，见 5.341），与 ``reduce_any_source`` 同一口径。
     """
-    return reduce_axis(kind)
+    return reduce_axis(kind, pred)
 
 
-def reduce_axis_tiled_source(kind: str) -> Kernel:
+def reduce_axis_tiled_source(kind: str, pred: str | None = None) -> Kernel:
     """非末维归约的两维铺法：x 沿 inner、y 切 reduce 轴（5.174）。"""
-    return reduce_axis_tiled(kind)
+    return reduce_axis_tiled(kind, pred)
 
 
 def softmax_axis_source() -> Kernel:

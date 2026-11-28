@@ -484,6 +484,9 @@ class DeviceBackend(
         r.register("reduce_sum", self._op_reduce_sum)
         r.register("reduce_max", self._op_reduce_max)
         r.register("reduce_mean", self._op_reduce_mean)
+        # 5.341：bool 归约（输入输出都是 1 字节 bool），与 sum 共用内核骨架。
+        r.register("reduce_any", self._op_reduce_any)
+        r.register("reduce_all", self._op_reduce_all)
         r.register("argmax", self._op_argmax)
         r.register("topk_values", self._op_topk_values)
         r.register("topk_indices", self._op_topk_indices)
