@@ -9,6 +9,12 @@
   派发、接口内部复制与同步，以及设备计算，并非只计内核。
 * **训练一步**：设备驻留输入下的前向、反向与可选 SGD 更新。
 
+纯算用例里既有单算子（``matmul`` / ``conv2d`` / ``maxpool``），也有整图
+（``transformer_block`` / ``cnn_lenet`` 及其权重常驻版本）。整图用例同样是
+"同一份权重、先对拍数值、再计时"，区别只在于它检验的是整图调度与多种 kernel
+混合，而不是单个内核。torch 侧按 ``benchmarks.cases`` 的结构逐项重写算式，
+不经过 AetherFlow 前端。
+
 本脚本当前不测每轮 H2D / D2H 的主机端到端路径。
 
 torch 侧**不经过 AetherFlow 前端**：torch 2.5.1 不在兼容矩阵内，走
@@ -37,7 +43,12 @@ import numpy as np
 from aetherflow import backward
 from benchmarks.cases import CASES
 
-DEFAULT_CASES = ("matmul_1024", "conv2d_3x3_pad1", "maxpool2x2")
+DEFAULT_CASES = (
+    "matmul_1024",
+    "conv2d_3x3_pad1",
+    "transformer_block",
+    "cnn_lenet",
+)
 
 
 def _stats(samples: List[float]) -> Dict[str, object]:
@@ -89,6 +100,45 @@ def _measure_interleaved(fn_a: Callable[[], object], sync_a: Callable[[], None],
     return _stats(samples_a), _stats(samples_b)
 
 
+def _torch_transformer_block(tensors: Mapping[str, object], F):
+    """与 ``benchmarks.cases._transformer_block`` 的 pre-norm 块逐项对齐。
+
+    ``heads`` / ``eps`` 与那里的 ``BlockSpec(d_model=64, num_heads=4,
+    d_ff=128)`` 绑定；该用例**没有因果掩码**（双向注意力），这里不能偷偷
+    补一个，否则只是"看起来对"。
+    """
+    x = tensors["x"]
+    dim = x.shape[-1]
+    heads = 4
+    head_dim = dim // heads
+    eps = 1e-5
+    h1 = F.layer_norm(x, (dim,), tensors["ln1_g"], tensors["ln1_b"], eps=eps)
+    q = h1 @ tensors["wq"]
+    k = h1 @ tensors["wk"]
+    v = h1 @ tensors["wv"]
+    batch, seq = x.shape[0], x.shape[1]
+    qh = q.reshape(batch, seq, heads, head_dim).transpose(1, 2)
+    kh = k.reshape(batch, seq, heads, head_dim).transpose(1, 2)
+    vh = v.reshape(batch, seq, heads, head_dim).transpose(1, 2)
+    attn = F.softmax((qh @ kh.transpose(-1, -2)) * tensors["scale"], dim=-1)
+    merged = (attn @ vh).transpose(1, 2).reshape(batch, seq, dim)
+    x1 = x + merged @ tensors["wo"]
+    h2 = F.layer_norm(x1, (dim,), tensors["ln2_g"], tensors["ln2_b"], eps=eps)
+    return x1 + F.silu(h2 @ tensors["w1"]) @ tensors["w2"]
+
+
+def _torch_cnn_lenet(tensors: Mapping[str, object], F):
+    """与 ``benchmarks.cases._cnn_lenet`` 同构的两个卷积块 + 全连接。"""
+    h = F.max_pool2d(
+        F.relu(F.conv2d(tensors["x"], tensors["w1"], tensors["b1"])), 2, 2
+    )
+    h = F.max_pool2d(
+        F.relu(F.conv2d(h, tensors["w2"], tensors["b2"])), 2, 2
+    )
+    h = h.reshape(h.shape[0], -1)
+    return F.relu(h @ tensors["fc"]) + tensors["fcb"]
+
+
 def _torch_call(name: str, tensors: Mapping[str, object], F):
     """把 case 名字映射成一条 torch 算式；形状必须与 ``benchmarks.cases`` 一致。"""
     if name.startswith("matmul"):
@@ -97,6 +147,10 @@ def _torch_call(name: str, tensors: Mapping[str, object], F):
         return F.conv2d(tensors["x"], tensors["w"], tensors["b"], stride=1, padding=1)
     if name.startswith("maxpool"):
         return F.max_pool2d(tensors["x"], 2, 2)
+    if name.startswith("transformer_block"):
+        return _torch_transformer_block(tensors, F)
+    if name.startswith("cnn_lenet"):
+        return _torch_cnn_lenet(tensors, F)
     raise SystemExit(f"未登记的对照用例：{name}（在 _torch_call 里补一条等价算式）")
 
 

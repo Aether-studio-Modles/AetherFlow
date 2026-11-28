@@ -364,6 +364,34 @@ class TestFrameworkCompare(unittest.TestCase):
         self.assertEqual(a["samples_ms"], [1.0, 1.0, 1.0])
         self.assertEqual(b["median_ms"], 1.0)
 
+    def test_torch_matches_whole_graph_cases(self):
+        """整图对照必须真的数值一致，否则基准只是"两边都在跑"。
+
+        CPU 上也能跑：参考后端逐算子解释，与 torch 的算子组合只差求和顺序。
+        这条用例把 ``_torch_call`` 里的整图算式钉在图语义上，结构变了会先
+        在这里失败，而不是等某天有人拿基准报告下结论。
+        """
+        try:
+            import torch
+            import torch.nn.functional as F
+        except ImportError:
+            self.skipTest("没有安装 torch")
+        from benchmarks import framework_compare as compare
+
+        for name in ("transformer_block", "cnn_lenet"):
+            case = next(c for c in CASES if c.name == name)
+            graph, feed = build_case(case)
+            with self.subTest(case=name):
+                ref = ReferenceBackend().execute(graph, feed)
+                self.assertEqual(len(ref), 1)
+                want = compare._torch_call(
+                    name, {k: torch.from_numpy(v.copy()) for k, v in feed.items()}, F
+                )
+                np.testing.assert_allclose(
+                    next(iter(ref.values())), want.detach().numpy(),
+                    rtol=1e-4, atol=1e-4,
+                )
+
     def test_training_checks_both_backward_paths_on_cpu(self):
         try:
             import torch
