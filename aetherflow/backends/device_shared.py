@@ -24,9 +24,9 @@ from ..lower.plan import (
 from .base import BackendCapabilityError
 
 
-#: 设备端还没有 fp8 的存储容器与内核：bf16 走 uint16 位模式，fp8 连位模式
-#: 都还没接。参考语义已覆盖（runtime/fp8.py），设备端遇到这些类型必须显式
-#: 拒绝——否则会被 ``np_dtype`` 的 f32 载体悄悄当成 f32 计算。
+#: fp8 在 IR 里的载体也是 f32（``np_dtype``），设备端没有 1 字节容器。
+#: ``cast`` 由 ``_CAST_FP8_SRC`` 在设备上把数值舍入到格式格点（见 5.325）；
+#: 其它算子若遇到 fp8 仍必须显式拒绝——否则会被 f32 载体悄悄当成 f32 计算。
 #: 放在共享层是因为两条路径都要用它：逐节点的 ``invoke`` 与计划构建期的
 #: ``_planned_kernel``（后者预绑定内核后就不再经过 ``invoke`` 的检查）。
 FP8_DTYPES: FrozenSet[DType] = frozenset({DType.F8E4M3, DType.F8E5M2})
@@ -282,6 +282,143 @@ extern "C" __global__ void af_dequantize_i8_group_zp(
   long long col = i - row * cols;
   long long si = (row / group) * cols + col;
   out[i] = (float)((int)q[i] - (int)zp[si]) * s[si];
+}
+"""
+
+# fp8 的量化：f32 载体 → fp8 格点，**输出仍是 f32**。设备端没有 1 字节容器，
+# "cast 到 fp8"在设备上只是把数值舍入到该格式可表示的格点上，不省带宽
+# （见 DESIGN 5.325）。算法逐位复刻 runtime/fp8.py 的 ``pack_fp8`` /
+# ``unpack_fp8``：double 精度下的 RNE、e4m3 饱和到 ±448（无 inf）、e5m2
+# 溢出到 ±inf。全部用 double，是为了和主机侧 numpy float64 的参考实现逐位一致；
+# ``fabs / isinf`` 都靠 f32 位模式判断，避免依赖设备端 libm 的符号。
+_CAST_FP8_SRC = r"""
+__device__ __forceinline__ unsigned int af_fp8_u32(float f) {
+  union { float f; unsigned int u; } v;
+  v.f = f;
+  return v.u;
+}
+
+__device__ __forceinline__ float af_fp8_f32(unsigned int u) {
+  union { float f; unsigned int u; } v;
+  v.u = u;
+  return v.f;
+}
+
+__device__ __forceinline__ double af_fp8_pow2(int e) {
+  union { double d; unsigned long long u; } v;
+  v.u = (unsigned long long)(e + 1023) << 52;
+  return v.d;
+}
+
+__device__ __forceinline__ int af_fp8_ilog2(double x) {
+  union { double d; unsigned long long u; } v;
+  v.d = x;
+  return (int)((v.u >> 52) & 0x7ffull) - 1023;
+}
+
+__device__ __forceinline__ double af_fp8_nan() {
+  union { double d; unsigned long long u; } v;
+  v.u = 0x7ff8000000000000ull;
+  return v.d;
+}
+
+__device__ __forceinline__ double af_fp8_inf() {
+  union { double d; unsigned long long u; } v;
+  v.u = 0x7ff0000000000000ull;
+  return v.d;
+}
+
+/* Round-half-to-even for non-negative doubles; call-site quotients are below
+   32, so the integer cast is safe. */
+__device__ __forceinline__ double af_fp8_rint(double x) {
+  unsigned long long q = (unsigned long long)x;
+  double frac = x - (double)q;
+  if (frac > 0.5) return (double)(q + 1ull);
+  if (frac < 0.5) return (double)q;
+  return (double)(q + (q & 1ull));
+}
+
+extern "C" __global__ void af_cast_fp8(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    long long n, int kind) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+
+  int M = (kind == 1) ? 3 : 2;
+  int exp_bits = (kind == 1) ? 4 : 5;
+  int bias = (kind == 1) ? 7 : 15;
+  int e_min = (kind == 1) ? -6 : -14;
+  int e_max = (kind == 1) ? 8 : 15;
+  double max_value = (kind == 1) ? 448.0 : 57344.0;
+  int saturate = (kind == 1);
+  int exp_all = (1 << exp_bits) - 1;
+  int nan_code = 0x7f;
+  int inf_code = (kind == 1) ? 0x7e : (exp_all << M);
+
+  unsigned int bits = af_fp8_u32(in[i]);
+  int negative = (int)(bits >> 31);
+  double exact = (double)af_fp8_f32(bits & 0x7fffffffu);
+
+  /* runtime/fp8.py's _round_abs: round twice inside the binade, and redo the
+     carry with the new exponent when it crosses a binade. 0 / inf / NaN pass
+     through unchanged. */
+  int finite = (exact > 0.0) && (exact < 1e308);
+  double safe = finite ? exact : 1.0;
+  int e = af_fp8_ilog2(safe);
+  if (e < e_min) e = e_min;
+  double ulp = af_fp8_pow2(e - M);
+  double first = af_fp8_rint(safe / ulp) * ulp;
+  int e2 = af_fp8_ilog2(first > 0.0 ? first : 1.0);
+  if (e2 < e_min) e2 = e_min;
+  double ulp2 = af_fp8_pow2(e2 - M);
+  double value = finite ? af_fp8_rint(safe / ulp2) * ulp2 : exact;
+
+  /* _encode: saturate, then subnormal / normal, then special-value overrides. */
+  double work = value;
+  if (saturate && ((work > 1e308) || (work > max_value))) work = max_value;
+  int finite_pos = (work > 0.0) && (work < 1e308);
+  double wsafe = finite_pos ? work : 1.0;
+  int exponent = af_fp8_ilog2(wsafe);
+
+  int sub = finite_pos && (exponent < e_min);
+  double sub_raw = sub ? af_fp8_rint(work * af_fp8_pow2(M - e_min)) : 0.0;
+  int sub_carry = sub && (sub_raw >= (double)(1 << M));
+  int sub_code = sub ? (int)sub_raw : 0;
+
+  int normal = finite_pos && !sub;
+  int normal_exp = exponent < e_min ? e_min : exponent;
+  double raw = normal ? af_fp8_rint(wsafe / af_fp8_pow2(normal_exp - M)) : 0.0;
+  int carry = normal && (raw >= (double)(1 << (M + 1)));
+  int final_exp = carry ? normal_exp + 1 : normal_exp;
+  int mant = normal ? (carry ? 0 : ((int)raw - (1 << M))) : 0;
+  int overflow = normal && (final_exp > e_max);
+  int normal_code = overflow ? inf_code : (((final_exp + bias) << M) | mant);
+
+  int code = normal ? normal_code : 0;
+  if (sub && !sub_carry) code = sub_code;
+  if (sub_carry) code = (1 << M);
+  if (!finite_pos) code = 0;
+  if (value != value) code = nan_code;
+  else if (value > 1e308) code = inf_code;
+  if (value == 0.0) code = 0;
+
+  /* unpack: decode the code back into the f32 carrier (sign applied later). */
+  int ue = (code >> M) & exp_all;
+  int um = code & ((1 << M) - 1);
+  double uval;
+  if (ue == 0) {
+    uval = (double)um * af_fp8_pow2(e_min - M);
+  } else {
+    uval = af_fp8_pow2(ue - bias) * (1.0 + (double)um / (double)(1 << M));
+  }
+  int all_one = (ue == exp_all);
+  int u_nan = all_one && ((kind == 1) ? (um == (1 << M) - 1) : (um != 0));
+  int u_inf = all_one && (um == 0) && (kind != 1);
+  if (u_nan) uval = af_fp8_nan();
+  else if (u_inf) uval = af_fp8_inf();
+  float result = (float)uval;
+  out[i] = negative ? -result : result;
 }
 """
 

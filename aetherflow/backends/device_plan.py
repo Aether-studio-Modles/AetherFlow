@@ -470,20 +470,19 @@ class _PlanMixin:
     def _planned_kernel(self, node: Node):
         """按 IR 声明预判能否跳过 ``invoke`` 的校验；能就返回内核函数。
 
-        与 ``invoke`` 的检查逐条对应：注册表里有这个算子；输出类型不是
-        fp8；整数下标的位置（``_INDEX_ARGS``）声明为 i32/i8；其余输入声明
-        为 f32，或 f16 且该算子在 f16 支持面内。返回 ``None`` 表示"这条不能
-        预判"，走原路径。
+        与 ``invoke`` 的检查逐条对应：注册表里有这个算子；fp8 只出现在
+        ``cast`` 上（其它算子遇到 fp8 要留给 ``invoke`` 报错）；整数下标的
+        位置（``_INDEX_ARGS``）声明为 i32/i8；其余输入声明为 f32，或 f16 /
+        bf16 且该算子在该支持面内。返回 ``None`` 表示"这条不能预判"，走原路径。
 
-        输出侧必须单独判：``cast`` 的输入是 f32 载体，fp8 只出现在输出上，
-        只扫输入会让它被预绑定进快路径，而快路径不再经过 ``invoke`` 里
-        含 ``node.output`` 的 fp8 检查——f8 就被当成 f32 算掉了。
+        ``cast`` 是唯一承接 fp8 的算子（5.325）：fp8 的输入 / 输出都是 f32
+        载体，快路径末尾会按 ``out_dtype`` 调 ``quantize`` 把数值落回格点。
         """
         name = node.op.name
         fn = self.kernels.get(name)
         if fn is None:
             return None
-        if node.output.type.dtype in FP8_DTYPES:
+        if node.output.type.dtype in FP8_DTYPES and name != "cast":
             return None
         if name in _LAYOUT_OPS and node.attrs.get("layout", "nchw") != "nchw":
             # 布局不匹配要留给 ``invoke`` 报错，不能在这里返回内核——
@@ -497,6 +496,8 @@ class _PlanMixin:
                     return None
                 continue
             if dtype == DType.F32:
+                continue
+            if dtype in FP8_DTYPES and name == "cast":
                 continue
             if dtype == DType.F16 and name in self._f16_ops:
                 continue

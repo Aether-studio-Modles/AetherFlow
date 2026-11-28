@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..ir.types import DType
+from .device_shared import FP8_DTYPES
 import numpy as np
 
 
@@ -30,11 +31,14 @@ class _ShapeMixin:
     def _op_cast(self, node, args, attrs):
         # 执行骨架也会按 IR 推导的 dtype 调 ``cast`` 钩子（正常路径）；这里同样
         # 走那条实现，保证"单独测这个算子"与"整图执行"是同一条代码路径。
-        # 目标是 bf16 时还要走一次 ``quantize``：``cast`` 的载体是 f32，
-        # 只按 numpy dtype 看它"不需要转换"，真正落到 uint16 的是打包那一步。
+        # bf16 / fp8 的载体都是 f32：``cast`` 只按 numpy dtype 看会"不需要转换"，
+        # 真正落格点的是随后的 ``quantize``（bf16 打包成 uint16；fp8 在设备上
+        # 重做 RNE 量化，见 5.325）。
         target = DType(attrs["dtype"])
         out = self.cast(args[0], target.np_dtype)
-        return self.quantize(out, target) if target is DType.BF16 else out
+        if target is DType.BF16 or target in FP8_DTYPES:
+            return self.quantize(out, target)
+        return out
 
     def _op_slice(self, node, args, attrs):
         x = args[0]

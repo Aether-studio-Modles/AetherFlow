@@ -1675,13 +1675,13 @@ def default_cases() -> List[Case]:
                    "不能按逐通道或逐行读"),
         _case("dequantize_i8_group_zp", _dequantize_i8_group_zp(),
               note="逐组非对称：q - zp 在 int32 里算，scale / zp 同形"),
-        # fp8（e4m3 / e5m2）：目前只有参考语义，设备端必须显式拒绝
+        # fp8（e4m3 / e5m2）：载体是 f32，检验的是边界处是否量化到格式格点
         _case("cast_f8e4m3", _fp8_cast("e4m3"),
               note="fp8 没有 inf：超出 448 饱和；1.0625 / 1.1875 检验 RNE 中点；"
-                   "设备端没有 fp8 的存储与内核，必须显式拒绝"),
+                   "载体仍是 f32，只检验数值是否落在格点上"),
         _case("cast_f8e5m2", _fp8_cast("e5m2"),
               note="IEEE 溢出按 RNE 到 inf（100000）；次正规最小到 2^-16；"
-                   "设备端必须显式拒绝"),
+                   "载体仍是 f32，只检验数值是否落在格点上"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

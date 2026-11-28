@@ -22,6 +22,12 @@ from .bf16 import round_bf16
 from .fp8 import round_fp8
 
 
+#: 载体是 f32、但边界必须落在格式格点上的 IR 类型。
+#: bf16 / fp8 都是这样：设备上的 ``quantize`` 负责这一步（bf16 打包成 uint16，
+#: fp8 在设备上重做 RNE 量化，见 DESIGN 5.325）。
+_QUANTIZED_DTYPES = frozenset({DType.BF16, DType.F8E4M3, DType.F8E5M2})
+
+
 class ShapeMismatchError(ValueError):
     pass
 
@@ -362,7 +368,7 @@ class Executor:
             group.expected.shape,
             node.output.id,
             group.dtype,
-            group.out_dtype is DType.BF16,
+            group.out_dtype in _QUANTIZED_DTYPES,
         )
 
     # ---- 固定流程 ----

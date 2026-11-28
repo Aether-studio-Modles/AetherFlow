@@ -70,6 +70,7 @@ import numpy as np
 from .device_shared import (
     FP8_DTYPES as _FP8_DTYPES,
     GPU_OPS as GPU_OPS,
+    _CAST_FP8_SRC as _CAST_FP8_SRC,
     _ALL_TUNABLE_OPS as _ALL_TUNABLE_OPS,
     _BOOL_OPS as _BOOL_OPS,
     _CONV_CB_OPTIONS as _CONV_CB_OPTIONS,
@@ -564,12 +565,18 @@ class DeviceBackend(
         return np.dtype(dtype.np_dtype)
 
     def quantize(self, value: Any, dtype: DType) -> Any:
-        """bf16 边界：舍入到 bf16 格点，并存成两字节位模式。
+        """节点边界：bf16 / fp8 都舍入到格式的格点上。
 
-        参考后端在主机侧 ``round_bf16``（载体仍是 f32）；设备端直接落到
-        ``uint16`` 容器，打包用 ``cast``（f32 -> bf16 的 store helper 就是
-        RNE，与主机侧逐位一致），不在边界上做一次 D2H 同步。
+        bf16 的载体在设备上是两字节位模式，打包用 ``cast``（f32 -> bf16 的
+        store helper 就是 RNE）；fp8 的载体仍是 f32，用 ``_fp8_round`` 在设备
+        上重做一遍 pack/unpack 的量化（见 5.325）。两者都不做 D2H 同步。
         """
+        if dtype in _FP8_DTYPES:
+            cp = self.cp
+            if isinstance(value, cp.ndarray):
+                kind = "e4m3" if dtype is DType.F8E4M3 else "e5m2"
+                return self._fp8_round(value, kind)
+            return super().quantize(value, dtype)
         if dtype is not DType.BF16:
             return value
         cp = self.cp
@@ -578,6 +585,28 @@ class DeviceBackend(
                 return value
             return self.cast(value, np.dtype(np.uint16))
         return super().quantize(value, dtype)
+
+    def _fp8_round(self, value, kind: str):
+        """把 f32 载体量化到 fp8 的格点（输出仍是 f32）。
+
+        IR 里 fp8 的 ``np_dtype`` 就是 f32，所以"cast 到 fp8"在设备上只是
+        把数值舍入到格式能表示的格点上；``_CAST_FP8_SRC`` 与 runtime/fp8.py
+        的 RNE / 饱和 / 溢出规则逐位一致。
+        """
+        cp = self.cp
+        src = self._contig(value)
+        out = cp.empty(src.shape, cp.float32)
+        n = int(src.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(("cast_fp8", kind), _CAST_FP8_SRC, "af_cast_fp8")
+        block, grid = self._grid("cast", n)
+        kernel(
+            (grid,),
+            (block,),
+            (src, out, np.int64(n), np.int32(1 if kind == "e4m3" else 2)),
+        )
+        return out
 
     def _cast_kernel(self, value, target, src_key: str, dst_key: str):
         cp = self.cp
@@ -1081,13 +1110,17 @@ class DeviceBackend(
             raise BackendCapabilityError(
                 f"{self._LABEL}未实现算子 {name}（节点 %{node.output.name}）"
             )
-        for item in (*node.inputs, node.output):
-            if item.type.dtype in _FP8_DTYPES:
-                raise BackendCapabilityError(
-                    f"{self._LABEL}还没有 fp8 的存储与内核（节点 "
-                    f"%{node.output.name} 涉及 {item.type.dtype.value}）；"
-                    "fp8 目前只有参考语义，见 DESIGN 5.318"
-                )
+        # fp8 的载体是 f32，但语义要求节点边界落在格式格点上；设备端只有
+        # ``cast`` 承接 fp8（内核在设备上重做 RNE 量化，见 5.325）。其它算子
+        # 遇到 fp8 必须显式拒绝，否则会被 f32 载体当成 f32 算掉。
+        if name != "cast":
+            for item in (*node.inputs, node.output):
+                if item.type.dtype in _FP8_DTYPES:
+                    raise BackendCapabilityError(
+                        f"{self._LABEL}的 {name} 不承接 fp8（节点 "
+                        f"%{node.output.name} 涉及 {item.type.dtype.value}）；"
+                        "目前只有 cast 能做 fp8 的类型转换，见 DESIGN 5.325"
+                    )
         if name in _LAYOUT_OPS and attrs.get("layout", "nchw") != "nchw":
             raise BackendCapabilityError(
                 f"{self._LABEL}的 {name} 只承接 NCHW 布局，收到 layout="
