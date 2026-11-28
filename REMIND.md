@@ -180,7 +180,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 | 参考 | Windows / Python 3.14 | 3563 个用例，464 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
+| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `174 executed / 3 refused / 0 failed`（5.349 复跑：`cumprod` / `flip` / `roll` / `roll_negative` / `argmin` ×3 / `logsumexp` ×2 全部 err=0.0，3 条 refused 是两条 `sort`——设备端按设计不承接——与既有的 `f64_input_relu`）；全量 `3549 个用例 / 178 跳过 / OK`、96 秒（5.349 起跑全量；此前只跑子集）。历史备注：`matmul_partial_batch` 的 4.8e-07 来自 f32 GEMM 累加顺序 |
 
 ```bash
 # 本地全量
@@ -270,8 +270,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **算子面**：`sort` 只给值、不给下标，也没有 `stable` 参数，设备端不承接
   （构图期报 `BackendCapabilityError`）；`argmin` / `flip` / `roll` / `cumprod`
   都是单轴，空轴显式拒绝，全归约请先 reshape；`roll` 的 `shift` 只能是构图期常量。
-  5.349 新增的 5 个设备内核只做了源码级渲染核对与静态对账，**没有真机数值一致性
-  与吞吐结论**（5.349）。
+  5.349 的 5 个设备内核在 V100 上数值等价（`verify_cuda.py` 174 executed /
+  3 refused / 0 failed，新用例 err 全为 0），但没有吞吐基准，不作性能结论（5.349）。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态

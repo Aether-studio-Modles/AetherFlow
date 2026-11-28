@@ -22380,11 +22380,23 @@ ruff 通过；全量 `3540 通过 / 464 跳过`（GGUF 之前是 3496）。
 把 5 个新内核纳入核对，20 条通过。ruff 通过；全量 `3563 通过 / 464 跳过`
 （5.348 之后是 3540，新增 23 条）。
 
+**真机验证（V100-SXM2-32GB / 驱动 550.127.05 / CUDA 12.9 / cupy 14.2）。**
+`verify_cuda.py` → `174 executed / 3 refused / 0 failed`：9 条新用例
+（`cumprod` / `flip` / `roll` / `roll_negative` / `argmin_last` /
+`argmin_keepdims` / `argmin_axis0` / `logsumexp_last` /
+`logsumexp_axis1_keepdims`）全部 `err=0.0e+00`；3 条 refused 是两条 `sort`
+（按设计不承接）与既有的 `f64_input_relu`。全量 `python3 -m unittest discover`
+→ `3549 个用例 / 178 跳过 / OK`，96 秒。
+
+**真机抓到的错。** 第一轮 `roll` 的两条用例分别以 3.4 / 2.4 的绝对误差失败：
+内核写成了 `out[j] = x[j + shift]`，而 `np.roll` 是赋值语义
+`out[j] = x[j - shift]`。本地参考后端直接走 numpy，参考语义与测试都碰不到
+这条内核，只有真机能暴露。改成 `(j + steps - shift) % steps`（先把被减数抬到
+非负再取模，绕开 C 的 `%` 向零截断）后转绿。
+
 **未声称。**
 
-- 5 个新设备内核只做了**源码级渲染核对**与静态对账，**没在真机上跑过**：
-  `cumprod` / `flip_axis` / `roll_axis` / `argmin_last` / `logsumexp_axis` 的
-  数值一致性与吞吐都还没有 V100 结论，等跑批回填。这里不给性能数字。
+- 这 5 个内核**没有吞吐数字**：只验了数值等价，没做基准对照，不给性能结论。
 - `sort` 只给值、不给下标，也没有 `stable` 参数；需要"值 + 原位置"的模型仍会在
   导出期被拒。
 - `argmin` 只支持单轴，空轴拒绝；全归约请先 `flip` / `reshape` 把轴并过来。
