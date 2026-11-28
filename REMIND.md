@@ -49,8 +49,10 @@
   饱和到 ±448，e5m2 溢出到 inf，5.318），设备端 `cast` 已有量化内核（5.325，
   载体仍是 f32、不省带宽），写侧有带 scale 的量化（5.326：
   `quantize_weight_fp8` 逐输出通道 / `per_tensor=True` 对齐 HF 的
-  `weight_scale`，`quantize_activation_fp8` 逐 token），其它算子遇到 fp8 仍
-  显式拒绝；
+  `weight_scale`，`quantize_activation_fp8` 逐 token），线性层有
+  `linear_fp8`（weight-only）与 `linear_fp8a8`（W8A8）（5.327：反量化后走
+  既有 f32 GEMM、累加在浮点里，不承诺 fp8 tensor core），其它算子遇到 fp8
+  仍显式拒绝；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
   支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8（e4m3 / e5m2）
@@ -163,7 +165,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   写入 / 读取入口与设备端 `cast`（e4m3 / e5m2，5.318 / 5.319 / 5.325 /
   5.326：带 scale 的逐通道权重与逐 token 激活量化、`FP8Weight` 容器要求载荷
   值真的在格点上；设备上载体仍是 f32，只把值落到格式格点、不省带宽），
-  其它算子遇到 fp8 仍显式拒绝，也没有 fp8 GEMM 与逐块 scale；
+  `linear_fp8` / `linear_fp8a8` 已有 IR 与设备实现（5.327：反量化走
+  `mul`、GEMM 复用 sgemm，不承诺 tensor core），其它算子遇到 fp8 仍显式
+  拒绝，也没有 fp8 tensor core 与逐块 scale；
   W8A8 也尚无反向（bias 除外）。非对称零点的量化 / 反量化与融合线性层都已有
   设备内核（5.322 / 5.323，V100 上 conformance 通过），但 `linear_i8a8_zp`
   走标量乘加、没用 dp4a / IMMA，也**不融合 epilogue**（int32 累加后仍物化一份
@@ -702,6 +706,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   不省带宽也不省显存；`invoke` 与 `_planned_kernel` 只对 `cast` 放行，其它
   算子仍 refused。`_fast_step` 的量化标记要包含 `F8E4M3` / `F8E5M2`，否则
   图输出会跳过 `quantize`、真机表现为 failed。
+- **fp8 的"格式"在设备端不可见**（5.327）：载荷是 f32 载体，内核从数组
+  dtype 分不出它是 e4m3、e5m2 还是未量化的 f32。所以设备端**不能**靠 dtype
+  兜底，只能信 IR 声明 + 写入侧的格点校验（`load_fp8_linear`）；`linear_fp8`
+  的内核注释写死了这条分工。放行名单用共享常量 `FP8_OPS`（cast + 两个
+  线性层），`invoke` 与 `_planned_kernel` 同源判定，别再各自维护一份。
+- **真机脚本不要硬编码 SSH 密码**：本机执行策略会以"物化具体凭证"为由
+  拒绝运行（哪怕凭证已在本文件里）。需要真机回归时先向用户明确说明风险并
+  取得授权，或用用户自己的终端执行同步与验证命令。
 
 ---
 

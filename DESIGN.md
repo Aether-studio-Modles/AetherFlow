@@ -20692,6 +20692,75 @@ V100 上的 `verify_cuda.py` 与 `tests.test_cuda_backend` 作为回归确认。
 - 不提供 fp8 linear 算子——写侧只产出数组与 scale，怎么参与 GEMM 是 5.327。
 - 不改变存储宽度：`w` 仍是 f32 载体，1 字节打包与传输是 5.328。
 
+### 5.327　fp8 线性层（`linear_fp8` / `linear_fp8a8`）
+
+**缺口。** 5.326 让本仓库能造出 fp8 权重，但没有任何算子消费它：设备端对
+fp8 的白名单只有 `cast`（5.325），一张 `linear_fp8` 图在真机上会以
+"不承接 fp8"被 refused。缺的是**语义定义**——"拿到 f8 载体和 scale 之后，
+线性层到底算什么"。
+
+**参考语义只有一条式子。** 新增两个算子，`infer` 负责类型与形状，参考实现
+与 int8 族逐字对齐：
+
+- `linear_fp8(x, qweight, weight_scale[, bias])`，
+  `y = matmul(x, qweight.astype(f32) * weight_scale) + bias`；
+- `linear_fp8a8(x_q, x_scale, w_q, w_scale[, bias])`，
+  `y = matmul(x_q * x_scale, w_q * w_scale) + bias`。
+
+因为 fp8 的载荷已经是"缩放后的 f8 载体"，反量化就是一次乘法，不需要解码
+位模式，也不需要 zero_point（fp8 的 0 精确可表示）。这与 `linear_i8` 的
+"反量化后走 f32 GEMM"同构，区别只在**累加**：`linear_i8a8` 在 int32 里累加、
+scale 必须提到求和号外，因此 IR 要求激活 scale 沿 K 恒定；fp8 先落成 f32
+张量、累加本来就在浮点，所以 `linear_fp8a8` 的 scale 只要按 numpy 规则
+广播到载荷即可（IR 仍把形态收窄为逐 token / 逐输出通道，见下）。
+
+**IR 把口径钉死，而不是留给后端猜。**
+
+- `x` / `x_q` 必须是 `F32`（载荷的载体），秩 >= 2；权重必须是 fp8 且秩 2；
+  两个 fp8 输入（`linear_fp8a8` 的两路载荷）**必须是同一种格式**——混合
+  e4m3 / e5m2 没有定义好的反量化顺序，允许它只会产出"看起来能跑"的数。
+- `weight_scale` 走 `_check_scale_broadcast`（标准 numpy 广播），因此接受
+  `(1,)` 与 `(N,)`；`(K/G, N)` 逐组 scale 对 `(K, N)` 不广播，**构图期
+  直接拒绝**。逐组是 `linear_i8_group` 那一批的事（5.329）：它需要"沿 K
+  重复 scale 再乘"的语义，不能靠广播偷渡。
+- 激活 scale 在 `linear_fp8a8` 里要求"沿 K 为 1"（`shape[-1] == 1`），
+  外加可广播；这样 `(B, T, 1)` 与 `(1,)` 都合法，而 `(B, T, K)` 被拒——
+  逐元素 scale 会让"量化"退化成"带噪声的恒等变换"。
+- `bias` 必须是 `F32`、秩 1、长度 `N`。输出恒为 `F32`：fp8 只是输入侧
+  的存储格式，结果不落回格点（要落回就显式 `cast`）。
+
+**设备端不新增内核。** 反量化是 `_binary("mul")`（标量 / 尾维 / 逐 token
+三种广播面都已支持），GEMM 复用既有 sgemm，bias 是 `_binary("add")`。收益
+只在**驻留与读带宽**——fp8 权重按 f32 载体存时并不省显存（1 字节存储是
+5.328），更不省算力：fp8 tensor core 需要另一套缩放与累加语义（scale 提到
+求和号外、块级缩放、溢出处理），本版明确不承诺。
+
+**白名单要同时覆盖两条执行路径。** 5.320 的教训是 `invoke` 与
+`_planned_kernel` 的判定必须逐条对应：只在 `invoke` 里放行，预绑定的快路径
+会绕开检查、把 fp8 载体当普通 f32 算掉。因此新增共享常量
+`device_shared.FP8_OPS = {cast, linear_fp8, linear_fp8a8}`，两条路径都按它
+判定；写成白名单而非"排除几个"，新算子默认仍不承接 fp8。
+
+**设备端不复查格点。** `weights.load_fp8_linear` 已经逐位校验
+`round_fp8(w) == w`；设备端再查一次要把权重读回主机，与整条设备路径的
+"零同步"直接冲突。这条分工写进了内核注释：写入侧保证值在格点上，设备端
+只负责按载体读数。
+
+**验证。** 本地 `3228` 个用例 / 460 跳过全绿（较 5.326 增加 8：
+`test_quantize.py::TestLinearFP8` 钉住"等于手写反量化再 matmul"、per-tensor
+scale、e5m2 按自己的格点舍入、W8A8 的逐 token scale、非正 scale 拒绝、
+7 类构图期拒绝与 JSON 往返），ruff 通过；conformance 新增 4 条
+（`linear_fp8_e4m3_bias` / `linear_fp8_e5m2_bias` / `linear_fp8a8_e4m3_bias` /
+`linear_fp8a8_e5m2_rank2`），参考后端全通过。
+
+**未声称。**
+
+- 不承诺 fp8 tensor core：算力与等价的 f32 GEMM 相同。
+- 不省显存 / 带宽：载荷仍是 f32 载体，1 字节打包是 5.328。
+- 不支持逐组 scale；`linear_fp8` 只有 weight-only 与 W8A8 两种形态，
+  没有 zero_point 变体。
+- 没有反向规则（与 int8 线性层一致，量化路径按推理用）。
+
 
 
 

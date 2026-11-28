@@ -289,8 +289,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   f32、只把值落到格式格点，不省带宽），写侧有带 scale 的逐通道权重 /
   逐 token 激活量化与 `FP8Weight` / `load_fp8_linear` 容器（5.326：载荷每个
   值必须真的落在 fp8 格点上，格式由文件 dtype 推出，支持 HF 的
-  `weight_scale` / `input_scale` 命名），其它算子遇到 fp8 仍显式拒绝；
-  没有 fp8 GEMM 与 1 字节存储容器；
+  `weight_scale` / `input_scale` 命名），线性层有 `linear_fp8`（weight-only）
+  与 `linear_fp8a8`（W8A8）两个算子（5.327：反量化后走既有 f32 GEMM，
+  累加在浮点里，不承诺 fp8 tensor core），其它算子遇到 fp8 仍显式拒绝；
+  没有 fp8 tensor core 与 1 字节存储容器；
   没有 int8 tensor core 级的矩阵乘；非对称零点
   有主机侧语义与构图入口（`quantize_i8_zp` / `dequantize_i8_zp` /
   `linear_i8_zp` / `linear_i8a8_zp`，5.315），四个都已有设备内核
