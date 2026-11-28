@@ -68,6 +68,8 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "matmul",
         "quantize_i8",
         "dequantize_i8",
+        "dequantize_i8_group",
+        "dequantize_i8_group_zp",
         "fake_quantize_i8",
         "fake_quantize_i8_lsq",
         "linear_i8",
@@ -144,6 +146,9 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "spike_csr": frozenset({1}),
     # 量化：i8 是**数据**而不是下标，但它同样不能走"只支持浮点"的默认检查。
     "dequantize_i8": frozenset({0}),
+    # 逐组反量化：q 与 L2 的 zero_point 是 i8 **数据**；scale 仍是 f32。
+    "dequantize_i8_group": frozenset({0}),
+    "dequantize_i8_group_zp": frozenset({0, 2}),
     "linear_i8": frozenset({1}),
     # W8A8：激活与权重都是 i8 数据，scale / bias 仍是 f32。
     "linear_i8a8": frozenset({0, 2}),
@@ -196,6 +201,43 @@ extern "C" __global__ void af_dequantize_i8(
   if (i >= n) return;
   float sv = per_row ? s[i % cols] : s[i];
   out[i] = (float)q[i] * sv;
+}
+"""
+
+# 逐组（per-group）weight-only 反量化：q 是 (K, N)，scale 是 (K/G, N)。
+# 组大小 G 不另设 attr，由 ``K / scale.shape[0]`` 推出（见 DESIGN 5.317）；
+# 因此内核只需要知道列数 N 与组行数 G，下标按 ``row / G`` 折回 scale 的行。
+# 组内共用一份 scale，和 GPTQ / AWQ 的 group_size 形态一致。
+_DEQUANTIZE_I8_GROUP_SRC = r"""
+extern "C" __global__ void af_dequantize_i8_group(
+    const signed char* __restrict__ q,
+    const float* __restrict__ s,
+    float* __restrict__ out,
+    long long n, long long cols, long long group) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long row = i / cols;
+  long long col = i - row * cols;
+  long long si = (row / group) * cols + col;
+  out[i] = (float)q[i] * s[si];
+}
+"""
+
+# 非对称版本：减法留在 int32 里做，再乘 scale——与参考实现的
+# ``(int32)q - (int32)zp`` 顺序一致，逐位相同。zero_point 与 scale 同形。
+_DEQUANTIZE_I8_GROUP_ZP_SRC = r"""
+extern "C" __global__ void af_dequantize_i8_group_zp(
+    const signed char* __restrict__ q,
+    const float* __restrict__ s,
+    const signed char* __restrict__ zp,
+    float* __restrict__ out,
+    long long n, long long cols, long long group) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long row = i / cols;
+  long long col = i - row * cols;
+  long long si = (row / group) * cols + col;
+  out[i] = (float)((int)q[i] - (int)zp[si]) * s[si];
 }
 """
 

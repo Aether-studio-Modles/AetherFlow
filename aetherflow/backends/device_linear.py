@@ -5,6 +5,8 @@ from __future__ import annotations
 from .base import BackendCapabilityError
 import numpy as np
 from .device_shared import (
+    _DEQUANTIZE_I8_GROUP_SRC,
+    _DEQUANTIZE_I8_GROUP_ZP_SRC,
     _DEQUANTIZE_I8_SRC,
     _LINEAR_I8A8_DP4A_SRC,
     _LINEAR_I8A8_SRC,
@@ -184,6 +186,109 @@ class _LinearMixin:
             (grid,),
             (block,),
             (qq, s, out, np.int64(n), np.int64(cols), np.int64(per_row)),
+        )
+        return out
+
+    def _group_shape(self, name: str, q, scale) -> tuple:
+        """校验逐组反量化的形状，返回 ``(cols, rows_per_group)``。
+
+        IR 的 infer 已保证这些条件；设备端再判一次是因为图可以来自反序列化，
+        不能假设上游一定跑过 verifier——形状对不上时越界读显存不会报错，
+        只会悄悄算错。
+        """
+        if q.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {name} 要求 q 是二维 (K, N)，收到 {q.shape}"
+            )
+        if scale.ndim != 2 or int(scale.shape[1]) != int(q.shape[1]):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {name} 要求 scale 形如 (K/G, N)，"
+                f"收到 {scale.shape} 与 q {q.shape}"
+            )
+        rows = int(scale.shape[0])
+        k = int(q.shape[0])
+        if rows <= 0 or k % rows != 0:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {name} 的组数 {rows} 不能整除 K={k}"
+            )
+        return int(q.shape[1]), k // rows
+
+    def _op_dequantize_i8_group(self, node, args, attrs):
+        """逐组对称反量化：q (K, N) 沿 K 每 ``K/G`` 行共用一份 scale。
+
+        组大小由形状推出（G = K / scale.shape[0]），不另设 attr（DESIGN 5.317）；
+        内核按 ``row / G`` 折回 scale 的行，组内共用同一份系数。输出必须连续，
+        下游通常直接接 GEMM。
+        """
+        cp = self.cp
+        q, scale = args
+        if q.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_group 第一个输入必须是 i8，收到 {q.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_group 的 scale 必须是 f32，收到 {scale.dtype}"
+            )
+        cols, group = self._group_shape("dequantize_i8_group", q, scale)
+        qq = self._contig(q)
+        ss = self._contig(scale)
+        out = cp.empty(qq.shape, np.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("dequantize_i8_group",), _DEQUANTIZE_I8_GROUP_SRC, "af_dequantize_i8_group"
+        )
+        block, grid = self._grid("dequantize_i8_group", n)
+        kernel(
+            (grid,),
+            (block,),
+            (qq, ss, out, np.int64(n), np.int64(cols), np.int64(group)),
+        )
+        return out
+
+    def _op_dequantize_i8_group_zp(self, node, args, attrs):
+        """逐组非对称反量化：``(int32)q - (int32)zp`` 再乘 scale。
+
+        减法留在整数里做，与参考实现的 ``(int32)q - (int32)zp`` 顺序一致，
+        因此逐位相同（不会因为先转 f32 而丢低位）。
+        """
+        cp = self.cp
+        q, scale, zp = args
+        if q.dtype != cp.int8 or zp.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_group_zp 要求 q 与 zero_point 都是 i8，"
+                f"收到 {q.dtype} 与 {zp.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_group_zp 的 scale 必须是 f32，"
+                f"收到 {scale.dtype}"
+            )
+        if tuple(zp.shape) != tuple(scale.shape):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_i8_group_zp 的 zero_point 必须与 scale "
+                f"同形，收到 {zp.shape} 与 {scale.shape}"
+            )
+        cols, group = self._group_shape("dequantize_i8_group_zp", q, scale)
+        qq = self._contig(q)
+        ss = self._contig(scale)
+        zz = self._contig(zp)
+        out = cp.empty(qq.shape, np.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("dequantize_i8_group_zp",),
+            _DEQUANTIZE_I8_GROUP_ZP_SRC,
+            "af_dequantize_i8_group_zp",
+        )
+        block, grid = self._grid("dequantize_i8_group_zp", n)
+        kernel(
+            (grid,),
+            (block,),
+            (qq, ss, zz, out, np.int64(n), np.int64(cols), np.int64(group)),
         )
         return out
 

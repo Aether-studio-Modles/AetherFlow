@@ -441,6 +441,8 @@ class DeviceBackend(
         r.register("matmul", self._op_matmul)
         r.register("quantize_i8", self._op_quantize_i8)
         r.register("dequantize_i8", self._op_dequantize_i8)
+        r.register("dequantize_i8_group", self._op_dequantize_i8_group)
+        r.register("dequantize_i8_group_zp", self._op_dequantize_i8_group_zp)
         r.register("fake_quantize_i8", self._op_fake_quantize_i8)
         # LSQ 版与 STE 版只差反向规则；设备端前向共用同一对内核。
         r.register("fake_quantize_i8_lsq", self._op_fake_quantize_i8_lsq)

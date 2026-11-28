@@ -18,6 +18,7 @@ import numpy as np
 from aetherflow import BackendCapabilityError, KernelRegistry
 from aetherflow.backends.cuda import CUDA_AVAILABLE, CUDA_OPS, CudaBackend
 from aetherflow.backends.cuda.cufft import available as cufft_available
+from aetherflow.backends.device_shared import GPU_OPS, _INDEX_ARGS
 from aetherflow.ir import Graph, f32
 from aetherflow.ir.ops import OPS
 
@@ -170,6 +171,18 @@ class TestCudaDeclarations(unittest.TestCase):
 
     def test_declared_ops_all_exist_in_ir(self):
         self.assertLessEqual(set(CUDA_OPS), set(OPS))
+
+    def test_i8_data_args_declared(self):
+        """i8 数据位置必须登记在 ``_INDEX_ARGS`` 里。
+
+        ``invoke`` 的通用 dtype 检查只放行登记过的 i8 参数；漏登记不会算错，
+        但会让算子在本机被误判成"不支持"——真机才暴露，本地断言更便宜。
+        逐组反量化的 q 是 i8、scale 仍是 f32；带零点的版本另有 zero_point。
+        """
+        self.assertEqual(_INDEX_ARGS["dequantize_i8_group"], frozenset({0}))
+        self.assertEqual(_INDEX_ARGS["dequantize_i8_group_zp"], frozenset({0, 2}))
+        self.assertIn("dequantize_i8_group", GPU_OPS)
+        self.assertIn("dequantize_i8_group_zp", GPU_OPS)
 
 
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")
