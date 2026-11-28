@@ -38,6 +38,7 @@ from .lm import (
     masked_lm_loss_indexed,
     sample_next_token,
 )
+from .lm_bpe import BpeTokenizer, BpeTokenizerError
 from .lm_text import ByteTokenizer, ChatTemplate
 from .lm_tools import JsonGrammar, Tool, ToolRegistry, parse_tool_call
 from .mamba import (
@@ -160,6 +161,8 @@ __all__ = [
     "QueueFullError",
     "ByteTokenizer",
     "ChatTemplate",
+    "BpeTokenizer",
+    "BpeTokenizerError",
     "JsonGrammar",
     "Tool",
     "ToolRegistry",
