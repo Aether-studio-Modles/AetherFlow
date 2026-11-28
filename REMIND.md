@@ -762,6 +762,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `223.109.239.32:20824` / `180.127.11.166:20824`（密码 `co7eeNie`、
   `/root/afv2`）已释放，别再用。
   SSH 偶发 `banner` 被重置，连接要带 3–5 次重试，别把一次失败当环境坏了。
+  2026-11-28 复测：两条线路 24432 端口的 SSH 可达（banner 正常），但
+  `root` / `vipuser` × `hogheiW9` 四组组合全部 `AuthenticationException`，
+  凭证已与上面的记录不一致，用前先向用户确认新密码或账户。
 - **两条执行路径要逐条对齐检查**（5.320）：设备后端同时有逐节点 `invoke` 与
   计划期预绑定后的批量派发快路径。5.318 只在 `invoke` 里判 fp8，`_planned_kernel`
   只扫输入 dtype，于是 `cast`（输入 f32、输出 fp8）被预绑定、绕开检查，真机上
