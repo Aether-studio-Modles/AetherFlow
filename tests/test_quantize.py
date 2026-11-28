@@ -33,11 +33,15 @@ from aetherflow.models.quantize import (
     build_int8a8_linear_zp,
     dequantize_weight,
     dequantize_weight_asymmetric,
+    dequantize_weight_fp8,
     quantize_activation,
     quantize_activation_asymmetric,
+    quantize_activation_fp8,
     quantize_weight,
     quantize_weight_asymmetric,
+    quantize_weight_fp8,
 )
+from aetherflow.runtime.fp8 import FP8_MAX, quantize_fp8, round_fp8
 
 BACKEND = ReferenceBackend()
 
@@ -950,6 +954,93 @@ class TestAsymmetricQuantizeSemantics(unittest.TestCase):
         }
         again = loads(dumps(g))
         np.testing.assert_array_equal(_run(g, feed)["q"], _run(again, feed)["q"])
+
+
+class TestFP8WriteSide(unittest.TestCase):
+    """fp8 写侧：scale 的口径必须与 int8 逐通道 / 逐 token 一致。
+
+    判据不是"看起来像 fp8"，而是三条可断言的事实：
+
+    1. 量化产物**逐位**等于 ``round_fp8(x / scale)``——量化只有一份真值。
+    2. 每个通道 / token 的 amax 被顶到该格式的最大有限值（scale 定义正确）。
+    3. 反量化误差落在该格式半个 ulp 的量级内（e4m3 尾数 3 位，相对误差
+       上限 1/16）。
+    """
+
+    def test_weight_scale_is_per_output_channel(self):
+        w = np.array([[1.0, -2.0], [3.0, 4.0]], np.float32)
+        q, scale = quantize_weight_fp8(w)
+        np.testing.assert_array_equal(scale, np.array([3.0 / 448.0, 4.0 / 448.0], np.float32))
+        np.testing.assert_array_equal(q, round_fp8(w / scale, "e4m3"))
+        np.testing.assert_allclose(np.abs(q).max(axis=0), [448.0, 448.0], rtol=0)
+
+    def test_round_trip_relative_error_within_half_ulp(self):
+        rng = np.random.default_rng(7)
+        w = (rng.standard_normal((16, 8)) * 2.0).astype(np.float32)
+        q, scale = quantize_weight_fp8(w)
+        back = dequantize_weight_fp8(q, scale)
+        np.testing.assert_array_equal(back, q * scale)
+        np.testing.assert_allclose(back, w, rtol=1.0 / 16.0, atol=1e-6)
+
+    def test_per_tensor_scale_matches_hf_weight_scale(self):
+        rng = np.random.default_rng(8)
+        w = (rng.standard_normal((8, 5)) * 3.0).astype(np.float32)
+        q, scale = quantize_weight_fp8(w, per_tensor=True)
+        self.assertEqual(scale.shape, (1,))
+        self.assertAlmostEqual(float(scale[0]), float(np.abs(w).max()) / 448.0, places=7)
+        self.assertLessEqual(float(np.abs(q).max()), 448.0)
+
+    def test_zero_channel_gets_unit_scale(self):
+        w = np.zeros((3, 2), np.float32)
+        w[:, 1] = np.array([1.0, -2.0, 0.5], np.float32)
+        q, scale = quantize_weight_fp8(w)
+        self.assertEqual(float(scale[0]), 1.0)
+        np.testing.assert_array_equal(q[:, 0], np.zeros(3, np.float32))
+
+    def test_e5m2_saturates_instead_of_inf(self):
+        w = np.array([[1.0e9, -1.0e9]], np.float32)
+        q, scale = quantize_weight_fp8(w, kind="e5m2")
+        self.assertTrue(np.all(np.isfinite(q)))
+        self.assertEqual(float(np.abs(q).max()), FP8_MAX["e5m2"])
+
+    def test_activation_scale_is_per_token(self):
+        rng = np.random.default_rng(9)
+        x = (rng.standard_normal((2, 3, 4)) * 5.0).astype(np.float32)
+        q, scale = quantize_activation_fp8(x)
+        self.assertEqual(scale.shape, (2, 3, 1))
+        np.testing.assert_array_equal(q, round_fp8(x / scale, "e4m3"))
+        np.testing.assert_allclose(
+            np.abs(q).max(axis=-1), np.full((2, 3), 448.0), rtol=0
+        )
+
+    def test_quantize_fp8_clips_before_rounding(self):
+        x = np.array([1.0e9, -1.0e9, 0.0], np.float32)
+        q = quantize_fp8(x, np.array(1.0, np.float32), "e4m3")
+        np.testing.assert_array_equal(q, np.array([448.0, -448.0, 0.0], np.float32))
+
+    def test_rejections(self):
+        cases = [
+            ("rank", lambda: quantize_weight_fp8(np.ones(3, np.float32))),
+            ("dtype", lambda: quantize_weight_fp8(np.ones((2, 2), np.int32))),
+            ("nan", lambda: quantize_weight_fp8(np.array([[np.nan]], np.float32))),
+            ("kind", lambda: quantize_weight_fp8(np.ones((1, 1), np.float32), "e3m2")),
+            (
+                "activation_rank",
+                lambda: quantize_activation_fp8(np.ones(3, np.float32)),
+            ),
+        ]
+        for name, call in cases:
+            with self.subTest(case=name):
+                with self.assertRaises((ValueError, TypeError)):
+                    call()
+
+    def test_quantize_fp8_rejects_non_positive_scale(self):
+        for bad in (0.0, -1.0, np.nan):
+            with self.subTest(scale=bad):
+                with self.assertRaises(ValueError):
+                    quantize_fp8(
+                        np.ones((2, 3), np.float32), np.array(bad, np.float32)
+                    )
 
 
 class TestAsymmetricHelpers(unittest.TestCase):

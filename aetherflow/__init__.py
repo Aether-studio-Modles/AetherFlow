@@ -87,11 +87,14 @@ from .conformance import Case, CaseResult, CheckResult, Report, default_cases, r
 from .deploy import BundleError, Deployment, load_bundle, save_bundle
 from .dynamic import DynamicRunner
 from .weights import (
+    FP8Weight,
     QuantizedWeight,
     SafeTensorsError,
     SafeTensorsFile,
     TensorInfo,
+    build_fp8_weight,
     build_quantized_weight,
+    load_fp8_linear,
     load_into_store,
     load_quantized_linear,
     load_safetensors,
@@ -167,10 +170,13 @@ __all__ = [
     "SafeTensorsFile",
     "TensorInfo",
     "QuantizedWeight",
+    "FP8Weight",
     "load_safetensors",
     "load_safetensors_dir",
     "build_quantized_weight",
     "load_quantized_linear",
+    "build_fp8_weight",
+    "load_fp8_linear",
     "load_into_store",
     "BundleError",
     "Deployment",

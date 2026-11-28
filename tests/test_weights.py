@@ -23,13 +23,18 @@ from aetherflow.models.quantize import (
     dequantize_weight_asymmetric,
     quantize_weight,
     quantize_weight_asymmetric,
+    quantize_weight_fp8,
 )
+from aetherflow.runtime.fp8 import pack_fp8
 from aetherflow.train.params import ParameterStore
 from aetherflow.weights import (
+    FP8Weight,
     QuantizedWeight,
     SafeTensorsError,
     SafeTensorsFile,
+    build_fp8_weight,
     build_quantized_weight,
+    load_fp8_linear,
     load_into_store,
     load_quantized_linear,
     load_safetensors,
@@ -67,6 +72,29 @@ def _file(path, tensors, metadata=None):
         raw = np.ascontiguousarray(arr).tobytes()
         header[name] = {
             "dtype": _NUMPY_TO_ST[arr.dtype],
+            "shape": list(arr.shape),
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        chunks.append(raw)
+        offset += len(raw)
+    if metadata is not None:
+        header["__metadata__"] = dict(metadata)
+    _raw_file(path, header, b"".join(chunks))
+
+
+def _typed_file(path, tensors, metadata=None):
+    """``{名字: (safetensors dtype 名, ndarray)}`` 打包，dtype 由调用方指定。
+
+    用来写 fp8 文件：``F8_E4M3`` / ``F8_E5M2`` 在 numpy 里没有对应 dtype，
+    ``_NUMPY_TO_ST`` 里也不该有——它们是 1 字节位模式。
+    """
+    header = {}
+    chunks = []
+    offset = 0
+    for name, (dtype, arr) in tensors.items():
+        raw = np.ascontiguousarray(arr).tobytes()
+        header[name] = {
+            "dtype": dtype,
             "shape": list(arr.shape),
             "data_offsets": [offset, offset + len(raw)],
         }
@@ -592,6 +620,189 @@ class TestQuantizedWeight(_TempDir):
         )
         with self.assertRaises(SafeTensorsError):
             load_quantized_linear(target, "q", "s")
+
+
+class TestFP8Weight(_TempDir):
+    """fp8 量化权重的读取入口。
+
+    与 int8 的差别：载荷是 f32 载体，所以"是不是真的量化过"必须由值本身
+    来证明（每个值都要在格式格点上），不能靠 dtype。其余判据同源：
+    格式从文件 dtype 推出、显式 kind 不许与文件矛盾、scale 形状与 K/N 自洽、
+    metadata 自描述矛盾直接报错。
+    """
+
+    W = np.array(
+        [[-1.5, 0.25, 2.0], [0.5, -0.75, 0.0], [1.25, 0.125, -2.5]],
+        dtype=np.float32,
+    )
+
+    def _f8_file(self, kind="e4m3", per_tensor=False, metadata=None):
+        q, scale = quantize_weight_fp8(self.W, kind=kind, per_tensor=per_tensor)
+        dtype = {"e4m3": "F8_E4M3", "e5m2": "F8_E5M2"}[kind]
+        target = self.path("w8.safetensors")
+        _typed_file(
+            target,
+            {"weight": (dtype, pack_fp8(q, kind)), "weight_scale": ("F32", scale)},
+            metadata=metadata,
+        )
+        return target, q, scale
+
+    def test_f8_dtype_supplies_kind(self):
+        target, q, scale = self._f8_file()
+        got = load_fp8_linear(target, "weight", "weight_scale")
+        self.assertIsInstance(got, FP8Weight)
+        self.assertEqual(got.kind, "e4m3")
+        self.assertEqual(got.shape, (3, 3))
+        np.testing.assert_array_equal(got.w, q)
+        np.testing.assert_array_equal(got.weight_scale, scale)
+        self.assertIsNone(got.input_scale)
+        np.testing.assert_array_equal(got.dequantize(), q * scale)
+
+    def test_f8_dtype_conflicting_kind_is_rejected(self):
+        target, _, _ = self._f8_file("e5m2")
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(target, "weight", "weight_scale", kind="e4m3")
+        self.assertIn("矛盾", str(ctx.exception))
+
+    def test_f32_carrier_requires_explicit_kind(self):
+        q, scale = quantize_weight_fp8(self.W)
+        target = self.path("carrier.safetensors")
+        _file(target, {"weight": q, "weight_scale": scale})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(target, "weight", "weight_scale")
+        self.assertIn("kind", str(ctx.exception))
+        got = load_fp8_linear(target, "weight", "weight_scale", kind="e4m3")
+        np.testing.assert_array_equal(got.w, q)
+
+    def test_unquantized_f32_is_rejected(self):
+        # 取值刻意偏离格点：W 本身的元素（1.5 / 0.25 / 0.125 ...）恰好都能被
+        # e4m3 精确表示，拿它测"未量化"会得到假通过。
+        raw = (self.W + 0.013).astype(np.float32)
+        target = self.path("raw.safetensors")
+        _file(
+            target,
+            {
+                "weight": raw,
+                "weight_scale": np.array([1.0], np.float32),
+            },
+        )
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(target, "weight", "weight_scale", kind="e4m3")
+        self.assertIn("格点", str(ctx.exception))
+
+    def test_per_tensor_weight_scale_and_input_scale(self):
+        target, q, scale = self._f8_file(per_tensor=True)
+        self.assertEqual(scale.shape, (1,))
+        got = load_fp8_linear(
+            target,
+            "weight",
+            "weight_scale",
+            kind="e4m3",
+        )
+        self.assertEqual(got.weight_scale.shape, (1,))
+        self.assertEqual(got.group_size, 3)
+        self.assertFalse(got.per_group)
+
+        with_input = self.path("with_input.safetensors")
+        _typed_file(
+            with_input,
+            {
+                "weight": ("F8_E4M3", pack_fp8(q, "e4m3")),
+                "weight_scale": ("F32", scale),
+                "input_scale": ("F32", np.array([0.125], np.float32)),
+            },
+        )
+        got = load_fp8_linear(
+            with_input, "weight", "weight_scale", "input_scale"
+        )
+        np.testing.assert_array_equal(got.input_scale, np.array([0.125], np.float32))
+
+    def test_input_scale_must_be_scalar(self):
+        q, scale = quantize_weight_fp8(self.W)
+        target = self.path("bad_input.safetensors")
+        _file(
+            target,
+            {
+                "weight": q,
+                "weight_scale": scale,
+                "input_scale": np.array([0.5, 1.0], np.float32),
+            },
+        )
+        with self.assertRaises(SafeTensorsError):
+            load_fp8_linear(
+                target, "weight", "weight_scale", "input_scale", kind="e4m3"
+            )
+
+    def test_transpose_reads_torch_layout(self):
+        w = np.arange(12, dtype=np.float32).reshape(4, 3) - 5.5
+        q, scale = quantize_weight_fp8(w)
+        target = self.path("torch8.safetensors")
+        _file(target, {"weight": q.T, "weight_scale": scale})
+        with self.assertRaises(SafeTensorsError):
+            load_fp8_linear(target, "weight", "weight_scale", kind="e4m3")
+        got = load_fp8_linear(
+            target, "weight", "weight_scale", kind="e4m3", transpose=True
+        )
+        self.assertEqual(got.shape, (4, 3))
+        np.testing.assert_array_equal(got.w, q)
+
+    def test_per_group_scale_repeats_along_k(self):
+        w = np.arange(24, dtype=np.float32).reshape(8, 3) - 10.0
+        q, _ = quantize_weight_fp8(w)
+        groups = np.array(
+            [[1.0, 2.0, 3.0], [0.5, 0.25, 0.125]], dtype=np.float32
+        )
+        got = build_fp8_weight(
+            {"weight": q, "weight_scale": groups}, "weight", "weight_scale"
+        )
+        self.assertEqual(got.group_size, 4)
+        self.assertTrue(got.per_group)
+        want = q * np.repeat(groups, 4, axis=0)
+        np.testing.assert_array_equal(got.dequantize(), want)
+
+    def test_metadata_is_cross_checked(self):
+        target, q, scale = self._f8_file(metadata={"quantization": "fp8"})
+        np.testing.assert_array_equal(
+            load_fp8_linear(target, "weight", "weight_scale").w, q
+        )
+
+        target, _, _ = self._f8_file(metadata={"quantization": "fp8_e5m2"})
+        with self.assertRaises(SafeTensorsError):
+            load_fp8_linear(target, "weight", "weight_scale")
+
+        target, _, _ = self._f8_file(metadata={"quantization": "int8"})
+        with self.assertRaises(SafeTensorsError):
+            load_fp8_linear(target, "weight", "weight_scale")
+
+        target, _, _ = self._f8_file(
+            metadata={"quantization": "fp8", "quantization.group_size": "2"}
+        )
+        with self.assertRaises(SafeTensorsError):
+            load_fp8_linear(target, "weight", "weight_scale")
+
+    def test_check_metadata_false_only_skips_self_description(self):
+        target, q, _ = self._f8_file(metadata={"quantization": "fp8_e5m2"})
+        got = load_fp8_linear(
+            target, "weight", "weight_scale", check_metadata=False
+        )
+        np.testing.assert_array_equal(got.w, q)
+
+    def test_missing_tensors_are_reported(self):
+        target, _, _ = self._f8_file()
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_fp8_linear(target, "weight", "nope")
+        self.assertIn("nope", str(ctx.exception))
+
+        q, scale = quantize_weight_fp8(self.W)
+        with self.assertRaises(SafeTensorsError):
+            build_fp8_weight({"weight": q}, "weight", "weight_scale")
+
+    def test_e5m2_round_trip(self):
+        target, q, scale = self._f8_file("e5m2")
+        got = load_fp8_linear(target, "weight", "weight_scale", kind="e5m2")
+        self.assertEqual(got.kind, "e5m2")
+        np.testing.assert_array_equal(got.w, q)
+        np.testing.assert_array_equal(got.dequantize(), q * scale)
 
     def test_scale_f64_requires_allow_downcast(self):
         target = self.path("s64.safetensors")

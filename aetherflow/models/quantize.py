@@ -1,9 +1,10 @@
-"""int8 量化的构图与离线工具。
+"""int8 / fp8 量化的构图与离线工具。
 
 这里没有任何新的数值语义：量化与反量化的定义都在 ``ir/ops.py``
 （``quantize_i8`` / ``dequantize_i8`` / ``fake_quantize_i8`` / ``linear_i8`` /
 ``linear_i8a8``，以及带零点的 ``*_zp`` 族），参考实现在同一处的 reference
-函数里。本模块只做三件事：
+函数里。fp8 的数值语义（含带 scale 的量化）在 ``runtime/fp8.py``。本模块
+只做三件事：
 
 1. **离线量化一份权重**（``quantize_weight`` / ``quantize_weight_asymmetric``）：
    从 f32 的 ``(K, N)`` 权重算出逐输出通道的量化参数与 int8 权重。它直接调用
@@ -16,6 +17,13 @@
    ``build_int8a8_linear`` 是激活也量化的 W8A8；带 ``_zp`` 的两个 builder 是
    对应的非对称版本。权重形状约定与 ``models/mlp.py`` 一致——权重是
    ``(in, out)``，不是 PyTorch 的 ``(out, in)``。
+
+fp8 的一节只覆盖**写侧**（把 f32 权重 / 激活压到 fp8 格点并给出 scale）：
+``quantize_weight_fp8`` / ``quantize_activation_fp8`` / ``dequantize_weight_fp8``。
+IR 里的 fp8 张量是 f32 载体（``DType.F8E4M3`` 的 ``np_dtype`` 就是 float32），
+所以"量化"产出的是缩放后的 f32 数组，值全部落在 fp8 格点上；配套的 scale
+与 int8 的逐通道 / 逐 token 口径一致，可直接用于 HF 风格的
+``weight_scale`` / ``input_scale`` 约定。
 
 两套语义的差别写清楚：
 
@@ -41,10 +49,12 @@ import numpy as np
 
 from ..ir.graph import Graph, Value
 from ..ir.ops import get_op
+from ..runtime.fp8 import FP8_KINDS, FP8_MAX, dequantize_fp8, quantize_fp8
 
 __all__ = [
     "QUANT_MAX",
     "QUANT_MIN_ASYMMETRIC",
+    "FP8_KINDS",
     "quantize_weight",
     "dequantize_weight",
     "quantize_activation",
@@ -55,6 +65,9 @@ __all__ = [
     "build_int8a8_linear",
     "build_int8_linear_zp",
     "build_int8a8_linear_zp",
+    "quantize_weight_fp8",
+    "dequantize_weight_fp8",
+    "quantize_activation_fp8",
 ]
 
 #: 对称 int8 的正端点。负端点是 -127 而不是 -128——见 ``ir/ops.py`` 的说明。
@@ -360,4 +373,82 @@ def build_int8a8_linear_zp(
         inputs["bias"] = g.input("bias", f32[n])
         args.append(inputs["bias"])
     return inputs, g.add_node("linear_i8a8_zp", args)
+
+
+# --------------------------------------------------------------------------
+# fp8 写侧（e4m3 / e5m2）
+# --------------------------------------------------------------------------
+#
+# 与 int8 的差别只有格点：fp8 的格点由格式决定（e4m3 最大 448、e5m2 最大
+# 57344），量化参数仍然只有 scale——fp8 的 0 精确可表示，非对称量化没有收益，
+# 所以这里既不提供 zero_point，也不接受它。
+#
+# scale 的口径刻意与 int8 一致：权重逐输出通道、激活逐 token。这样同一条
+# linear 只需要替换"权重容器 + 算子"，缩放约定不用跟着换；HF 的 fp8 检查点
+# 常用 per-tensor 的 ``weight_scale``，对应 ``per_tensor=True``。
+#
+# 全零的通道 / token 给 scale = 1.0，理由与 ``quantize_weight`` 相同：零在
+# 任何 scale 下都量化为 0，但 scale = 0 会触发"非正 scale"拒绝。
+
+
+def _fp8_limit(kind: str) -> float:
+    if kind not in FP8_KINDS:
+        raise ValueError(f"未知的 fp8 格式 {kind!r}；支持 {FP8_KINDS}")
+    return float(FP8_MAX[kind])
+
+
+def quantize_weight_fp8(
+    weight: np.ndarray, kind: str = "e4m3", per_tensor: bool = False
+) -> Tuple[np.ndarray, np.ndarray]:
+    """把 ``(K, N)`` 的 f32 权重压到 fp8 格点，返回 ``(w_f8, weight_scale)``。
+
+    ``w_f8`` 与输入同形状、仍是 f32 载体（值全部落在 fp8 格点上，数量级在
+    ``±max`` 内）；``weight_scale`` 是逐输出通道的 ``(N,)``，``per_tensor=True``
+    时退化成 ``(1,)`` 的整张量一个 scale（HF 的 ``weight_scale`` 形态）。
+    反量化是 ``w_f8 * weight_scale``（:func:`dequantize_weight_fp8`）。
+    """
+    limit = _fp8_limit(kind)
+    w = np.asarray(weight)
+    if w.ndim != 2:
+        raise ValueError(f"quantize_weight_fp8 只接受 (K, N) 的线性层权重，得到 {w.shape}")
+    if w.dtype.kind != "f":
+        raise TypeError(f"quantize_weight_fp8 需要浮点权重，得到 {w.dtype}")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("权重里有 NaN / Inf：量化会把这些值传播到整条推理链")
+
+    if per_tensor:
+        amax = np.array([np.max(np.abs(w))], dtype=np.float32)
+    else:
+        amax = np.max(np.abs(w), axis=0)
+    scale = np.where(amax > 0, amax / limit, 1.0).astype(np.float32)
+    return quantize_fp8(w.astype(np.float32), scale, kind), scale
+
+
+def dequantize_weight_fp8(w: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """``(K, N)`` 的 f8 载体还原成真实数值：``w * scale``。"""
+    return dequantize_fp8(w, scale)
+
+
+def quantize_activation_fp8(
+    x: np.ndarray, kind: str = "e4m3"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """把 f32 激活按 **token**（最后一维）压到 fp8 格点，返回 ``(x_f8, scale)``。
+
+    ``scale`` 的形状是 ``x.shape[:-1] + (1,)``：每个 token 一个 scale，与
+    ``quantize_activation`` 的 int8 版本完全同口径。静态激活 scale 需要的是
+    一个标量，可以自己做 ``x.reshape(-1, k).max()`` 后手算，或直接用
+    :func:`quantize_fp8` 配自己的 scale。
+    """
+    limit = _fp8_limit(kind)
+    a = np.asarray(x)
+    if a.ndim < 2:
+        raise ValueError(f"quantize_activation_fp8 至少需要 2 维，得到 {a.shape}")
+    if a.dtype.kind != "f":
+        raise TypeError(f"quantize_activation_fp8 需要浮点激活，得到 {a.dtype}")
+    if not np.all(np.isfinite(a)):
+        raise ValueError("激活里有 NaN / Inf：量化会把这些值传播到整条推理链")
+
+    amax = np.max(np.abs(a), axis=-1, keepdims=True)
+    scale = np.where(amax > 0, amax / limit, 1.0).astype(np.float32)
+    return quantize_fp8(a.astype(np.float32), scale, kind), scale
 

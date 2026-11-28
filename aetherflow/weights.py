@@ -38,17 +38,20 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from .runtime.fp8 import unpack_fp8
+from .runtime.fp8 import FP8_KINDS, round_fp8, unpack_fp8
 
 __all__ = [
     "SafeTensorsError",
     "TensorInfo",
     "SafeTensorsFile",
     "QuantizedWeight",
+    "FP8Weight",
     "load_safetensors",
     "load_safetensors_dir",
     "build_quantized_weight",
     "load_quantized_linear",
+    "build_fp8_weight",
+    "load_fp8_linear",
     "load_into_store",
 ]
 
@@ -567,6 +570,31 @@ def build_quantized_weight(
     )
 
 
+def _check_group_size_metadata(
+    metadata: Mapping[str, str], group_size: int, where: str
+) -> None:
+    """metadata 的 ``quantization.group_size`` 若存在，必须与形状推出的组大小一致。"""
+    group = metadata.get("quantization.group_size")
+    if group is None:
+        return
+    text = group.strip()
+    try:
+        size = int(text)
+    except ValueError:
+        raise SafeTensorsError(
+            f"{where}：metadata 的 quantization.group_size={group!r} 不是正整数"
+        ) from None
+    if size <= 0:
+        raise SafeTensorsError(
+            f"{where}：metadata 的 quantization.group_size={group!r} 必须为正"
+        )
+    if size != group_size:
+        raise SafeTensorsError(
+            f"{where}：metadata 的 quantization.group_size={group!r} 与张量矛盾"
+            f"（q 的 K 与 scale 推出的每组行数是 {group_size}）"
+        )
+
+
 def _check_quantization_metadata(
     metadata: Mapping[str, str], weight: QuantizedWeight, where: str
 ) -> None:
@@ -587,24 +615,7 @@ def _check_quantization_metadata(
                 f"{where}：metadata 声称 quantization=int8，却给了 zero_point 张量"
             )
 
-    group = metadata.get("quantization.group_size")
-    if group is not None:
-        text = group.strip()
-        try:
-            size = int(text)
-        except ValueError:
-            raise SafeTensorsError(
-                f"{where}：metadata 的 quantization.group_size={group!r} 不是正整数"
-            ) from None
-        if size <= 0:
-            raise SafeTensorsError(
-                f"{where}：metadata 的 quantization.group_size={group!r} 必须为正"
-            )
-        if size != weight.group_size:
-            raise SafeTensorsError(
-                f"{where}：metadata 的 quantization.group_size={group!r} 与张量矛盾"
-                f"（q 的 K={weight.in_features}，scale 推出每组 {weight.group_size} 行）"
-            )
+    _check_group_size_metadata(metadata, weight.group_size, where)
 
 
 def load_quantized_linear(
@@ -641,6 +652,311 @@ def load_quantized_linear(
     )
     if check_metadata:
         _check_quantization_metadata(metadata, got, root)
+    return got
+
+
+# -- fp8 量化权重 ---------------------------------------------------------
+#
+# fp8 的容器与 int8 的差别只有两处：载荷是 f32 载体（`DType.F8E4M3` 在
+# numpy 里没有标量类型，5.319 读文件时就解码成 f32），量化参数只有 scale
+# （fp8 的 0 精确可表示，非对称没有收益）。因此这里额外守一条 int8 不需要
+# 的规则：**载荷的每个值必须落在该格式的格点上**。
+#
+# 为什么这条必须查：`w` 的 dtype 是 f32，一份未经量化的 f32 权重与一份
+# 量化过的 f8 载体在字节层面完全同型。不查，就会把"忘了量化"读成"量化
+# 精度很高"，推理照跑、数值只差一点点——这类错误没有任何症状。
+#
+# 约定（与 HF 的 fp8 检查点对齐）：
+#
+# - 张量名：权重 `weight`、权重 scale `weight_scale`、可选的静态激活 scale
+#   `input_scale`；名字由调用方显式给，不猜。
+# - `w`：`(K, N)` 的 f32 载体，值落在 `kind` 的格点上，量级在缩放后的
+#   `±max` 内。PyTorch / safetensors 的 `(N, K)` 布局要显式 `transpose=True`。
+# - `weight_scale`：f32，`(1,)`（整张量一个，HF 最常见）/ `(N,)`（逐输出
+#   通道）或 `(K/G, N)`（逐组）。
+# - `input_scale`：可选，f32 标量。静态激活 scale 用它；动态 per-token
+#   量化没有这个张量，缺省即不校验。
+# - metadata `quantization`：缺省时不校验；写了就必须是 `"fp8"`（格式由
+#   张量 dtype 或显式 kind 决定）、`"fp8_e4m3"` 或 `"fp8_e5m2"`，且与 kind
+#   不矛盾。
+
+#: metadata 里的 fp8 自描述 → 格式；``None`` 表示只声明"是 fp8"，格式另定。
+_FP8_QUANTIZATION: Dict[str, Optional[str]] = {
+    "fp8": None,
+    "fp8_e4m3": "e4m3",
+    "fp8_e5m2": "e5m2",
+}
+
+
+@dataclass(frozen=True)
+class FP8Weight:
+    """一份 fp8 量化线性层权重。
+
+    ``w`` 是 ``(K, N)`` 的 f32 载体（值全部落在 ``kind`` 的格点、缩放后的
+    量级），``weight_scale`` 是 ``(1,)`` / ``(N,)`` / ``(K/G, N)``。
+    ``input_scale`` 是可选的静态激活 scale（标量），动态 per-token 场景为
+    ``None``。三个数组可能直接引用调用方传入的数组，当成只读用。
+    """
+
+    w: np.ndarray
+    weight_scale: np.ndarray
+    kind: str = "e4m3"
+    input_scale: Optional[np.ndarray] = None
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return (int(self.w.shape[0]), int(self.w.shape[1]))
+
+    @property
+    def in_features(self) -> int:
+        return self.shape[0]
+
+    @property
+    def out_features(self) -> int:
+        return self.shape[1]
+
+    @property
+    def group_size(self) -> int:
+        """沿输入维每组包含多少行；一维 scale 等价于 ``group_size = K``。"""
+        if self.weight_scale.ndim == 2:
+            return self.in_features // int(self.weight_scale.shape[0])
+        return self.in_features
+
+    @property
+    def per_group(self) -> bool:
+        return self.group_size < self.in_features
+
+    def dequantize(self) -> np.ndarray:
+        """还原成 f32 的真实数值：``w * weight_scale``（逐组时沿 K 重复）。"""
+        scale = self.weight_scale
+        if scale.ndim == 2:
+            scale = np.repeat(scale, self.in_features // int(scale.shape[0]), axis=0)
+        return (self.w * scale.astype(np.float32)).astype(np.float32)
+
+
+def _check_fp8_scale(
+    scale: np.ndarray,
+    q: np.ndarray,
+    *,
+    allow_downcast: bool,
+    label: str,
+    what: str,
+) -> np.ndarray:
+    """校验 weight scale：``(1,)`` / ``(N,)`` / ``(K/G, N)``，有限且严格为正。"""
+    s = np.asarray(scale)
+    if s.dtype.kind != "f":
+        raise SafeTensorsError(f"{label}的 {what} 必须是浮点，得到 {s.dtype}")
+    if s.ndim > 2:
+        raise SafeTensorsError(
+            f"{label}的 {what} 必须是一维 (1,) / (N,) 或二维 (K/G, N)，"
+            f"得到形状 {s.shape}"
+        )
+    k, n = q.shape
+    if s.ndim == 1:
+        if s.size not in (1, n):
+            raise SafeTensorsError(
+                f"{label}的 {what} 有 {s.size} 个元素，但 q 的输出维是 {n}："
+                "逐通道量化只接受 1 个（逐张量）或 N 个（逐通道）"
+            )
+    else:
+        groups, cols = s.shape
+        if cols != n:
+            raise SafeTensorsError(
+                f"{label}的 {what} 形状是 {s.shape}，列数与 q 的输出维 {n} 不一致"
+            )
+        if groups <= 0 or k % groups != 0:
+            raise SafeTensorsError(
+                f"{label}的 {what} 有 {groups} 组，但 q 的输入维 K={k} 不能被它整除"
+            )
+    if not allow_downcast and not np.can_cast(s.dtype, np.float32, casting="safe"):
+        raise SafeTensorsError(
+            f"{label}的 {what} 是 {s.dtype}，转成 f32 是有损转换，需要 allow_downcast=True"
+        )
+    s = s.astype(np.float32)
+    if not np.all(np.isfinite(s)) or np.any(s <= 0.0):
+        raise SafeTensorsError(
+            f"{label}的 {what} 必须是有限且严格为正的数，得到 {s.tolist()}"
+        )
+    return s
+
+
+def _check_fp8_arrays(
+    w: np.ndarray,
+    weight_scale: np.ndarray,
+    kind: str,
+    input_scale: Optional[np.ndarray],
+    *,
+    transpose: bool,
+    allow_downcast: bool,
+    label: str,
+) -> FP8Weight:
+    """校验并规整成 :class:`FP8Weight`（唯一的构造路径）。"""
+    if kind not in FP8_KINDS:
+        raise SafeTensorsError(f"未知的 fp8 格式 {kind!r}；支持 {FP8_KINDS}")
+
+    w = np.asarray(w)
+    if w.dtype.kind != "f":
+        raise SafeTensorsError(
+            f"{label}的 w 必须是浮点载体（fp8 位模式请先用 unpack_fp8 解码），"
+            f"得到 {w.dtype}"
+        )
+    if not allow_downcast and not np.can_cast(w.dtype, np.float32, casting="safe"):
+        raise SafeTensorsError(
+            f"{label}的 w 是 {w.dtype}，转成 f32 是有损转换，需要 allow_downcast=True"
+        )
+    w = np.ascontiguousarray(w.astype(np.float32))
+    if w.ndim != 2:
+        raise SafeTensorsError(f"{label}的 w 必须是二维 (K, N)，得到形状 {w.shape}")
+    if transpose:
+        # PyTorch nn.Linear 的 (out, in) → 本仓库的 (in, out)。
+        w = np.ascontiguousarray(w.T)
+    k, n = w.shape
+    if k <= 0 or n <= 0:
+        raise SafeTensorsError(f"{label}的 w 形状非法：{tuple(w.shape)}（两维都必须为正）")
+    if not np.all(np.isfinite(w)):
+        raise SafeTensorsError(f"{label}的 w 含 NaN / Inf：量化权重必须全部有限")
+    if not np.array_equal(round_fp8(w, kind), w, equal_nan=True):
+        raise SafeTensorsError(
+            f"{label}的 w 有值不在 {kind} 的格点上：这份数组不是 fp8 量化结果，"
+            "而是原始 f32 权重（或用了另一种格式）。请先用 quantize_weight_fp8 量化，"
+            "或确认 kind 与实际格式一致"
+        )
+
+    scale = _check_fp8_scale(
+        weight_scale, w, allow_downcast=allow_downcast, label=label, what="weight_scale"
+    )
+
+    iscale: Optional[np.ndarray] = None
+    if input_scale is not None:
+        raw = np.asarray(input_scale)
+        if raw.dtype.kind != "f":
+            raise SafeTensorsError(f"{label}的 input_scale 必须是浮点，得到 {raw.dtype}")
+        if raw.ndim > 1 or raw.size != 1:
+            raise SafeTensorsError(
+                f"{label}的 input_scale 必须是标量，得到形状 {raw.shape}："
+                "动态 per-token 量化没有这个张量，静态场景也只有一个全局 scale"
+            )
+        if not allow_downcast and not np.can_cast(
+            raw.dtype, np.float32, casting="safe"
+        ):
+            raise SafeTensorsError(
+                f"{label}的 input_scale 是 {raw.dtype}，转成 f32 是有损转换，"
+                "需要 allow_downcast=True"
+            )
+        iscale = raw.astype(np.float32).reshape(1)
+        if not np.all(np.isfinite(iscale)) or np.any(iscale <= 0.0):
+            raise SafeTensorsError(
+                f"{label}的 input_scale 必须是有限且严格为正的数，得到 {iscale.tolist()}"
+            )
+
+    return FP8Weight(w=w, weight_scale=scale, kind=kind, input_scale=iscale)
+
+
+def _check_fp8_metadata(
+    metadata: Mapping[str, str], weight: FP8Weight, where: str
+) -> None:
+    """校验 metadata 的 fp8 自描述（缺失即不校验），矛盾直接报错。"""
+    declared = metadata.get("quantization")
+    if declared is not None:
+        if declared not in _FP8_QUANTIZATION:
+            raise SafeTensorsError(
+                f"{where}：metadata 里的 quantization={declared!r} 不是 fp8 的写法"
+                f"（支持 {', '.join(_FP8_QUANTIZATION)}）"
+            )
+        expected = _FP8_QUANTIZATION[declared]
+        if expected is not None and expected != weight.kind:
+            raise SafeTensorsError(
+                f"{where}：metadata 声称 quantization={declared}，"
+                f"但载荷按 {weight.kind} 校验"
+            )
+    _check_group_size_metadata(metadata, weight.group_size, where)
+
+
+def build_fp8_weight(
+    tensors: Mapping[str, np.ndarray],
+    weight: str,
+    weight_scale: str,
+    input_scale: Optional[str] = None,
+    *,
+    kind: str = "e4m3",
+    transpose: bool = False,
+    allow_downcast: bool = False,
+) -> FP8Weight:
+    """从"名字 → 数组"的表里组装 fp8 量化权重（显式名字，不猜格式）。
+
+    ``kind`` 必须显式给：数组是 f32 载体，格式信息不在 dtype 里。
+    """
+    needed = [weight, weight_scale] + ([input_scale] if input_scale is not None else [])
+    missing = [name for name in needed if name not in tensors]
+    if missing:
+        raise SafeTensorsError(f"fp8 量化权重缺少张量: {missing}")
+    return _check_fp8_arrays(
+        tensors[weight],
+        tensors[weight_scale],
+        kind,
+        None if input_scale is None else tensors[input_scale],
+        transpose=transpose,
+        allow_downcast=allow_downcast,
+        label=f"张量 {weight!r} ",
+    )
+
+
+def load_fp8_linear(
+    path,
+    weight: str,
+    weight_scale: str,
+    input_scale: Optional[str] = None,
+    *,
+    kind: Optional[str] = None,
+    transpose: bool = False,
+    allow_downcast: bool = False,
+    check_metadata: bool = True,
+) -> FP8Weight:
+    """从 ``.safetensors`` 读一份 fp8 量化线性层权重。
+
+    格式的优先级是**文件说了算**：张量 dtype 是 ``F8_E4M3`` / ``F8_E5M2``
+    时 ``kind`` 可缺省，显式给了就必须一致；权重存成 ``F32``（已解码的载体）
+    时必须显式给 ``kind``。这与"名字与布局都显式给、不猜"是同一条原则——
+    格式能由文件唯一确定时就不该再让调用方重复一遍。
+    """
+    root = os.fspath(path)
+    with SafeTensorsFile(root) as fh:
+        needed = [weight, weight_scale] + (
+            [input_scale] if input_scale is not None else []
+        )
+        missing = [name for name in needed if name not in fh]
+        if missing:
+            raise SafeTensorsError(f"{root} 里缺少 fp8 量化权重需要的张量: {missing}")
+        file_kind = _FP8.get(fh.info(weight).dtype)
+        if kind is None:
+            if file_kind is None:
+                raise SafeTensorsError(
+                    f"{root}：张量 {weight!r} 的 dtype 是 {fh.info(weight).dtype}，"
+                    "推不出 fp8 格式；请显式给 kind"
+                )
+            resolved = file_kind
+        else:
+            if kind not in FP8_KINDS:
+                raise SafeTensorsError(f"未知的 fp8 格式 {kind!r}；支持 {FP8_KINDS}")
+            if file_kind is not None and file_kind != kind:
+                raise SafeTensorsError(
+                    f"{root}：张量 {weight!r} 的 dtype 是 {fh.info(weight).dtype}"
+                    f"（{file_kind}），与 kind={kind} 矛盾"
+                )
+            resolved = kind
+        arrays = {name: fh.tensor(name) for name in needed}
+        metadata = dict(fh.metadata)
+    got = _check_fp8_arrays(
+        arrays[weight],
+        arrays[weight_scale],
+        resolved,
+        None if input_scale is None else arrays[input_scale],
+        transpose=transpose,
+        allow_downcast=allow_downcast,
+        label=f"{root} 的 fp8 权重",
+    )
+    if check_metadata:
+        _check_fp8_metadata(metadata, got, root)
     return got
 
 

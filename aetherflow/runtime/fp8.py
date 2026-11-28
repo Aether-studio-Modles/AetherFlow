@@ -30,7 +30,10 @@ __all__ = [
     "round_fp8",
     "pack_fp8",
     "unpack_fp8",
+    "quantize_fp8",
+    "dequantize_fp8",
     "FP8_KINDS",
+    "FP8_MAX",
     "STORAGE_BYTES",
 ]
 
@@ -90,6 +93,9 @@ _E5M2 = _Format(
 )
 
 _FORMATS = {"e4m3": _E4M3, "e5m2": _E5M2}
+
+#: 每种格式的最大有限值；带 scale 的量化把它当作缩放后的值域端点。
+FP8_MAX = {kind: fmt.max_value for kind, fmt in _FORMATS.items()}
 
 
 def _format(kind: str) -> _Format:
@@ -231,3 +237,39 @@ def round_fp8(value: Any, kind: str = "e4m3") -> np.ndarray:
     在一个可表示的位模式上。
     """
     return unpack_fp8(pack_fp8(value, kind), kind)
+
+
+def quantize_fp8(value: Any, scale: Any, kind: str = "e4m3") -> np.ndarray:
+    """带 scale 的 fp8 量化：``round_fp8(clip(x / scale, ±max))``。
+
+    与 int8 的 ``quantize_i8`` 同构——先除以 scale、落到格点，产物是
+    **缩放后的** f8 载体（数量级在 ``±max`` 内），反量化时再乘回 scale。
+    这样 GEMM 可以先把整段值域压进 fp8 的可表示范围，而不要求权重本身
+    落在 ``[-448, 448]``。
+
+    为什么显式 clip：e4m3 在 encode 阶段自己饱和，但 e5m2 溢出会舍到
+    ``±inf``；而量化权重里出现 inf 会让整条推理链变成 inf。统一先夹到
+    格式的最大有限值，两种格式的语义就一致了。
+
+    scale 必须能广播到 ``value``（逐通道 / 逐 token 时形状分别是 ``(N,)`` 与
+    ``(..., 1)``），且有限、严格为正——与 int8 的约束同源。
+    """
+    fmt = _format(kind)
+    x = np.asarray(value, dtype=np.float32)
+    s = np.asarray(scale, dtype=np.float32)
+    if not np.all(np.isfinite(s)) or np.any(s <= 0.0):
+        raise ValueError(
+            f"quantize_fp8 的 scale 必须是有限且严格为正的数，得到 {s.tolist()}"
+        )
+    scaled = np.clip(x / s, -fmt.max_value, fmt.max_value)
+    return round_fp8(scaled, kind).astype(np.float32)
+
+
+def dequantize_fp8(value: Any, scale: Any) -> np.ndarray:
+    """把缩放后的 f8 载体乘回 scale，得到真实数值（仍是 f32 载体）。
+
+    与 ``dequantize_i8`` 同一口径：fp8 张量在 IR 里是 f32 载体，所以这里
+    只是一次乘法，不需要解码位模式。
+    """
+    product = np.asarray(value, dtype=np.float32) * np.asarray(scale, dtype=np.float32)
+    return product.astype(np.float32)
