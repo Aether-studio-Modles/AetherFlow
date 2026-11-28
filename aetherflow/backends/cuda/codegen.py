@@ -24,6 +24,7 @@ from ...lower.kernels import (
     adaptive_avg_pool2d,
     adaptive_avg_pool2d_backward,
     argmax_last,
+    argmin_last,
     attention_fwd,
     avgpool2d,
     avgpool2d_backward,
@@ -36,6 +37,7 @@ from ...lower.kernels import (
     conv2d_tiled,
     conv2d_weight_grad,
     cumsum,
+    cumprod,
     dropout_mask,
     ew_binary,
     ew_broadcast,
@@ -46,9 +48,11 @@ from ...lower.kernels import (
     ew_unary,
     ew_where_bcast,
     ew_where_same,
+    flip,
     im2col,
     layernorm_last,
     layernorm_residual_last,
+    logsumexp_axis,
     maxpool2d,
     maxpool2d_backward,
     maxpool2d_indices,
@@ -61,6 +65,7 @@ from ...lower.kernels import (
     reduce_axis,
     reduce_axis_tiled,
     rmsnorm_last,
+    roll,
     scan_linear,
     softmax_axis,
     scan_linear_backward,
@@ -2192,6 +2197,23 @@ def argmax_source() -> Kernel:
     return argmax_last()
 
 
+def argmin_source() -> Kernel:
+    """末维 argmin 的 L2 描述（生产路径，5.349）。
+
+    与 ``argmax_source`` 同构，只换比较方向；并列同样取第一次出现。
+    """
+    return argmin_last()
+
+
+def logsumexp_source() -> Kernel:
+    """任意单轴 logsumexp 的 L2 描述（5.349）。
+
+    铺法与 ``softmax_axis`` 相同（一个线程扫完一行），输出比输入少一维，
+    每行一个标量。
+    """
+    return logsumexp_axis()
+
+
 def topk_source() -> str:
     """末维 topk 的手写内核源码（values / indices / mask 三个入口共用）。
 
@@ -2545,6 +2567,24 @@ def cumsum_source() -> Kernel:
     沿时间轴走），差别只在没有 ``a_t`` 乘法，抄一份模板只会多一处漂移点。
     """
     return cumsum()
+
+
+def cumprod_source() -> Kernel:
+    """前缀积的 L2 描述（5.349）。
+
+    与 ``cumsum_source`` 同一份铺法，只有累加器换成累乘、初值换成 1。
+    """
+    return cumprod()
+
+
+def flip_source() -> Kernel:
+    """单轴反转的 L2 描述（5.349）：一个线程搬一个元素。"""
+    return flip()
+
+
+def roll_source() -> Kernel:
+    """单轴循环移位的 L2 描述（5.349）：一个线程搬一个元素，``shift`` 由 host 归一化。"""
+    return roll()
 
 
 def tril_source() -> Kernel:

@@ -65,6 +65,96 @@ class _ScanMixin:
         )
         return out
 
+    def _op_cumprod(self, node, args, attrs):
+        """沿单个轴的前缀积：与 ``cumsum`` 同一套 ``(outer, steps, inner)`` 铺法。
+
+        累乘换掉累加，内核初值 1；其它（轴归一化、链数、边界）逐条同 ``cumsum``。
+        """
+        cp = self.cp
+        x = self._contig(args[0])
+        axis = self._axis_of(attrs, x.ndim, "cumprod")
+        shape = tuple(int(d) for d in x.shape)
+        steps = shape[axis]
+        outer = int(np.prod(shape[:axis], dtype=np.int64))
+        inner = int(np.prod(shape[axis + 1 :], dtype=np.int64))
+        out = cp.empty_like(x)
+        work = outer * inner
+        if work == 0 or steps == 0:
+            return out
+        kernel = self._kernel(
+            ("cumprod", self._kind(x)),
+            lambda: self.codegen.render(self.codegen.cumprod_source(), x.dtype),
+            "cumprod",
+        )
+        block, grid = self._grid("cumprod", work)
+        kernel(
+            (grid,),
+            (block,),
+            (x, out, np.int64(work), np.int64(steps), np.int64(inner)),
+        )
+        return out
+
+    def _axis_of(self, attrs, ndim: int, op: str) -> int:
+        """``axis`` 归一化 + 越界检查；``flip`` / ``roll`` / ``cumprod`` 共用。"""
+        axis = attrs.get("axis", -1)
+        if isinstance(axis, bool) or not isinstance(axis, int):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 的 axis 必须是整数，收到 {axis!r}"
+            )
+        axis = axis + ndim if axis < 0 else axis
+        if not 0 <= axis < ndim:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 {op} 轴越界: {attrs.get('axis')!r}，秩为 {ndim}"
+            )
+        return axis
+
+    def _reorder(self, source, kernel_name: str, x, axis: int, shift):
+        """沿单轴的元素搬运（``flip`` / ``roll`` 共用）：一个线程搬一个元素。
+
+        与 ``tril`` / 逐元素族同一套扁平铺法：``work`` 是整个张量的元素数，
+        内核把线性下标拆成 ``(o, j, i)`` 后只改 ``j``。``shift`` 在这里归一化到
+        ``[0, steps)``——C 的 ``%`` 对负数向零截断，交给内核会得到负下标。
+        """
+        cp = self.cp
+        shape = tuple(int(d) for d in x.shape)
+        steps = shape[axis]
+        inner = int(np.prod(shape[axis + 1 :], dtype=np.int64))
+        work = int(np.prod(shape, dtype=np.int64))
+        out = cp.empty_like(x)
+        if work == 0 or steps == 0:
+            return out
+        extra = () if shift is None else (np.int64(int(shift) % steps),)
+        kernel = self._kernel(
+            (kernel_name, self._kind(x)),
+            lambda: self.codegen.render(source(), x.dtype),
+            kernel_name,
+        )
+        block, grid = self._grid(kernel_name, work)
+        kernel(
+            (grid,),
+            (block,),
+            (x, out, np.int64(work), np.int64(steps), np.int64(inner)) + extra,
+        )
+        return out
+
+    def _op_flip(self, node, args, attrs):
+        """沿单个轴反转：读写下标互为镜像，不需要额外缓冲。"""
+        x = self._contig(args[0])
+        axis = self._axis_of(attrs, x.ndim, "flip")
+        return self._reorder(self.codegen.flip_source, "flip_axis", x, axis, None)
+
+    def _op_roll(self, node, args, attrs):
+        """沿单个轴循环右移；``shift`` 取模后一定是非负的。"""
+        x = self._contig(args[0])
+        axis = self._axis_of(attrs, x.ndim, "roll")
+        shift = attrs.get("shift", 0)
+        if isinstance(shift, bool) or not isinstance(shift, int):
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 roll 的 shift 必须是整数，收到 {shift!r}"
+            )
+        return self._reorder(self.codegen.roll_source, "roll_axis", x, axis, shift)
+
+
     def _op_tril(self, node, args, attrs):
         """最后两维保留下三角、其余置零：一个线程一个元素。
 

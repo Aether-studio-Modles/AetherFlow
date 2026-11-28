@@ -531,6 +531,83 @@ def softmax_axis() -> Kernel:
     )
 
 
+def logsumexp_axis() -> Kernel:
+    """任意单轴 ``logsumexp``：一个线程负责一行，两遍扫描后写一个标量。
+
+    与 ``softmax_axis`` 同一套铺法（行在内存里不连续，一个线程串行扫完整行），
+    但只写**每行一个**结果：``m + log(Σ exp(x - m))``。输出少一维，其展平下标
+    正好是 ``o * inner + i``——也就是 ``softmax_axis`` 的行标识 ``idx``，所以
+    不需要额外的坐标换算。两遍扫描都把读入提到 float，输出按存储类型写回。
+    """
+    base = Bin(
+        "+",
+        Bin("*", Bin("*", Var("o"), Var("reduce_len")), Var("inner")),
+        Var("i"),
+    )
+
+    def at(offset: Expr) -> Expr:
+        return Bin("+", base, Bin("*", Var("r"), Var("inner")))
+
+    return Kernel(
+        name="logsumexp_axis",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "total"),
+            Scalar("long long", "reduce_len"),
+            Scalar("long long", "inner"),
+        ),
+        body=(
+            Let(
+                "long long",
+                "idx",
+                Bin(
+                    "+",
+                    Bin("*", Cast("long long", Axis("bid")), Axis("bdim")),
+                    Axis("tid"),
+                ),
+            ),
+            If(Bin(">=", Var("idx"), Var("total")), (Return(),)),
+            Let("long long", "o", Bin("/", Var("idx"), Var("inner"))),
+            Let("long long", "i", Bin("%", Var("idx"), Var("inner"))),
+            Let("float", "m", Num("-3.4e38f")),
+            For(
+                "r",
+                Num("0"),
+                Var("reduce_len"),
+                Num("1"),
+                (
+                    Let("float", "v", Load("x", at(Num("0")))),
+                    Assign(
+                        Var("m"),
+                        Cond(Bin(">", Var("v"), Var("m")), Var("v"), Var("m")),
+                    ),
+                ),
+                type_name="long long",
+            ),
+            Let("float", "s", Num("0.f")),
+            For(
+                "r",
+                Num("0"),
+                Var("reduce_len"),
+                Num("1"),
+                (
+                    AugAssign(
+                        Var("s"),
+                        "+",
+                        Call(
+                            "expf",
+                            (Bin("-", Load("x", at(Num("0"))), Var("m")),),
+                        ),
+                    ),
+                ),
+                type_name="long long",
+            ),
+            Store("out", Var("idx"), Bin("+", Var("m"), Call("logf", (Var("s"),)))),
+        ),
+    )
+
+
 def argmax_last() -> Kernel:
     """沿最后一维取最大值的下标（i32）。
 
@@ -582,6 +659,72 @@ def argmax_last() -> Kernel:
             Sync(),
             If(
                 Bin("==", Var("best"), Var("m")),
+                (AtomicMin("ibuf", Num("0"), Var("best_i")),),
+            ),
+            Sync(),
+            If(
+                Bin("==", Axis("tid"), Num("0")),
+                (Store("out", Var("row"), Index("ibuf", Num("0")), raw=True),),
+            ),
+        ),
+    )
+
+
+def argmin_last() -> Kernel:
+    """沿最后一维取最小值的下标（i32），与 ``argmax_last`` 同一套两段式。
+
+    预置里只有 ``block_reduce_max``，没有 min 版本：把每线程最小值取负再过
+    最大值归约，得到的 ``-m`` 就是全局最小值——对 IEEE 浮点取负是精确的
+    （含 ``±0``，因为 ``-0 == 0``），不需要为它新增一个块内归约实现。
+    并列最小值同样交给 ``atomicMin`` 取**第一次出现**的下标。
+    """
+    return Kernel(
+        name="argmin_last",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False, type_name="int"),
+            Scalar("long long", "rows"),
+            Scalar("long long", "cols"),
+        ),
+        body=(
+            Let("long long", "row", Axis("bid")),
+            If(Bin(">=", Var("row"), Var("rows")), (Return(),)),
+            Ptr("xr", "x", Bin("*", Var("row"), Var("cols"))),
+            Shared("float", "smem", REDUCE_SCRATCH),
+            Shared("int", "ibuf", 1),
+            Let("float", "best", Num("3.4e38f")),
+            Let("int", "best_i", Num("-1")),
+            For(
+                "i",
+                Axis("tid"),
+                Var("cols"),
+                Axis("bdim"),
+                (
+                    Let("float", "v", Load("xr", Var("i"))),
+                    If(
+                        Bin("<", Var("v"), Var("best")),
+                        (
+                            Assign(Var("best"), Var("v")),
+                            Assign(Var("best_i"), Cast("int", Var("i"))),
+                        ),
+                    ),
+                ),
+            ),
+            Let(
+                "float",
+                "m",
+                Call(
+                    "block_reduce_max",
+                    (Bin("-", Num("0.f"), Var("best")), Var("smem")),
+                ),
+            ),
+            If(
+                Bin("==", Axis("tid"), Num("0")),
+                (Store("ibuf", Num("0"), Cast("int", Var("cols")), raw=True),),
+            ),
+            Sync(),
+            If(
+                Bin("==", Var("best"), Bin("-", Num("0.f"), Var("m"))),
                 (AtomicMin("ibuf", Num("0"), Var("best_i")),),
             ),
             Sync(),

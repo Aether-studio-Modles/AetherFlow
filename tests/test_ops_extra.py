@@ -1407,5 +1407,230 @@ class TestTopK(unittest.TestCase):
             g.add_node("topk_indices", [mask], {"k": 1})
 
 
+class TestSort(unittest.TestCase):
+    """``sort``：只输出值，不输出置换下标。"""
+
+    def test_forward_ascending_middle_axis(self):
+        xs = np.array(
+            [[[3.0, -1.0], [2.0, 5.0], [2.0, 0.0]]], dtype=np.float64
+        )
+        g = Graph("sort_asc")
+        x = g.input("x", f64[1, 3, 2])
+        g.output(g.sort(x, axis=1), "y")
+        np.testing.assert_array_equal(_run(g, {"x": xs})["y"], np.sort(xs, axis=1))
+
+    def test_forward_descending_is_reversed_ascending(self):
+        rng = np.random.default_rng(3)
+        xs = rng.standard_normal((5, 4))
+        xs[0] = xs[1]  # 并列值：降序不能靠"取负再排序"那种会翻转并列顺序的写法
+        g = Graph("sort_desc")
+        x = g.input("x", f64[5, 4])
+        g.output(g.sort(x, axis=0, descending=True), "y")
+        want = np.sort(xs, axis=0)[::-1]
+        np.testing.assert_array_equal(_run(g, {"x": xs})["y"], want)
+
+    def test_has_no_gradient_rule(self):
+        """排序本身在可导路径之外：没有规则时必须明确报错。"""
+        g = Graph("sort_nograd")
+        x = g.input("x", f64[4])
+        g.output(g.sort(x), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[g.find("x")])
+
+    def test_rejects_bad_attrs(self):
+        g = Graph("sort_bad")
+        x = g.input("x", f64[4])
+        with self.assertRaises(TypeError):
+            g.sort(x, descending="yes")
+        with self.assertRaises(ValueError):
+            g.sort(x, axis=(0, 1))
+
+
+class TestArgMin(unittest.TestCase):
+    """``argmin``：输出 i32，并列取第一次出现，不可导。"""
+
+    def test_forward_matches_numpy(self):
+        rng = np.random.default_rng(4)
+        xs = rng.standard_normal((4, 7))
+        g = Graph("argmin_last")
+        x = g.input("x", f64[4, 7])
+        g.output(g.argmin(x), "y")
+        np.testing.assert_array_equal(_run(g, {"x": xs})["y"], np.argmin(xs, axis=1))
+
+    def test_tie_takes_first_occurrence(self):
+        xs = np.array([[2.0, -1.0, -1.0, 4.0], [-9.0, 0.0, -9.0, -9.0]])
+        g = Graph("argmin_tie")
+        x = g.input("x", f64[2, 4])
+        g.output(g.argmin(x, axis=1), "y")
+        np.testing.assert_array_equal(_run(g, {"x": xs})["y"], np.array([1, 0]))
+
+    def test_axis0_keepdims(self):
+        rng = np.random.default_rng(5)
+        xs = rng.standard_normal((3, 4, 5))
+        g = Graph("argmin_axis0")
+        x = g.input("x", f64[3, 4, 5])
+        g.output(g.argmin(x, axis=0, keepdims=True), "y")
+        out = _run(g, {"x": xs})["y"]
+        np.testing.assert_array_equal(out, np.argmin(xs, axis=0)[None, ...])
+
+    def test_has_no_gradient_rule(self):
+        g = Graph("argmin_nograd")
+        x = g.input("x", f64[4])
+        g.output(g.argmin(x), "y")
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[g.find("x")])
+
+
+class TestCumProd(unittest.TestCase):
+    """``cumprod``：含端点前缀积，反向靠伴随扫描而不是除法。"""
+
+    def test_forward_matches_numpy(self):
+        rng = np.random.default_rng(6)
+        xs = rng.standard_normal((2, 4, 3)) * 1.5
+        g = Graph("cumprod")
+        x = g.input("x", f64[2, 4, 3])
+        g.output(g.cumprod(x, axis=1), "y")
+        np.testing.assert_allclose(
+            _run(g, {"x": xs})["y"], np.cumprod(xs, axis=1), rtol=1e-12
+        )
+
+    def test_gradient_matches_numeric(self):
+        rng = np.random.default_rng(7)
+        xs = rng.standard_normal((2, 3, 2))
+        g = Graph("cumprod_grad")
+        x = g.input("x", f64[2, 3, 2])
+        g.output(g.cumprod(x, axis=1), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-7)
+
+    def test_gradient_survives_zeros(self):
+        """含零时闭式解 ``y/x`` 会 0/0；伴随扫描必须仍然给出正确梯度。"""
+        xs = np.array([[0.0, 2.0, 3.0]])
+        g = Graph("cumprod_zero")
+        x = g.input("x", f64[1, 3])
+        g.output(g.cumprod(x, axis=1), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-7)
+        # 手算：sum(y) = x0 + x0*x1 + x0*x1*x2，在 (0, 2, 3) 处为 [9, 0, 0]
+        np.testing.assert_allclose(dx, np.array([[9.0, 0.0, 0.0]]), atol=1e-12)
+
+    def test_axis0_rank3_gradient(self):
+        """非末轴 + 秩 3：转置到时间维再转回来的路径。"""
+        rng = np.random.default_rng(8)
+        xs = rng.standard_normal((3, 2, 2)) * 0.8
+        g = Graph("cumprod_axis0")
+        x = g.input("x", f64[3, 2, 2])
+        g.output(g.cumprod(x, axis=0), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-7)
+
+    def test_rejects_multiple_axes(self):
+        g = Graph("cumprod_bad")
+        x = g.input("x", f64[2, 3])
+        with self.assertRaises(ValueError):
+            g.cumprod(x, axis=(0, 1))
+
+
+class TestFlipRoll(unittest.TestCase):
+    """``flip`` / ``roll``：只搬运元素，形状与 dtype 不变。"""
+
+    def test_flip_forward(self):
+        rng = np.random.default_rng(9)
+        xs = rng.standard_normal((2, 5, 3))
+        g = Graph("flip")
+        x = g.input("x", f64[2, 5, 3])
+        g.output(g.flip(x, axis=1), "y")
+        np.testing.assert_array_equal(_run(g, {"x": xs})["y"], np.flip(xs, axis=1))
+
+    def test_flip_gradient_is_self_adjoint(self):
+        rng = np.random.default_rng(10)
+        xs = rng.standard_normal((3, 4))
+        g = Graph("flip_grad")
+        x = g.input("x", f64[3, 4])
+        g.output(g.flip(x, axis=0), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_array_equal(dx, np.flip(np.ones((3, 4)), axis=0))
+
+    def test_roll_forward_positive_and_negative(self):
+        rng = np.random.default_rng(11)
+        xs = rng.standard_normal((4, 3))
+        for shift in (2, -1, 4):
+            with self.subTest(shift=shift):
+                g = Graph("roll")
+                x = g.input("x", f64[4, 3])
+                g.output(g.roll(x, shift=shift, axis=0), "y")
+                np.testing.assert_array_equal(
+                    _run(g, {"x": xs})["y"], np.roll(xs, shift, axis=0)
+                )
+
+    def test_roll_gradient_shifts_back(self):
+        rng = np.random.default_rng(12)
+        xs = rng.standard_normal((4, 3))
+        g = Graph("roll_grad")
+        x = g.input("x", f64[4, 3])
+        g.output(g.roll(x, shift=1, axis=1), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_array_equal(dx, np.roll(np.ones((4, 3)), -1, axis=1))
+
+    def test_rejects_bad_attrs(self):
+        g = Graph("roll_bad")
+        x = g.input("x", f64[3])
+        with self.assertRaises(TypeError):
+            g.roll(x, shift=1.5)
+        with self.assertRaises(TypeError):
+            g.roll(x, shift=True)
+        with self.assertRaises(ValueError):
+            g.flip(x, axis=2)
+
+
+class TestLogSumExp(unittest.TestCase):
+    """``logsumexp``：稳定化必须在长轴上也成立。"""
+
+    def test_forward_matches_stable_formula(self):
+        rng = np.random.default_rng(13)
+        xs = rng.standard_normal((3, 4, 5)) * 8.0
+        g = Graph("logsumexp")
+        x = g.input("x", f64[3, 4, 5])
+        g.output(g.logsumexp(x, axis=-1), "y")
+        m = np.max(xs, axis=-1, keepdims=True)
+        want = (m + np.log(np.sum(np.exp(xs - m), axis=-1, keepdims=True)))[..., 0]
+        np.testing.assert_allclose(_run(g, {"x": xs})["y"], want, rtol=1e-12)
+
+    def test_large_magnitude_does_not_overflow(self):
+        xs = np.array([[1000.0, 1000.0], [-1000.0, -1000.0]])
+        g = Graph("logsumexp_big")
+        x = g.input("x", f32[2, 2])
+        g.output(g.logsumexp(x, axis=1), "y")
+        out = _run(g, {"x": xs.astype(np.float32)})["y"]
+        np.testing.assert_allclose(out, np.array([1000.0 + np.log(2), -1000.0 + np.log(2)]), rtol=1e-6)
+
+    def test_gradient_matches_numeric_dropped_axis(self):
+        rng = np.random.default_rng(14)
+        xs = rng.standard_normal((3, 4))
+        g = Graph("logsumexp_grad")
+        x = g.input("x", f64[3, 4])
+        g.output(g.logsumexp(x, axis=1, keepdims=False), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        e = np.exp(xs - xs.max(axis=1, keepdims=True))
+        want = e / e.sum(axis=1, keepdims=True)
+        np.testing.assert_allclose(dx, want, rtol=1e-12)
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-7)
+
+    def test_gradient_middle_axis_keepdims(self):
+        rng = np.random.default_rng(15)
+        xs = rng.standard_normal((3, 4, 5))
+        g = Graph("logsumexp_grad_keep")
+        x = g.input("x", f64[3, 4, 5])
+        g.output(g.logsumexp(x, axis=1, keepdims=True), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-7)
+
+    def test_rejects_integer_input(self):
+        g = Graph("logsumexp_int")
+        x = g.input("x", i32[4])
+        with self.assertRaises(TypeError):
+            g.logsumexp(x)
+
+
 if __name__ == "__main__":
     unittest.main()

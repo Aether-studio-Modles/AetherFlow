@@ -344,6 +344,58 @@ class _ReduceMixin:
         kernel((rows,), (block,), (x, out, np.int64(rows), np.int64(cols)))
         return out.reshape(target)
 
+    def _op_argmin(self, node, args, attrs):
+        """任意单轴的 argmin：输出 i32，与 ``argmax`` 逐条同构，只换比较方向。
+
+        非末轴先置换到最后复用末维内核；并列取**第一次出现**的位置（numpy /
+        PyTorch 的约定）。空轴同样拒绝，而不是返回没有定义的 ``-1``。
+        """
+        x = args[0]
+        axis = attrs.get("axis", -1)
+        if isinstance(axis, (tuple, list)):
+            if len(axis) != 1:
+                raise BackendCapabilityError(
+                    f"{self._LABEL}的 argmin 一次只支持一个轴，收到 {axis}"
+                )
+            axis = axis[0]
+        if x.ndim == 0:
+            raise BackendCapabilityError(f"{self._LABEL}的 argmin 需要至少一维")
+        axis = int(axis) % x.ndim
+        keepdims = bool(attrs.get("keepdims", False))
+        if axis == x.ndim - 1:
+            return self._argmin_last(x, keepdims)
+        shape = tuple(int(d) for d in x.shape)
+        perm = tuple(i for i in range(x.ndim) if i != axis) + (axis,)
+        flat = self.cp.ascontiguousarray(self.cp.transpose(self._contig(x), perm))
+        out = self._argmin_last(flat, False)
+        target = (
+            tuple(1 if i == axis else shape[i] for i in range(x.ndim))
+            if keepdims
+            else tuple(shape[i] for i in range(x.ndim) if i != axis)
+        )
+        return out.reshape(target)
+
+    def _argmin_last(self, x, keepdims: bool):
+        cp = self.cp
+        rows, cols = self._last_dim_2d(x, "argmin")
+        if cols == 0:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 argmin 不能对空轴归约（形状 {x.shape}）"
+            )
+        target = x.shape[:-1] + ((1,) if keepdims else ())
+        out = cp.empty(rows, dtype=cp.int32)
+        if out.size == 0:
+            return out.reshape(target)
+        dtype_key = self._kind(x)
+        kernel = self._kernel(
+            ("argmin", dtype_key),
+            lambda: self.codegen.render(self.codegen.argmin_source(), x.dtype),
+            "argmin_last",
+        )
+        block = self._reduce_block("argmin", cols)
+        kernel((rows,), (block,), (x, out, np.int64(rows), np.int64(cols)))
+        return out.reshape(target)
+
     # -- topk ---------------------------------------------------------
     #
     # 三个算子共用一份内核（``topk_source``）：一个 block 处理一行，``k`` 轮

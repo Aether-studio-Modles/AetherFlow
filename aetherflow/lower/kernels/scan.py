@@ -200,6 +200,159 @@ def cumsum() -> Kernel:
     )
 
 
+def cumprod() -> Kernel:
+    """沿单个轴的前缀积：与 ``cumsum`` 同构，初值 1、每步相乘。
+
+    铺法与 ``cumsum`` 完全一致（``(outer, steps, inner)`` 三元切分，一个线程
+    负责一条 ``(o, i)`` 链），只有累加器换成累乘。累乘同样在 ``float`` 里做：
+    前缀积每一步都是最终输出，f16 逐项累乘会先溢出再失真。``x`` 含零或负值时
+    结果不单调，但那是语义本身，内核不需要特判。
+    """
+    return Kernel(
+        name="cumprod",
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "work"),
+            Scalar("long long", "steps"),
+            Scalar("long long", "inner"),
+        ),
+        body=_flat_loop(
+            (
+                Let("const long long", "o", Bin("/", Var("idx"), Var("inner"))),
+                Let("const long long", "j", Bin("%", Var("idx"), Var("inner"))),
+                Let(
+                    "const long long",
+                    "base",
+                    Bin(
+                        "+",
+                        Bin(
+                            "*",
+                            Var("o"),
+                            Bin("*", Var("steps"), Var("inner")),
+                        ),
+                        Var("j"),
+                    ),
+                ),
+                Let("float", "acc", Num("1.f")),
+                For(
+                    "t",
+                    Num("0"),
+                    Var("steps"),
+                    Num("1"),
+                    (
+                        Let(
+                            "const long long",
+                            "pos",
+                            Bin(
+                                "+",
+                                Var("base"),
+                                Bin("*", Var("t"), Var("inner")),
+                            ),
+                        ),
+                        Assign(
+                            Var("acc"),
+                            Bin("*", Var("acc"), Load("x", Var("pos"))),
+                        ),
+                        Store("out", Var("pos"), Var("acc")),
+                    ),
+                    incr="++",
+                ),
+            ),
+            index="idx",
+            count="work",
+            stride="step",
+        ),
+    )
+
+
+def _reorder_axis(name: str, extra_params: tuple, map_j) -> Kernel:
+    """沿单个轴的元素搬运：``out[idx] = x[src(idx)]``，一个线程一个元素。
+
+    输出线性下标拆成 ``(o, j, i)``，与 ``(outer, steps, inner)`` 对应；只有
+    ``j`` 被 ``map_j`` 换掉。读和写都是连续路径上的同一位置，不需要 shared。
+    改写后的 ``j`` 由调用方保证落在 ``[0, steps)``——越界会读出别的 ``o`` 段，
+    所以 ``roll`` 的 ``shift`` 在 host 就归一化好再传进来。
+    """
+    def plane():
+        # L2 打印二元表达式时不自动补括号（``cstyle._expr`` 按原样展开），
+        # 而 ``/`` 与 ``*`` 同优先级左结合，``idx / steps * inner`` 会算成
+        # ``(idx / steps) * inner``。这里必须显式 Paren。
+        return Paren(Bin("*", Var("steps"), Var("inner")))
+
+    return Kernel(
+        name=name,
+        params=(
+            Tensor("x"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "work"),
+            Scalar("long long", "steps"),
+            Scalar("long long", "inner"),
+        )
+        + extra_params,
+        body=_flat_loop(
+            (
+                Let("const long long", "o", Bin("/", Var("idx"), plane())),
+                Let("const long long", "rem", Bin("%", Var("idx"), plane())),
+                Let("const long long", "j", Bin("/", Var("rem"), Var("inner"))),
+                Let("const long long", "i", Bin("%", Var("rem"), Var("inner"))),
+                Let(
+                    "const long long",
+                    "src",
+                    Bin(
+                        "+",
+                        Bin(
+                            "*",
+                            # 同上：``o * steps + j`` 必须先成组再乘 ``inner``。
+                            Paren(
+                                Bin(
+                                    "+",
+                                    Bin("*", Var("o"), Var("steps")),
+                                    map_j(Var("j")),
+                                )
+                            ),
+                            Var("inner"),
+                        ),
+                        Var("i"),
+                    ),
+                ),
+                Store("out", Var("idx"), Load("x", Var("src"))),
+            ),
+            index="idx",
+            count="work",
+            stride="step",
+        ),
+    )
+
+
+def flip() -> Kernel:
+    """沿单个轴反转：``j -> steps - 1 - j``。反转是自伴的，同一份内核也跑反向。"""
+    return _reorder_axis(
+        "flip_axis",
+        (),
+        lambda j: Bin("-", Bin("-", Var("steps"), Num("1")), j),
+    )
+
+
+def roll() -> Kernel:
+    """沿单个轴循环右移：``j -> (j + shift) % steps``。
+
+    ``shift`` 由 host 归一化到 ``[0, steps)``：C 的 ``%`` 对负数向零截断，
+    传负值会得到负下标并读到别的 ``o`` 段，所以不在内核里做归一化。
+    """
+    return _reorder_axis(
+        "roll_axis",
+        (Scalar("long long", "shift"),),
+        lambda j: Bin(
+            "%",
+            # ``(j + shift) % steps``：``%`` 优先级高于 ``+``，不括起来会算成
+            # ``j + (shift % steps)``。
+            Paren(Bin("+", j, Var("shift"))),
+            Var("steps"),
+        ),
+    )
+
+
 def tril() -> Kernel:
     """最后两维的下三角掩码：一个线程一个元素。
 

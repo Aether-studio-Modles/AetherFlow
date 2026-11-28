@@ -3760,6 +3760,56 @@ register(
 )
 
 
+def _infer_logsumexp(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"logsumexp 需要 1 个输入，得到 {len(inputs)}")
+    t = inputs[0]
+    if not t.dtype.is_float:
+        raise TypeError(
+            f"logsumexp 只接受浮点输入，得到 {t.dtype.value}："
+            "整数上的 exp / log 会先在 dtype 上截断，结果不是这个算子承诺的值"
+        )
+    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+    if len(axes) != 1:
+        raise ValueError(f"logsumexp 只接受一个轴，得到 {axes}")
+    if attrs.get("keepdims", False):
+        shape = tuple(1 if i in axes else d for i, d in enumerate(t.shape))
+    else:
+        shape = tuple(d for i, d in enumerate(t.shape) if i not in axes)
+    return TensorType(t.dtype, shape)
+
+
+def _ref_logsumexp(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """log(sum(exp(x))) 的数值稳定实现：先减最大值再算。
+
+    直接 ``np.log(np.sum(np.exp(x)))`` 在 x 含 90 以上的数时先溢出成 inf，
+    在 x 全为 -100 时先下溢成 log(0)= -inf；减最大值后两种情形都回到正常区间。
+    f16 在 float32 里算，理由同 ``cumsum``。
+    """
+    x = args[0]
+    axis = _norm_axes(attrs.get("axis", -1), x.ndim)[0]
+    work = x.astype(np.float32) if x.dtype == np.float16 else x
+    keep = attrs.get("keepdims", False)
+    m = np.max(work, axis=axis, keepdims=True)
+    out = m + np.log(np.sum(np.exp(work - m), axis=axis, keepdims=True))
+    if not keep:
+        out = np.squeeze(out, axis=axis)
+    return out.astype(x.dtype, copy=False)
+
+
+register(
+    Op(
+        name="logsumexp",
+        infer=_infer_logsumexp,
+        reference=_ref_logsumexp,
+        attrs_schema=("axis", "keepdims"),
+        doc="沿单个轴的 log(sum(exp(x)))，先减最大值保证不溢出 / 不下溢；"
+        "反向是 g 乘同轴 softmax（不需要单独的反向内核）。与 softmax 不重复："
+        "后者归一化成概率，这里保留绝对量级（配分函数的对数）",
+    )
+)
+
+
 def _infer_attention(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (3, 4):
         raise ValueError(f"attention 需要 3 或 4 个输入（q, k, v[, mask]），得到 {len(inputs)}")
@@ -4183,6 +4233,81 @@ register(
 )
 
 
+def _infer_argmin(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"argmin 需要 1 个输入，得到 {len(inputs)}")
+    t = inputs[0]
+    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+    if len(axes) != 1:
+        raise ValueError(f"argmin 只接受一个轴，得到 {axes}")
+    if attrs.get("keepdims", False):
+        shape = tuple(1 if i in axes else d for i, d in enumerate(t.shape))
+    else:
+        shape = tuple(d for i, d in enumerate(t.shape) if i not in axes)
+    return TensorType(DType.I32, shape)
+
+
+def _ref_argmin(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """沿单个轴取最小值的下标；并列取**第一个**（与 numpy / PyTorch 一致）。"""
+    axis = _norm_axes(attrs.get("axis", -1), args[0].ndim)[0]
+    out = np.argmin(args[0], axis=axis)
+    if attrs.get("keepdims", False):
+        out = np.expand_dims(out, axis)
+    return out.astype(np.int32)
+
+
+register(
+    Op(
+        name="argmin",
+        infer=_infer_argmin,
+        reference=_ref_argmin,
+        attrs_schema=("axis", "keepdims"),
+        doc="沿单个轴取最小值的下标，输出 i32（并列取第一个）。与 argmax 同构、"
+        "不可导：索引不是连续量，接进损失会在 backward 时明确报错",
+    )
+)
+
+
+def _infer_sort(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"sort 需要 1 个输入，得到 {len(inputs)}")
+    t = inputs[0]
+    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+    if len(axes) != 1:
+        raise ValueError(f"sort 只接受一个轴，得到 {axes}")
+    # descending 拼错成字符串会让参考实现静默按 False 走，所以钉住类型。
+    desc = attrs.get("descending", False)
+    if not isinstance(desc, bool):
+        raise TypeError(f"sort 的 descending 必须是 bool，得到 {desc!r}")
+    return t
+
+
+def _ref_sort(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """沿单个轴升序（或降序）排序，**不返回置换下标**。
+
+    只给值不给下标，是因为下标是整数、接进损失没有意义；需要下标请用
+    ``topk_indices`` / ``argmax``。NaN 的位置随 numpy 的 ``sort``：升序时在末尾，
+    降序时（整体反转）在最前面。
+    """
+    axis = _norm_axes(attrs.get("axis", -1), args[0].ndim)[0]
+    out = np.sort(args[0], axis=axis)
+    if attrs.get("descending", False):
+        out = np.flip(out, axis=axis)
+    return out
+
+
+register(
+    Op(
+        name="sort",
+        infer=_infer_sort,
+        reference=_ref_sort,
+        attrs_schema=("axis", "descending"),
+        doc="沿单个轴排序（升序 / 降序），只输出值。不可导：没有置换下标就无从把"
+        "梯度搬回原位置，接进损失会在 backward 时明确报错",
+    )
+)
+
+
 # --------------------------------------------------------------------------
 # 前缀和 / 三角掩码
 # --------------------------------------------------------------------------
@@ -4220,6 +4345,103 @@ register(
         "（数值稳定性的命脉）与因果累积均值都靠它。与 scan_linear 不重复："
         "后者是 a_t 可变的递归，这里是 a_t == 1 的纯累加，后端可以按纯前缀和"
         "优化（分块 / 并行），不必套进递归的串行骨架",
+    )
+)
+
+
+def _infer_cumprod(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"cumprod 需要 1 个输入，得到 {len(inputs)}")
+    axes = _norm_axes(attrs.get("axis", -1), inputs[0].rank)
+    if len(axes) != 1:
+        raise ValueError(f"cumprod 只接受一个轴，得到 {axes}")
+    return inputs[0]
+
+
+def _ref_cumprod(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """沿单个轴的**含端点**前缀积。
+
+    f16 在 float32 里累乘，理由与 ``cumsum`` 相同：每一步都是最终输出，
+    逐项 f16 累乘会先溢出再失真。
+    """
+    x = args[0]
+    axis = _norm_axes(attrs.get("axis", -1), x.ndim)[0]
+    work = x.astype(np.float32) if x.dtype == np.float16 else x
+    return np.cumprod(work, axis=axis).astype(x.dtype, copy=False)
+
+
+register(
+    Op(
+        name="cumprod",
+        infer=_infer_cumprod,
+        reference=_ref_cumprod,
+        attrs_schema=("axis",),
+        doc="沿单个轴的含端点前缀积；衰减因子的连乘轨迹（如逐帧的 α^t 权重）"
+        "用它比显式幂次更稳。反向由伴随扫描给出：dx = exclusive_cumprod(x) * "
+        "scan_linear_backward(x, g)，不在乘法链上做除法，所以 x 含零也成立",
+    )
+)
+
+
+# --------------------------------------------------------------------------
+# 重排：flip / roll（逐元素搬运，不改变形状与 dtype）
+# --------------------------------------------------------------------------
+
+
+def _infer_flip(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"flip 需要 1 个输入，得到 {len(inputs)}")
+    t = inputs[0]
+    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+    if len(axes) != 1:
+        raise ValueError(f"flip 只接受一个轴，得到 {axes}")
+    return t
+
+
+def _ref_flip(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    axis = _norm_axes(attrs.get("axis", -1), args[0].ndim)[0]
+    return np.flip(args[0], axis=axis).copy()
+
+
+register(
+    Op(
+        name="flip",
+        infer=_infer_flip,
+        reference=_ref_flip,
+        attrs_schema=("axis",),
+        doc="沿单个轴反转；形状与 dtype 不变。反向是同一个算子（反转自伴）；"
+        "cumprod 的伴随扫描与自回归的倒序展开都靠它",
+    )
+)
+
+
+def _infer_roll(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) != 1:
+        raise ValueError(f"roll 需要 1 个输入，得到 {len(inputs)}")
+    t = inputs[0]
+    axes = _norm_axes(attrs.get("axis", -1), t.rank)
+    if len(axes) != 1:
+        raise ValueError(f"roll 只接受一个轴，得到 {axes}")
+    shift = attrs.get("shift", 0)
+    if isinstance(shift, bool) or not isinstance(shift, int):
+        raise TypeError(f"roll 的 shift 必须是整数，得到 {shift!r}")
+    return t
+
+
+def _ref_roll(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """沿单个轴循环移位；``shift`` 为负时向反方向移位（numpy 语义）。"""
+    axis = _norm_axes(attrs.get("axis", -1), args[0].ndim)[0]
+    return np.roll(args[0], int(attrs.get("shift", 0)), axis=axis).copy()
+
+
+register(
+    Op(
+        name="roll",
+        infer=_infer_roll,
+        reference=_ref_roll,
+        attrs_schema=("shift", "axis"),
+        doc="沿单个轴循环移位，shift 可正可负（numpy 语义）。反向是 shift 取负的"
+        "同一个算子；滑动窗口的相位对齐与周期填充都靠它",
     )
 )
 

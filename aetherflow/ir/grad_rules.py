@@ -497,9 +497,11 @@ def _scan_linear(ctx):
 def _cumsum(ctx):
     """含端点前缀和的反向：``dx_i = Σ_{j >= i} g_j``（后缀和）。
 
-    没有 ``flip`` 原语，用恒等式 ``后缀和 = 总和 - 不含端点前缀和`` 拼出来：
-    ``exclusive = shift(cumsum(g))``，其中 shift 是 ``pad + slice``——与
-    ``scan_linear`` 反向里的平移同一个手段，不引入新原语。
+    用恒等式 ``后缀和 = 总和 - 不含端点前缀和`` 拼出来：``exclusive =
+    shift(cumsum(g))``，其中 shift 是 ``pad + slice``——与 ``scan_linear``
+    反向里的平移同一个手段。``flip`` 在 5.349 之后已经可用（反转 -> 前缀和
+    -> 反转同样能表达后缀和），但这里保留原写法：它不依赖新原语，反向图
+    的形态也已被现有测试钉住。
 
     ``axis`` 的长度必须静态：pad 的补零宽度要写进输出类型。这与
     ``scan_linear`` 要求静态时间维是同一条约束，报错点也一致。
@@ -518,6 +520,75 @@ def _cumsum(ctx):
     )
     full = b.add_node("broadcast_to", [total], {"shape": list(shape)})
     return (b.add_node("sub", [full, excl]),)
+
+
+@vjp("cumprod")
+def _cumprod(ctx):
+    """含端点前缀积的反向：``dx_i = (∏_{s<i} x_s) · Σ_{t>=i} g_t ∏_{s=i+1..t} x_s``。
+
+    前半是**不含端点**的前缀积（前面补一个 1 再 cumprod，切掉最后一个），
+    后半正是线性递归的伴随 ``dh_t = g_t + x_{t+1}·dh_{t+1}``，直接复用
+    ``scan_linear_backward``。刻意不写 ``y_t / x_i`` 那条闭式解：x 含零时它会
+    变成 0/0，而伴随扫描只做乘加，含零也成立。
+
+    ``scan_linear_backward`` 的时间维固定在 0 且要求秩 >= 2，所以先把目标轴
+    转置到最前、一维情形补成 ``(T, 1)``；这两步都要求该轴长度静态，报错点与
+    ``cumsum`` / ``scan_linear`` 一致。
+    """
+    b, g = ctx.b, ctx.g
+    x = ctx.input(0)
+    dtype = x.type.dtype
+    shape = _static(x, "cumprod")
+    r = len(shape)
+    raw = ctx.attrs.get("axis", -1)
+    axis = int(raw[0] if isinstance(raw, (list, tuple)) else raw) % r
+    steps = shape[axis]
+
+    perm = [axis] + [i for i in range(r) if i != axis]
+    if perm != list(range(r)):
+        x = b.add_node("transpose", [x], {"perm": perm})
+        g = b.add_node("transpose", [g], {"perm": perm})
+    if r == 1:
+        x = b.add_node("reshape", [x], {"shape": [steps, 1]})
+        g = b.add_node("reshape", [g], {"shape": [steps, 1]})
+    inner = [int(d) for d in x.type.shape[1:]]
+
+    ones = _expand_to(b, _const(b, 1.0, dtype), [1] + inner)
+    ext = b.add_node("concat", [ones, x], {"axis": 0})
+    excl = b.add_node(
+        "slice",
+        [b.add_node("cumprod", [ext], {"axis": 0})],
+        {"dim": 0, "start": 0, "stop": steps},
+    )
+    adj = b.add_node("scan_linear_backward", [x, g])
+    dx = b.add_node("mul", [excl, adj])
+
+    if r == 1:
+        return (b.add_node("reshape", [dx], {"shape": [steps]}),)
+    if perm != list(range(r)):
+        inv = [0] * r
+        for pos, src in enumerate(perm):
+            inv[src] = pos
+        dx = b.add_node("transpose", [dx], {"perm": inv})
+    return (dx,)
+
+
+@vjp("flip")
+def _flip(ctx):
+    """反转是自伴的：把梯度沿同一轴再反转一次就回到输入的坐标系。"""
+    return (ctx.b.add_node("flip", [ctx.g], {"axis": int(ctx.attrs.get("axis", -1))}),)
+
+
+@vjp("roll")
+def _roll(ctx):
+    """移位是可逆的：``dx = roll(g, -shift)``，不需要重新分配任何缓冲。"""
+    return (
+        ctx.b.add_node(
+            "roll",
+            [ctx.g],
+            {"shift": -int(ctx.attrs.get("shift", 0)), "axis": int(ctx.attrs.get("axis", -1))},
+        ),
+    )
 
 
 @vjp("tril")
@@ -781,6 +852,27 @@ def _softmax(ctx):
         # 训练时不应更新它（ADR-010 的融合只发生在推理图里）。
         return (b.add_node("mul", [dx, ctx.input(1)]), None)
     return (dx,)
+
+
+@vjp("logsumexp")
+def _logsumexp(ctx):
+    """``dx = g ⊙ softmax(x, axis)``。
+
+    ``d/dx_j log(Σ exp(x)) = exp(x_j) / Σ exp(x)``，也就是同轴 softmax；
+    数值稳定性由 softmax 自己的减最大值负责，这里不需要再减一次。``keepdims``
+    为假时 ``g`` 少一维，先 reshape 把那一维补回 1 再广播——不能直接
+    ``broadcast_to``：目标形状中间多出的维度按右对齐规则对不上。
+    """
+    b, g = ctx.b, ctx.g
+    x = ctx.input(0)
+    axis = int(ctx.attrs.get("axis", -1)) % x.type.rank
+    s = b.add_node("softmax", [x], {"axis": axis})
+    if not ctx.attrs.get("keepdims", False):
+        shape = list(g.type.shape)
+        shape.insert(axis, 1)
+        g = b.add_node("reshape", [g], {"shape": shape})
+    g = b.add_node("broadcast_to", [g], {"shape": list(x.type.shape)})
+    return (b.add_node("mul", [g, s]),)
 
 
 def _sum_to_mask(b, ds, mask):

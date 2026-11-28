@@ -84,6 +84,54 @@ class _AttentionMixin:
         )
         return out
 
+    def _op_logsumexp(self, node, args, attrs):
+        """任意单轴 ``logsumexp``：一个线程扫完一行，每行写一个标量。
+
+        与 ``_softmax_any_axis`` 同一套 ``(outer, reduce, inner)`` 切分，但末维
+        也走这条路——输出比输入小 ``steps`` 倍，不存在"每行写回整行"的合并
+        访问问题，没必要再为末维单独做块内归约。输出展平后下标恰是
+        ``o * inner + i``，``keepdims`` 只改形状不改顺序，两种情形共用一个内核。
+
+        沿空轴没有定义（空和的对数是 ``-inf``），在边界拒绝。
+        """
+        cp = self.cp
+        x = self._contig(args[0])
+        if x.ndim == 0:
+            raise BackendCapabilityError(f"{self._LABEL}的 logsumexp 需要至少一维")
+        axis = int(attrs.get("axis", -1)) % x.ndim
+        shape = tuple(int(dim) for dim in x.shape)
+        outer = 1
+        for dim in shape[:axis]:
+            outer *= dim
+        reduce_len = shape[axis]
+        inner = 1
+        for dim in shape[axis + 1 :]:
+            inner *= dim
+        if reduce_len == 0:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 logsumexp 不能沿空轴归约（形状 {shape}，axis={axis}）"
+            )
+        if attrs.get("keepdims", False):
+            out_shape = shape[:axis] + (1,) + shape[axis + 1 :]
+        else:
+            out_shape = shape[:axis] + shape[axis + 1 :]
+        out = cp.empty(out_shape, dtype=x.dtype)
+        total = outer * inner
+        if total == 0:
+            return out
+        kernel = self._kernel(
+            ("logsumexp", self._kind(x)),
+            lambda: self.codegen.render(self.codegen.logsumexp_source(), x.dtype),
+            "logsumexp_axis",
+        )
+        block = self._reduce_block("logsumexp", total)
+        kernel(
+            (cdiv(total, block),),
+            (block,),
+            (x, out, np.int64(total), np.int64(reduce_len), np.int64(inner)),
+        )
+        return out
+
     def _op_attention(self, node, args, attrs):
         """融合注意力前向：分块 online softmax，不物化 ``(S, T)`` 分数矩阵。
 

@@ -132,6 +132,10 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "reduce_any",
         "reduce_all",
         "argmax",
+        # 5.349：argmin 与 argmax 同构（并列取第一次出现），设备端多一份内核；
+        # ``sort`` 刻意不在这里——设备排序需要 bitonic + shared 或库内核，
+        # 拿 O(n²) 的串行实现凑数不如明确拒绝（见 DESIGN 5.349）。
+        "argmin",
         "topk_values",
         "topk_indices",
         "topk_mask",
@@ -162,6 +166,10 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "scan_linear",
         "scan_linear_backward",
         "cumsum",
+        "cumprod",
+        "flip",
+        "roll",
+        "logsumexp",
         "tril",
         "clamp",
         "mod",
@@ -1019,6 +1027,8 @@ _REDUCE_TUNABLE_OPS: FrozenSet[str] = frozenset(
         "reduce_max",
         "reduce_mean",
         "argmax",
+        "argmin",
+        "logsumexp",
         "topk_values",
         "topk_indices",
         "topk_mask",

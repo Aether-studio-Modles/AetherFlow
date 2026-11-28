@@ -1270,6 +1270,88 @@ def _tril(shape: tuple = (2, 5, 5), diagonal: int = -1):
     return build
 
 
+def _signed(rng, shape: tuple, axis: int, scale: float = 1.5):
+    """沿 ``axis`` 交替正负的随机张量：前缀积的符号会翻转，能压出只乘不加的错。"""
+    x = _f32(rng, shape, scale=scale)
+    pattern = np.where(np.arange(shape[axis]) % 2 == 0, 1.0, -1.0).astype(np.float32)
+    bshape = [1] * len(shape)
+    bshape[axis] = shape[axis]
+    return (x * pattern.reshape(bshape)).astype(np.float32)
+
+
+def _cumprod(shape: tuple = (2, 4, 3), axis: int = 1):
+    def build(rng):
+        g = Graph("cumprod")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("cumprod", [x], {"axis": axis}), "y")
+        # 中间轴 + 交替符号：既压到 outer/inner 两侧的折维，也让符号翻转暴露出来
+        return g, {"x": _signed(rng, shape, axis)}
+
+    return build
+
+
+def _flip(shape: tuple = (2, 5, 3), axis: int = 1):
+    def build(rng):
+        g = Graph("flip")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("flip", [x], {"axis": axis}), "y")
+        # 中间轴：反转必须只发生在 steps 段内，不能把 outer/inner 一起翻掉
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
+def _roll(shape: tuple = (2, 5, 3), axis: int = 1, shift: int = 2):
+    def build(rng):
+        g = Graph("roll")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("roll", [x], {"shift": shift, "axis": axis}), "y")
+        # 非零且非整圈的移位 + 中间轴，能同时检验模运算与段边界
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
+def _argmin(axis: int = -1, keepdims: bool = False, shape: tuple = (4, 7)):
+    def build(rng):
+        g = Graph("argmin")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("argmin", [x], {"axis": axis, "keepdims": keepdims}), "y")
+        # 刻意造并列最小值：argmin 必须取第一次出现，比较方向写反会露馅
+        feed = _f32(rng, shape)
+        if axis in (-1, 1) and shape[-1] > 1:
+            feed[0, 1] = feed[0, 0] = -3.5
+        return g, {"x": feed}
+
+    return build
+
+
+def _sort(shape: tuple = (4, 7), axis: int = -1, descending: bool = False):
+    def build(rng):
+        g = Graph("sort")
+        x = g.input("x", f32[shape])
+        g.output(g.add_node("sort", [x], {"axis": axis, "descending": descending}), "y")
+        # 造重复值：稳定性与"并列怎么排"是排序最容易写错的地方
+        feed = _f32(rng, shape)
+        feed[..., 0] = feed[..., 1]
+        return g, {"x": feed}
+
+    return build
+
+
+def _logsumexp(shape: tuple = (3, 4, 5), axis: int = -1, keepdims: bool = False):
+    def build(rng):
+        g = Graph("logsumexp")
+        x = g.input("x", f32[shape])
+        g.output(
+            g.add_node("logsumexp", [x], {"axis": axis, "keepdims": keepdims}), "y"
+        )
+        # 幅度 8：exp 会溢出 float32 的朴素写法在这里必然爆掉，减最大值必须生效
+        return g, {"x": _f32(rng, shape, scale=8.0)}
+
+    return build
+
+
 def _clamp(lo=None, hi=None, shape: tuple = (5, 7)):
     def build(rng):
         g = Graph("clamp")
@@ -1939,6 +2021,14 @@ def default_cases() -> List[Case]:
               note="伴随递归：从后往前累积，是 scan_linear 反向的唯一手段"),
         _case("cumsum", _cumsum(),
               note="非末轴前缀和：折成 (outer, steps, inner) 后并行链数来自 outer*inner"),
+        _case("cumprod", _cumprod(),
+              note="非末轴前缀积：与 cumsum 同铺法，交替符号检验乘而不是加"),
+        _case("flip", _flip(),
+              note="中间轴反转：只改 steps 段内的坐标，outer/inner 段偏移必须原样"),
+        _case("roll", _roll(),
+              note="中间轴循环右移：模运算与段边界，shift 由 host 归一化"),
+        _case("roll_negative", _roll(shape=(3, 4), axis=0, shift=-1),
+              note="负移位：host 先取模再传内核，不能把负下标带进去"),
         _case("tril", _tril(),
               note="前导维逐片独立；negative diagonal 覆盖对角线以下才保留的情况"),
         # 数值稳定（SSM）与整数哈希（Engram）
@@ -2164,6 +2254,19 @@ def default_cases() -> List[Case]:
               note="任意单轴：非末轴先置换到最后再复用同一个内核，下标语义不变"),
         _case("argmax_axis1_keepdims", _argmax(axis=1, keepdims=True, shape=(3, 4, 5)),
               rtol=0.0, atol=0.0),
+        _case("argmin_last", _argmin(), rtol=0.0, atol=0.0,
+              note="输出 i32 下标：必须精确相等，并列时取第一次出现"),
+        _case("argmin_keepdims", _argmin(keepdims=True), rtol=0.0, atol=0.0),
+        _case("argmin_axis0", _argmin(axis=0, shape=(4, 7)), rtol=0.0, atol=0.0,
+              note="任意单轴：非末轴先置换到最后，下标语义不变"),
+        _case("sort_ascending", _sort(),
+              note="只输出值、不输出下标：因此排序不可导，反向必须报规则缺失"),
+        _case("sort_descending_axis0", _sort(shape=(5, 3), axis=0, descending=True),
+              note="降序 + 非末轴：反转必须只发生在目标轴上"),
+        _case("logsumexp_last", _logsumexp(),
+              note="幅度 8：不减最大值的朴素 exp 会溢出，稳定化必须生效"),
+        _case("logsumexp_axis1_keepdims", _logsumexp(shape=(3, 4, 5), axis=1, keepdims=True),
+              note="中间轴 + keepdims：输出该维为 1，展平顺序不变"),
         _case("topk_mask_last", _topk_mask(), rtol=0.0, atol=0.0,
               note="路由掩码：输出 0/1，必须精确相等；同值按下标小者优先（稳定排序）"),
         _case("topk_mask_axis0", _topk_mask(k=1, axis=0, shape=(4, 3)),
