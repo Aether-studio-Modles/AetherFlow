@@ -440,18 +440,21 @@ class _PoolMixin:
             return out
 
         if mode == "nearest":
-            name = "interpolate_nearest"
+            key = func = "interpolate_nearest"
             source = self.codegen.interpolate_nearest_source
             render = lambda: self.codegen.render(source(), x.dtype)  # noqa: E731
         else:
-            name = "interpolate_bilinear" + ("_ac" if align else "_half")
+            # 两个 align_corners 口径各编译一份：缓存键带后缀，但源码里的
+            # extern "C" 符号名是同一个（每个变体独立模块），取函数要用它。
+            key = "interpolate_bilinear" + ("_ac" if align else "_half")
+            func = "interpolate_bilinear"
             render = lambda: self.codegen.render(  # noqa: E731
                 self.codegen.interpolate_bilinear_source(align), x.dtype
             )
 
         dtype_key = self._kind(x)
-        kernel = self._kernel((name, dtype_key), render, name)
-        block, grid = self._grid(name, total)
+        kernel = self._kernel((key, dtype_key), render, func)
+        block, grid = self._grid(key, total)
         kernel(
             (grid,),
             (block,),
@@ -495,19 +498,20 @@ class _PoolMixin:
             return dx
 
         if mode == "nearest":
-            name = "interpolate_nearest_backward"
+            key = func = "interpolate_nearest_backward"
             render = lambda: self.codegen.render(  # noqa: E731
                 self.codegen.interpolate_nearest_backward_source(), dy.dtype
             )
         else:
-            name = "interpolate_bilinear_backward" + ("_ac" if align else "_half")
+            key = "interpolate_bilinear_backward" + ("_ac" if align else "_half")
+            func = "interpolate_bilinear_backward"
             render = lambda: self.codegen.render(  # noqa: E731
                 self.codegen.interpolate_bilinear_backward_source(align), dy.dtype
             )
 
         dtype_key = self._kind(dy)
-        kernel = self._kernel((name, dtype_key), render, name)
-        block, grid = self._grid(name, total)
+        kernel = self._kernel((key, dtype_key), render, func)
+        block, grid = self._grid(key, total)
         kernel(
             (grid,),
             (block,),

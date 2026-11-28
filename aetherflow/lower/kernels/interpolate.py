@@ -239,7 +239,11 @@ def interpolate_nearest() -> Kernel:
                 _image_slice("x"),
                 _nearest_index("ih", "oh", "H", "OH"),
                 _nearest_index("iw", "ow", "W", "OW"),
-                Store("out", Var("idx"), _tap_at(Var("ih"), Var("iw"))),
+                Store(
+                    "out",
+                    Var("idx"),
+                    Load("base", _tap_at(Var("ih"), Var("iw")).index),
+                ),
             )
         ),
     )
@@ -263,26 +267,26 @@ def interpolate_bilinear(*, align_corners: bool) -> Kernel:
             "+",
             Bin(
                 "*",
-                Var("a"),
-                _tap_at(Var("hi0"), Var("wi0")),
+                Var("wa"),
+                Load("base", _tap_at(Var("hi0"), Var("wi0")).index),
             ),
             Bin(
                 "*",
-                Var("b"),
-                _tap_at(Var("hi0"), Var("wi1")),
+                Var("wb"),
+                Load("base", _tap_at(Var("hi0"), Var("wi1")).index),
             ),
         ),
         Bin(
             "+",
             Bin(
                 "*",
-                Var("c"),
-                _tap_at(Var("hi1"), Var("wi0")),
+                Var("wc"),
+                Load("base", _tap_at(Var("hi1"), Var("wi0")).index),
             ),
             Bin(
                 "*",
-                Var("d"),
-                _tap_at(Var("hi1"), Var("wi1")),
+                Var("wd"),
+                Load("base", _tap_at(Var("hi1"), Var("wi1")).index),
             ),
         ),
     )
@@ -305,10 +309,10 @@ def interpolate_bilinear(*, align_corners: bool) -> Kernel:
                     "lw0",
                     Bin("-", Num("1.f"), Var("wilam")),
                 ),
-                Let("float", "a", Bin("*", Var("lh0"), Var("lw0"))),
-                Let("float", "b", Bin("*", Var("lh0"), Var("wilam"))),
-                Let("float", "c", Bin("*", Var("hilam"), Var("lw0"))),
-                Let("float", "d", Bin("*", Var("hilam"), Var("wilam"))),
+                Let("float", "wa", Bin("*", Var("lh0"), Var("lw0"))),
+                Let("float", "wb", Bin("*", Var("lh0"), Var("wilam"))),
+                Let("float", "wc", Bin("*", Var("hilam"), Var("lw0"))),
+                Let("float", "wd", Bin("*", Var("hilam"), Var("wilam"))),
                 Store("out", Var("idx"), acc),
             )
         ),
