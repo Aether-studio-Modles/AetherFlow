@@ -125,7 +125,7 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3197 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
+当前基线：**3198 个用例**，本地 460 跳过（Python 3.14 + torch 2.13）全绿；
 WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套件（见第 6 节）。
 
 ## 4. 第一代版本的能力面
@@ -135,8 +135,8 @@ WSL HIP（RX 7650 GRE / ROCm 7.2）本轮只复跑了后端与控制流相关套
 | 权重入口 | `safetensors` 读取（自解析，运行期仍只依赖 numpy）：按需取单张量、分片目录合并、bf16 无损展宽为 f32、fp8（e4m3 / e5m2）按位模式解码成 f32 载体（5.318）；`load_into_store` 把外部张量装进参数容器（名字映射 / PyTorch `nn.Linear` 布局转置 / 有损 dtype 需显式同意，先全量校验再原地写，失败不留半装状态，DESIGN 5.313）；`load_quantized_linear` / `QuantizedWeight` 读量化权重（int8 强制、scale 与零点形状 / 值域校验、逐通道与逐组、metadata 自描述一致性，5.317） |
 | 文本入口 | `BpeTokenizer` 读 HF `tokenizer.json` 的 ByteLevel BPE（GPT-2 / Qwen2 / Qwen3 形态）：256 字节映射、merges 两种写法、added / special token 整体匹配、NFC 系 normalizer、`use_regex` / `add_prefix_space`；解码先把连续字节拼回再解 UTF-8；WordPiece / Unigram / SentencePiece / `Split` 显式拒绝，不给近似实现（DESIGN 5.314） |
 | 前端 | `torch.export` 导入：卷积 / 池化 / linear / LayerNorm / softmax / SDPA / 归一化 / 索引与切片之外，P7 补上了逐元素数学、激活展开、clamp 与标量运算、dtype 转换、归约（mean / sum / amax / max.dim / argmax）、tril / triu / cumsum / pad、栈与切分、mm / mv / dot / addmm、常量构造（zeros / ones / full / arange 等）；不能精确表达的算子显式拒绝（见第 6 节） |
-| 算子 | IR 里 80 个算子；CUDA / HIP 各自承接 71 个（68 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8` + 1 个由量化与反量化组合的 `fake_quantize_i8` + 1 个前向同源、反向为 LSQ 的 `fake_quantize_i8_lsq`，其中 W8A8 的 `linear_i8a8` 是 int8 读入、int32 累加的专用内核，5.309；QAT 假量化见 5.311，LSQ 见 5.312），CUDA 另有 cuFFT 的 fft/rfft；非对称零点的 4 个 `*_zp` 算子与逐组反量化的 2 个 `*_group*` 算子只有参考实现，设备端显式拒绝（5.315 / 5.317）；参考后端承接全部 |
-| 精度 | f32 全覆盖；f16 覆盖 65 个（71 个设备端算子去掉 5 个 int8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` / `fake_quantize_i8` / `fake_quantize_i8_lsq` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
+| 算子 | IR 里 80 个算子；CUDA / HIP 各自承接 73 个（70 个自研内核 + 1 个由反量化与 GEMM 组合的 `linear_i8` + 1 个由量化与反量化组合的 `fake_quantize_i8` + 1 个前向同源、反向为 LSQ 的 `fake_quantize_i8_lsq`，其中 W8A8 的 `linear_i8a8` 是 int8 读入、int32 累加的专用内核，5.309；QAT 假量化见 5.311，LSQ 见 5.312），CUDA 另有 cuFFT 的 fft/rfft；非对称零点的 4 个 `*_zp` 算子只有参考实现，设备端显式拒绝（5.315）；逐组反量化的 2 个 `*_group*` 算子已有设备内核（5.321）；参考后端承接全部 |
+| 精度 | f32 全覆盖；f16 覆盖 65 个（73 个设备端算子去掉 7 个 i8 语义算子 `quantize_i8` / `dequantize_i8` / `linear_i8` / `fake_quantize_i8` / `fake_quantize_i8_lsq` / `dequantize_i8_group` / `dequantize_i8_group_zp` 与整数 `mod`，它们的数据类型由语义决定；attention 为混合精度：存储半精度、累加 float）；**bf16** 覆盖逐元素 / 搬运 / 归约 / softmax / layernorm / matmul（32 个，`backends/cuda/backend.py` 的 `BF16_OPS`），设备侧是**真 16 位存储**——`uint16` 位模式，存取是纯位操作（不依赖 sm_80 的 `cvt`），GEMM 走 cuBLAS `CUDA_R_16BF`（A800 2048³ 实测 90.5 TFLOPS，f32 的 6.6×）；卷积 / 池化 / scan / sparse 的 bf16 尚未验证，明确拒绝；f64 / 复数部分承接；weight-only int8 权重（计算仍在 f32，见下） |
 | 自动微分 | 49 条 VJP 规则，反向图是可序列化、可执行的普通图；二阶导、激活重算、反向图裁剪 |
 | 控制流 | `Conditional` / `WhileLoop` 表达为子图关系（每次判定回主机）；`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、状态与输出常驻显存，但每次判定仍要读一次谓词（无 device-side 真分支，且实测不比宿主路径快，见 DESIGN 5.245 / 5.277）；推理解码循环接不进这套形态——判定在主机采样之后（5.278），但 decode 的**状态**可以常驻（5.279） |
 | 多卡 | 设备枚举 / 切换、跨卡拷贝、NCCL / RCCL 设备侧集合通信绑定（AllReduce / AllGather / ReduceScatter / Broadcast）、数据并行（默认主机中转归约；单进程多卡可显式接设备侧归约，`nccl_device_collective(backend, devices)`，见下）、ZeRO-1/2/3 分片、GPipe / 1F1B 流水、张量并行（列 / 行并行 + attention 头切分，仅前向） |
@@ -288,10 +288,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   e5m2 溢出到 inf，5.318），但设备端没有存储容器与内核、显式拒绝；
   没有 int8 tensor core 级的矩阵乘；非对称零点
   已有主机侧语义与构图入口（`quantize_i8_zp` / `dequantize_i8_zp` /
-  `linear_i8_zp` / `linear_i8a8_zp`，5.315），逐组（per-group，GPTQ / AWQ 的
-  `group_size` 形态）weight-only 反量化有 `dequantize_i8_group` /
-  `dequantize_i8_group_zp`（组大小由形状推出，5.317）；这两族都只有参考实现，
-  设备端没有内核、显式拒绝；
+  `linear_i8_zp` / `linear_i8a8_zp`，5.315），设备端没有内核、显式拒绝；
+  逐组（per-group，GPTQ / AWQ 的 `group_size` 形态）weight-only 反量化有
+  `dequantize_i8_group` / `dequantize_i8_group_zp`（组大小由形状推出，5.317），
+  设备内核只做反量化、不融合 GEMM（5.321，V100 上 conformance 逐位相同）；
 - **动态性**：主机态的执行与训练支持符号批维（一次构图跑不同 batch，归约反向的计数在
   运行期按实际形状算）；设备态的捕获计划、分段重算与需要合并维度的广播反向仍要求静态形状；
   控制流每次判定回主机；`DeviceWhileLoop` / `DeviceConditional` 只是把条件、分支
@@ -342,7 +342,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3197 个用例
+tests/                3198 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
