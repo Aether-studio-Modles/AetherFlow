@@ -22700,6 +22700,63 @@ layernorm 改读 a、b 两个张量而不是 x1，多一遍张量读。换来的
   保证。
 - `DiskPrefixCache` 的落盘仍是 f32，量化不省盘。
 
+### 5.354　cuFFT 的多维变换：`fft` / `rfft` 的 `axes` 属性
+
+**缺口清单的第四项（cuFFT 部分）。** 此前 `fft` / `rfft` 只能对最后一维做
+一维变换（`cufftPlanMany` 的 batch 只铺前缀维）。清单要求补齐 FFT 的多维
+能力。做法是给既有两个算子加 `axes` 属性，**不新增 `fft2` / `fftn` /
+`ifft`**：`inverse` 已经区分正反向，再拆一个 `ifft` 就是同一个语义的第二
+个名字；`fft2` / `fftn` 与 `fft(axes=...)` 也只是 numpy 的两种写法。
+
+**约束（构图期就拒绝，不留到驱动）。**
+
+| 项 | 规则 |
+|---|---|
+| 轴数 | 1–3 个（`cufftPlanMany` 的 rank 上限是 3） |
+| 连续性 | 必须是**末尾连续**的升序轴，如 `(-2, -1)`；`(0, 2)` 拒绝 |
+| 缺省 | `axes=None` 等价于 `(rank - 1,)`，即原来的行为 |
+| 类型 | 非 tuple / list、bool、非 int → `TypeError`；越界 / 重复 / 乱序 / 非末尾 → `ValueError` |
+
+非连续轴（如 `(0, 2)`）拒绝而不是拆成多次一维变换：那需要逐轴 stride
+变换，参考语义与设备实现会分叉，拆开写图更好排查。`rfft` 因为末尾连续，
+`axes` 必然包含最后一维，半谱长度就落在那一维上。
+
+**plan 的构建。** `sizes` 是被变换各轴的形状（从外到内），`rows` 是前缀维
+拉平后的 batch 数（`x.size / prod(sizes)`）。二维 / 三维分别等价 numpy 的
+`fft2` / `fftn`、`rfftn`。归一化按**总点数** `prod(sizes)`：`norm="ortho"`
+是 `1/sqrt(总点数)`，不是每轴各除一次。R2C / D2Z 的输出最后一轴是
+`n // 2 + 1`，其余轴与输入相同。
+
+**一个与文档相反的事实（V100 实测）。** `cufftPlanMany` 的 `n` 数组与
+numpy 的形状**同序**——最后一个元素才是连续维；照 cuFFT 文档里"n[0] 是
+最内层"倒序传，一维看不出差别（正反序相同），二维及以上会整体错位。
+实测判据：`n = (10, 4)` 的结果与 `np.fft.fft2(x.reshape(10, 4))` 逐位吻合，
+`n = (4, 10)` 才等于对原 `(4, 10)` 数组做二维变换。输入连续时
+`inembed` / `onembed` 传 `NULL` 让 cuFFT 按紧凑布局推导，batch 间距只靠
+`idist = prod(sizes)` / `odist = prod(out_sizes)` 表达。
+
+**验证。**
+
+- `tests/test_fft.py` 35 个用例：`TestFftMultiAxis` 8 个覆盖二维正反向、
+  三维、正负轴等价、`rfft2` 的形状与数值、符号维（`(B, C, 6, 6)` 的前两维
+  仍是符号）、`axes=None` 保持原语义；`TestFftRejections` 3 个覆盖末尾
+  连续性、类型错误、`rfft` 的轴必须含最后一维；`TestCufftOffline` 覆盖
+  `plan_key` 带上每个轴与 `_sizes_tuple` 的 rank 越界。
+- `conformance.py` 新增 4 个用例：`fft2_ortho`（`(2, 4, 10)`，轴
+  `(-2, -1)`）、`fft2_inverse`、`fftn_forward`（`(2, 3, 6, 8)`，轴
+  `(-3, -2, -1)`）、`rfft2_backward`（`(2, 6, 10)`）。
+- V100：`verify_cuda.py` 全部通过（4 个新用例的最大绝对误差均 `<= 1e-6`），
+  `tests.test_fft` 35 个通过 / 1 跳过（纯离线用例）；本地全量 3614 / 464 跳过
+  / OK，V100 真机全量 3600 / 178 跳过 / OK。
+
+**未声称。**
+
+- 只支持 1–3 维、末尾连续轴；4 维及以上、非连续轴、stride 变换都显式拒绝。
+- 没有性能数据：多维 plan 的吞吐与同等拆分的一维变换没有对比过。
+- 只走紧凑连续输入；非连续输入要求调用方先 `ascontiguousarray`，本模块
+  不求值也不做隐式拷贝。
+
+
 
 
 

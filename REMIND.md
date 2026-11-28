@@ -1055,6 +1055,16 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `cached_forward(quantize="i8")` 实测最大绝对差 `4.77e-07`（相对 `3.33e-05`），
   用 `assert_allclose(rtol=1e-5, atol=1e-5)`；写 `assert_array_equal` 会得到
   35/48 不匹配的假失败。
+- **`cufftPlanMany` 的 `n` 与 numpy 形状同序，不是文档说的"n[0] 最内层"**
+  （5.354）：V100（cufft 11.2）实测，`n = (10, 4)` 的结果等于
+  `np.fft.fft2(x.reshape(10, 4))`，`n = (4, 10)` 才等于对原 `(4, 10)` 数组做
+  二维变换。一维看不出差别（正反序相同），二维及以上会整体错位，最大绝对
+  误差是 O(10) 量级而不是 1e-7。最小复现是**单 batch 二维**（`(4, 10)`、
+  rows=1），不需要 batch 参与就能判断是布局问题还是 idist 问题。
+- **`verify_cuda.py` 的失败项会被尾部截断掩盖**（5.354）：报告只打印末尾
+  12000 字符，新加的用例排在前面时 `[FAIL]` 会被截掉，只能看到
+  `result : FAIL`。定位用 `python3 verify_cuda.py 2>&1 | grep -n -i -B4 -A20 fail`
+  （或先 `| head -n 120`），不要只看 stdout 尾部。
 
 ---
 
