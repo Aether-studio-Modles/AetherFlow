@@ -444,11 +444,49 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   / `llama_inv_freq` / `llama_param_shapes` / `llama_param_transposes`（DESIGN
   5.358，提交 3afdf93）；`tests/test_llama.py` 用独立 float64 numpy 实现对拍 13
   个用例（MHA / GQA / causal / qkv bias / 无 logits），全量 3630 通过（464 跳过）。
-- 阶段 1 剩余：① HF 权重加载器（`llama_param_shapes` + `llama_param_transposes`
-  配 `load_into_store`，`tie_weights` 时把 `embed_tokens.weight` 转置后同时填
-  `lm_head.weight`）；② V100 装 `transformers` / `safetensors`，用 Qwen2.5-0.5B
-  真实权重对拍 logits；③ 公开 examples 前向脚本。
+- 阶段 1 第三步（完成）：`load_llama_weights`（tied 判据是文件里没有
+  `lm_head.weight`）+ `LlamaSpec.from_hf_config`（`qkv_bias` 看权重里有没有
+  `q_proj.bias`，不信 config 的 `attention_bias`）；V100 真实权重三路对拍
+  （HF f32 / 参考后端 / CUDA 后端，max abs 8.9e-5 / 1.4e-4，top-1 8/8 一致）；
+  `examples/llm/forward.py`（提交 1363f3f，DESIGN 5.359）。
+- 阶段 2（完成）：`examples/llm/pretrain.py` 字节级从零训练，tiny 200 步 11 秒
+  loss 5.44 → 2.88；0.5B 结构（630.2M 参数、真实 15 万词表、seq64 / batch1 /
+  Adam 3e-4）在 V100 上 60 步 11.84 → 7.98，0.20 s/步，峰值显存 16578 MiB。
+- 阶段 3（待做）：全参 SFT——指令对数据、只对回答段算 loss（`mask` 已支持）；
+  阶段 4（待做）：LoRA——adapter 注入与单独存取。
 - 注意：`seq` 静态（无 `arange`），换长度要重建图；图内不做权重转置。
+- `lm_head` 与 `embed_tokens` 当前各占一份（tied 只在加载时填两份），所以 0.5B
+  结构实测 630.2M 参数；训练期合并两份梯度尚未做。
+
+**V100 远端环境（2026-11-28 更新）**
+
+- 入口：移动 `ssh root@223.109.239.36 -p 24124`；电信
+  `ssh vipuser@180.127.11.177 -p 24124`（密码 `Ahg4EeNo`，`sudo` 同密码；
+  vipuser 不能直接写 `/root`，用 `echo 密码 | sudo -S ...`）。旧端口 24432 已失效。
+- 代码：`/root/afv3`，非 git 仓库，用本机 `git archive HEAD` 打包后 sftp 上传、
+  `sudo tar xzf ... -C /root/afv3` 覆盖同步（包约 2 MB）。
+- 模型：`/root/models/Qwen2.5-0.5B/`（`config.json` + `model.safetensors` 988 MB
+  bf16 + `tokenizer.json`）。
+- Python 3.10 + numpy 2.2.6 + cupy-cuda12x 14.2.0 + torch 2.14.1+cpu +
+  transformers 4.46.3 + safetensors。**torch 必须用
+  `--index-url https://download.pytorch.org/whl/cpu`**（196 MB）；走 pypi 镜像
+  会拉 CUDA 版（数 GB）。其余包用清华镜像。
+- 上行带宽只有 ~1 MB/s，传 1 GB 权重约 15 分钟；改用远端直接
+  `wget https://modelscope.cn/models/Qwen/Qwen2.5-0.5B/resolve/master/<file>`
+  下载（~1.2 MB/s）。
+- 远端 `masked_lm_loss_indexed` 在 `aetherflow.models` 包，不在 `models.llama`。
+- 待清理的远端临时文件：`/root/verify_qwen.py`、`/root/af_pretrain_big.py`、
+  `/root/af_*.log`、`/root/wget_qwen.log`、`/tmp/af_sync.tar.gz`、
+  `/tmp/af_pretrain_big.py`、`/tmp/qwen25_model.safetensors`（上传中断的残片）。
+
+**真机回归里发现的两件事（2026-11-28）**
+
+- `b689554` 把 `REDUCE_BLOCK` 1024→256，但 `tests/test_cuda_backend.py` 的
+  `test_reduce_block_override_reaches_launch` 仍断言 1024。该用例只在有 CUDA 时
+  执行，本地与 CI 都是 skip，所以提交时没暴露；真机全量一跑就红。已把两处期望
+  改为 256（顺带注明依据），真机 3621 个用例 / 81 跳过 / OK。
+- 远端装 `torch==2.14.1` 后 137 个前端用例 error——超出仓库兼容矩阵（2.9–2.13）。
+  降回 `2.13.0+cpu` 即全绿；以后在这台机器上不要随手装最新 torch。
 - **`mod` 必须做 floor 修正**：C 的 `%` 与 Python `%` / `torch.remainder` 在被除数
   为负时结果不同（C 是截断语义）。设备端在 `r = x % y` 之后必须补
   `r != 0 && (r < 0) != (y < 0) ⇒ r += y`，否则负槽位哈希会与参考实现分叉。

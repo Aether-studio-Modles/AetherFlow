@@ -22910,6 +22910,52 @@ embedding → [ rmsnorm → q/k/v → RoPE → attention(GQA) → o_proj → 残
 **刻意不做。** 不做 decode 的 KV cache 变体（那是推理侧，训练只跑整段前向）；
 不把权重转置搬进图；不为架构新增算子——如果哪天需要，应当先怀疑抽象层次。
 
+### 5.359　从零预训练与真实权重的三路对拍：训练主线的前两块硬证据
+
+5.358 只证明"结构建得出来、与一份独立参考实现对得上"。这一节补上两个更硬的
+证据：**同一份真实权重在三种实现里给出同一组 logits**，以及**同一份图在真实
+规模（Qwen2.5-0.5B 结构、15 万词表）上真的能把 loss 训下去**。
+
+**两个公开示例。** `examples/llm/pretrain.py` 用字节级词表从零训练一个缩小版
+（d128 / 2 层 / 4 头 / 2 KV 头 / seq64 / batch4），200 步 11 秒，前 5 步均值
+5.4449 → 后 5 步 2.8819；`examples/llm/forward.py` 默认同一缩小版随机初始化，
+`--weights DIR` 则读 `config.json` + `*.safetensors` 走真实权重。示例不引入
+BPE 依赖：真实模型的词表是 15 万级 BPE，仓库自带的分词器只覆盖字节级，所以
+`--weights` 直接吃 token id——"喂进去的是什么"必须确定，而不是拿字节 id 去
+凑一个 BPE 词表。
+
+**`LlamaSpec.from_hf_config`。** 形状与超参从 `config.json` 读；`qkv_bias`
+**不由 config 的 `attention_bias` 决定**（Qwen2 的 `Qwen2Attention` 硬编码
+`bias=True`，该字段默认 false 与实重不符），而是看权重里是否存在
+`...self_attn.q_proj.bias`。真实 Qwen2.5-0.5B 的 290 个张量里没有
+`lm_head.weight`（tied）、没有 `rotary_emb.inv_freq`、有 `q_proj.bias`，
+三条都与加载器的判据吻合。
+
+**三路对拍（V100-SXM2-32GB，bf16 权重 988 MB 展开成 f32，seq=8，batch=1）。**
+三路是 HuggingFace `Qwen2ForCausalLM`（torch f32）、本仓库参考后端、本仓库
+CUDA 后端，喂同一份 token id：
+
+| 对比 | max abs | mean abs | top-1 位置 |
+| --- | --- | --- | --- |
+| HF vs 参考后端 | 8.87e-5 | 8.70e-6 | 8/8 一致 |
+| CUDA vs 参考后端 | 1.39e-4 | — | — |
+| CUDA vs HF | 9.20e-5 | — | — |
+
+logits 幅值 18 上下，1e-4 的绝对差对应 1e-5 量级的相对差，来源是 cuBLAS 与
+numpy 的累加顺序，不是口径差异。同一张图参考后端 13.1 s、CUDA 1.68 s。
+
+**真实规模的训练闭环。** 用 `qwen2_5_0_5b(seq=64, batch=1)` 从零随机初始化，
+词表用真实 BPE（`tokenizer.json` 编码 `DESIGN.md` 前 40 万字符 → 23.6 万 token、
+3632 个不重叠窗口），Adam lr 3e-4，CUDA 后端：前 3 步均值 11.8427 → 后 3 步
+7.9839（60 步），每步 0.20 s，峰值显存 16578 MiB。参数量 **630.2M** 而不是
+官方的 494M——`lm_head` 与 `embed_tokens` 各占一份（5.358 的取舍），训练期
+合并两份梯度还没做。
+
+这组数字的口径是"闭环成立"，不是"训出了可用模型"：从零、单卡、60 步、
+6 万 token 远不足以让模型说人话，loss 绝对值也只对应词表上的均匀偏置被逐步
+磨掉。它证明的是梯度、优化器状态、设备态捕获与显存估算在真实规模下都成立，
+接下来的全参 SFT 与 LoRA 才能挂在这条已经被验证过的链路上。
+
 
 
 

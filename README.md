@@ -89,6 +89,12 @@ RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）�
 （`build_llama` + `LlamaSpec`，含 GQA、RoPE、qkv bias；`LlamaSpec.qwen2_5_0_5b()`
 是 Qwen2.5-0.5B 的官方超参，参数名与 HF `state_dict` 同名，DESIGN 5.358）。
 
+两个可直接跑的 LLM 示例：`examples/llm/pretrain.py`（字节级从零预训练，
+tiny 200 步 loss 5.44 → 2.88）与 `examples/llm/forward.py`（默认随机初始化，
+`--weights DIR` 读真实 Qwen2.5-0.5B 权重）。真实权重在 HF、参考后端、CUDA
+后端三路对拍到 1e-4；同结构 0.5B / 15 万词表在 V100 上从零训练 60 步，
+loss 11.84 → 7.98，每步 0.20 s（DESIGN 5.359）。
+
 ### 装外部权重
 
 ```python
@@ -153,8 +159,8 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3617 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
-V100 真机 3603 个用例 / 178 跳过 / OK（差值都是只在本地跳过的设备端测试）。
+当前基线：**3635 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
+V100 真机 3621 个用例 / 81 跳过 / OK（差值都是只在本地跳过的设备端测试）。
 
 ## 4. 第一代版本的能力面
 
@@ -424,7 +430,7 @@ aetherflow/           包本体
   models/             MLP / CNN / RNN / Transformer / Mamba / SNN / Llama 构件
   frontend/           torch.export 适配
 benchmarks/           固定用例、基线、趋势
-tests/                3602 个用例
+tests/                3635 个用例
 DESIGN.md             唯一规范与全部实验结论（含 250 余节实验记录）
 REMIND.md             发布说明、环境要求与已知限制
 ```
