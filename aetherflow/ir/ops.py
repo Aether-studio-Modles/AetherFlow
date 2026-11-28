@@ -1486,6 +1486,192 @@ register(
 )
 
 
+# --------------------------------------------------------------------------
+# fp8 线性层
+# --------------------------------------------------------------------------
+#
+# 与 int8 的两个版本一一对应，差别只在语义来源：fp8 的载荷是 f32 载体
+# （``DType.F8E4M3`` / ``F8E5M2`` 的 ``np_dtype`` 都是 float32），值已经在
+# 写入侧落到格式格点上，所以这里反量化就是一次乘法，不需要解码位模式。
+#
+# 这一版**不承诺算力**：两条路径都是"反量化成 f32 再 GEMM"，与
+# ``linear_i8`` 的定位相同——省的是权重占用与读带宽（真正 1 字节存储要到
+# 5.328，届时带宽才会下降），不是 tensor core 吞吐。fp8 tensor core 需要
+# 另一套缩放与累加语义，不在本版声称范围内。
+
+_FP8_TYPES: FrozenSet[DType] = frozenset({DType.F8E4M3, DType.F8E5M2})
+
+
+def _check_same_fp8(x: TensorType, w: TensorType, what: str) -> None:
+    for item, role in ((x, "激活"), (w, "权重")):
+        if item.dtype not in _FP8_TYPES:
+            raise TypeError(
+                f"{what} 的{role}必须是 fp8（f8e4m3 / f8e5m2），"
+                f"得到 {item.dtype.value}"
+            )
+    if x.dtype != w.dtype:
+        raise TypeError(
+            f"{what} 的激活与权重必须是同一种 fp8 格式，得到 "
+            f"{x.dtype.value} 与 {w.dtype.value}；混合格式需要显式 cast"
+        )
+
+
+def _check_bias(
+    inputs: Tuple[TensorType, ...], count_without_bias: int, n: Dim, what: str
+) -> None:
+    if len(inputs) != count_without_bias + 1:
+        return
+    bias = inputs[-1]
+    if bias.dtype != DType.F32:
+        raise TypeError(f"{what} 的 bias 必须是 f32，得到 {bias.dtype.value}")
+    if bias.rank != 1:
+        raise ValueError(f"{what} 的 bias 必须是秩 1，得到秩 {bias.rank}")
+    if isinstance(bias.shape[0], int) and isinstance(n, int) and bias.shape[0] != n:
+        raise ValueError(f"{what} 的 bias 长度 {bias.shape[0]} 与 N={n} 不一致")
+
+
+def _infer_linear_fp8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) not in (3, 4):
+        raise ValueError(
+            "linear_fp8 需要 (x, qweight, weight_scale[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    x, qweight, scale = inputs[0], inputs[1], inputs[2]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加，混精度入口不在这一版"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_fp8 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype not in _FP8_TYPES:
+        raise TypeError(
+            f"linear_fp8 的权重必须是 fp8（f8e4m3 / f8e5m2），"
+            f"得到 {qweight.dtype.value}"
+        )
+    if qweight.rank != 2:
+        raise ValueError(f"linear_fp8 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}")
+    if scale.dtype != DType.F32:
+        raise TypeError(f"linear_fp8 的 weight_scale 必须是 f32，得到 {scale.dtype.value}")
+    _check_scale_broadcast(qweight, scale, "linear_fp8 的 weight_scale")
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_fp8 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_fp8 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    _check_bias(inputs, 3, n, "linear_fp8")
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_fp8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, qweight, scale = args[0], args[1], args[2]
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"linear_fp8 的 weight_scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    weight = qweight.astype(np.float32) * scale
+    out = np.matmul(x, weight)
+    if len(args) > 3:
+        out = out + args[3]
+    return out
+
+
+register(
+    Op(
+        name="linear_fp8",
+        infer=_infer_linear_fp8,
+        reference=_ref_linear_fp8,
+        doc="weight-only fp8 线性层：(..., K) x f8(K, N) -> (..., N)。"
+        "权重按 weight_scale 反量化后在 f32 上做 GEMM，数值等于"
+        "``matmul(x, qweight * weight_scale) [+ bias]``；"
+        "省的是权重占用与读带宽，不是算力（1 字节存储见 5.328）",
+    )
+)
+
+
+def _infer_linear_fp8a8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    if len(inputs) not in (4, 5):
+        raise ValueError(
+            "linear_fp8a8 需要 (x_q, x_scale, w_q, w_scale[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    xq, xs, wq, ws = inputs[0], inputs[1], inputs[2], inputs[3]
+    _check_same_fp8(xq, wq, "linear_fp8a8")
+    if xq.rank < 2:
+        raise ValueError(f"linear_fp8a8 的激活至少是 2 维，得到秩 {xq.rank}")
+    if wq.rank != 2:
+        raise ValueError(f"linear_fp8a8 的量化权重必须是 2 维 (K, N)，得到 {wq.shape}")
+    if xs.dtype != DType.F32:
+        raise TypeError(f"linear_fp8a8 的激活 scale 必须是 f32，得到 {xs.dtype.value}")
+    if ws.dtype != DType.F32:
+        raise TypeError(f"linear_fp8a8 的权重 scale 必须是 f32，得到 {ws.dtype.value}")
+
+    k, n = wq.shape
+    kx = xq.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_fp8a8 的内维不匹配：激活的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_fp8a8 的内维符号不一致：激活 {kx} 与权重 K={k}")
+
+    _check_scale_broadcast(xq, xs, "linear_fp8a8 的激活 scale")
+    # 反量化后再做 f32 GEMM，所以不要求 scale 沿压缩轴恒定；但仍要求
+    # "每个 token 一个激活 scale、每个输出通道一个权重 scale"——这是写入侧
+    # （quantize_activation_fp8 / quantize_weight_fp8）产出的形态，允许更宽的
+    # 逐元素 scale 只会让设备端无法按行 / 按列取，属于未定义的模糊地带。
+    if xs.rank > 0 and xs.shape[-1] != 1:
+        raise ValueError(
+            f"linear_fp8a8 的激活 scale 形状 {xs.shape} 沿 K 维不是 1："
+            "需要每个 token 一个 scale（如 (B, T, 1) 或标量）"
+        )
+    if ws.rank > 1:
+        raise ValueError(
+            f"linear_fp8a8 的权重 scale 必须是逐输出通道 (N,) 或逐张量标量，"
+            f"得到秩 {ws.rank} 形状 {ws.shape}"
+        )
+    if ws.rank == 1 and ws.shape[0] != 1 and ws.shape[0] != n:
+        raise ValueError(f"linear_fp8a8 的权重 scale 长度 {ws.shape[0]} 与 N={n} 不一致")
+
+    _check_bias(inputs, 4, n, "linear_fp8a8")
+    return TensorType(DType.F32, xq.shape[:-1] + (n,))
+
+
+def _ref_linear_fp8a8(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    xq, xs, wq, ws = args[0], args[1], args[2], args[3]
+    if float(np.min(xs)) <= 0.0 or float(np.min(ws)) <= 0.0:
+        raise ValueError(
+            "linear_fp8a8 的激活 / 权重 scale 必须严格为正，得到 "
+            f"{float(np.min(xs))} 与 {float(np.min(ws))}"
+        )
+    x = xq.astype(np.float32) * xs
+    weight = wq.astype(np.float32) * ws
+    out = np.matmul(x, weight)
+    if len(args) > 4:
+        out = out + args[4]
+    return out
+
+
+register(
+    Op(
+        name="linear_fp8a8",
+        infer=_infer_linear_fp8a8,
+        reference=_ref_linear_fp8a8,
+        doc="W8A8 fp8 线性层：(..., K) f8、双 scale -> (..., N)。"
+        "激活与权重各自按 scale 反量化后做 f32 GEMM，数值等于"
+        "``matmul(x_q * x_scale, w_q * w_scale) [+ bias]``；"
+        "不承诺 fp8 tensor core，累加仍是 f32",
+    )
+)
+
+
 def _infer_linear_i8a8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (4, 5):
         raise ValueError(

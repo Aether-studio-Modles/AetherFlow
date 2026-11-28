@@ -10,9 +10,10 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from ..ir.graph import Graph as Graph, Node
 from ..ir.types import DType
 
-#: 设备端还没有 fp8 的存储容器与内核（见 device_shared.FP8_DTYPES）。
-#: 参考语义在 runtime/fp8.py；设备端遇到这些类型必须显式拒绝，
-#: 否则会被 np_dtype 的 f32 载体悄悄当成 f32 计算。
+#: 设备端还没有 fp8 的 1 字节存储容器与专用内核（见 device_shared.FP8_DTYPES）。
+#: IR 里 fp8 的载体是 f32，只有白名单算子（``FP8_OPS``：cast 与两个线性层）
+#: 承接；其余算子遇到这些类型必须显式拒绝，否则会被 f32 载体悄悄当成 f32 算。
+#: 参考语义在 runtime/fp8.py。
 from ..lower.elementwise import (
     CHAIN_OPS as CHAIN_OPS,
     ElemInput as ElemInput,
@@ -69,6 +70,7 @@ from weakref import ref
 import numpy as np
 from .device_shared import (
     FP8_DTYPES as _FP8_DTYPES,
+    FP8_OPS as _FP8_OPS,
     GPU_OPS as GPU_OPS,
     _CAST_FP8_SRC as _CAST_FP8_SRC,
     _ALL_TUNABLE_OPS as _ALL_TUNABLE_OPS,
@@ -453,6 +455,10 @@ class DeviceBackend(
         r.register("linear_i8_zp", self._op_linear_i8_zp)
         r.register("linear_i8a8", self._op_linear_i8a8)
         r.register("linear_i8a8_zp", self._op_linear_i8a8_zp)
+        # fp8 线性层没有专用内核：载体是 f32，反量化是一次 ``mul``，之后复用
+        # sgemm（见 DESIGN 5.327）。
+        r.register("linear_fp8", self._op_linear_fp8)
+        r.register("linear_fp8a8", self._op_linear_fp8a8)
         r.register("conv2d", self._op_conv2d)
         r.register("maxpool2d", self._op_maxpool2d)
         r.register("maxpool2d_indices", self._op_maxpool2d_indices)
@@ -1111,9 +1117,10 @@ class DeviceBackend(
                 f"{self._LABEL}未实现算子 {name}（节点 %{node.output.name}）"
             )
         # fp8 的载体是 f32，但语义要求节点边界落在格式格点上；设备端只有
-        # ``cast`` 承接 fp8（内核在设备上重做 RNE 量化，见 5.325）。其它算子
-        # 遇到 fp8 必须显式拒绝，否则会被 f32 载体当成 f32 算掉。
-        if name != "cast":
+        # ``cast``（内核在设备上重做 RNE 量化，见 5.325）与两个线性层
+        # （按 f32 载体读出、反量化后走既有 GEMM，见 5.327）承接 fp8。其它
+        # 算子遇到 fp8 必须显式拒绝，否则会被 f32 载体当成 f32 算掉。
+        if name not in _FP8_OPS:
             for item in (*node.inputs, node.output):
                 if item.type.dtype in _FP8_DTYPES:
                     raise BackendCapabilityError(

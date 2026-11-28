@@ -21,6 +21,8 @@ from aetherflow import (
     dumps,
     f16,
     f32,
+    f8e4m3,
+    f8e5m2,
     i8,
     loads,
 )
@@ -1461,6 +1463,195 @@ class TestGroupDequantize(unittest.TestCase):
         np.testing.assert_array_equal(_run(g, feed)["w"], _run(again, feed)["w"])
 
 
+class TestLinearFP8(unittest.TestCase):
+    """fp8 线性层：载荷是 f32 载体，语义是"按 scale 反量化一次再做 f32 GEMM"。
+
+    这一组钉住三件事：
+
+    1. 数值等于手写的 ``q * scale`` 再 matmul，而不是把 f32 载体当普通权重；
+    2. 两种格式按各自的格点解释（e5m2 的格点比 e4m3 粗）；
+    3. 逐组 scale、未量化权重、错误的秩 / dtype / bias 都在构图期被拒绝。
+    """
+
+    def _weight_graph(self, x_shape, w_shape, bias=True, kind="e4m3", scale_shape=None):
+        dtype = f8e4m3 if kind == "e4m3" else f8e5m2
+        g = Graph("linear_fp8")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", dtype[w_shape])
+        s = g.input(
+            "s", f32[scale_shape if scale_shape is not None else (w_shape[-1],)]
+        )
+        args = [x, q, s]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_fp8", args), "y")
+        return g
+
+    def _a8_graph(self, x_shape, w_shape, bias=True, kind="e4m3"):
+        dtype = f8e4m3 if kind == "e4m3" else f8e5m2
+        g = Graph("linear_fp8a8")
+        q = g.input("x_q", dtype[x_shape])
+        sx = g.input("x_scale", f32[x_shape[:-1] + (1,)])
+        wq = g.input("w_q", dtype[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        args = [q, sx, wq, sw]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_fp8a8", args), "y")
+        return g
+
+    def test_matches_manual_dequantize_then_matmul(self):
+        rng = np.random.default_rng(31)
+        x = rng.standard_normal((2, 4, 8)).astype(np.float32)
+        scale = rng.random(6).astype(np.float32) + 0.1
+        q = quantize_fp8(rng.standard_normal((8, 6)).astype(np.float32) * 3.0, scale)
+        b = rng.standard_normal(6).astype(np.float32)
+        got = _run(self._weight_graph((2, 4, 8), (8, 6)), {"x": x, "q": q, "s": scale, "b": b})[
+            "y"
+        ]
+        np.testing.assert_allclose(
+            got, np.matmul(x, q * scale) + b, rtol=1e-6, atol=1e-6
+        )
+
+    def test_per_tensor_scale_without_bias(self):
+        rng = np.random.default_rng(32)
+        x = rng.standard_normal((3, 5)).astype(np.float32)
+        scale = np.array([0.5], np.float32)
+        q = quantize_fp8(rng.standard_normal((5, 4)).astype(np.float32) * 2.0, scale)
+        got = _run(
+            self._weight_graph((3, 5), (5, 4), bias=False, scale_shape=(1,)),
+            {"x": x, "q": q, "s": scale},
+        )["y"]
+        np.testing.assert_allclose(
+            got, np.matmul(x, q * np.float32(0.5)), rtol=1e-6, atol=1e-6
+        )
+
+    def test_e5m2_rounds_at_its_own_grid(self):
+        """0.55 在两种格式下落在不同格点：e4m3 是 0.5625，e5m2 是 0.5。
+
+        e4m3 的格点更密，所以"e5m2 能表示的数"在 e4m3 里也都能表示；要区分
+        后端有没有按声明的格式舍入，只能看一个非格点输入被舍到哪一格。如果
+        执行器把格式硬编码成 e4m3，这条会以 0.5625 失败。
+        """
+        self.assertEqual(float(round_fp8(np.array([0.55], np.float32), "e4m3")[0]), 0.5625)
+        self.assertEqual(float(round_fp8(np.array([0.55], np.float32), "e5m2")[0]), 0.5)
+        got = _run(
+            self._weight_graph((1, 1), (1, 1), bias=False, kind="e5m2"),
+            {
+                "x": np.ones((1, 1), np.float32),
+                "q": np.array([[0.55]], np.float32),
+                "s": np.array([1.0], np.float32),
+            },
+        )["y"]
+        self.assertEqual(float(got[0, 0]), 0.5)
+
+    def test_fp8a8_matches_manual(self):
+        rng = np.random.default_rng(33)
+        xq, xs = quantize_activation_fp8(rng.standard_normal((2, 3, 8)).astype(np.float32))
+        wq, ws = quantize_weight_fp8(rng.standard_normal((8, 6)).astype(np.float32))
+        b = rng.standard_normal(6).astype(np.float32)
+        got = _run(
+            self._a8_graph((2, 3, 8), (8, 6)),
+            {"x_q": xq, "x_scale": xs, "w_q": wq, "w_scale": ws, "b": b},
+        )["y"]
+        np.testing.assert_allclose(
+            got, np.matmul(xq * xs, wq * ws) + b, rtol=1e-6, atol=1e-6
+        )
+
+    def test_fp8a8_rank2_with_per_token_scale(self):
+        rng = np.random.default_rng(34)
+        xq, _ = quantize_activation_fp8(rng.standard_normal((4, 8)).astype(np.float32))
+        xs = (np.abs(rng.standard_normal((4, 1))) * 0.1 + 0.05).astype(np.float32)
+        wq, ws = quantize_weight_fp8(rng.standard_normal((8, 3)).astype(np.float32))
+        got = _run(
+            self._a8_graph((4, 8), (8, 3), bias=False),
+            {"x_q": xq, "x_scale": xs, "w_q": wq, "w_scale": ws},
+        )["y"]
+        np.testing.assert_allclose(
+            got, np.matmul(xq * xs, wq * ws), rtol=1e-6, atol=1e-6
+        )
+
+    def test_scale_must_be_strictly_positive(self):
+        x = np.ones((2, 4), np.float32)
+        q = quantize_fp8(np.ones((4, 3), np.float32), np.ones(3, np.float32))
+        for bad in (0.0, -0.5):
+            with self.subTest(scale=bad):
+                with self.assertRaises(ValueError):
+                    _run(
+                        self._weight_graph((2, 4), (4, 3), bias=False),
+                        {"x": x, "q": q, "s": np.full(3, bad, np.float32)},
+                    )
+
+    def test_rejects_bad_dtypes_ranks_and_scales(self):
+        with self.subTest(case="x_not_f32"):
+            g = Graph("linear_fp8")
+            x = g.input("x", f16[2, 4])
+            q = g.input("q", f8e4m3[4, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8", [x, q, s])
+        with self.subTest(case="weight_not_fp8"):
+            g = Graph("linear_fp8")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", f32[4, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8", [x, q, s])
+        with self.subTest(case="x_rank1"):
+            g = Graph("linear_fp8")
+            x = g.input("x", f32[4])
+            q = g.input("q", f8e4m3[4, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8", [x, q, s])
+        with self.subTest(case="group_scale_is_not_broadcastable"):
+            # (K/G, N) 逐组 scale 要先把权重展开成 (K, N) 才有意义，
+            # 这一版不接受；逐组路径留给 linear_i8_group 那一批（5.329）。
+            g = Graph("linear_fp8")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", f8e4m3[4, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8", [x, q, s])
+        with self.subTest(case="bias_length"):
+            g = Graph("linear_fp8")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", f8e4m3[4, 3])
+            s = g.input("s", f32[3])
+            b = g.input("b", f32[4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8", [x, q, s, b])
+        with self.subTest(case="mixed_formats"):
+            g = Graph("linear_fp8a8")
+            q = g.input("x_q", f8e4m3[2, 4])
+            sx = g.input("x_scale", f32[2, 1])
+            wq = g.input("w_q", f8e5m2[4, 3])
+            sw = g.input("w_scale", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8a8", [q, sx, wq, sw])
+        with self.subTest(case="activation_scale_along_k"):
+            g = Graph("linear_fp8a8")
+            q = g.input("x_q", f8e4m3[2, 4])
+            sx = g.input("x_scale", f32[2, 4])
+            wq = g.input("w_q", f8e4m3[4, 3])
+            sw = g.input("w_scale", f32[3])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8a8", [q, sx, wq, sw])
+
+    def test_graph_survives_json_roundtrip(self):
+        rng = np.random.default_rng(35)
+        scale = np.array([0.5, 0.25, 0.125], np.float32)
+        feed = {
+            "x": rng.standard_normal((2, 8)).astype(np.float32),
+            "q": quantize_fp8(rng.standard_normal((8, 3)).astype(np.float32), scale),
+            "s": scale,
+            "b": np.zeros(3, np.float32),
+        }
+        g = self._weight_graph((2, 8), (8, 3))
+        again = loads(dumps(g))
+        np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
@@ -1476,6 +1667,10 @@ class TestConformanceCases(unittest.TestCase):
             "linear_i8a8_zp_bias",
             "dequantize_i8_group",
             "dequantize_i8_group_zp",
+            "linear_fp8_e4m3_bias",
+            "linear_fp8_e5m2_bias",
+            "linear_fp8a8_e4m3_bias",
+            "linear_fp8a8_e5m2_rank2",
         }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)

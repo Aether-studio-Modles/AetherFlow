@@ -1,4 +1,4 @@
-"""线性代数与量化：matmul、int8 量化 / 反量化、weight-only 与 W8A8 线性层。"""
+"""线性代数与量化：matmul、i8 / fp8 量化与反量化、weight-only 与 W8A8 线性层。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .device_shared import (
 
 
 class _LinearMixin:
-    """线性代数与量化：matmul、int8 量化 / 反量化、weight-only 与 W8A8 线性层。"""
+    """线性代数与量化：matmul、i8 / fp8 量化与反量化、weight-only 与 W8A8 线性层。"""
 
     #: W8A8 的点积是否走 ``__dp4a``（sm_61+ 的 4 路 int8 点积指令）。CUDA 侧
     #: 覆盖成 True；HIP 的 hipRTC 不带 ``hip_runtime.h``，走标量乘加。两条路
@@ -527,6 +527,84 @@ class _LinearMixin:
                 ),
             )
         out = out.reshape(xq.shape[:-1] + (n,))
+        if len(args) > 4:
+            out = self._binary("add", [out, args[4]])
+        return out
+
+    def _op_linear_fp8(self, node, args, attrs):
+        """weight-only fp8 线性层：反量化权重后走既有 f32 GEMM。
+
+        fp8 在设备上的载荷就是 f32 载体（数值已在写入侧落到格式格点上），所以
+        反量化只是一次逐元素乘，既不解码位模式、也不需要新内核：乘完直接交给
+        cuBLAS / hipBLAS 的 sgemm。收益只在"权重占用与读带宽"（真正的 1 字节
+        存储见 5.328），不是算力——fp8 tensor core 需要另一套缩放与累加语义，
+        不在本版声称范围内。
+
+        设备端不复查"值是否在格点上"：那需要把权重读回主机，与"零同步"的
+        设备路径直接冲突；格点校验由写入侧（``weights.load_fp8_linear``）负责。
+        """
+        cp = self.cp
+        x, qweight, scale = args[0], args[1], args[2]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if qweight.dtype != cp.float32 or scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8 要求权重（f32 载体）与 scale 都是 f32，"
+                f"收到 {qweight.dtype} 与 {scale.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8 要求 x 秩 >= 2、权重秩 2，"
+                f"收到 {x.shape} 与 {qweight.shape}"
+            )
+        weight = self._binary("mul", [qweight, scale])
+        out = self._op_matmul(node, [x, weight], {})
+        if len(args) > 3:
+            out = self._binary("add", [out, args[3]])
+        return out
+
+    def _op_linear_fp8a8(self, node, args, attrs):
+        """W8A8 fp8 线性层：两路载荷各按自己的 scale 反量化，再走 f32 GEMM。
+
+        与 ``linear_i8a8`` 的分界：那边累加在 int32 里、scale 必须提到求和号
+        外面，因此 IR 限定"沿 K 恒定"；这里反量化先落成 f32 张量，累加本来
+        就在浮点，所以设备端不需要对 scale 形状做额外假设——只要它按 numpy
+        规则广播到载荷即可（IR 已把形态收窄成逐 token / 逐输出通道）。
+
+        没有任何 fp8 专用内核，也不承诺 fp8 tensor core：收益同 ``linear_fp8``，
+        仍只在驻留与读带宽（1 字节存储见 5.328）。
+        """
+        cp = self.cp
+        xq, xs, wq, ws = args[0], args[1], args[2], args[3]
+        for label, arr in (("激活", xq), ("激活 scale", xs), ("权重", wq), ("权重 scale", ws)):
+            if arr.dtype != cp.float32:
+                raise BackendCapabilityError(
+                    f"{self._LABEL}的 linear_fp8a8 要求{label}是 f32"
+                    f"（fp8 的载荷也是 f32 载体），收到 {arr.dtype}"
+                )
+        if xq.ndim < 2 or wq.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8a8 要求激活秩 >= 2、权重秩 2，"
+                f"收到 {xq.shape} 与 {wq.shape}"
+            )
+        k = int(xq.shape[-1])
+        n = int(wq.shape[-1])
+        if int(wq.shape[0]) != k:
+            raise BackendCapabilityError(
+                f"linear_fp8a8 的内维不匹配：{xq.shape} @ {wq.shape}"
+            )
+        if len(args) > 4:
+            bias = args[4]
+            if bias.dtype != cp.float32 or int(bias.size) != n:
+                raise BackendCapabilityError(
+                    f"linear_fp8a8 的 bias 必须是长度 {n} 的 f32，收到 "
+                    f"{bias.dtype} {bias.shape}"
+                )
+        x = self._binary("mul", [xq, xs])
+        weight = self._binary("mul", [wq, ws])
+        out = self._op_matmul(node, [x, weight], {})
         if len(args) > 4:
             out = self._binary("add", [out, args[4]])
         return out

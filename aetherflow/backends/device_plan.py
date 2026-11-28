@@ -18,6 +18,7 @@ from ..lower.plan import (
 import numpy as np
 from .device_shared import (
     FP8_DTYPES,
+    FP8_OPS,
     _INDEX_ARGS,
     _INDEX_DTYPES,
     _LAYOUT_OPS,
@@ -470,19 +471,20 @@ class _PlanMixin:
     def _planned_kernel(self, node: Node):
         """按 IR 声明预判能否跳过 ``invoke`` 的校验；能就返回内核函数。
 
-        与 ``invoke`` 的检查逐条对应：注册表里有这个算子；fp8 只出现在
-        ``cast`` 上（其它算子遇到 fp8 要留给 ``invoke`` 报错）；整数下标的
-        位置（``_INDEX_ARGS``）声明为 i32/i8；其余输入声明为 f32，或 f16 /
-        bf16 且该算子在该支持面内。返回 ``None`` 表示"这条不能预判"，走原路径。
+        与 ``invoke`` 的检查逐条对应：注册表里有这个算子；fp8 只出现在白名单
+        算子上（``FP8_OPS``：cast 与两个 fp8 线性层；其它算子遇到 fp8 要留给
+        ``invoke`` 报错）；整数下标的位置（``_INDEX_ARGS``）声明为 i32/i8；
+        其余输入声明为 f32，或 f16 / bf16 且该算子在该支持面内。返回 ``None``
+        表示"这条不能预判"，走原路径。
 
-        ``cast`` 是唯一承接 fp8 的算子（5.325）：fp8 的输入 / 输出都是 f32
-        载体，快路径末尾会按 ``out_dtype`` 调 ``quantize`` 把数值落回格点。
+        fp8 的输入 / 输出都是 f32 载体，快路径末尾会按 ``out_dtype`` 调
+        ``quantize`` 把数值落回格点（cast 与节点边界，见 5.325 / 5.327）。
         """
         name = node.op.name
         fn = self.kernels.get(name)
         if fn is None:
             return None
-        if node.output.type.dtype in FP8_DTYPES and name != "cast":
+        if node.output.type.dtype in FP8_DTYPES and name not in FP8_OPS:
             return None
         if name in _LAYOUT_OPS and node.attrs.get("layout", "nchw") != "nchw":
             # 布局不匹配要留给 ``invoke`` 报错，不能在这里返回内核——
@@ -497,7 +499,7 @@ class _PlanMixin:
                 continue
             if dtype == DType.F32:
                 continue
-            if dtype in FP8_DTYPES and name == "cast":
+            if dtype in FP8_DTYPES and name in FP8_OPS:
                 continue
             if dtype == DType.F16 and name in self._f16_ops:
                 continue

@@ -51,9 +51,10 @@ from .backends.reference_backend import ReferenceBackend
 from .ir.graph import Graph
 from .ir.ops import OPS
 from .ir.serialize import dumps, loads, to_dict
-from .ir.types import boolean, c64, f32, f64, i8, i32
+from .ir.types import boolean, c64, f32, f64, f8e4m3, f8e5m2, i8, i32
 from .ir.verifier import verify_portable_only
 from .models.transformer import BlockSpec, build_transformer_block
+from .runtime.fp8 import quantize_fp8
 
 __all__ = [
     "Case",
@@ -544,6 +545,60 @@ def _linear_i8a8_zp(x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)):
                 np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05
             ).astype(np.float32),
             "w_zp": np.array([-128, 0, 1, -127, 127, -64], dtype=np.int8),
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
+def _linear_fp8(kind: str = "e4m3", x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
+    """weight-only fp8：权重是 f8 载体，逐输出通道一个 scale，带 bias。"""
+    dtype = f8e4m3 if kind == "e4m3" else f8e5m2
+
+    def build(rng):
+        g = Graph("linear_fp8")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", dtype[w_shape])
+        s = g.input("s", f32[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_fp8", [x, q, s, b]), "y")
+        scale = (np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        # 载荷必须落在格式格点上：先在"反量化后的量级"生成随机权重，再按
+        # 同一 scale 量化，与写入侧 quantize_weight_fp8 的产物同形。直接给
+        # 任意 f32 也不会算出不同的面积——入口会重新舍入——但那样用例就
+        # 不再验证"权重是已量化载体的读数路径"。
+        qvalues = quantize_fp8(_f32(rng, w_shape, scale=1.5), scale, kind)
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": qvalues,
+            "s": scale,
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
+def _linear_fp8a8(kind: str = "e4m3", x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)):
+    """W8A8 fp8：激活逐 token、权重逐输出通道各一个 scale，带 bias。"""
+    dtype = f8e4m3 if kind == "e4m3" else f8e5m2
+
+    def build(rng):
+        g = Graph("linear_fp8a8")
+        q = g.input("x_q", dtype[x_shape])
+        sx = g.input("x_scale", f32[x_shape[:-1] + (1,)])
+        wq = g.input("w_q", dtype[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_fp8a8", [q, sx, wq, sw, b]), "y")
+        x_scale = (np.abs(_f32(rng, x_shape[:-1] + (1,), scale=0.1)) + 0.02).astype(
+            np.float32
+        )
+        w_scale = (np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        return g, {
+            "x_q": quantize_fp8(_f32(rng, x_shape, scale=1.5), x_scale, kind),
+            "x_scale": x_scale,
+            "w_q": quantize_fp8(_f32(rng, w_shape, scale=1.5), w_scale, kind),
+            "w_scale": w_scale,
             "b": _f32(rng, (w_shape[-1],), scale=0.1),
         }
 
@@ -1682,6 +1737,18 @@ def default_cases() -> List[Case]:
         _case("cast_f8e5m2", _fp8_cast("e5m2"),
               note="IEEE 溢出按 RNE 到 inf（100000）；次正规最小到 2^-16；"
                    "载体仍是 f32，只检验数值是否落在格点上"),
+        # fp8 线性层（5.327）：权重 / 激活是 f32 载体，反量化后走既有 f32 GEMM
+        _case("linear_fp8_e4m3_bias", _linear_fp8("e4m3"),
+              note="weight-only fp8：数值必须等于先按 weight_scale 反量化再 matmul；"
+                   "不承诺 fp8 tensor core，算力与等价的 f32 GEMM 相同"),
+        _case("linear_fp8_e5m2_bias", _linear_fp8("e5m2"),
+              note="e5m2 的格点更粗：检验两种格式都按各自的格式格点读数，"
+                   "而不是把载体当普通 f32 直接乘"),
+        _case("linear_fp8a8_e4m3_bias", _linear_fp8a8("e4m3"),
+              note="W8A8 fp8：激活逐 token、权重逐通道各一个 scale，"
+                   "反量化后 f32 累加（不是 int32，也不是 tensor core）"),
+        _case("linear_fp8a8_e5m2_rank2", _linear_fp8a8("e5m2", x_shape=(4, 8)),
+              note="秩 2 激活 + 逐 token scale：与秩 3 共用同一条实现"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),
               note="CNN 的最小真实形态：3x3 + same padding + bias；未声明 conv2d 的后端必须显式拒绝"),

@@ -26,10 +26,17 @@ from .base import BackendCapabilityError
 
 #: fp8 在 IR 里的载体也是 f32（``np_dtype``），设备端没有 1 字节容器。
 #: ``cast`` 由 ``_CAST_FP8_SRC`` 在设备上把数值舍入到格式格点（见 5.325）；
-#: 其它算子若遇到 fp8 仍必须显式拒绝——否则会被 f32 载体悄悄当成 f32 计算。
-#: 放在共享层是因为两条路径都要用它：逐节点的 ``invoke`` 与计划构建期的
-#: ``_planned_kernel``（后者预绑定内核后就不再经过 ``invoke`` 的检查）。
+#: 承接 fp8 的算子只有 ``cast`` 与两个线性层（5.327：它们按 f32 载体读出、
+#: 反量化后走既有 GEMM），其余算子遇到 fp8 仍必须显式拒绝——否则会被 f32
+#: 载体悄悄当成 f32 计算。放在共享层是因为两条路径都要用它：逐节点的
+#: ``invoke`` 与计划构建期的 ``_planned_kernel``（后者预绑定内核后就不再
+#: 经过 ``invoke`` 的检查）。
 FP8_DTYPES: FrozenSet[DType] = frozenset({DType.F8E4M3, DType.F8E5M2})
+
+#: 允许输入 / 输出带 fp8 标量的算子。fp8 的载体就是 f32，所以它们不需要
+#: 新内核，只需要让 ``invoke`` 与 ``_planned_kernel`` 不再按"fp8 一律拒绝"
+#: 处理。刻意写成白名单而不是"排除几个"：新算子默认仍然不承接 fp8。
+FP8_OPS: FrozenSet[str] = frozenset({"cast", "linear_fp8", "linear_fp8a8"})
 
 
 # 同一批自研内核模板（NVRTC / hipRTC 各编译一份）承接的算子面。它是声明，
@@ -78,6 +85,11 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "linear_i8_zp",
         "linear_i8a8",
         "linear_i8a8_zp",
+        # fp8 线性层不新增内核：载体是 f32，反量化就是一次 ``mul``，
+        # 之后复用 sgemm（见 DESIGN 5.327）。声明在这里是因为能力面
+        # 与注册表必须逐项对账。
+        "linear_fp8",
+        "linear_fp8a8",
         "conv2d",
         "maxpool2d",
         "maxpool2d_indices",
