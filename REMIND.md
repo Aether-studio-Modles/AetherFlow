@@ -21,7 +21,10 @@
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
 - **自动微分**：49 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
-- **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行（主机中转）、
+- **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行
+  （5.331 起 NCCL / RCCL 可加载时**默认设备侧归约**：单进程多卡自动
+  `ncclCommInitAll`、每进程一卡自动 `ncclCommInitRank`；库缺失或显式
+  `collective="host"` 才经主机中转）、
   ZeRO-1/2/3、GPipe 与 1F1B 流水、张量并行（仅前向）。
 - **推理**：跨请求图缓存与权重驻留、前缀缓存、批量解码、束搜索、连续批处理；
   **设备态解码**（`LMRunner(device_state=True)` / `ServingEngine(device_state=True)`）：
@@ -132,7 +135,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3275 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3287 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -150,14 +153,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 
 ### 已知限制
 
-- **分布式**：NCCL / RCCL 已到设备侧绑定（AllReduce / AllGather / ReduceScatter /
-  Broadcast）。单进程多卡可显式接设备侧归约：
-  `DataParallelTrainer(..., collective="device",
-  device_collective=nccl_device_collective(backend, devices))`（`ncclCommInitAll`
-  + 每卡原地 AllReduce，5.284），不注入时仍报 `DeviceCollectiveUnavailable`；
-  多进程 `DistributedDataParallel` **仍走主机中转**，`overlap` 恒为 `False`。
-  真机只到 `world=1`（RCCL 与 CUDA 各一条），两卡数值用例已写但当前没有多卡
-  机器、未执行。ZeRO-1/2/3 与流水部分参见 DESIGN §7。
+- **分布式**：NCCL / RCCL 绑定已接进数据并行默认路径（5.331）。单进程多卡
+  `DataParallelTrainer(collective="auto")` 在库可加载时自动
+  `nccl_device_collective(backend, devices)`（`ncclCommInitAll` + 每卡原地
+  AllReduce）；每进程一卡的 `DistributedDataParallel.from_env` 在设备态默认
+  `NcclDeviceCollective.from_env()`（rank 0 经 `AF_MASTER_ADDR` /
+  `AF_MASTER_PORT` 分发 uid，其余 rank `ncclCommInitRank`）。库缺失时显式抛
+  `DeviceCollectiveUnavailable`（不静默降级），显式 `device=False` 或
+  `collective="host"` 才走主机中转。`overlap` 仍恒为 `False`，设备态强制
+  `bucket_bytes=0` / `threads=1`。真机只到 `world=1`（RCCL 与 CUDA 各一条），
+  多卡数值与 uid 分发用例已写但当前没有多卡机器、未执行。ZeRO-1/2/3 与流水
+  部分参见 DESIGN §7。
 - **张量并行**：只有前向（列 / 行并行 + attention 头切分）。行并行返回**部分和**，
   需调用方归约；反向通信与优化器分片未接。
 - **量化**：weight-only int8（权重驻留 1 字节，GEMM 仍走 f32 反量化）与 W8A8
@@ -782,6 +788,30 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **5.330 的真机债**：`reduce_all` / `reduce_any` 只有参考语义，不在
   `GPU_OPS`（设备端无 bool 归约内核，`af_add_q` 仍是 stub），CUDA / HIP 会
   显式拒绝；逻辑组合与 bool cast 的设备路径只有源码级检查，V100 未回归。
+- **能力声明按"库能不能加载"，不按"路径有没有接"**（5.331）：
+  `collective_support` 先前恒报 `device_allreduce=False`，理由是"路径没接"，
+  但 5.228 / 5.244 之后库已能加载。声明与实际不符会让调用方永远不敢用设备侧
+  路径。现在的判据只有一个：`nccl.vendor()` / `version_string()` 成功即 True。
+- **默认值可以改变行为，但必须写进 DESIGN**（5.331）：
+  `DataParallelTrainer` 的 `collective` 从 `"host"` 改成 `"auto"`，在有 NCCL
+  的机器上会把既有调用的通信从主机搬到设备。这是有意的（设备态梯度本就在
+  显存里），但"默认值变更"属于对外行为，必须在小节里点名，不能只藏在代码。
+- **不静默降级是硬约束**（5.331）：设备侧不可用时抛
+  `DeviceCollectiveUnavailable` 并给出 `device=False` / `collective="host"`
+  的出口，而不是悄悄走主机中转——否则调用方会以为通信留在设备上，性能结论
+  整体失真。
+- **uid 分发先挂线程再初始化自己**（5.331）：`ncclCommInitRank` 阻塞到全员
+  到齐，rank 0 若先初始化再分发，其余 rank 会在 `fetch_unique_id` 上白等到
+  超时。顺序反过来才对；`world_size == 1` 直接返回 `_LocalComm`，单卡调试
+  不该被"必须先装 NCCL"挡住。
+- **切卡与 `ncclCommInitRank` 必须合并**（5.331）：`nccl.init_rank` 先
+  `cp.cuda.Device(device)` 再建 comm。分开写的话，"comm 绑错卡"要到第一次
+  集合调用才炸，错误现场离配置错误太远；没有 cupy 时直接抛 `NcclUnavailable`，
+  不猜卡号。
+- **5.331 的真机债**：本机没有 NCCL / RCCL，所有"有库"分支靠 mock 覆盖；
+  `ncclCommInitAll` 多卡归约、`NcclDeviceCollective.from_env` 的 uid 分发与
+  两卡数值用例均待授权真机回归。`overlap` 仍为 False，设备态强制
+  `bucket_bytes=0` / `threads=1` / `overlap=False`。
 
 ---
 

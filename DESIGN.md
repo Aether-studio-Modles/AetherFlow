@@ -21030,6 +21030,86 @@ bool 输出只能精确相等，这五条的 rtol / atol 都是 0。
 - 新增设备端路径（bool cast、逻辑组合的方言选择）只有源码级检查与参考
   后端对拍，V100 真机回归仍待授权。
 
+### 5.331 DDP 去掉主机中转：设备侧 communicator 成为默认路径
+
+**缺口。** 设备侧集合通信在 5.228 / 5.244 已经能加载 NCCL / RCCL、能建
+communicator，但数据并行这条路仍要求调用方自己把 provider 拼好：
+
+1. `collective_support` 的声明是"库已接入但路径没接"，`device_allreduce`
+   在未注入 provider 时恒为 False——能力存在却声称没有。
+2. `DataParallelTrainer(collective="device")` 没有注入
+   `device_collective` 时直接抛 `DeviceCollectiveUnavailable`，等于把
+   "建 communicator" 这件事推回给调用方。
+3. `DistributedDataParallel.from_env` 缺省用 `HostCollective.from_env()`：
+   设备态的梯度本来就在显存里，却先 D2H、主机求和、再 H2D，是反常的那一侧。
+
+**1. 能力声明的判据改为"库能不能加载"。** `collective_support` 不再假设
+"路径没接"：`_device_collective_reason()` 尝试 `nccl.vendor()` /
+`version_string()`，成功即声明 `device_allreduce=True`、`provider="nccl"`，
+失败才声明只能主机中转。理由文本按真实厂商命名（HIP 上是 RCCL），并写明
+两条默认路径各自的构造入口。`overlap` 仍恒为 False（执行器同步、切卡串行，
+没有可重叠的窗口），不随这次改动变化。
+
+**2. `DataParallelTrainer` 默认 `collective="auto"`。** 解析顺序：注入
+provider ⇒ `device`；否则查 `collective_support(backend).device_allreduce`
+⇒ `device` / `host`。解析成 `device` 且没有 provider 时，构造期直接调
+`nccl_device_collective(backend, picked)`（`ncclCommInitAll`），不再要求
+调用方注入。显式 `collective="device"` 但库缺失仍抛
+`DeviceCollectiveUnavailable`，消息带原因并给出 `collective="host"` 的
+出口——**不静默降级**，否则调用方会以为通信留在设备上。
+
+**3. `NcclDeviceCollective.from_env`：一进程一卡自建 communicator。**
+rank 0 生成 `ncclUniqueId`，用 `UniqueIdServer` 在 `AF_MASTER_ADDR` /
+`AF_MASTER_PORT` 上分发，其余 rank `fetch_unique_id` 取回后
+`ncclCommInitRank`。协议与 `train.distributed.spawn` /
+`host_collective.launch` 同源（`AF_RANK` / `AF_WORLD_SIZE` /
+`AF_MASTER_ADDR` / `AF_MASTER_PORT`），所以用这两个启动器或 `torchrun`
+拉起的进程直接可用。rank 0 先挂分发线程再初始化自己：`init_rank` 会阻塞
+到全员到齐，顺序反过来会让其余 rank 在 fetch 上白等到超时。
+`world_size == 1` 返回 `_LocalComm`（归约恒等），单卡调试不需要装 NCCL。
+
+**4. `nccl.init_rank`：切卡与初始化合并。** 先 `cp.cuda.Device(target)`
+再 `ncclCommInitRank`，`device` 缺省取 rank。分开写的话，"comm 绑错卡"
+要到第一次集合调用才炸，错误现场离配置错误很远。没有 cupy 时抛
+`NcclUnavailable`——无法确定 communicator 绑在哪张卡上，不能猜。
+
+**5. `DistributedDataParallel.from_env` 默认跟随 `trainer.device_state`。**
+`device=None` 时设备态走 `NcclDeviceCollective.from_env`，主机态走
+`HostCollective.from_env`；显式 `device=False` 保留主机中转（跨机且没有
+NCCL 时唯一可用的路）。桶与线程数的缺省值也随形态走：设备态
+`bucket_bytes=0` / `threads=1`（NCCL 调用必须各 rank 同序，设备态不拼桶），
+主机态 `DEFAULT_BUCKET_BYTES` / 2。`NcclUnavailable` 被转成
+`DeviceCollectiveUnavailable`，消息提示 `device=False`。
+
+**验证。** 本地 3287 条通过 / 460 跳过（较 5.330 增 12），ruff 通过。
+`test_nccl` 新增 `TestInitRank` 3 条（先切卡再初始化、device 缺省取 rank、
+负 device 拒绝），并把能力声明用例改为按新事实断言（成功时
+`device_allreduce=True`、`provider="nccl"`、理由含库版本与两条例名入口；
+缺库时 False + 理由含"加载不到"）。`test_zero` 新增
+`NcclDeviceCollectiveFromEnvTest` 4 条（单 rank 直通、rank 0 分发 uid、
+worker 取回 uid、rank / world 越界拒绝）。`test_ddp` 新增
+`TestDistributedFromEnvBindsDevice` 3 条（设备态默认走
+`NcclDeviceCollective.from_env` 且桶 0 / 线程 1、显式 `device=False` 走
+`HostCollective.from_env` 且桶 >0 / 线程 2、缺库抛
+`DeviceCollectiveUnavailable`）。`test_parallel` 的 `TestCollectiveSeam`
+增 2 条（auto 在有库时自建 provider 并落在 device、缺库时落回 host 且不建
+communicator），旧的"注入 provider 却选 host"用例改为显式
+`collective="host"` 以保留原语义。
+
+**未声称。**
+
+- 本机没有 NCCL / RCCL，"有库"分支全部靠 mock 覆盖；真机上的
+  `ncclCommInitAll` 多卡归约与 `from_env` uid 分发仍待授权回归。
+- `overlap` 仍恒为 False：设备态强制 `bucket_bytes=0` / `threads=1` /
+  `overlap=False`，没有"梯度一就绪就归约"的反向重叠。
+- `ncclCommInitAll` 那组 communicator 只服务单进程多卡；每进程一卡的 DDP
+  必须走 `ncclCommInitRank`，两组不能混用。
+- 跨机、无 NCCL 的场景仍只能 `device=False` 走主机中转；`auto` 不会
+  在没有库时偷偷退回。
+- `ncclAvg` 与 bf16 仍被绑定拒绝（平均在调用侧补除、bf16 主机侧算不出
+  期望值），本次未放开。
+
+
 
 
 
