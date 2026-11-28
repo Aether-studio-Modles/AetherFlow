@@ -18,11 +18,20 @@ import unittest
 
 import numpy as np
 
+from aetherflow.models.quantize import (
+    dequantize_weight,
+    dequantize_weight_asymmetric,
+    quantize_weight,
+    quantize_weight_asymmetric,
+)
 from aetherflow.train.params import ParameterStore
 from aetherflow.weights import (
+    QuantizedWeight,
     SafeTensorsError,
     SafeTensorsFile,
+    build_quantized_weight,
     load_into_store,
+    load_quantized_linear,
     load_safetensors,
     load_safetensors_dir,
 )
@@ -365,6 +374,176 @@ class TestLoadIntoStore(unittest.TestCase):
     def test_rejects_non_store(self):
         with self.assertRaises(TypeError):
             load_into_store({"w": np.zeros((3, 4), np.float32)}, {})
+
+
+class TestQuantizedWeight(_TempDir):
+    """量化权重的读取入口：张量校验 + metadata 自描述一致性。
+
+    判据与模块说明一致：数值上必须与 ``models.quantize`` 的同一份语义逐位
+    相等（``dequantize`` 走的是 IR 的 reference，不是另写一份）；打包错误
+    （非 int8 权重、零点越界、形状对不上、metadata 与张量矛盾）必须在
+    拿到 ``QuantizedWeight`` 之前报错，不能靠"看着像"去猜。
+    """
+
+    W = np.array(
+        [[-1.5, 0.25, 2.0], [0.5, -0.75, 0.0], [1.25, 0.125, -2.5]],
+        dtype=np.float32,
+    )
+
+    def _symmetric_file(self, metadata=None):
+        q, scale = quantize_weight(self.W)
+        target = self.path("q8.safetensors")
+        _file(target, {"w_q": q, "w_scale": scale}, metadata=metadata)
+        return target, q, scale
+
+    def _asymmetric_file(self, metadata=None, zp_dtype=np.int32):
+        q, scale, zp = quantize_weight_asymmetric(self.W)
+        target = self.path("q8zp.safetensors")
+        _file(
+            target,
+            {"w_q": q, "w_scale": scale, "w_zp": zp.astype(zp_dtype)},
+            metadata=metadata,
+        )
+        return target, q, scale, zp
+
+    def test_symmetric_round_trip(self):
+        target, q, scale = self._symmetric_file({"quantization": "int8"})
+        got = load_quantized_linear(target, "w_q", "w_scale")
+        self.assertIsInstance(got, QuantizedWeight)
+        self.assertTrue(got.symmetric)
+        self.assertEqual(got.shape, (3, 3))
+        self.assertEqual((got.in_features, got.out_features), (3, 3))
+        np.testing.assert_array_equal(got.q, q)
+        np.testing.assert_array_equal(got.scale, scale)
+        np.testing.assert_array_equal(got.dequantize(), dequantize_weight(q, scale))
+
+    def test_asymmetric_round_trip_widens_i32_zero_point(self):
+        target, q, scale, zp = self._asymmetric_file({"quantization": "int8_zp"})
+        got = load_quantized_linear(target, "w_q", "w_scale", "w_zp")
+        self.assertFalse(got.symmetric)
+        self.assertEqual(got.zero_point.dtype, np.int8)
+        np.testing.assert_array_equal(got.zero_point, zp)
+        np.testing.assert_array_equal(
+            got.dequantize(), dequantize_weight_asymmetric(q, scale, zp)
+        )
+
+    def test_transpose_reads_torch_layout(self):
+        w = np.arange(12, dtype=np.float32).reshape(3, 4) - 5.0
+        q, scale = quantize_weight(w)  # q 是 (3, 4)，scale 是 (4,)
+        target = self.path("torch.safetensors")
+        _file(target, {"w": q.T, "scale": scale})
+        got = load_quantized_linear(target, "w", "scale", transpose=True)
+        self.assertEqual(got.shape, (3, 4))
+        np.testing.assert_array_equal(got.q, q)
+
+    def test_metadata_absent_is_accepted(self):
+        target, q, scale = self._symmetric_file()
+        got = load_quantized_linear(target, "w_q", "w_scale")
+        np.testing.assert_array_equal(got.dequantize(), dequantize_weight(q, scale))
+
+    def test_group_size_one_is_accepted(self):
+        target, _, _ = self._symmetric_file(
+            {"quantization": "int8", "quantization.group_size": "1"}
+        )
+        self.assertTrue(load_quantized_linear(target, "w_q", "w_scale").symmetric)
+
+    def test_metadata_kind_must_match_zero_point(self):
+        target, _, _ = self._symmetric_file({"quantization": "int8_zp"})
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "w_q", "w_scale")
+        target, _, _, _ = self._asymmetric_file({"quantization": "int8"})
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "w_q", "w_scale", "w_zp")
+
+    def test_unknown_quantization_kind(self):
+        target, _, _ = self._symmetric_file({"quantization": "fp8"})
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "w_q", "w_scale")
+
+    def test_per_group_metadata_is_rejected(self):
+        target, _, _ = self._symmetric_file({"quantization.group_size": "32"})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_quantized_linear(target, "w_q", "w_scale")
+        self.assertIn("per-group", str(ctx.exception))
+
+    def test_check_metadata_false_only_skips_self_description(self):
+        target, q, scale = self._symmetric_file({"quantization": "int8_zp"})
+        got = load_quantized_linear(
+            target, "w_q", "w_scale", check_metadata=False
+        )
+        np.testing.assert_array_equal(got.dequantize(), dequantize_weight(q, scale))
+
+    def test_build_from_tensor_map(self):
+        q, scale = quantize_weight(self.W)
+        got = build_quantized_weight({"w_q": q, "w_scale": scale}, "w_q", "w_scale")
+        self.assertTrue(got.symmetric)
+        np.testing.assert_array_equal(got.dequantize(), dequantize_weight(q, scale))
+
+    def test_rejects_non_int8_q(self):
+        target = self.path("f32q.safetensors")
+        _file(target, {"q": np.ones((2, 3), np.float32), "s": np.ones((3,), np.float32)})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_quantized_linear(target, "q", "s")
+        self.assertIn("int8", str(ctx.exception))
+
+    def test_rejects_zero_point_out_of_range(self):
+        target = self.path("zp.safetensors")
+        _file(
+            target,
+            {
+                "q": np.zeros((2, 3), np.int8),
+                "s": np.ones((3,), np.float32),
+                "z": np.array([0, 128, -129], np.int32),
+            },
+        )
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "q", "s", "z")
+
+    def test_rejects_float_zero_point(self):
+        target = self.path("zpf.safetensors")
+        _file(
+            target,
+            {
+                "q": np.zeros((2, 3), np.int8),
+                "s": np.ones((3,), np.float32),
+                "z": np.zeros((3,), np.float32),
+            },
+        )
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "q", "s", "z")
+
+    def test_rejects_scale_length_mismatch(self):
+        target = self.path("slen.safetensors")
+        _file(target, {"q": np.zeros((2, 3), np.int8), "s": np.ones((2,), np.float32)})
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "q", "s")
+
+    def test_rejects_non_positive_scale(self):
+        target = self.path("sneg.safetensors")
+        _file(
+            target,
+            {
+                "q": np.zeros((2, 3), np.int8),
+                "s": np.array([0.5, -0.5, 1.0], np.float32),
+            },
+        )
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "q", "s")
+
+    def test_scale_f64_requires_allow_downcast(self):
+        target = self.path("s64.safetensors")
+        _file(target, {"q": np.zeros((2, 3), np.int8), "s": np.ones((3,), np.float64)})
+        with self.assertRaises(SafeTensorsError):
+            load_quantized_linear(target, "q", "s")
+        got = load_quantized_linear(target, "q", "s", allow_downcast=True)
+        self.assertEqual(got.scale.dtype, np.float32)
+
+    def test_missing_tensor(self):
+        target = self.path("miss.safetensors")
+        _file(target, {"q": np.zeros((2, 3), np.int8)})
+        with self.assertRaises(SafeTensorsError) as ctx:
+            load_quantized_linear(target, "q", "s")
+        self.assertIn("'s'", str(ctx.exception))
 
 
 if __name__ == "__main__":
