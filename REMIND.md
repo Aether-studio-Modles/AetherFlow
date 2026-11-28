@@ -205,6 +205,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   池化反向与取值位置（`maxpool2d_indices`）没有 layout 属性，训练图仍是 NCHW
   （NHWC 无反向规则）。配置库的 conv2d 签名在 NHWC 下多一个 `layout` 字段，
   NCHW 保持旧签名。
+- **国产卡**：只有接入路径与真机准入判据（DESIGN 5.336），仓库内没有后端实现，
+  也没有任何实测记录。接入形态是把方言与运行时胶水打成 zip 硬件包（与 novac
+  同层），不改框架核心；可离线验证的是方言源码与装配拒绝面，runtime / BLAS
+  要等厂商 SDK 与硬件——不猜厂商 API，也不把"骨架就位"表述成"已接入"。
 - **循环级 IR**（5.332）：`LoopIR` / `LoopSplit` 只接受单图体，嵌套控制区域
   显式抛 `LoopIRError`；只做循环不变量外提，不做循环融合 / 分块 / 软件流水，
   也未接进 schedule 搜索或编译流水线。条件图不参与外提（每轮必须求值）；
