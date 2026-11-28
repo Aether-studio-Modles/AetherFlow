@@ -100,6 +100,13 @@ from .weights import (
     load_safetensors,
     load_safetensors_dir,
 )
+from .gguf import (
+    GGML_TYPES,
+    GGUFError,
+    GGUFFile,
+    GGUFTensorInfo,
+    read_gguf,
+)
 from .ir import (
     IR_VERSION,
     UNREPLAYABLE_EFFECTS,
@@ -180,6 +187,11 @@ __all__ = [
     "FP8Weight",
     "load_safetensors",
     "load_safetensors_dir",
+    "GGML_TYPES",
+    "GGUFError",
+    "GGUFFile",
+    "GGUFTensorInfo",
+    "read_gguf",
     "build_quantized_weight",
     "load_quantized_linear",
     "build_fp8_weight",
