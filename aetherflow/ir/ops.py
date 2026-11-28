@@ -6039,6 +6039,49 @@ register(
 #: ``ortho`` 两侧各除 √N，``forward`` 只在反向除以 N。
 _FFT_NORMS = ("backward", "ortho", "forward")
 
+#: ``cufftPlanMany`` 的 rank 上限是 3，IR 如实反映库能力而不是假装能算更多维。
+FFT_MAX_AXES = 3
+
+
+def fft_axes(rank: int, attrs: dict) -> Tuple[int, ...]:
+    """把 ``axes`` 属性规范成升序、末尾连续的轴元组。
+
+    ``axes=None`` 表示沿最后一维（既有语义）。只接受**升序且末尾连续**的一段：
+    cuFFT 可以把"前缀维"拉平成 batch，但要求被变换的轴在内存里连续；非连续轴
+    （例如 ``(0, 2)``）需要逐轴 stride 变换，参考语义与设备实现会立刻分叉，
+    所以显式拒绝而不是静默重排。
+    """
+    axes = attrs.get("axes", None)
+    if axes is None:
+        return (rank - 1,)
+    if isinstance(axes, (str, bytes)) or not isinstance(axes, (tuple, list)):
+        raise TypeError(
+            f"fft 的 axes 必须是整数元组或 None，得到 {type(axes).__name__}"
+        )
+    if not 1 <= len(axes) <= FFT_MAX_AXES:
+        raise ValueError(
+            f"fft 的 axes 只支持 1–{FFT_MAX_AXES} 个轴（cuFFT 的 rank 上限），"
+            f"得到 {len(axes)} 个"
+        )
+    normalized = []
+    for raw in axes:
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise TypeError(f"fft 的 axes 元素必须是 int，得到 {type(raw).__name__}")
+        axis = raw + rank if raw < 0 else raw
+        if not 0 <= axis < rank:
+            raise ValueError(f"fft 的 axes 里的 {raw} 超出输入的 {rank} 维范围")
+        normalized.append(axis)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"fft 的 axes 不允许重复，得到 {tuple(normalized)}")
+    if normalized != sorted(normalized):
+        raise ValueError(f"fft 的 axes 必须按升序给出，得到 {tuple(normalized)}")
+    if normalized != list(range(rank - len(normalized), rank)):
+        raise ValueError(
+            f"fft 的 axes 必须是末尾连续的一段（如 (-2, -1)），得到 "
+            f"{tuple(normalized)}；中间夹轴的变换请拆成多次一维 fft"
+        )
+    return tuple(normalized)
+
 
 def _fft_norm(attrs: dict) -> str:
     norm = attrs.get("norm", "backward")
@@ -6048,7 +6091,7 @@ def _fft_norm(attrs: dict) -> str:
 
 
 def _infer_fft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
-    """复数到复数的 DFT（沿最后一维）。形状与 dtype 都不变。
+    """复数到复数的 DFT（沿 ``axes``，默认最后一维）。形状与 dtype 都不变。
 
     只接受复数输入：实数进复数出是 ``rfft`` 的语义，混在同一个算子里会让
     输出形状依赖 dtype，类型推导就得多一条分支；更重要的是**默不作声地
@@ -6066,13 +6109,14 @@ def _infer_fft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     inverse = attrs.get("inverse", False)
     if not isinstance(inverse, bool):
         raise TypeError(f"fft 的 inverse 必须是 bool，得到 {type(inverse).__name__}")
+    fft_axes(x.rank, attrs)
     return x
 
 
 def _ref_fft(args: List[np.ndarray], attrs: dict) -> np.ndarray:
     norm = _fft_norm(attrs)
-    fn = np.fft.ifft if attrs.get("inverse", False) else np.fft.fft
-    return fn(args[0], axis=-1, norm=norm)
+    fn = np.fft.ifftn if attrs.get("inverse", False) else np.fft.fftn
+    return fn(args[0], axes=fft_axes(args[0].ndim, attrs), norm=norm)
 
 
 register(
@@ -6080,11 +6124,12 @@ register(
         name="fft",
         infer=_infer_fft,
         reference=_ref_fft,
-        attrs_schema=("norm", "inverse"),
-        doc="沿最后一维的离散傅里叶变换（复数 → 复数）。``inverse=True`` 走逆变换；"
-        "``norm`` 取 backward / ortho / forward，与 numpy.fft 同义。"
-        "复数 dtype 只有 c64 / c128 两种，形状与 dtype 都保持不变。"
-        "反向图暂不提供 VJP（复数线性算子的伴随需要共轭转置，"
+        attrs_schema=("norm", "inverse", "axes"),
+        doc="沿 ``axes``（默认最后一维，可给 1–3 个末尾连续轴）的离散傅里叶变换"
+        "（复数 → 复数）。``inverse=True`` 走逆变换；``norm`` 取 "
+        "backward / ortho / forward，与 numpy.fft 同义。两维 / 三维分别等价于 "
+        "numpy 的 ``fft2`` / ``fftn``。复数 dtype 只有 c64 / c128 两种，形状与 "
+        "dtype 都保持不变。反向图暂不提供 VJP（复数线性算子的伴随需要共轭转置，"
         "IR 里还没有 conj 算子），求导会显式报 NoGradientError。",
     )
 )
@@ -6092,6 +6137,9 @@ register(
 
 def _infer_rfft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     """实数到复数的半谱 DFT：``f32 -> c64``、``f64 -> c128``。
+
+    半谱只压最内层轴，所以 ``axes`` 的最后一个必须是最后一维（由
+    :func:`fft_axes` 的"末尾连续"规则自动保证）。
 
     f16 / bf16 显式拒绝：半精度 FFT 的舍入误差会盖过数值本身，且
     numpy 没有对应的参考实现——没有参考语义就不该进入 IR。
@@ -6109,6 +6157,7 @@ def _infer_rfft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if x.rank == 0:
         raise ValueError("rfft 至少需要 1 维（变换沿最后一维）")
     _fft_norm(attrs)
+    fft_axes(x.rank, attrs)
     last = x.shape[-1]
     if isinstance(last, int):
         last = last // 2 + 1
@@ -6118,7 +6167,9 @@ def _infer_rfft(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
 
 
 def _ref_rfft(args: List[np.ndarray], attrs: dict) -> np.ndarray:
-    return np.fft.rfft(args[0], axis=-1, norm=_fft_norm(attrs))
+    return np.fft.rfftn(
+        args[0], axes=fft_axes(args[0].ndim, attrs), norm=_fft_norm(attrs)
+    )
 
 
 register(
@@ -6126,9 +6177,10 @@ register(
         name="rfft",
         infer=_infer_rfft,
         reference=_ref_rfft,
-        attrs_schema=("norm",),
-        doc="沿最后一维的实数半谱 DFT：形状 ``(..., n) -> (..., n//2+1)``，"
-        "dtype 由 f32/f64 变成 c64/c128。只保留非负频率那一半，"
-        "因为实序列的谱是共轭对称的。反向同样不提供 VJP。",
+        attrs_schema=("norm", "axes"),
+        doc="沿 ``axes``（默认最后一维，可给 1–3 个末尾连续轴）的实数半谱 DFT："
+        "形状 ``(..., n) -> (..., n//2+1)``，dtype 由 f32/f64 变成 c64/c128。"
+        "只保留非负频率那一半，因为实序列的谱是共轭对称的；多维形态等价于 "
+        "numpy 的 ``rfftn``。反向同样不提供 VJP。",
     )
 )

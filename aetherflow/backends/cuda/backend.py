@@ -18,6 +18,7 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 import numpy as np
 
 from ...ir.graph import Node
+from ...ir.ops import fft_axes
 from ...lower.plan import CONV_CUDNN_MIN_GFLOPS
 from ...runtime.executor import _HostCopy
 from ..base import BackendCapabilityError
@@ -589,12 +590,16 @@ class CudaBackend(DeviceBackend):
                 f"{self._LABEL} 的 {name} 输入 dtype {x.dtype} 与 IR 声明的 "
                 f"{node.inputs[0].type.dtype.value} 不一致"
             )
-        size = int(x.shape[-1])
-        rows = int(x.size // size) if size else 0
+        axes = fft_axes(x.ndim, attrs)
+        sizes = tuple(int(x.shape[axis]) for axis in axes)
+        total = 1
+        for size in sizes:
+            total *= size
+        rows = int(x.size // total) if total else 0
         inverse = bool(attrs.get("inverse", False)) if name == "fft" else False
         return self._cufft_engine().transform(
             x,
-            size=size,
+            sizes=sizes,
             rows=rows,
             inverse=inverse,
             norm=attrs.get("norm", "backward"),

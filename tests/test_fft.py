@@ -169,6 +169,115 @@ class TestFftReference(unittest.TestCase):
         )
 
 
+class TestFftMultiAxis(unittest.TestCase):
+    """``axes`` 属性：1–3 个末尾连续轴，语义等价 numpy 的 fft2 / fftn / rfftn。"""
+
+    def test_fft2_matches_numpy(self):
+        rng = np.random.default_rng(10)
+        x = (
+            rng.standard_normal((2, 4, 10))
+            + 1j * rng.standard_normal((2, 4, 10))
+        ).astype(np.complex64)
+        g = Graph()
+        h = g.input("x", c64[2, 4, 10])
+        g.output(g.add_node("fft", [h], {"norm": "ortho", "axes": (-2, -1)}), "y")
+        self.assertEqual(g.outputs[0].type, c64[2, 4, 10])
+        got = _run(g, {"x": x})["y"]
+        np.testing.assert_allclose(
+            got, np.fft.fft2(x, norm="ortho"), rtol=1e-5, atol=1e-5
+        )
+
+    def test_fft2_inverse_round_trip(self):
+        rng = np.random.default_rng(11)
+        x = (
+            rng.standard_normal((2, 3, 6))
+            + 1j * rng.standard_normal((2, 3, 6))
+        ).astype(np.complex128)
+        g = Graph()
+        h = g.input("x", c128[2, 3, 6])
+        f = g.add_node("fft", [h], {"norm": "ortho", "axes": (-2, -1)})
+        back = g.add_node(
+            "fft", [f], {"norm": "ortho", "inverse": True, "axes": (-2, -1)}
+        )
+        g.output(back, "y")
+        got = _run(g, {"x": x})["y"]
+        np.testing.assert_allclose(got, x, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(
+            got, np.fft.ifft2(np.fft.fft2(x, norm="ortho"), norm="ortho"),
+            rtol=1e-12, atol=1e-12,
+        )
+
+    def test_fftn_three_axes(self):
+        rng = np.random.default_rng(12)
+        x = (
+            rng.standard_normal((2, 3, 4, 6))
+            + 1j * rng.standard_normal((2, 3, 4, 6))
+        ).astype(np.complex64)
+        g = Graph()
+        h = g.input("x", c64[2, 3, 4, 6])
+        g.output(
+            g.add_node("fft", [h], {"norm": "forward", "axes": (-3, -2, -1)}), "y"
+        )
+        got = _run(g, {"x": x})["y"]
+        np.testing.assert_allclose(
+            got, np.fft.fftn(x, axes=(1, 2, 3), norm="forward"),
+            rtol=1e-5, atol=1e-5,
+        )
+
+    def test_positive_axes_equal_negative(self):
+        rng = np.random.default_rng(13)
+        x = (
+            rng.standard_normal((2, 4, 6))
+            + 1j * rng.standard_normal((2, 4, 6))
+        ).astype(np.complex64)
+        outs = []
+        for axes in ((1, 2), (-2, -1)):
+            g = Graph()
+            h = g.input("x", c64[2, 4, 6])
+            g.output(g.add_node("fft", [h], {"axes": axes}), "y")
+            outs.append(_run(g, {"x": x})["y"])
+        np.testing.assert_array_equal(outs[0], outs[1])
+
+    def test_rfft2_shape_and_values(self):
+        rng = np.random.default_rng(14)
+        x = rng.standard_normal((2, 6, 10)).astype(np.float32)
+        g = Graph()
+        h = g.input("x", f32[2, 6, 10])
+        y = g.add_node("rfft", [h], {"axes": (-2, -1)})
+        g.output(y, "y")
+        # 半谱只压最内层轴，外层的轴保持原长
+        self.assertEqual(y.type, c64[2, 6, 6])
+        np.testing.assert_allclose(
+            _run(g, {"x": x})["y"], np.fft.rfftn(x, axes=(-2, -1)),
+            rtol=1e-5, atol=1e-5,
+        )
+
+    def test_rfft2_symbolic_last_dim(self):
+        g = Graph()
+        h = g.input("x", f32["B", "C", "T"])
+        y = g.add_node("rfft", [h], {"axes": (-2, -1)})
+        g.output(y, "y")
+        self.assertEqual([str(s) for s in y.type.shape[:2]], ["B", "C"])
+        self.assertIn("T", str(y.type.shape[-1]))
+        x = np.random.default_rng(15).standard_normal((2, 4, 7)).astype(np.float32)
+        self.assertEqual(_run(g, {"x": x})["y"].shape, (2, 4, 4))
+
+    def test_axes_none_keeps_last_axis(self):
+        rng = np.random.default_rng(16)
+        x = (
+            rng.standard_normal((3, 8))
+            + 1j * rng.standard_normal((3, 8))
+        ).astype(np.complex64)
+        outs = []
+        for attrs in ({}, {"axes": None}, {"axes": (-1,)}):
+            g = Graph()
+            h = g.input("x", c64[3, 8])
+            g.output(g.add_node("fft", [h], dict(attrs)), "y")
+            outs.append(_run(g, {"x": x})["y"])
+        np.testing.assert_array_equal(outs[0], outs[1])
+        np.testing.assert_array_equal(outs[0], outs[2])
+
+
 class TestFftRejections(unittest.TestCase):
     def test_fft_rejects_real_input(self):
         g = Graph()
@@ -209,6 +318,30 @@ class TestFftRejections(unittest.TestCase):
         with self.assertRaises(ValueError):
             g.add_node("fft", [h], {})
 
+    def test_axes_must_be_trailing_contiguous(self):
+        # 非末尾连续 / 降序 / 重复 / 越界 / 超过 cuFFT 的 rank 上限 / 空
+        for axes in ((0, 2), (1, 0), (0, 0), (3,), (0, 1, 2, 3), ()):
+            with self.subTest(axes=axes):
+                g = Graph()
+                h = _complex_input(g, shape=(2, 4, 6))
+                with self.assertRaises(ValueError):
+                    g.add_node("fft", [h], {"axes": axes})
+
+    def test_axes_type_errors(self):
+        for axes in ("last", 1, (0, True)):
+            with self.subTest(axes=axes):
+                g = Graph()
+                h = _complex_input(g, shape=(2, 4, 6))
+                with self.assertRaises(TypeError):
+                    g.add_node("fft", [h], {"axes": axes})
+
+    def test_rfft_rejects_axes_without_last_dim(self):
+        # 半谱只压最内层轴：axes 的末项必须是最后一维
+        g = Graph()
+        h = g.input("x", f32[2, 4, 6])
+        with self.assertRaises(ValueError):
+            g.add_node("rfft", [h], {"axes": (0, 1)})
+
 
 class TestCufftOffline(unittest.TestCase):
     def test_normalization_table(self):
@@ -247,9 +380,23 @@ class TestCufftOffline(unittest.TestCase):
 
     def test_plan_key_is_address_free(self):
         key = cufft.CufftPlan.plan_key(0x29, 16, 3)
-        self.assertEqual(key, (0x29, 16, 3))
+        self.assertEqual(key, (0x29, (16,), 3))
         # 方向不进键：同一个 plan 正反共用
         self.assertEqual(cufft.CufftPlan.plan_key(0x29, 16, 3), key)
+
+    def test_plan_key_carries_every_axis(self):
+        key = cufft.CufftPlan.plan_key(0x29, (4, 16), 3)
+        self.assertEqual(key, (0x29, (4, 16), 3))
+        # 轴序不同是不同 plan：n 数组的顺序从最内层开始
+        self.assertNotEqual(key, cufft.CufftPlan.plan_key(0x29, (16, 4), 3))
+
+    def test_sizes_tuple_rejects_bad_rank(self):
+        for bad in ((1, 2, 3, 4), (0,), (-1,), ()):
+            with self.subTest(sizes=bad):
+                with self.assertRaises(cufft.CufftUnsupported):
+                    cufft.CufftPlan._sizes_tuple(bad)
+        self.assertEqual(cufft.CufftPlan._sizes_tuple(8), (8,))
+        self.assertEqual(cufft.CufftPlan._sizes_tuple((4, 8)), (4, 8))
 
     def test_available_never_raises(self):
         self.assertIsInstance(cufft.available(), bool)

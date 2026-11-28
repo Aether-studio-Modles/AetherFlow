@@ -6,9 +6,9 @@ IR 里的 ``fft`` / ``rfft`` 是 PORTABLE 算子——参考后端用 ``numpy.ff
 
 覆盖范围：
 
-- **只做沿最后一维的一维变换**，批量维靠 ``cufftPlanMany`` 的 batch 铺开。
-  IR 算子本身就只定义了最后一维，多维 FFT 需要新的轴属性与新的参考语义，
-  不在这一步里顺带扩。
+- **1–3 维末尾连续轴的变换**（``axes`` 属性），前缀维靠 ``cufftPlanMany``
+  的 batch 铺开。非连续轴（如 ``(0, 2)``）显式拒绝：那需要逐轴 stride
+  变换，参考语义与设备实现会分叉，拆成多次一维变换更好排查。
 - dtype 只认 c64 / c128（``fft``）与 f32 / f64（``rfft``），四者分别对应
   ``CUFFT_C2C`` / ``CUFFT_Z2Z`` / ``CUFFT_R2C`` / ``CUFFT_D2Z``。未登记的
   组合显式抛 ``CufftUnsupported``。
@@ -234,14 +234,29 @@ class CufftPlan:
             raise RuntimeError(f"cuFFT {what} 失败，cufftResult={status}")
 
     @staticmethod
-    def plan_key(kind_id: int, size: int, rows: int) -> tuple:
+    def plan_key(kind_id: int, sizes, rows: int) -> tuple:
         """plan 的缓存键：只含决定 plan 内容的量，与地址无关。
 
-        ``rows`` 是 batch 数（把前面的维拉平），它进键是因为 ``cufftPlanMany``
-        把 batch 写进了 plan。**方向不进键**：``cufftExecC2C`` 把方向作为
-        执行参数，同一个 plan 正反两个方向共用。
+        ``sizes`` 是被变换的各轴长度（从外到内），``rows`` 是 batch 数（把
+        前面的维拉平）。两者都进键是因为 ``cufftPlanMany`` 把它们写进了 plan。
+        **方向不进键**：``cufftExecC2C`` 把方向作为执行参数，同一个 plan 正反
+        两个方向共用。
         """
-        return (int(kind_id), int(size), int(rows))
+        if isinstance(sizes, int):
+            sizes = (sizes,)
+        return (int(kind_id), tuple(int(s) for s in sizes), int(rows))
+
+    @staticmethod
+    def _sizes_tuple(sizes) -> Tuple[int, ...]:
+        """把 ``sizes`` 规范成 1–3 个正整数；越界在碰驱动前就拒绝。"""
+        if isinstance(sizes, int):
+            sizes = (sizes,)
+        sizes = tuple(int(s) for s in sizes)
+        if not 1 <= len(sizes) <= 3:
+            raise CufftUnsupported(f"cuFFT 只支持 1–3 维变换，得到 {len(sizes)} 维")
+        if any(s <= 0 for s in sizes):
+            raise CufftUnsupported(f"cuFFT 的变换长度必须为正，得到 {sizes}")
+        return sizes
 
     def set_stream(self, ptr: int) -> None:
         """绑定 stream。与 cuBLAS / cuSPARSE 一样缓存，减少驱动调用。"""
@@ -256,20 +271,37 @@ class CufftPlan:
             )
         self._stream_ptr = ptr
 
-    def _plan(self, kind_id: int, size: int, rows: int) -> int:
-        key = self.plan_key(kind_id, size, rows)
+    def _plan(self, kind_id: int, sizes, rows: int) -> int:
+        sizes = self._sizes_tuple(sizes)
+        key = self.plan_key(kind_id, sizes, rows)
         handle = self._plans.get(key)
         if handle is not None:
             return handle
         i32 = ctypes.c_int
         handle = i32(0)
-        n = (i32 * 1)(size)
-        out_size = size // 2 + 1 if kind_id in (_CUFFT_R2C, _CUFFT_D2Z) else size
+        rank = len(sizes)
+        # ``n`` 与 numpy 的形状同序：**最后一个元素才是连续（最内层）维**。
+        # 这一点与 cuFFT 文档里"n[0] 是最内层"的说法相反，是 V100 上实测
+        # 出来的：n=(10, 4) 的结果与 ``np.fft.fft2(x.reshape(10, 4))`` 逐位
+        # 吻合，n=(4, 10) 才等于对原 (4, 10) 数组做二维变换。照文档倒序传会让
+        # 二维及以上的结果整体错位（一维看不出差别，因为正反序相同）。
+        # 输入连续时 inembed / onembed 传 NULL 让 cuFFT 按紧凑布局推导，
+        # batch 间距只靠 idist / odist 表达。
+        n = (i32 * rank)(*sizes)
+        total = 1
+        for size in sizes:
+            total *= size
+        out_sizes = sizes[:-1] + (
+            sizes[-1] // 2 + 1 if kind_id in (_CUFFT_R2C, _CUFFT_D2Z) else sizes[-1],
+        )
+        out_total = 1
+        for size in out_sizes:
+            out_total *= size
         self._check(
             self.lib.cufftPlanMany(
-                ctypes.byref(handle), 1, n,
-                None, 1, size,          # inembed / istride / idist
-                None, 1, out_size,      # onembed / ostride / odist
+                ctypes.byref(handle), rank, n,
+                None, 1, total,         # inembed / istride / idist
+                None, 1, out_total,     # onembed / ostride / odist
                 kind_id, rows,
             ),
             "cufftPlanMany",
@@ -291,33 +323,42 @@ class CufftPlan:
 
     # ------------------------------------------------------------------
 
-    def transform(self, src, *, size: int, rows: int, inverse: bool,
+    def transform(self, src, *, sizes, rows: int, inverse: bool,
                   norm: str = "backward"):
-        """对 ``src`` 的最后一维做变换，返回新的设备数组。
+        """对 ``src`` 的末尾 ``len(sizes)`` 维做变换，返回新的设备数组。
 
-        ``src`` 必须是**连续**的设备数组；本模块不做布局转换——非连续输入
-        在 ``data.ptr`` 上会被读成错误的行。dtype 与方向先过登记表，未登记
-        的形态在碰驱动之前就抛 ``CufftUnsupported``。缩放因子在结果上原地
-        应用一次，语义与 numpy 同 ``norm`` 一致。
+        ``sizes`` 是被变换各轴的长度（从外到内，1–3 个）；其余前缀维靠
+        ``rows`` 铺成 batch。``src`` 必须是**连续**的设备数组；本模块不做布局
+        转换——非连续输入在 ``data.ptr`` 上会被读成错误的行。dtype 与方向先过
+        登记表，未登记的形态在碰驱动之前就抛 ``CufftUnsupported``。缩放因子在
+        结果上原地应用一次，语义与 numpy 同 ``norm`` 一致（按总点数归一化）。
         """
         import cupy as cp
 
+        sizes = self._sizes_tuple(sizes)
         kind_id = kind(src.dtype, inverse)
         if not src.flags.c_contiguous:
             raise CufftUnsupported("cuFFT 路径要求输入连续（请先 ascontiguousarray）")
-        out_size = size // 2 + 1 if kind_id in (_CUFFT_R2C, _CUFFT_D2Z) else size
+        rank = len(sizes)
+        if src.ndim < rank or tuple(int(s) for s in src.shape[-rank:]) != sizes:
+            raise CufftUnsupported(
+                f"cuFFT 的变换轴 {sizes} 与输入末尾 {rank} 维 {src.shape[-rank:]} 不一致"
+            )
+        out_sizes = sizes[:-1] + (
+            sizes[-1] // 2 + 1 if kind_id in (_CUFFT_R2C, _CUFFT_D2Z) else sizes[-1],
+        )
         out_dtype = (
             np.dtype("complex64") if src.dtype == np.dtype("float32")
             else np.dtype("complex128") if src.dtype == np.dtype("float64")
             else np.dtype(src.dtype)
         )
-        shape = tuple(src.shape[:-1]) + (out_size,)
+        shape = tuple(src.shape[:-rank]) + out_sizes
         out = cp.empty(shape, dtype=out_dtype)
         if src.size == 0:
             return out
 
         self.set_stream(int(cp.cuda.get_current_stream().ptr))
-        handle = self._plan(kind_id, size, rows)
+        handle = self._plan(kind_id, sizes, rows)
         direction = _CUFFT_INVERSE if inverse else _CUFFT_FORWARD
         exec_name, pointer = {
             _CUFFT_C2C: ("cufftExecC2C", ctypes.POINTER(ctypes.c_float)),
@@ -334,7 +375,10 @@ class CufftPlan:
             ),
             exec_name,
         )
-        scale = normalization(size, norm, inverse)
+        total = 1
+        for size in sizes:
+            total *= size
+        scale = normalization(total, norm, inverse)
         if scale != 1.0:
             out *= scale
         return out

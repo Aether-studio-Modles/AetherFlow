@@ -1077,21 +1077,25 @@ def _complex(shape: tuple, rng: np.random.Generator) -> np.ndarray:
     ).astype(np.complex64)
 
 
-def _fft(norm: str = "ortho", inverse: bool = False, shape: tuple = (3, 8)):
+def _fft(norm: str = "ortho", inverse: bool = False, shape: tuple = (3, 8),
+         axes=None):
     def build(rng):
         g = Graph("fft")
         x = g.input("x", c64[shape])
-        g.output(g.add_node("fft", [x], {"norm": norm, "inverse": inverse}), "y")
+        g.output(
+            g.add_node("fft", [x], {"norm": norm, "inverse": inverse, "axes": axes}),
+            "y",
+        )
         return g, {"x": _complex(shape, rng)}
 
     return build
 
 
-def _rfft(norm: str = "backward", shape: tuple = (4, 10)):
+def _rfft(norm: str = "backward", shape: tuple = (4, 10), axes=None):
     def build(rng):
         g = Graph("rfft")
         x = g.input("x", f32[shape])
-        g.output(g.add_node("rfft", [x], {"norm": norm}), "y")
+        g.output(g.add_node("rfft", [x], {"norm": norm, "axes": axes}), "y")
         return g, {"x": _f32(rng, shape)}
 
     return build
@@ -2097,6 +2101,16 @@ def default_cases() -> List[Case]:
               note="逆变换：cuFFT 不归一化，缩放必须由实现显式补上"),
         _case("rfft_backward", _rfft(),
               note="实数半谱：形状 (..., n) -> (..., n//2+1)，dtype f32 -> c64"),
+        _case("fft2_ortho", _fft(shape=(2, 4, 10), axes=(-2, -1)),
+              note="二维 DFT：等价 numpy.fft.fft2，cuFFT 走 rank=2 的 plan"),
+        _case("fft2_inverse", _fft(norm="backward", inverse=True,
+                                   shape=(2, 4, 10), axes=(-2, -1)),
+              note="二维逆变换：缩放按总点数，不是单轴长度"),
+        _case("fftn_forward", _fft(norm="forward", shape=(2, 3, 6, 8),
+                                   axes=(-3, -2, -1)),
+              note="三维末尾连续轴：cuFFT 的 rank 上限，再多的轴要拆"),
+        _case("rfft2_backward", _rfft(shape=(2, 6, 10), axes=(-2, -1)),
+              note="rfftn 的半谱只压最内层轴，外层的轴保持原长"),
         _case("broadcast_to", _broadcast_to(),
               note="归约/softmax 反向把梯度广播回原形状的唯一手段"),
         _case("pad", _pad(), note="slice 的反向；补零必须与切片严格对称"),
