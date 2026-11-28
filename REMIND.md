@@ -51,7 +51,11 @@
   `quantize_weight_fp8` 逐输出通道 / `per_tensor=True` 对齐 HF 的
   `weight_scale`，`quantize_activation_fp8` 逐 token），线性层有
   `linear_fp8`（weight-only）与 `linear_fp8a8`（W8A8）（5.327：反量化后走
-  既有 f32 GEMM、累加在浮点里，不承诺 fp8 tensor core），其它算子遇到 fp8
+  既有 f32 GEMM、累加在浮点里，不承诺 fp8 tensor core），以及把 fp8 真正
+  存成 1 字节的 `pack_fp8` / `unpack_fp8`（IR 用 i8 位模式承载）与融合内核
+  `linear_fp8_packed`（5.328：权重 1 字节驻留、设备端解码后乘 scale 累加，
+  读带宽降到 f32 载体的 1/4，但不省算力；主机侧入口
+  `FP8Weight.pack()` / `load_fp8_linear(packed=True)`），其它算子遇到 fp8
   仍显式拒绝；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
@@ -65,7 +69,9 @@
   `load_fp8_linear` / `FP8Weight` 读 fp8 量化权重——载荷每个值必须真的落在
   fp8 格点上（未量化的 f32 与 f8 载体同型，只能按值判定）、格式由文件 dtype
   推出、显式 kind 不许与文件矛盾、支持 `input_scale` 标量与 `(K/G, N)` 逐组
-  scale（5.326）。
+  scale（5.326）；`packed=True` 读 1 字节位模式（F8 / I8 / U8，I8 / U8 需显式
+  kind，字节走 `SafeTensorsFile.raw` 不经解码再编码以免 NaN 多码归一化），
+  `FP8Weight.pack()` 返回幂等的 1 字节副本且 `dequantize()` 数值不变（5.328）。
 - **文本入口**：`BpeTokenizer` 读 HF `tokenizer.json` 的 ByteLevel BPE 谱系
   （GPT-2 / Qwen2 / Qwen3），不引 `tokenizers`；支持 merges 两种写法、added /
   special token 整体匹配、NFC 系 normalizer、`use_regex` / `add_prefix_space`；
@@ -164,10 +170,13 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 有参考语义、
   写入 / 读取入口与设备端 `cast`（e4m3 / e5m2，5.318 / 5.319 / 5.325 /
   5.326：带 scale 的逐通道权重与逐 token 激活量化、`FP8Weight` 容器要求载荷
-  值真的在格点上；设备上载体仍是 f32，只把值落到格式格点、不省带宽），
+  值真的在格点上；设备上 `cast` / `linear_fp8` / `linear_fp8a8` 的载体仍是
+  f32、只把值落到格式格点、不省带宽），
   `linear_fp8` / `linear_fp8a8` 已有 IR 与设备实现（5.327：反量化走
-  `mul`、GEMM 复用 sgemm，不承诺 tensor core），其它算子遇到 fp8 仍显式
-  拒绝，也没有 fp8 tensor core 与逐块 scale；
+  `mul`、GEMM 复用 sgemm，不承诺 tensor core）；要真正省驻留 / 读带宽就走
+  5.328 的 `pack_fp8` / `unpack_fp8` + `linear_fp8_packed`（1 字节权重、
+  设备端解码，但算力与 f32 GEMM 持平，且只接逐张量 / 逐通道 scale、没有
+  反向），其它算子遇到 fp8 仍显式拒绝，也没有 fp8 tensor core 与逐块 scale；
   W8A8 也尚无反向（bias 除外）。非对称零点的量化 / 反量化与融合线性层都已有
   设备内核（5.322 / 5.323，V100 上 conformance 通过），但 `linear_i8a8_zp`
   走标量乘加、没用 dp4a / IMMA，也**不融合 epilogue**（int32 累加后仍物化一份
@@ -711,6 +720,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   兜底，只能信 IR 声明 + 写入侧的格点校验（`load_fp8_linear`）；`linear_fp8`
   的内核注释写死了这条分工。放行名单用共享常量 `FP8_OPS`（cast + 两个
   线性层），`invoke` 与 `_planned_kernel` 同源判定，别再各自维护一份。
+- **1 字节 fp8 用 i8 位模式承载**（5.328）：`pack_fp8` 的输出是 `int8` 的
+  **位模式**，不是整数——`-128` 就是码 `0x80`。设备端读 `unsigned char`
+  再解码，主机侧比对必须先 `view(np.uint8)`；直接拿 int8 值去比码会在
+  负码上差 256。`linear_fp8_packed` 不在 `FP8_OPS` 里（输出是 f32，图里没有
+  fp8 dtype），但它的权重输入是 1 字节，必须进 `_INDEX_ARGS`
+  （`{1}`），否则字节数推断会按 f32 算成 4 倍。
+- **packed 路径只降存储，不降算力**（5.328）：V100 是 sm_70，没有 fp8
+  tensor core，也不存在吃 1 字节权重的 GEMM；`af_linear_fp8_packed` 是
+  每线程一个输出元素的朴素内核（逐元素解码 + f32 累加），速度与 f32 GEMM
+  持平甚至略慢。要速度得换硬件，不是换内核。逐组 scale 与 W8A8 的打包
+  激活都未接，构图期显式拒绝，别静默降级成逐张量。
 - **真机脚本不要硬编码 SSH 密码**：本机执行策略会以"物化具体凭证"为由
   拒绝运行（哪怕凭证已在本文件里）。需要真机回归时先向用户明确说明风险并
   取得授权，或用用户自己的终端执行同步与验证命令。

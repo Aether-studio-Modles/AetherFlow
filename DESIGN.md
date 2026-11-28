@@ -20761,6 +20761,93 @@ scale、e5m2 按自己的格点舍入、W8A8 的逐 token scale、非正 scale �
   没有 zero_point 变体。
 - 没有反向规则（与 int8 线性层一致，量化路径按推理用）。
 
+### 5.328 fp8 的 1 字节存储：pack / unpack 与融合的 packed 线性层
+
+**缺口。** 5.325 的 `cast(f8e4m3)` 与 5.327 的两个 fp8 线性层都只把数值
+落到格式格点上，容器仍是 f32：4 字节/权重。也就是说 fp8 目前只是"数值
+精度变低"，显存驻留与读带宽一点没降——而后者才是 fp8 权重的主要动机。
+
+**为什么不能直接让后端换容器。** IR 里 `DType.F8E4M3` / `F8E5M2` 的
+`np_dtype` 都是 `float32`（5.318 起就是这么定的），参考语义、序列化、
+verifier 全按 f32 载体推理。把 dtype 改成 1 字节会连带改掉整条链路的
+语义，且 numpy 没有 fp8 标量类型，参考语义仍得绕回 f32。所以打包是一个
+**显式的表示转换**，不是 dtype 的重新定义。
+
+**容器取 i8 位模式。** IR 没有 `u8`，而 `int8` 正好是 8 位、有符号性不影响
+位模式。于是新增三个算子：
+
+- `pack_fp8(x, kind) -> i8`：f32 载体 → 1 字节码。参考语义是
+  `runtime.fp8.pack_fp8(x, kind).view(np.int8)`——纯粹的位拷贝，返回的
+  i8 **不代表整数**，`-128` 就是码 `0x80`。
+- `unpack_fp8(q, kind) -> f8 载体`：i8 码 → f32 载体。先把 i8 按位
+  `view(np.uint8)`，再 `unpack_fp8`，避免负码在升位时被符号扩展。
+- `linear_fp8_packed(x, q_i8, weight_scale[, bias], kind) -> f32`：直接吃
+  1 字节权重。参考语义是 `matmul(x, unpack(q) * scale) [+ bias]`，即"先
+  解码再走浮点 GEMM"——设备端可以自己决定怎么实现，语义只有这一条。
+
+`kind` 走 attr（`attrs_schema=("kind",)`），取值 `{\"e4m3\", \"e5m2\"}`；
+缺省或拼错在构图期报 `ValueError`，不是静默按 e4m3 处理。
+
+**设备端复用同一份编解码。** 5.325 的 `af_cast_fp8` 里那套 RNE + 饱和 +
+e4m3 无 inf 的逻辑被抽成 `af_fp8_encode(float, int) -> int` 与
+`af_fp8_decode(int, int) -> float`（`_FP8_COMMON_SRC`）。`af_cast_fp8`
+改成 `decode(encode(x))`，逐行搬迁、算法未改；`af_pack_fp8` 直接存
+`encode` 的字节，`af_unpack_fp8` 读字节后 `decode`。因此 **pack → unpack
+恒等于 cast**，三者共享同一份舍入与饱和规则，不会出现"打包路径和 cast
+路径在边界值上不一致"。
+
+`af_linear_fp8_packed` 照 `_LINEAR_I8A8_SRC` 的朴素结构：每线程算一个
+输出元素，权重按 `unsigned char` 读、在寄存器里解码、乘 weight scale、
+f32 顺序累加。`ws_stride=0` 表示逐张量 scale，`1` 表示逐列——两种都只走
+`ws[0]` / `ws[col]` 一次，内层循环不重复读 scale。这里刻意不接 cuBLAS：
+V100 是 sm_70，没有 fp8 tensor core，也没有能吃 1 字节权重的 GEMM 入口。
+**这条路径只承诺存储与读带宽下降，不承诺速度**——解码是每元素几次整数
+位运算，算力与 f32 GEMM 持平甚至略慢。
+
+**scale / bias 的边界。** `linear_fp8_packed` 的 scale 只接 `(1,)` 或
+`(N,)`（rank ≤ 1），逐组 scale 在构图期显式拒绝并留到 5.329——把它接到
+这个内核上要么静默只用第一组、要么退化成逐元素分支，两者都不该发生。
+bias 必须是 f32、长度 `N`；非正 scale 在参考语义与设备端都报错（构图期
+只能看到形状，看不到值）。设备端还要求 x 是 f32 且秩 ≥ 2、权重是 i8 秩 2。
+
+**白名单与索引参数。** `device_shared.FP8_OPS` 只放 `cast` /
+`linear_fp8` / `linear_fp8a8` / `pack_fp8` / `unpack_fp8`——
+`linear_fp8_packed` 不在其中，因为它的输出 dtype 是 f32、图里根本没有 fp8
+类型，不属于"fp8 dtype 算子"这一族，放进白名单会让"未声明 fp8 却执行"
+这条检查失去意义。`_INDEX_ARGS` 新增 `unpack_fp8: {0}` 与
+`linear_fp8_packed: {1}`：前者的输入是 1 字节码，后者的权重是 1 字节码，
+都不能套用 f32 的字节数推断。
+
+**主机侧入口。** `FP8Weight.pack()` 返回 1 字节副本（`w` 变成 i8 码、
+`packed=True`），幂等；`dequantize()` 在 packed 时先解码再乘 scale，所以
+打包前后数值逐位相同。`load_fp8_linear(..., packed=True)` 要求权重 dtype
+是 `F8_E4M3` / `F8_E5M2` / `I8` / `U8`，字节用新增的
+`SafeTensorsFile.raw()` **原样**读出：不能走 `tensor()` 解码再编码——数值
+虽等价，但 e4m3 的 NaN 有 `0x7F` / `0xFF` 两个码，往返会归一化成一个，
+位模式不再是文件里的那一份。`I8` / `U8` 推不出格式，`kind` 必须显式给；
+`F32` 载体用 `packed=True` 读会直接报错并提示改用 `packed=False`。
+
+**验证。** 本地 3241 条通过 / 460 跳过（较 5.327 增 13），ruff 通过。
+`test_quantize` 新增 9 条：pack / unpack 的码逐位对拍、pack→unpack 恒等
+cast、融合线性层与手写 `matmul(unpack*scale)` 对拍（含 bias、逐张量
+e5m2）、8 类形状 / dtype 拒绝、非正 scale、JSON 往返。
+`test_weights` 新增 5 条：`pack()` 的字节数与码、逐组 scale 打包后
+`dequantize` 不变、`packed=True` 读原始字节与 I8 容器需显式 kind、
+F32 载体与三维权重的拒绝、PyTorch 转置布局的打包读取。conformance 新增
+6 条（`pack_fp8_e4m3` / `pack_fp8_e5m2` / `unpack_fp8_e4m3` /
+`unpack_fp8_e5m2` / `linear_fp8_packed_e4m3_bias` /
+`linear_fp8_packed_e5m2`），参考后端全通过。
+
+**未声称。**
+
+- 不省算力：没有 fp8 tensor core，解码 + f32 累加比原生 GEMM 慢。
+- 不支持逐组 scale、也不支持 W8A8 的 packed 激活打包（`linear_fp8_packed`
+  只打包权重；激活打包留到 5.329）。
+- 没有反向规则（量化权重按冻结常量处理，与 int8 / fp8 线性层一致）。
+- V100 真机回归（`verify_cuda.py`、`tests.test_cuda_backend`、pack /
+  unpack / packed linear 的 conformance）仍待授权执行；设备端只做了源码级
+  检查，未经编译验证。
+
 
 
 
