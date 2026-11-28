@@ -545,7 +545,7 @@ class TestDeviceSideDistributed(unittest.TestCase):
 
         _, trainer = self._trainer(hook=hook)
         collective = _DeviceCollective(0, 2)
-        ddp = DistributedDataParallel(
+        DistributedDataParallel(
             trainer, collective, bucket_bytes=0, threads=1
         )
         reduced = trainer.grad_hook(self._grads())
