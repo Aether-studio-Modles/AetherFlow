@@ -537,6 +537,8 @@ class DeviceBackend(
         r.register("flip", self._op_flip)
         r.register("roll", self._op_roll)
         r.register("repeat_interleave", self._op_repeat_interleave)
+        r.register("interpolate", self._op_interpolate)
+        r.register("interpolate_backward", self._op_interpolate_backward)
         r.register("logsumexp", self._op_logsumexp)
         r.register("tril", self._op_tril)
         r.register("clamp", self._op_clamp)

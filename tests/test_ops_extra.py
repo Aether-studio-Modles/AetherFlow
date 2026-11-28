@@ -1770,5 +1770,173 @@ class TestRepeatInterleave(unittest.TestCase):
             g.repeat_interleave(x, repeats=2, axis=0)
 
 
+def _interp_reference(x, size, mode="bilinear", align_corners=False):
+    """独立写的插值实现（浮点坐标），不调用参考后端。
+
+    与 IR 的整数口径是两条不同的算法路径：如果两边都写错成同一个公式，
+    对拍就失去意义。
+    """
+    oh, ow = size
+
+    def axis(in_dim, out_dim):
+        if mode == "nearest":
+            idx = (np.arange(out_dim) * (in_dim / out_dim)).astype(np.int64)
+            return idx, idx, None
+        dst = np.arange(out_dim, dtype=np.float64)
+        if align_corners:
+            if out_dim > 1:
+                src = dst * (in_dim - 1) / (out_dim - 1)
+            else:
+                src = np.zeros_like(dst)
+        else:
+            src = np.clip(
+                (dst + 0.5) * in_dim / out_dim - 0.5, 0.0, float(in_dim - 1)
+            )
+        i0 = np.floor(src).astype(np.int64)
+        return i0, np.minimum(i0 + 1, in_dim - 1), src - i0
+
+    h0, h1, lh = axis(x.shape[2], oh)
+    w0, w1, lw = axis(x.shape[3], ow)
+    rows = h0[:, None]
+    cols = w0[None, :]
+    if mode == "nearest":
+        return x[:, :, rows, cols]
+    cols1 = w1[None, :]
+    rows1 = h1[:, None]
+    lhm = lh[:, None]
+    lwm = lw[None, :]
+    xf = x.astype(np.float64)
+    return (
+        (1.0 - lhm) * (1.0 - lwm) * xf[:, :, rows, cols]
+        + (1.0 - lhm) * lwm * xf[:, :, rows, cols1]
+        + lhm * (1.0 - lwm) * xf[:, :, rows1, cols]
+        + lhm * lwm * xf[:, :, rows1, cols1]
+    )
+
+
+class TestInterpolate(unittest.TestCase):
+    """二维空间插值：最近邻 / 双线性，前向与反向。"""
+
+    def test_nearest_forward_uses_floor_not_round(self):
+        xs = np.arange(4, dtype=np.float64).reshape(1, 1, 2, 2)
+        g = Graph("interp_nearest")
+        x = g.input("x", f64[1, 1, 2, 2])
+        g.output(g.interpolate(x, size=(3, 3), mode="nearest"), "y")
+        got = _run(g, {"x": xs})["y"]
+        # floor(dst*2/3) = [0,0,1]：四舍五入会得到 [0,1,1]
+        expect = np.array([[[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [2.0, 2.0, 3.0]]]])
+        np.testing.assert_allclose(got, expect, rtol=0.0, atol=0.0)
+
+    def test_bilinear_half_pixel_values(self):
+        xs = np.arange(4, dtype=np.float64).reshape(1, 1, 2, 2)
+        g = Graph("interp_bilinear")
+        x = g.input("x", f64[1, 1, 2, 2])
+        g.output(g.interpolate(x, size=(3, 3), mode="bilinear"), "y")
+        got = _run(g, {"x": xs})["y"]
+        expect = np.array([[[[0.0, 0.5, 1.0], [1.0, 1.5, 2.0], [2.0, 2.5, 3.0]]]])
+        np.testing.assert_allclose(got, expect, rtol=0.0, atol=0.0)
+
+    def test_forward_matches_independent_implementation(self):
+        rng = np.random.default_rng(31)
+        xs = rng.standard_normal((2, 3, 4, 5))
+        for mode, align in (("nearest", False), ("bilinear", False), ("bilinear", True)):
+            with self.subTest(mode=mode, align_corners=align):
+                g = Graph(f"interp_fwd_{mode}_{align}")
+                x = g.input("x", f64[2, 3, 4, 5])
+                g.output(
+                    g.interpolate(x, size=(7, 6), mode=mode, align_corners=align), "y"
+                )
+                got = _run(g, {"x": xs})["y"]
+                expect = _interp_reference(xs, (7, 6), mode, align)
+                np.testing.assert_allclose(got, expect, rtol=0.0, atol=1e-9)
+
+    def test_align_corners_changes_the_result(self):
+        rng = np.random.default_rng(32)
+        xs = rng.standard_normal((1, 1, 3, 3))
+        outs = []
+        for align in (False, True):
+            g = Graph(f"interp_align_{align}")
+            x = g.input("x", f64[1, 1, 3, 3])
+            g.output(
+                g.interpolate(x, size=(5, 5), mode="bilinear", align_corners=align), "y"
+            )
+            outs.append(_run(g, {"x": xs})["y"])
+        self.assertGreater(np.max(np.abs(outs[0] - outs[1])), 1e-3)
+
+    def test_bilinear_gradient_matches_numeric(self):
+        rng = np.random.default_rng(33)
+        xs = rng.standard_normal((1, 2, 4, 5))
+        for align in (False, True):
+            with self.subTest(align_corners=align):
+                g = Graph(f"interp_grad_{align}")
+                x = g.input("x", f64[1, 2, 4, 5])
+                g.output(
+                    g.interpolate(x, size=(7, 6), mode="bilinear", align_corners=align),
+                    "y",
+                )
+                (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+                np.testing.assert_allclose(
+                    dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-6
+                )
+
+    def test_nearest_gradient_counts_repeats(self):
+        rng = np.random.default_rng(34)
+        xs = rng.standard_normal((1, 1, 2, 2))
+        g = Graph("interp_nearest_grad")
+        x = g.input("x", f64[1, 1, 2, 2])
+        g.output(g.interpolate(x, size=(3, 3), mode="nearest"), "y")
+        (dx,) = _analytic_grad(g, {"x": xs}, ["x"])
+        # 9 个输出格按 floor 映射：左上 4 次、右上 2 次、左下 2 次、右下 1 次
+        expect = np.array([[[[4.0, 2.0], [2.0, 1.0]]]])
+        np.testing.assert_allclose(dx, expect, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(dx, _numeric_grad(g, {"x": xs}, "x"), atol=1e-6)
+
+    def test_single_pixel_input_broadcasts(self):
+        xs = np.array([[[[2.5]]]])
+        for mode in ("nearest", "bilinear"):
+            with self.subTest(mode=mode):
+                g = Graph(f"interp_single_{mode}")
+                x = g.input("x", f64[1, 1, 1, 1])
+                g.output(
+                    g.interpolate(x, size=(3, 4), mode=mode, align_corners=False),
+                    "y",
+                )
+                got = _run(g, {"x": xs})["y"]
+                np.testing.assert_allclose(got, np.full((1, 1, 3, 4), 2.5), atol=0.0)
+
+    def test_rejects_unsupported_modes(self):
+        for bad in ("bicubic", "linear", "trilinear", "area"):
+            g = Graph(f"interp_bad_mode_{bad}")
+            x = g.input("x", f64[1, 1, 4, 4])
+            with self.assertRaises(ValueError):
+                g.interpolate(x, size=(2, 2), mode=bad)
+
+    def test_rejects_nearest_with_align_corners(self):
+        g = Graph("interp_nearest_ac")
+        x = g.input("x", f64[1, 1, 4, 4])
+        with self.assertRaises(ValueError):
+            g.interpolate(x, size=(2, 2), mode="nearest", align_corners=True)
+
+    def test_rejects_non_4d_input(self):
+        for shape in ((4, 4), (2, 3, 4, 5, 6)):
+            g = Graph(f"interp_bad_rank_{len(shape)}")
+            x = g.input("x", f64[shape])
+            with self.assertRaises(ValueError):
+                g.interpolate(x, size=(2, 2), mode="bilinear")
+
+    def test_rejects_integer_input(self):
+        g = Graph("interp_int_input")
+        x = g.input("x", i32[1, 1, 4, 4])
+        with self.assertRaises(TypeError):
+            g.interpolate(x, size=(2, 2), mode="bilinear")
+
+    def test_rejects_bad_size(self):
+        for bad in (0, -3, (0, 2), (2, 2, 2)):
+            g = Graph(f"interp_bad_size_{bad!r}")
+            x = g.input("x", f64[1, 1, 4, 4])
+            with self.assertRaises((TypeError, ValueError)):
+                g.interpolate(x, size=bad, mode="bilinear")
+
+
 if __name__ == "__main__":
     unittest.main()

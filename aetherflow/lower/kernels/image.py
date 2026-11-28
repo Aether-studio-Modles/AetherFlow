@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from ..kernel import Bin, Expr, Index, Ptr, Var
+from ..kernel import Bin, Cast, Expr, Index, Ptr, Var
 from ..indexing import Layout
 
 
@@ -86,3 +86,12 @@ def _image_slice_nhwc(buf: str, name: str = "base", *, const: bool = True) -> Pt
 def _tap_nhwc(buf: str = "base") -> Expr:
     """``buf[((long long)ih * W + iw) * C]``——同一像素的通道连续存放。"""
     return Index(buf, _TAP_LAYOUT_NHWC.offset(("ih", "iw")))
+
+
+def _tap_at(ih: Expr, iw: Expr, buf: str = "base") -> Expr:
+    """``buf[(long long)ih * W + iw]``，下标由表达式给出。
+
+    与 :func:`_tap` 的区别只在于后者写死了变量名 ``ih`` / ``iw``。插值的四个
+    角需要同时取 ``(hi0, wi0)``、``(hi0, wi1)`` …，变量名不同，因此单独给出。
+    """
+    return Index(buf, Bin("+", Bin("*", Cast("long long", ih), Var("W")), iw))

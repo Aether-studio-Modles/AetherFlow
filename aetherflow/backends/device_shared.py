@@ -151,6 +151,8 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "avgpool2d_backward",
         "adaptive_avg_pool2d",
         "adaptive_avg_pool2d_backward",
+        "interpolate",
+        "interpolate_backward",
         "concat",
         "embedding",
         "embedding_backward",

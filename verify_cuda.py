@@ -536,6 +536,29 @@ def _extra_cases() -> list:
         g.output(g.repeat_interleave(x, repeats=4, axis=-1), "y")
         return g, {"x": _rand(rng, 2, 3)}
 
+    def interpolate_nearest_1x1():
+        """1x1 输入放大：H==1/W==1 时整轴退化成取唯一像素，不能读出界。"""
+        g = Graph("interpolate_nearest_1x1")
+        x = g.input("x", f32[2, 3, 1, 1])
+        g.output(g.interpolate(x, size=(3, 5), mode="nearest"), "y")
+        return g, {"x": _rand(rng, 2, 3, 1, 1)}
+
+    def interpolate_bilinear_up():
+        """非整数倍放大：四个角的权重两两不同，邻近拷贝会露馅。"""
+        g = Graph("interpolate_bilinear_up")
+        x = g.input("x", f32[1, 2, 4, 5])
+        g.output(g.interpolate(x, size=(7, 6), mode="bilinear"), "y")
+        return g, {"x": _rand(rng, 1, 2, 4, 5)}
+
+    def interpolate_bilinear_ac_down():
+        """align_corners=True 且缩小：端点必须精确落在首尾像素上。"""
+        g = Graph("interpolate_bilinear_ac_down")
+        x = g.input("x", f32[2, 2, 7, 6])
+        g.output(
+            g.interpolate(x, size=(3, 4), mode="bilinear", align_corners=True), "y"
+        )
+        return g, {"x": _rand(rng, 2, 2, 7, 6)}
+
     return [
         ("gelu_saturation", gelu),
         ("rmsnorm_rank3", rmsnorm),
@@ -578,6 +601,9 @@ def _extra_cases() -> list:
         ("remainder_both_signs", remainder_both_signs),
         ("repeat_interleave_axis0", repeat_interleave_axis0),
         ("repeat_interleave_last_wide", repeat_interleave_last_wide),
+        ("interpolate_nearest_1x1", interpolate_nearest_1x1),
+        ("interpolate_bilinear_up", interpolate_bilinear_up),
+        ("interpolate_bilinear_ac_down", interpolate_bilinear_ac_down),
     ]
 
 
@@ -681,6 +707,17 @@ def _run_f16_extra(cuda: CudaBackend, ref: ReferenceBackend) -> list:
                 "gamma": (_rand(rng, 16, scale=0.1) + 1.0).astype(np.float16),
                 "beta": _rand(rng, 16, scale=0.1).astype(np.float16),
             },
+        )
+    )
+
+    g = Graph("interpolate_bilinear_f16")
+    x = g.input("x", f16[1, 2, 4, 5])
+    g.output(g.interpolate(x, size=(7, 6), mode="bilinear"), "y")
+    cases.append(
+        (
+            "interpolate_bilinear_f16",
+            g,
+            {"x": _rand(rng, 1, 2, 4, 5).astype(np.float16)},
         )
     )
 

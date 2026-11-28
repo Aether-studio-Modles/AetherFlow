@@ -43,6 +43,10 @@ from ...lower.kernels import (
     ew_broadcast,
     ew_cast,
     ew_clamp,
+    interpolate_bilinear,
+    interpolate_bilinear_backward,
+    interpolate_nearest,
+    interpolate_nearest_backward,
     ew_mod_int,
     ew_step,
     ew_unary,
@@ -2709,6 +2713,26 @@ def adaptive_avg_pool2d_backward_source() -> Kernel:
 def adaptive_avg_pool2d_backward_template() -> str:
     """手写模板——对照物，不参与生产。"""
     return ADAPTIVE_AVGPOOL2D_BACKWARD_SRC
+
+
+def interpolate_nearest_source() -> Kernel:
+    """最近邻插值的 L2 描述（生产路径）。"""
+    return interpolate_nearest()
+
+
+def interpolate_bilinear_source(align_corners: bool = False) -> Kernel:
+    """双线性插值的 L2 描述（生产路径）；``align_corners`` 决定坐标公式。"""
+    return interpolate_bilinear(align_corners=align_corners)
+
+
+def interpolate_nearest_backward_source() -> Kernel:
+    """最近邻插值反向的 L2 描述（生产路径）。"""
+    return interpolate_nearest_backward()
+
+
+def interpolate_bilinear_backward_source(align_corners: bool = False) -> Kernel:
+    """双线性插值反向的 L2 描述（生产路径）。"""
+    return interpolate_bilinear_backward(align_corners=align_corners)
 
 
 def im2col_source() -> Kernel:

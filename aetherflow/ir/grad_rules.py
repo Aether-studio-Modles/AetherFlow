@@ -829,6 +829,25 @@ def _adaptive_avg_pool2d(ctx):
     )
 
 
+@vjp("interpolate")
+def _interpolate(ctx):
+    """dx 由 ``interpolate_backward`` 散射回来。
+
+    ``input_shape`` 允许带符号 batch（与池化反向一致）：它只是属性，执行时随
+    符号绑定一起解析。nearest 与 bilinear 共用同一条规则，模式与对齐口径原样
+    透传，避免反向在别的模式下悄悄换成半像素坐标。
+    """
+    x = ctx.input(0)
+    attrs = {
+        k: ctx.attrs[k] for k in ("size", "mode", "align_corners") if k in ctx.attrs
+    }
+    return (
+        ctx.b.add_node(
+            "interpolate_backward", [ctx.g], {"input_shape": list(x.type.shape), **attrs}
+        ),
+    )
+
+
 # conv / pool 的反向算子只有一阶规则。给它们留 None 会让"对反向图再求导"
 # 变成静默的二阶零；这里不写 vjp（=缺规则），引擎会明确报 NoGradientError。
 

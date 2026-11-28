@@ -3843,6 +3843,211 @@ register(
 
 
 # --------------------------------------------------------------------------
+# 空间插值
+# --------------------------------------------------------------------------
+
+
+def _interp_size(attrs: dict) -> Tuple[int, int]:
+    """``size`` 属性：目标空间尺寸 ``(OH, OW)``。"""
+    raw = attrs["size"]
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        oh = ow = int(raw)
+    elif isinstance(raw, (tuple, list)) and len(raw) in (1, 2):
+        oh = int(raw[0])
+        ow = int(raw[-1])
+    else:
+        raise ValueError(
+            f"interpolate 的 size 必须是 int 或长度 1/2 的序列，得到 {raw!r}"
+        )
+    if oh < 1 or ow < 1:
+        raise ValueError(f"interpolate 的 size 必须 >= 1，得到 {(oh, ow)}")
+    return oh, ow
+
+
+def _interp_mode(attrs: dict) -> str:
+    mode = attrs.get("mode", "nearest")
+    if mode not in ("nearest", "bilinear"):
+        raise ValueError(
+            f"interpolate 只支持 mode='nearest' / 'bilinear'，得到 {mode!r}；"
+            "bicubic、三线性与 antialias 尚未实现"
+        )
+    return mode
+
+
+def _interp_align(attrs: dict, mode: str) -> bool:
+    align = attrs.get("align_corners", False)
+    if not isinstance(align, bool):
+        raise ValueError(f"interpolate 的 align_corners 必须是 bool，得到 {align!r}")
+    if mode == "nearest" and align:
+        raise ValueError(
+            "interpolate 的 nearest 模式不接受 align_corners=True："
+            "最近邻没有角对齐语义（PyTorch 同样拒绝这一组合）"
+        )
+    return align
+
+
+def _interp_axis(
+    in_size: int, out_size: int, align_corners: bool, nearest: bool
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """单轴的源坐标与权重，``(i0, i1, lam)``（nearest 的 lam 为 None）。
+
+    坐标用整数分子/分母表示，避免"参考实现与设备内核用浮点算 scale、在边界
+    差一格"：
+
+    - nearest：``i = (dst * in) // out``。
+    - bilinear / align_corners=True：``src = dst * (in-1) / (out-1)``；
+      ``out == 1`` 时整轴取 0。
+    - bilinear / align_corners=False：``src = ((2*dst+1)*in - out) / (2*out)``，
+      再截断到 ``[0, in-1]``（下界对应 torch 的 ``src<0 -> 0``，上界是双线性
+      插值的标准定义，in==1 时整轴取 0）。
+
+    ``i1`` 截断到 ``in-1``：当 ``src`` 落在最后一格时 ``lam`` 可能恰好为 1，
+    与 ``i1 == i0`` 等价，不会读出界。
+    """
+    dst = np.arange(out_size, dtype=np.int64)
+    if nearest:
+        idx = (dst * int(in_size)) // int(out_size)
+        return idx, idx, None
+    if align_corners:
+        if out_size > 1:
+            num = dst * (int(in_size) - 1)
+            den = int(out_size) - 1
+        else:
+            num = np.zeros(1, dtype=np.int64)
+            den = 1
+    else:
+        num = (2 * dst + 1) * int(in_size) - int(out_size)
+        den = 2 * int(out_size)
+        np.maximum(num, 0, out=num)
+        if in_size > 1:
+            np.minimum(num, (int(in_size) - 1) * den, out=num)
+        else:
+            num[:] = 0
+    i0 = num // den
+    rem = num - i0 * den
+    lam = rem.astype(np.float64) / float(den)
+    i1 = np.minimum(i0 + 1, int(in_size) - 1)
+    return i0, i1, lam
+
+
+def _infer_interpolate(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
+    x = inputs[0]
+    if x.rank != 4:
+        raise ValueError(f"interpolate 要求 NCHW 秩 4 输入，得到秩 {x.rank}")
+    if not x.dtype.is_float:
+        raise TypeError(f"interpolate 需要浮点输入，得到 {x.dtype.value}")
+    mode = _interp_mode(attrs)
+    _interp_align(attrs, mode)
+    oh, ow = _interp_size(attrs)
+    n, c, _, _ = x.shape
+    return TensorType(x.dtype, (n, c, oh, ow))
+
+
+def _ref_interpolate(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x = args[0]
+    mode = _interp_mode(attrs)
+    align = _interp_align(attrs, mode)
+    oh, ow = _interp_size(attrs)
+    ih = _interp_axis(x.shape[2], oh, align, mode == "nearest")
+    iw = _interp_axis(x.shape[3], ow, align, mode == "nearest")
+    if mode == "nearest":
+        return x[:, :, ih[0][:, None], iw[0][None, :]]
+
+    h0, h1, lh = ih
+    w0, w1, lw = iw
+    xf = x.astype(np.float64)
+    h0, h1, lh = h0[:, None], h1[:, None], lh[:, None]
+    w0, w1, lw = w0[None, :], w1[None, :], lw[None, :]
+    out = (
+        (1.0 - lh) * (1.0 - lw) * xf[:, :, h0, w0]
+        + (1.0 - lh) * lw * xf[:, :, h0, w1]
+        + lh * (1.0 - lw) * xf[:, :, h1, w0]
+        + lh * lw * xf[:, :, h1, w1]
+    )
+    return out.astype(x.dtype)
+
+
+register(
+    Op(
+        name="interpolate",
+        infer=_infer_interpolate,
+        reference=_ref_interpolate,
+        attrs_schema=("size", "mode", "align_corners"),
+        doc="NCHW 二维空间插值（只缩空间维，不改 N/C）：size=(OH,OW)，"
+        "mode 默认 nearest、也接受 bilinear；bilinear 的 align_corners=False "
+        "用半像素对齐（(dst+0.5)*in/out-0.5），True 用角对齐（dst*(in-1)/(out-1)）；"
+        "bicubic / 三线性 / antialias / scale_factor 未实现",
+    )
+)
+
+
+def _infer_interpolate_backward(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    dy = inputs[0]
+    shape = _as_shape(attrs["input_shape"])
+    if len(shape) != 4:
+        raise ValueError(f"input_shape 必须是 NCHW 四元组，得到 {shape}")
+    if dy.rank != 4:
+        raise ValueError(f"interpolate_backward 要求 dy 是秩 4，得到秩 {dy.rank}")
+    mode = _interp_mode(attrs)
+    _interp_align(attrs, mode)
+    _interp_size(attrs)
+    return TensorType(dy.dtype, shape)
+
+
+def _ref_interpolate_backward(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    """插值对输入的梯度：逐个输出格把 dy 散射回它的源位置。
+
+    nearest 一个源点、bilinear 四个角；多个输出格可能命中同一输入格
+    （最近邻的重复采样、bilinear 在 in/out 不成比例时的重叠），所以必须
+    ``+=`` / 设备侧 atomicAdd，不能覆盖。
+    """
+    dy = args[0]
+    n, c, h, w = (int(d) for d in attrs["input_shape"])
+    mode = _interp_mode(attrs)
+    align = _interp_align(attrs, mode)
+    oh, ow = _interp_size(attrs)
+    if dy.shape != (n, c, oh, ow):
+        raise ValueError(
+            f"interpolate_backward 的 dy 形状应为 {(n, c, oh, ow)}，得到 {dy.shape}"
+        )
+    ih = _interp_axis(h, oh, align, mode == "nearest")
+    iw = _interp_axis(w, ow, align, mode == "nearest")
+    dx = np.zeros((n, c, h, w), dtype=np.float64)
+    dyf = dy.astype(np.float64)
+    if mode == "nearest":
+        hmap, wmap = ih[0], iw[0]
+        for i in range(oh):
+            for j in range(ow):
+                dx[:, :, hmap[i], wmap[j]] += dyf[:, :, i, j]
+        return dx.astype(dy.dtype)
+
+    h0, h1, lh = ih
+    w0, w1, lw = iw
+    for i in range(oh):
+        for j in range(ow):
+            part = dyf[:, :, i, j]
+            dx[:, :, h0[i], w0[j]] += part * ((1.0 - lh[i]) * (1.0 - lw[j]))
+            dx[:, :, h0[i], w1[j]] += part * ((1.0 - lh[i]) * lw[j])
+            dx[:, :, h1[i], w0[j]] += part * (lh[i] * (1.0 - lw[j]))
+            dx[:, :, h1[i], w1[j]] += part * (lh[i] * lw[j])
+    return dx.astype(dy.dtype)
+
+
+register(
+    Op(
+        name="interpolate_backward",
+        infer=_infer_interpolate_backward,
+        reference=_ref_interpolate_backward,
+        attrs_schema=("input_shape", "size", "mode", "align_corners"),
+        doc="插值对输入的梯度：dy(N,C,OH,OW) -> dx(N,C,H,W)，input_shape 为原输入形状；"
+        "重复命中的输入位置累加（nearest 的重复采样、bilinear 的四角），只定义一阶",
+    )
+)
+
+
+# --------------------------------------------------------------------------
 # 归一化与归约
 # --------------------------------------------------------------------------
 

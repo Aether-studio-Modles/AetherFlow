@@ -140,6 +140,12 @@ from .image import (
     _split_output_index as _split_output_index,
     _tap as _tap,
 )
+from .interpolate import (
+    interpolate_nearest,
+    interpolate_bilinear,
+    interpolate_nearest_backward,
+    interpolate_bilinear_backward,
+)
 
 # 兼容转口：这些名字在拆分前直接住在 ``kernels`` 模块里（自身定义或从邻近
 # 模块导入），外部可能按旧路径取用，故保持同名可见。
@@ -238,6 +244,10 @@ __all__ = [
     "avgpool2d_backward",
     "adaptive_avg_pool2d",
     "adaptive_avg_pool2d_backward",
+    "interpolate_nearest",
+    "interpolate_bilinear",
+    "interpolate_nearest_backward",
+    "interpolate_bilinear_backward",
     "im2col",
     "conv2d_tiled",
     "conv2d_grouped",

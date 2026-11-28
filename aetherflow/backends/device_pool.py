@@ -7,6 +7,37 @@ import numpy as np
 from .device_shared import _pair, _pool_flags, _pool_out_dim
 
 
+def _interp_geometry(attrs, where: str) -> tuple:
+    """``(mode, align_corners, OH, OW)``；与 ``ir/ops.py`` 的解析逐字一致。"""
+    mode = attrs.get("mode", "nearest")
+    if mode not in ("nearest", "bilinear"):
+        raise BackendCapabilityError(
+            f"{where} 只支持 mode='nearest' / 'bilinear'，收到 {mode!r}"
+        )
+    align = attrs.get("align_corners", False)
+    if not isinstance(align, bool):
+        raise BackendCapabilityError(
+            f"{where} 的 align_corners 必须是 bool，收到 {align!r}"
+        )
+    if mode == "nearest" and align:
+        raise BackendCapabilityError(
+            f"{where} 的 nearest 模式不接受 align_corners=True"
+        )
+    raw = attrs.get("size")
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        oh = ow = int(raw)
+    elif isinstance(raw, (tuple, list)) and len(raw) in (1, 2):
+        oh = int(raw[0])
+        ow = int(raw[-1])
+    else:
+        raise BackendCapabilityError(
+            f"{where} 的 size 必须是 int 或长度 1/2 的序列，收到 {raw!r}"
+        )
+    if oh < 1 or ow < 1:
+        raise BackendCapabilityError(f"{where} 的 size 必须 >= 1，收到 {(oh, ow)}")
+    return mode, align, oh, ow
+
+
 class _PoolMixin:
     """池化：最大 / 平均 / 自适应平均，含反向与取值位置。"""
 
@@ -371,6 +402,112 @@ class _PoolMixin:
             "adaptive_avg_pool2d_backward",
         )
         block, grid = self._grid("adaptive_avg_pool2d_backward", total)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                dy,
+                dx,
+                np.int32(c),
+                np.int32(h),
+                np.int32(w),
+                np.int32(oh),
+                np.int32(ow),
+                np.int64(total),
+            ),
+        )
+        return dx
+
+    def _op_interpolate(self, node, args, attrs):
+        """二维空间插值：一个输出元素一个线程。
+
+        坐标口径与 ``ir/ops.py`` 的参考实现完全相同（整数分子/分母），因此
+        ``nearest`` 只是一次取值，``bilinear`` 是四角加权；``align_corners``
+        是构图期属性，两套公式各编译一份，执行期不分支。
+        """
+        cp = self.cp
+        x = self._contig(args[0])
+        if x.ndim != 4:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 interpolate 要求 NCHW 秩 4，收到 {x.shape}"
+            )
+        mode, align, oh, ow = _interp_geometry(attrs, "interpolate")
+        n, c, h, w = (int(v) for v in x.shape)
+
+        out = cp.empty((n, c, oh, ow), dtype=x.dtype)
+        total = int(out.size)
+        if total == 0:
+            return out
+
+        if mode == "nearest":
+            name = "interpolate_nearest"
+            source = self.codegen.interpolate_nearest_source
+            render = lambda: self.codegen.render(source(), x.dtype)  # noqa: E731
+        else:
+            name = "interpolate_bilinear" + ("_ac" if align else "_half")
+            render = lambda: self.codegen.render(  # noqa: E731
+                self.codegen.interpolate_bilinear_source(align), x.dtype
+            )
+
+        dtype_key = self._kind(x)
+        kernel = self._kernel((name, dtype_key), render, name)
+        block, grid = self._grid(name, total)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                x,
+                out,
+                np.int32(c),
+                np.int32(h),
+                np.int32(w),
+                np.int32(oh),
+                np.int32(ow),
+                np.int64(total),
+            ),
+        )
+        return out
+
+    def _op_interpolate_backward(self, node, args, attrs):
+        """插值反向：dy 按源位置散射回 dx。
+
+        最近邻一个源点、双线性四个角；多个输出格可能命中同一输入格，因此
+        dx 先清零、写回走 atomicAdd（空内核会留下未初始化结果，不能省）。
+        """
+        cp = self.cp
+        dy = self._contig(args[0])
+        mode, align, oh, ow = _interp_geometry(attrs, "interpolate_backward")
+        shape = tuple(int(d) for d in attrs["input_shape"])
+        if len(shape) != 4:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 interpolate_backward 的 input_shape "
+                f"必须是 NCHW 四元组，收到 {shape}"
+            )
+        n, c, h, w = shape
+        if tuple(dy.shape) != (n, c, oh, ow):
+            raise BackendCapabilityError(
+                f"interpolate_backward 的 dy 形状应为 {(n, c, oh, ow)}，收到 {dy.shape}"
+            )
+
+        dx = cp.zeros(shape, dtype=dy.dtype)
+        total = int(dy.size)
+        if total == 0:
+            return dx
+
+        if mode == "nearest":
+            name = "interpolate_nearest_backward"
+            render = lambda: self.codegen.render(  # noqa: E731
+                self.codegen.interpolate_nearest_backward_source(), dy.dtype
+            )
+        else:
+            name = "interpolate_bilinear_backward" + ("_ac" if align else "_half")
+            render = lambda: self.codegen.render(  # noqa: E731
+                self.codegen.interpolate_bilinear_backward_source(align), dy.dtype
+            )
+
+        dtype_key = self._kind(dy)
+        kernel = self._kernel((name, dtype_key), render, name)
+        block, grid = self._grid(name, total)
         kernel(
             (grid,),
             (block,),

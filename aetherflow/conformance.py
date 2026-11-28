@@ -1392,6 +1392,52 @@ def _repeat_interleave(shape: tuple = (2, 3, 4), axis: int = 1, repeats: int = 3
     return build
 
 
+def _interpolate(
+    shape: tuple = (2, 3, 4, 5),
+    size: tuple = (7, 6),
+    mode: str = "bilinear",
+    align_corners: bool = False,
+):
+    def build(rng):
+        g = Graph("interpolate")
+        x = g.input("x", f32[shape])
+        attrs = {"size": list(size), "mode": mode}
+        if mode == "bilinear":
+            attrs["align_corners"] = align_corners
+        g.output(g.add_node("interpolate", [x], attrs), "y")
+        # 4x5 -> 7x6 是非整数倍放大：双线性的四个权重两两不同，
+        # 邻近拷贝或只取一角的实现在这里必然对不上。
+        return g, {"x": _f32(rng, shape)}
+
+    return build
+
+
+def _interpolate_backward(
+    input_shape: tuple = (2, 3, 4, 5),
+    size: tuple = (7, 6),
+    mode: str = "bilinear",
+    align_corners: bool = False,
+):
+    def build(rng):
+        g = Graph("interpolate_backward")
+        n, c = input_shape[0], input_shape[1]
+        dy_shape = (n, c, size[0], size[1])
+        dy = g.input("dy", f32[dy_shape])
+        attrs = {
+            "input_shape": list(input_shape),
+            "size": list(size),
+            "mode": mode,
+        }
+        if mode == "bilinear":
+            attrs["align_corners"] = align_corners
+        g.output(g.add_node("interpolate_backward", [dy], attrs), "dx")
+        # 缩小（7x6 -> 4x5）时多个输出格命中同一输入格：覆盖写会丢梯度，
+        # 必须累加；梯度总和应等于 dy 元素数。
+        return g, {"dy": _f32(rng, dy_shape)}
+
+    return build
+
+
 def _clamp(lo=None, hi=None, shape: tuple = (5, 7)):
     def build(rng):
         g = Graph("clamp")
@@ -2313,6 +2359,23 @@ def default_cases() -> List[Case]:
               note="浮点 floor 取余：截断式 fmodf 在异号时符号错，必须与 numpy.mod 一致"),
         _case("repeat_interleave_middle", _repeat_interleave(),
               note="中间轴重复 3 次：输出轴长 dim*repeats，源下标 = 输出下标 / repeats"),
+        _case("interpolate_nearest_up", _interpolate(size=(8, 11), mode="nearest"),
+              note="最近邻放大：坐标 floor(oh*H/OH)，不是四舍五入"),
+        _case("interpolate_bilinear_up", _interpolate(size=(7, 6)),
+              note="align_corners=False：半像素中心对齐，四角权重两两不同"),
+        _case("interpolate_bilinear_align_corners", _interpolate(size=(5, 9),
+                                                                align_corners=True),
+              note="align_corners=True：端点对齐，与 False 的口径必须分岔"),
+        _case("interpolate_bilinear_down", _interpolate(size=(2, 3)),
+              note="缩小：多个输出格落到同一对输入像素，权重仍需逐格正确"),
+        _case("interpolate_backward_bilinear",
+              _interpolate_backward(input_shape=(2, 3, 7, 6), size=(4, 5)),
+              note="缩小反向：多输出格命中同一输入格，必须累加而非覆盖；"
+                   "顺序不固定", deterministic=False),
+        _case("interpolate_backward_nearest",
+              _interpolate_backward(size=(8, 11), mode="nearest"),
+              note="最近邻反向：重复采样同一源点，必须累加；顺序不固定",
+              deterministic=False),
         _case("topk_mask_last", _topk_mask(), rtol=0.0, atol=0.0,
               note="路由掩码：输出 0/1，必须精确相等；同值按下标小者优先（稳定排序）"),
         _case("topk_mask_axis0", _topk_mask(k=1, axis=0, shape=(4, 3)),
