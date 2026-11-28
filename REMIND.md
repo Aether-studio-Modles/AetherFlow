@@ -16,7 +16,7 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：80 个 IR 算子，CUDA / HIP 各自承接 77 个；
+- **一份语义 IR，多个硬件后端**：104 个 IR 算子，CUDA 承接 102 个、HIP 承接 100 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
@@ -132,7 +132,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3199 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3275 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -239,7 +239,8 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   BPE dropout 与 `lstrip` / `rstrip`；没有 offset mapping；用自造小词表逐 id
   对拍，未与 HF 官方实现在真实大词表上做全量对拍（5.314）。
 - **前端**：torch.export 子集。整数只有 i32（int64 收窄、越界拒绝）；
-  无 `bool` 张量，因此 `where` / `masked_fill` / 比较算子 / `topk` 显式拒绝；
+  `bool` 只作掩码：比较 / `where` / `masked_fill` / `topk` 的判定端已接，
+  但 `aten.logical_*` 与 bool 的 `to(dtype=...)` 未映射（IR 侧已有，5.330）；
   `sign` / `round` / `floor` / `ceil`、`baddbmm`、原地 `copy_` 无对应语义；
   非整数 `pow` 指数、图内 `clamp` 边界、非零或 reflect 的 `pad`、非默认
   `softplus.threshold` 一律拒绝；常量构造（zeros / ones / full / arange 等）
@@ -760,6 +761,27 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **5.329 的真机债**：`linear_i8_group` 的 conformance、
   `af_linear_i8a8_zp_bias` 的编译与逐位、动态 scale 链在 V100 上均未验证；
   新增内核注释为 ASCII（沿用 5.325 的约束）。
+- **bool 求和不叫求和，叫计数**（5.330）：`reduce_sum(mask)` 在 numpy 里会
+  把 true 当 1 累加，读代码的人却以为在求和。5.330 起 `_infer_reduce` 在入口
+  拒绝 bool（`reduce_max` / `reduce_mean` 同样拒绝，它们会退化成 OR / 比例），
+  错误信息给出两条替代：判定用 `reduce_all` / `reduce_any`，计数先 `cast`
+  到 f32。别再给 bool 开"参考端能跑就行"的口子——两端不一致比不支持更糟。
+- **逻辑算子不猜"非零即真"**（5.330）：`logical_and` / `logical_or` /
+  `logical_not` 只接受 bool，浮点输入直接拒绝并提示 `ne(x, 0)`。隐式转换在
+  NaN 与负数上会与显式比较分叉，等调用方踩到再解释就晚了。设备端复用比较
+  模板（`&&` / `||`）与一元模板（`lnot`），**没有新内核**。
+- **bool 结果必须 raw store，方言按 dtype 自动选**（5.330）：`logical_*` 的
+  输出是 1 字节 bool，走 store helper 会被按 float 语义写宽。CUDA / HIP 的
+  `render` 现在自己判断 `_dtype_key(dtype) == "bool"` 并选 `BOOL_DIALECT`，
+  调用点不必各自记住传方言；新增 bool 产出算子时只要走 `render` 就安全。
+- **cast 跨 bool 没有梯度**（5.330）：设备端 f32↔bool 走 `src != 0` / 升 f32，
+  f16 / bf16 必须经 f32 中转（直连 `__half` 会 Unresolved extern，bf16 的
+  uint16 按数值读会变成位模式）。反向对"源或目标是 bool"显式抛
+  `ValueError`——掩码不该进损失；`reduce_sum(bool)` 的反向同理（原先会静默
+  把 bool 梯度传回去）。
+- **5.330 的真机债**：`reduce_all` / `reduce_any` 只有参考语义，不在
+  `GPU_OPS`（设备端无 bool 归约内核，`af_add_q` 仍是 stub），CUDA / HIP 会
+  显式拒绝；逻辑组合与 bool cast 的设备路径只有源码级检查，V100 未回归。
 
 ---
 

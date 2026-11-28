@@ -13813,7 +13813,8 @@ WSL HIP `Ran 2285 tests / OK (skipped=369)`（WSL 内无 torch，矩阵相关用
 4. `_constant_node` 对 i32 常量做值域检查，越界在导入时拒绝，并提示"改成显式输入，
    让入口报出具体越界值"。
 5. `_to_dtype(dtype, row=None)` 接收矩阵行，`import_exported` 把自己拿到的行传进去：
-   声明与入口共用同一份事实来源；`bool` 仍在 `_TORCH_DTYPE` 之外。
+   声明与入口共用同一份事实来源（当时 `bool` 还在 `_TORCH_DTYPE` 之外；
+   5.330 起已映射到 `boolean`，只作掩码用，见 5.330 的"未声称"）。
 6. `padding_idx` 是 `Value` 时显式报"只支持静态缺省（None / -1）"。
 
 **用例**：`tests/test_resume.py` 新增 `test_user_meta_is_not_confused_with_loader_state`，
@@ -20950,6 +20951,84 @@ conformance 新增 1 条 `linear_i8_group_bias`，参考后端通过。
 - `linear_i8a8_zp` 仍是标量乘加，没有 dp4a / IMMA。
 - fp8 的逐组 scale 与 packed 激活（5.328 遗留）仍未做，留作独立阶段。
 - 新增 op 的 V100 真机 conformance 仍待授权；设备端只做了源码级检查。
+
+### 5.330 bool 张量算子：逻辑组合、bool 归约与 cast 的双向护栏
+
+**缺口。** bool 在 5.301 已经能存储、能比较、能被 `where` 消费，但三处没闭合：
+
+1. **掩码只能"产生"不能"组合"。** `gt` / `lt` 各自出一张掩码，要表达
+   "大于 0 且小于 1" 只能退回浮点算术（`mul(gt(...), lt(...))`），既绕开了
+   判定语义，也把 bool 又送进了算术路径。
+2. **归约两端不一致。** `_infer_reduce` 原先允许 bool，参考端 `np.sum` 把
+   true 当 1 累加，结果是**计数**；设备端却拒绝。"同一个图在两个后端一个能跑
+   一个报错"是最不该留下的状态。
+3. **设备端 cast 不接 bool。** `cast` 的 `dst_key` 只有 f32 / f16 / bf16，
+   bool 与浮点之间没有桥，量化掩码、导出标签都得在主机上倒一手。
+
+**1. `logical_and` / `logical_or` / `logical_not`。** 语义就是 numpy 的那三个：
+两侧必须是 bool，输出 bool，前两个走 numpy 广播。`infer` 在浮点输入上直接
+报错并指出正确写法（`ne(x, 0)`），不替调用方做"非零即真"的隐式转换——那会
+让 `logical_and(x, y)` 与 `logical_and(ne(x,0), ne(y,0))` 看起来等价，实际
+在 NaN 与负数上不是一回事。
+
+设备端**没有新增内核**：`logical_and` / `logical_or` 复用比较模板，`COMPARE_OP`
+加 `land` / `lor` 两个符号（bool 操作数经 `af_ld_q` 取出就是 0/1 的 float，
+C 的 `&&` / `||` 在 0/1 上的真值语义与 numpy 一致），`logical_not` 复用一元
+模板加 `lnot` 表达式（`x != 0 ? 0 : 1`）。结果写回必须走 raw store，否则
+store helper 会按 float 语义写 1 字节以外的宽度；因此 CUDA / HIP 的 `render`
+改成**按 dtype 自动选方言**：bool 用 `BOOL_DIALECT`，其余用原方言。这样
+所有调用点都不必各自记着传方言。
+
+**2. `reduce_all` / `reduce_any`。** 判定掩码的正确归约是 all / any，不是
+sum。两者只接受 bool、输出仍是 bool（降秩规则、`axis` 支持整数 / 元组 /
+负数、`keepdims` 与 `reduce_*` 完全同口径），空轴的恒等值分别是 true / false。
+参考语义直接落在 `np.all` / `np.any` 上。
+
+**3. `reduce_sum(bool)` 改为显式拒绝。** 名字承诺的是求和，bool 求和实际是
+计数——`reduce_sum(mask)` 在 numpy 里能跑，会让调用方以为拿到了"这些元素
+之和"，读代码的人也不会想到它是 `count_nonzero`。所以 `_infer_reduce` 在
+入口拒绝 bool，错误信息直接给出两条替代路径：判定用 `reduce_all` /
+`reduce_any`，计数先 `cast` 到 f32 再求和。`reduce_max` / `reduce_mean` 共用
+同一入口，一并拒绝（max 在 bool 上退化成 OR、mean 退化成比例，同样不是名字
+承诺的语义）。
+
+**4. `cast` 的 bool 双向。** 设备端补 `"bool"` 的载体键（1 字节
+`unsigned char`）：目标是 bool 时用 `src != 0`，从 bool 出发时统一先升到
+f32、再走既有的 `_cast_kernel`。f16 / bf16 必须经 f32 中转——直接和
+`__half` 互相构造会触发"Unresolved extern"，而 bf16 的 uint16 载体按数值
+读会被当成位模式。判据只有一条：**非零即真**，与 numpy 的 `astype(bool)` 一致。
+
+**5. 反向护栏。** 逻辑算子与 bool 归约没有 vjp（输出是判定值，导数无处可
+落），`backward` 走既有的 `NoGradientError`。另外两处原本会**静默**给出
+无意义梯度，现在显式报错：`reduce_sum` 的输入是 bool 时抛 `ValueError`
+（否则反向会把 bool 梯度原样传回去），`cast` 的源或目标是 bool 时也抛
+`ValueError`（掩码不该进损失；要在可导路径上用它，得在 cast 之前把这条
+支路摘掉）。
+
+**验证。** 本地 3275 条通过 / 460 跳过（较 5.329 增 13），ruff 通过。算子
+99 → 104；CUDA 承接 99 → 102（`GPU_OPS` 97 → 100，`reduce_all` /
+`reduce_any` 不在其中），HIP 97 → 100。`test_ops_extra` 新增 13 条：
+`TestLogical` 6 条（同形 / 广播对拍 numpy、`logical_not`、浮点输入拒绝、
+不可导、`gt`→`logical_and`→`where` 的掩码链对拍）、`TestReduceBool` 5 条
+（两种形状 × 两轴 × keepdims 两态对拍、空轴恒等值、`reduce_sum(bool)` 拒绝
+且消息含 `reduce_all`、浮点输入拒绝、不可导）、`TestBoolCast` 2 条
+（f32↔bool 往返对拍、从 bool 求导抛 `ValueError`）。conformance 新增 3 条
+逻辑用例（`logical_and_same` / `logical_or_broadcast` / `logical_not`）与
+2 条 bool 归约用例（`reduce_all_last` / `reduce_any_axis0`），参考后端通过；
+bool 输出只能精确相等，这五条的 rtol / atol 都是 0。
+
+**未声称。**
+
+- 设备端**没有** bool 归约内核（`af_add_q` 仍是 stub），`reduce_all` /
+  `reduce_any` 不在 `GPU_OPS` 里：CUDA / HIP 会显式拒绝，只有参考后端承接。
+- 没有 `count_nonzero`；计数必须先 `cast` 到 f32。这是有意的，不把计数
+  伪装成 `reduce_sum`。
+- 逻辑算子没有导数的替身（不做 STE）：判定值不进损失是使用方的责任。
+- 前端 `torch.export` 的 `aten.logical_and` / `aten.logical_or` /
+  `aten.logical_not` 与 bool 的 `to(dtype=...)` 尚未映射到这三个算子；
+  IR 有语义，导入侧仍显式拒绝。
+- 新增设备端路径（bool cast、逻辑组合的方言选择）只有源码级检查与参考
+  后端对拍，V100 真机回归仍待授权。
 
 
 
