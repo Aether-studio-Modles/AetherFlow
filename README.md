@@ -270,10 +270,10 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
 - **集合通信**：NCCL / RCCL 的 ctypes 绑定已接进数据并行路径（5.331）：单进程多卡
   自动 `ncclCommInitAll`，每进程一卡由 `NcclDeviceCollective.from_env()` 在 rank 0
   分发 uid、其余 rank `ncclCommInitRank`；库缺失时显式报错或显式 `collective="host"`，
-  不静默退回主机中转。仍无 P2P；梯度已按 `bucket_bytes` 拼桶、桶间线程并发提交
-  （200 个 2 KB 参数：65.4 → 28.5 ms/步，2.30×），但**没有**"梯度一就绪就归约"的反向重叠
-  （设备态强制 `bucket_bytes=0`、`threads=1`、`overlap=False`，`CollectiveSupport.overlap`
-  仍恒为 False）；
+  不静默退回主机中转。仍无 P2P；主机态梯度已按 `bucket_bytes` 拼桶、桶间线程并发提交
+  （200 个 2 KB 参数：65.4 → 28.5 ms/步，2.30×），但设备态**没有**"梯度一就绪就归约"的反向重叠
+  （设备态强制 `bucket_bytes=0`、`threads=1`、`overlap=False`；`CollectiveSupport.overlap`
+  声明的是设备态重叠，故恒为 False，不等于完全没有重叠，5.338）；
 - **并行策略**：有张量并行的切分与对齐（列 / 行并行 + attention 头切分，仅前向、归约走主机缓冲），
   但无列并行 / 行并行的反向通信，也没有"一份参数按 FSDP 式跨进程切分 + 按需拼回"的完整闭环；
 - **编译**：有循环级 IR（`LoopIR` / `LoopSplit`：单图体的条件 + 体规范形态、

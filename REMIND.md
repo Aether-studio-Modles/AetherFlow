@@ -171,8 +171,10 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `NcclDeviceCollective.from_env()`（rank 0 经 `AF_MASTER_ADDR` /
   `AF_MASTER_PORT` 分发 uid，其余 rank `ncclCommInitRank`）。库缺失时显式抛
   `DeviceCollectiveUnavailable`（不静默降级），显式 `device=False` 或
-  `collective="host"` 才走主机中转。`overlap` 仍恒为 `False`，设备态强制
-  `bucket_bytes=0` / `threads=1`。真机只到 `world=1`（RCCL 与 CUDA 各一条），
+  `collective="host"` 才走主机中转。`overlap` 声明的是设备态重叠，仍恒为 `False`
+  （设备态强制 `bucket_bytes=0` / `threads=1`）；主机态的桶间并发是
+  `DistributedDataParallel(overlap=True)` 的独立开关（5.302），5.338 已把这两件事
+  在文档与 reason 文本里分开。真机只到 `world=1`（RCCL 与 CUDA 各一条），
   多卡数值与 uid 分发用例已写但当前没有多卡机器、未执行。ZeRO-1/2/3 与流水
   部分参见 DESIGN §7。
 - **张量并行**：只有前向（列 / 行并行 + attention 头切分）。行并行返回**部分和**，
@@ -847,8 +849,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   不猜卡号。
 - **5.331 的真机债**：本机没有 NCCL / RCCL，所有"有库"分支靠 mock 覆盖；
   `ncclCommInitAll` 多卡归约、`NcclDeviceCollective.from_env` 的 uid 分发与
-  两卡数值用例均待授权真机回归。`overlap` 仍为 False，设备态强制
-  `bucket_bytes=0` / `threads=1` / `overlap=False`。
+  两卡数值用例均待授权真机回归。`overlap` 仍为 False（它声明的是设备态重叠），
+  设备态强制 `bucket_bytes=0` / `threads=1` / `overlap=False`；主机态桶间并发
+  已在 5.302，两者不是同一件事（5.338）。
 - **可外提的前提是"纯"与"不读状态"**（5.332）：只按 `op.pure` 与 carried
   依赖判断；RNG 每轮重新采样、STATE / IO 有副作用，都不能外提，它们的
   消费者也不能——否则新体会引用一个留在体内的值。
