@@ -397,6 +397,7 @@ class TestDataParallelTrainer(unittest.TestCase):
             backend=multi_backend,
             devices=list(range(world)),
             reduction=reduction,
+            collective="host",
         )
         multi_losses = [multi_trainer.step(batch) for _ in range(2)]
         return single, single_losses, multi, multi_losses, multi_backend, multi_trainer
@@ -421,7 +422,8 @@ class TestDataParallelTrainer(unittest.TestCase):
         graph = _linear_graph(4)
         store = _linear_store()
         trainer = DataParallelTrainer(
-            graph, store, SGD(store.arrays(), lr=0.1), backend=backend, devices=[0, 2]
+            graph, store, SGD(store.arrays(), lr=0.1), backend=backend, devices=[0, 2],
+            collective="host",
         )
         batch = _linear_batch()
         trainer.step(batch)
@@ -432,7 +434,7 @@ class TestDataParallelTrainer(unittest.TestCase):
         store = _linear_store()
         trainer = DataParallelTrainer(
             graph, store, SGD(store.arrays(), lr=0.1),
-            backend=_FakeDevices(3), devices=[0, 1, 2],
+            backend=_FakeDevices(3), devices=[0, 1, 2], collective="host",
         )
         with self.assertRaises(ValueError):
             trainer.step(_linear_batch(8))
@@ -443,7 +445,7 @@ class TestDataParallelTrainer(unittest.TestCase):
         store = _linear_store()
         trainer = DataParallelTrainer(
             graph, store, SGD(store.arrays(), lr=0.1),
-            backend=_FakeDevices(2), devices=[0, 1],
+            backend=_FakeDevices(2), devices=[0, 1], collective="host",
         )
         with self.assertRaises(ValueError):
             trainer.step(_linear_batch(8))
@@ -453,7 +455,7 @@ class TestDataParallelTrainer(unittest.TestCase):
         store = _linear_store()
         trainer = DataParallelTrainer(
             graph, store, SGD(store.arrays(), lr=0.1),
-            backend=_FakeDevices(2), devices=[0, 1],
+            backend=_FakeDevices(2), devices=[0, 1], collective="host",
         )
         batch = _linear_batch()
         with self.assertRaises(KeyError):
@@ -468,7 +470,7 @@ class TestDataParallelTrainer(unittest.TestCase):
         store = _linear_store()
         trainer = DataParallelTrainer(
             graph, store, SGD(store.arrays(), lr=0.1),
-            backend=_FakeDevices(2), devices=[0, 1],
+            backend=_FakeDevices(2), devices=[0, 1], collective="host",
         )
         batch = _linear_batch()
         batch["target"] = batch["target"][:4]
@@ -489,7 +491,7 @@ class TestDataParallelTrainer(unittest.TestCase):
             with self.assertRaises(error):
                 DataParallelTrainer(
                     graph, store, SGD(store.arrays(), lr=0.1),
-                    backend=_FakeDevices(2), devices=devices,
+                    backend=_FakeDevices(2), devices=devices, collective="host",
                 )
 
     def test_rejects_unsupported_backend_and_reduction(self):
@@ -504,6 +506,7 @@ class TestDataParallelTrainer(unittest.TestCase):
             DataParallelTrainer(
                 graph, store, SGD(store.arrays(), lr=0.1),
                 backend=_FakeDevices(2), devices=[0, 1], reduction="max",
+                collective="host",
             )
 
     def test_rejects_non_scalar_target(self):
@@ -515,7 +518,7 @@ class TestDataParallelTrainer(unittest.TestCase):
         with self.assertRaises(ValueError):
             DataParallelTrainer(
                 g, store, SGD(store.arrays(), lr=0.1),
-                backend=_FakeDevices(2), devices=[0, 1],
+                backend=_FakeDevices(2), devices=[0, 1], collective="host",
             )
 
 
@@ -813,6 +816,7 @@ class TestCollectiveSeam(unittest.TestCase):
             SGD(host_store.arrays(), lr=0.1),
             backend=_FakeDevices(2),
             devices=[0, 1],
+            collective="host",
         )
         device = DataParallelTrainer(
             _linear_graph(batch=4),

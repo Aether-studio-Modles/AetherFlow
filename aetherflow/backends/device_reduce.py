@@ -468,7 +468,7 @@ class _ReduceMixin:
         if perm is None:
             return out_perm.reshape(target)
         inv = tuple(sorted(range(len(perm)), key=lambda i: perm[i]))
-        return self.cp.ascontiguousarray(out_perm.transpose(inv))
+        return self.cp.ascontiguousarray(self.cp.transpose(out_perm, inv))
 
     def _op_topk_values(self, node, args, attrs):
         cp = self.cp
