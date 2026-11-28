@@ -357,6 +357,30 @@ def _linear_i8(x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6)):
     return build
 
 
+def _linear_i8_group(
+    x_shape: tuple = (2, 4, 8), w_shape: tuple = (8, 6), groups: int = 4
+):
+    """逐组 weight-only 线性层：K=8 分 4 组，组内共用一份 scale。"""
+
+    def build(rng):
+        g = Graph("linear_i8_group")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(groups, w_shape[-1])])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_i8_group", [x, q, s, b]), "y")
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": rng.integers(-127, 128, size=w_shape, dtype=np.int8),
+            "s": (
+                np.abs(_f32(rng, (groups, w_shape[-1]), scale=0.2)) + 0.05
+            ).astype(np.float32),
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
 def _linear_i8a8(x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)):
     def build(rng):
         g = Graph("linear_i8a8")
@@ -1771,6 +1795,10 @@ def default_cases() -> List[Case]:
         _case("linear_i8_bias", _linear_i8(),
               note="反量化 GEMM 的完整形态（含 bias）：数值必须等于先 dequantize "
                    "再 matmul"),
+        _case("linear_i8_group_bias", _linear_i8_group(),
+              note="逐组 weight-only 的完整形态：K=8 分 4 组、组内共用 scale，"
+                   "数值必须等于先 dequantize_i8_group 再 matmul；"
+                   "按逐通道 scale 解释会把组内贡献算错"),
         # W8A8 int8
         _case("linear_i8a8_bias", _linear_i8a8(),
               note="int8 激活 × int8 权重先在 int32 里累加，再乘两个 scale；"

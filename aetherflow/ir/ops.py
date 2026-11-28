@@ -1486,6 +1486,82 @@ register(
 )
 
 
+def _infer_linear_i8_group(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) not in (3, 4):
+        raise ValueError(
+            f"linear_i8_group 需要 (x, qweight, scale[, bias]) 输入，得到 {len(inputs)}"
+        )
+    x, qweight, scale = inputs[0], inputs[1], inputs[2]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_i8_group 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加，混精度入口不在这一版"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_i8_group 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype != DType.I8:
+        raise TypeError(
+            f"linear_i8_group 的权重必须是 i8，得到 {qweight.dtype.value}"
+        )
+    if qweight.rank != 2:
+        raise ValueError(
+            f"linear_i8_group 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(f"linear_i8_group 的 scale 必须是 f32，得到 {scale.dtype.value}")
+    _check_group_params(qweight, scale, "linear_i8_group", "scale")
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_i8_group 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_i8_group 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    if len(inputs) == 4:
+        bias = inputs[3]
+        if bias.dtype != DType.F32:
+            raise TypeError(f"linear_i8_group 的 bias 必须是 f32，得到 {bias.dtype.value}")
+        if bias.rank != 1:
+            raise ValueError(f"linear_i8_group 的 bias 必须是秩 1，得到秩 {bias.rank}")
+        if isinstance(bias.shape[0], int) and isinstance(n, int) and bias.shape[0] != n:
+            raise ValueError(
+                f"linear_i8_group 的 bias 长度 {bias.shape[0]} 与 N={n} 不一致"
+            )
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_i8_group(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    x, qweight, scale = args[0], args[1], args[2]
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            f"linear_i8_group 的 scale 必须严格为正，得到最小值 {float(np.min(scale))}"
+        )
+    repeated = np.repeat(scale, qweight.shape[0] // scale.shape[0], axis=0)
+    out = np.matmul(x, qweight.astype(np.float32) * repeated)
+    if len(args) > 3:
+        out = out + args[3]
+    return out
+
+
+register(
+    Op(
+        name="linear_i8_group",
+        infer=_infer_linear_i8_group,
+        reference=_ref_linear_i8_group,
+        doc="weight-only int8 线性层，权重按**组**共用 scale：(..., K) x i8(K, N) "
+        "-> (..., N)，scale 是 (K/G, N)，组大小由形状推出。数值等于 "
+        "``matmul(x, dequantize_i8_group(qweight, scale)) [+ bias]``；"
+        "与 ``linear_i8`` 的差别只有权重侧的量化粒度（GPTQ / AWQ 的 group_size 形态）",
+    )
+)
+
+
 # --------------------------------------------------------------------------
 # fp8 线性层
 # --------------------------------------------------------------------------

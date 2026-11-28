@@ -86,6 +86,7 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "fake_quantize_i8",
         "fake_quantize_i8_lsq",
         "linear_i8",
+        "linear_i8_group",
         "linear_i8_zp",
         "linear_i8a8",
         "linear_i8a8_zp",
@@ -177,6 +178,8 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "dequantize_i8_group": frozenset({0}),
     "dequantize_i8_group_zp": frozenset({0, 2}),
     "linear_i8": frozenset({1}),
+    # 逐组版只有权重是 1 字节；scale 是二维 f32，仍按 dtype 推断字节数。
+    "linear_i8_group": frozenset({1}),
     # W8A8：激活与权重都是 i8 数据，scale / bias 仍是 f32。
     "linear_i8a8": frozenset({0, 2}),
     # 非对称版：多出来的是两处 zero_point（都是 i8 数据）。
@@ -592,6 +595,19 @@ extern "C" __global__ void af_linear_i8a8(
 # 累加不等价（参考实现 5.315 就是这样定的）。零点减法会打散字节对齐，所以
 # 这一版不走 ``__dp4a``，用标量乘加；两条后端共用同一份源码。
 _LINEAR_I8A8_ZP_SRC = r"""
+// 逐项减零点的整数累加。抽成 device 函数只为一件事：无 bias / 带 bias
+// 两个入口必须共用同一份累加体，否则"融合 epilogue"会悄悄变成第二条语义。
+__device__ __forceinline__ int af_i8a8_zp_acc(
+    const signed char* __restrict__ xr,
+    const signed char* __restrict__ wc,
+    int zx, int zw, long long k, long long n) {
+  int acc = 0;
+  for (long long kk = 0; kk < k; ++kk) {
+    acc += ((int)xr[kk] - zx) * ((int)wc[kk * n] - zw);
+  }
+  return acc;
+}
+
 extern "C" __global__ void af_linear_i8a8_zp(
     const signed char* __restrict__ x,
     const signed char* __restrict__ xzp,
@@ -608,13 +624,35 @@ extern "C" __global__ void af_linear_i8a8_zp(
   long long col = idx - row * n;
   const signed char* xr = x + row * k;
   const signed char* wc = w + col;
-  int zx = (int)xzp[row];
-  int zw = (int)wzp[col];
-  int acc = 0;
-  for (long long kk = 0; kk < k; ++kk) {
-    acc += ((int)xr[kk] - zx) * ((int)wc[kk * n] - zw);
-  }
+  int acc = af_i8a8_zp_acc(xr, wc, (int)xzp[row], (int)wzp[col], k, n);
   out[idx] = (float)acc * xs[row] * ws[col];
+}
+
+// 带 bias 的入口：把 ``add`` 融进来，省一次 kernel launch 与一块 m*n 中间张量。
+// 两次乘法用 ``__fmul_rn``、加法用 ``__fadd_rn``：不融合时 bias 是在另一颗
+// 内核里做 f32 加法，各自按 RN 舍入；若这里让编译器发 FFMA，末位会差 1 ulp，
+// "融合前后逐位相同"就不成立了。
+extern "C" __global__ void af_linear_i8a8_zp_bias(
+    const signed char* __restrict__ x,
+    const signed char* __restrict__ xzp,
+    const float* __restrict__ xs,
+    const signed char* __restrict__ w,
+    const signed char* __restrict__ wzp,
+    const float* __restrict__ ws,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    long long m, long long k, long long n) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  long long total = m * n;
+  if (idx >= total) return;
+  long long row = idx / n;
+  long long col = idx - row * n;
+  const signed char* xr = x + row * k;
+  const signed char* wc = w + col;
+  int acc = af_i8a8_zp_acc(xr, wc, (int)xzp[row], (int)wzp[col], k, n);
+  float v = __fmul_rn((float)acc, xs[row]);
+  v = __fmul_rn(v, ws[col]);
+  out[idx] = __fadd_rn(v, bias[col]);
 }
 """
 

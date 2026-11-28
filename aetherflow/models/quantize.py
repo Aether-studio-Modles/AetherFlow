@@ -15,8 +15,11 @@
    min/max（非对称），得到每个 token 一组量化参数；与权重共用同一份 RNE 舍入。
 3. **把量化线性层表达成 IR**：``build_int8_linear`` 是 weight-only，
    ``build_int8a8_linear`` 是激活也量化的 W8A8；带 ``_zp`` 的两个 builder 是
-   对应的非对称版本。权重形状约定与 ``models/mlp.py`` 一致——权重是
-   ``(in, out)``，不是 PyTorch 的 ``(out, in)``。
+   对应的非对称版本；``build_int8_group_linear`` 是逐组 scale 的 weight-only，
+   ``build_int8a8_linear_qat`` 是训练期的假量化 STE / LSQ，
+   ``build_int8a8_linear_dynamic`` 在图内按 token 现算激活 scale。权重形状
+   约定与 ``models/mlp.py`` 一致——权重是 ``(in, out)``，不是 PyTorch 的
+   ``(out, in)``。
 
 fp8 的一节只覆盖**写侧**（把 f32 权重 / 激活压到 fp8 格点并给出 scale）：
 ``quantize_weight_fp8`` / ``quantize_activation_fp8`` / ``dequantize_weight_fp8``。
@@ -65,6 +68,10 @@ __all__ = [
     "build_int8a8_linear",
     "build_int8_linear_zp",
     "build_int8a8_linear_zp",
+    "quantize_weight_group",
+    "build_int8_group_linear",
+    "build_int8a8_linear_qat",
+    "build_int8a8_linear_dynamic",
     "quantize_weight_fp8",
     "dequantize_weight_fp8",
     "quantize_activation_fp8",
@@ -373,6 +380,185 @@ def build_int8a8_linear_zp(
         inputs["bias"] = g.input("bias", f32[n])
         args.append(inputs["bias"])
     return inputs, g.add_node("linear_i8a8_zp", args)
+
+
+def quantize_weight_group(
+    weight: np.ndarray, group_size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """把 ``(K, N)`` 的 f32 权重按 **K 方向每 ``group_size`` 行一组**量化。
+
+    返回 ``(q, scale)``：``q`` 与权重同形，``scale`` 是
+    ``(K // group_size, N)``。这是 GPTQ / AWQ 的 ``group_size`` 形态——
+    比逐通道多出 ``K/G`` 倍的 f32 量化参数，换来更细的动态范围：组内共用
+    一份 scale，某一行的离群值不会把同通道其它行整片压小。
+
+    组大小必须整除 ``K``；全零的组给 ``scale = 1.0``（理由同
+    :func:`quantize_weight`）。量化本身仍走 ``quantize_i8`` 的参考实现，
+    因此与图里"再乘回去"共享同一份 RNE 与饱和规则。
+    """
+    w = np.asarray(weight)
+    if w.ndim != 2:
+        raise ValueError(
+            f"quantize_weight_group 只接受 (K, N) 的线性层权重，得到 {w.shape}"
+        )
+    if w.dtype.kind != "f":
+        raise TypeError(f"quantize_weight_group 需要浮点权重，得到 {w.dtype}")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("权重里有 NaN / Inf：量化会把这些值传播到整条推理链")
+
+    gs = int(group_size)
+    if gs <= 0:
+        raise ValueError(f"group_size 必须为正，得到 {group_size}")
+    k, n = w.shape
+    if k % gs != 0:
+        raise ValueError(f"group_size={gs} 不能整除 K={k}：逐组量化要求整组切分")
+
+    grouped = w.astype(np.float32).reshape(k // gs, gs, n)
+    amax = np.max(np.abs(grouped), axis=1)
+    scale = np.where(amax > 0, amax / float(QUANT_MAX), 1.0).astype(np.float32)
+    # (K/G, 1, N) 与 (K/G, G, N) 广播：组内共用同一份 scale。
+    q = get_op("quantize_i8").reference([grouped, scale[:, None, :]], {})
+    return q.reshape(k, n), scale
+
+
+def build_int8_group_linear(
+    g: Graph,
+    in_features: int,
+    out_features: int,
+    group_size: int,
+    batch: str = "B",
+    bias: bool = True,
+) -> Tuple[Dict[str, Value], Value]:
+    """在 ``g`` 上构一个**逐组** weight-only int8 线性层。
+
+    返回 ``(输入表, 输出 Value)``；输入表含 ``x`` / ``w_i8`` / ``scale``
+    （形状 ``(K // group_size, N)``）与可选的 ``bias``。权重占用与
+    :func:`build_int8_linear` 相同（``K*N`` 个 int8），多出来的是
+    ``K/G * N`` 个 f32 的量化参数；换来的是更细的量化粒度。
+
+    用 :func:`quantize_weight_group` 准备 ``w_i8`` 与 ``scale``。
+    """
+    from ..ir.types import f32, i8
+
+    k, n = int(in_features), int(out_features)
+    if k <= 0 or n <= 0:
+        raise ValueError(f"in/out features 必须为正，得到 {k} 与 {n}")
+    gs = int(group_size)
+    if gs <= 0 or k % gs != 0:
+        raise ValueError(
+            f"group_size={gs} 必须为正且整除 in_features={k}，否则组切分不完整"
+        )
+
+    inputs: Dict[str, Value] = {
+        "x": g.input("x", f32[batch, k]),
+        "w_i8": g.input("w_i8", i8[k, n]),
+        "scale": g.input("scale", f32[k // gs, n]),
+    }
+    args = [inputs["x"], inputs["w_i8"], inputs["scale"]]
+    if bias:
+        inputs["bias"] = g.input("bias", f32[n])
+        args.append(inputs["bias"])
+    return inputs, g.add_node("linear_i8_group", args)
+
+
+def build_int8a8_linear_qat(
+    g: Graph,
+    in_features: int,
+    out_features: int,
+    batch: str = "B",
+    bias: bool = True,
+    learn_scale: bool = False,
+) -> Tuple[Dict[str, Value], Value]:
+    """在 ``g`` 上构一个 **QAT** 的 W8A8 线性层（假量化 + STE）。
+
+    输入表含 ``x`` / ``x_scale`` / ``w`` / ``w_scale``（可选 ``bias``），
+    全部是 f32。前向把两端假量化到 int8 格点后做 f32 GEMM——**图里没有 i8
+    张量**：训练要对浮点参数求导，int8 码在反向里没有连续变量。
+
+    ``learn_scale=True`` 时走 ``fake_quantize_i8_lsq``：反向把量化误差的
+    归约和送给 scale，量化步长本身可学；否则是标准 STE，scale 冻结。
+    导出的权重可以用 :func:`quantize_weight` / :func:`quantize_weight_group`
+    转成推理期的 int8 图，前向格点与训练时逐位相同。
+    """
+    from ..ir.types import f32
+
+    k, n = int(in_features), int(out_features)
+    if k <= 0 or n <= 0:
+        raise ValueError(f"in/out features 必须为正，得到 {k} 与 {n}")
+
+    fake = "fake_quantize_i8_lsq" if learn_scale else "fake_quantize_i8"
+    inputs: Dict[str, Value] = {
+        "x": g.input("x", f32[batch, k]),
+        "x_scale": g.input("x_scale", f32[batch, 1]),
+        "w": g.input("w", f32[k, n]),
+        "w_scale": g.input("w_scale", f32[n]),
+    }
+    xq = g.add_node(fake, [inputs["x"], inputs["x_scale"]])
+    wq = g.add_node(fake, [inputs["w"], inputs["w_scale"]])
+    out = g.add_node("matmul", [xq, wq])
+    if bias:
+        inputs["bias"] = g.input("bias", f32[n])
+        out = g.add_node("add", [out, inputs["bias"]])
+    return inputs, out
+
+
+def build_int8a8_linear_dynamic(
+    g: Graph,
+    in_features: int,
+    out_features: int,
+    batch: str = "B",
+    bias: bool = True,
+) -> Tuple[Dict[str, Value], Value]:
+    """在 ``g`` 上构一个 **per-token 动态 scale** 的 W8A8 线性层。
+
+    输入表含 ``x`` / ``w_q`` / ``w_scale``（可选 ``bias``）：激活的 scale
+    不再是图输入，而是在图里按每个 token 的 amax 现算
+    （``amax / 127``，全零 token 给 1.0）。这是 serving 里 "dynamic
+    per-token quantization" 的形态：输入分布变了也不需要重算激活 scale，
+    代价是每个 token 多一次 ``reduce_max``。
+
+    只由 ``reduce_max`` / ``where`` / ``gt`` / ``ge`` / ``neg`` / ``div`` /
+    ``quantize_i8`` 这些既有算子组成，设备端只要承接它们就能跑，没有新增
+    内核；量化格点与 :func:`quantize_activation` 完全同口径。
+    """
+    from ..ir.types import f32, i8
+
+    k, n = int(in_features), int(out_features)
+    if k <= 0 or n <= 0:
+        raise ValueError(f"in/out features 必须为正，得到 {k} 与 {n}")
+
+    inputs: Dict[str, Value] = {
+        "x": g.input("x", f32[batch, k]),
+        "w_q": g.input("w_q", i8[k, n]),
+        "w_scale": g.input("w_scale", f32[n]),
+    }
+    zero = g.constant(0.0)
+    one = g.constant(1.0)
+    limit = g.constant(float(QUANT_MAX))
+    # |x| = where(x >= 0, x, -x)
+    absx = g.add_node(
+        "where",
+        [
+            g.add_node("ge", [inputs["x"], zero]),
+            inputs["x"],
+            g.add_node("neg", [inputs["x"]]),
+        ],
+    )
+    amax = g.add_node("reduce_max", [absx], {"axis": -1, "keepdims": True})
+    x_scale = g.add_node(
+        "where",
+        [
+            g.add_node("gt", [amax, zero]),
+            g.add_node("div", [amax, limit]),
+            one,
+        ],
+    )
+    x_q = g.add_node("quantize_i8", [inputs["x"], x_scale])
+    args = [x_q, x_scale, inputs["w_q"], inputs["w_scale"]]
+    if bias:
+        inputs["bias"] = g.input("bias", f32[n])
+        args.append(inputs["bias"])
+    return inputs, g.add_node("linear_i8a8", args)
 
 
 # --------------------------------------------------------------------------

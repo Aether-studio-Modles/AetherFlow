@@ -566,17 +566,49 @@ def _linear_i8(ctx):
 
 @vjp("linear_i8a8")
 def _linear_i8a8(ctx):
-    """W8A8 线性层的反向：只有 bias 是连续量。
+    """W8A8 线性层的反向：int8 码冻结，两路 scale 是连续量。
 
-    激活与权重都是 int8，scale 是量化参数：在 int8 桶上求导没有连续变量，
-    与 ``linear_i8`` 同口径返回 ``None``（该输入不接收梯度），而不是造一张
-    零张量。要与训练接上需要量化感知训练，不在这一版。
+    前向是 ``(float)acc * x_scale * w_scale``，``acc`` 只由 i8 码决定。记
+    ``xd = xq * x_scale``、``wd = wq * w_scale``，两个 scale 分别沿 K 与 N
+    广播，因此：
+
+    - ``dL/dx_scale = Σ_K (g @ wdᵀ) * xq``，按 x_scale 的原形状归约；
+    - ``dL/dw_scale = Σ_K (xdᵀ @ g) * wq``，按 w_scale 的原形状归约。
+
+    激活与权重的 i8 码仍然返回 ``None``：整数域没有连续变量，要与训练接上
+    走 ``build_int8a8_linear_qat`` 的假量化（STE）路径，而不是往 int8 上传梯度。
     """
     b, g = ctx.b, ctx.g
+    xq, xs, wq, ws = (ctx.input(i) for i in range(4))
+    xf = b.add_node("cast", [xq], {"dtype": "f32"})
+    wf = b.add_node("cast", [wq], {"dtype": "f32"})
+    weight = b.add_node("mul", [wf, ws])
+    act = b.add_node("mul", [xf, xs])
+    dact = b.add_node("matmul", [g, _transpose_last_two(b, weight)])
+    dweight = b.add_node("matmul", [_transpose_last_two(b, act), g])
+    dxs = sum_to(b, b.add_node("mul", [dact, xf]), xs.type.shape)
+    dws = sum_to(b, b.add_node("mul", [dweight, wf]), ws.type.shape)
     if len(ctx.node.inputs) < 5:
-        return (None, None, None, None)
+        return (None, dxs, None, dws)
     db = sum_axes(b, g, tuple(range(g.type.rank - 1)))
-    return (None, None, None, None, db)
+    return (None, dxs, None, dws, db)
+
+
+@vjp("linear_i8_group")
+def _linear_i8_group(ctx):
+    """逐组 weight-only 的反向：与 ``linear_i8`` 同口径，只对激活与 bias 求导。
+
+    梯度里的权重必须是**逐组反量化**的那一份；用 ``linear_i8`` 的逐通道
+    反量化会把组内不同 scale 的贡献算错。
+    """
+    b, g = ctx.b, ctx.g
+    x = ctx.input(0)
+    weight = b.add_node("dequantize_i8_group", [ctx.input(1), ctx.input(2)])
+    dx = b.add_node("matmul", [g, _transpose_last_two(b, weight)])
+    if len(ctx.node.inputs) < 4:
+        return (sum_to(b, dx, x.type.shape), None, None)
+    db = sum_axes(b, g, tuple(range(g.type.rank - 1)))
+    return (sum_to(b, dx, x.type.shape), None, None, db)
 
 
 @vjp("linear_i8_zp")

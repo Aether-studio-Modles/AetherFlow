@@ -452,6 +452,7 @@ class DeviceBackend(
         # LSQ 版与 STE 版只差反向规则；设备端前向共用同一对内核。
         r.register("fake_quantize_i8_lsq", self._op_fake_quantize_i8_lsq)
         r.register("linear_i8", self._op_linear_i8)
+        r.register("linear_i8_group", self._op_linear_i8_group)
         r.register("linear_i8_zp", self._op_linear_i8_zp)
         r.register("linear_i8a8", self._op_linear_i8a8)
         r.register("linear_i8a8_zp", self._op_linear_i8a8_zp)

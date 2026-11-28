@@ -27,11 +27,15 @@ from aetherflow import (
     loads,
 )
 from aetherflow.conformance import default_cases, run_conformance
+from aetherflow.ir.ops import get_op
 from aetherflow.models.quantize import (
     QUANT_MAX,
+    build_int8_group_linear,
     build_int8_linear,
     build_int8_linear_zp,
     build_int8a8_linear,
+    build_int8a8_linear_dynamic,
+    build_int8a8_linear_qat,
     build_int8a8_linear_zp,
     dequantize_weight,
     dequantize_weight_asymmetric,
@@ -42,6 +46,7 @@ from aetherflow.models.quantize import (
     quantize_weight,
     quantize_weight_asymmetric,
     quantize_weight_fp8,
+    quantize_weight_group,
 )
 from aetherflow.runtime.fp8 import FP8_MAX, pack_fp8, quantize_fp8, round_fp8, unpack_fp8
 
@@ -562,12 +567,38 @@ class TestLinearI8A8Gradient(unittest.TestCase):
         out = _run(bwd, {**feed, "dy": dy})
         np.testing.assert_allclose(out["db"], dy.sum(axis=0), rtol=1e-6, atol=1e-6)
 
-    def test_int8_inputs_and_scales_have_no_gradient(self):
+    def test_int8_codes_have_no_gradient(self):
+        """i8 码是整数域，没有连续变量；scale 与 bias 才是可导的连续量。"""
         g = self._graph()
-        for name in ("x_q", "x_scale", "w_q", "w_scale"):
+        for name in ("x_q", "w_q"):
             with self.subTest(wrt=name):
                 with self.assertRaises(NoGradientError):
                     backward(g, wrt=[g.find(name)])
+
+    def test_scale_gradients_match_hand_derivation(self):
+        """两路 scale 的梯度按各自广播轴归约，与手写公式逐位对拍。"""
+        rng = np.random.default_rng(72)
+        feed = {
+            "x_q": rng.integers(-127, 128, size=(2, 4), dtype=np.int8),
+            "x_scale": np.array([[0.1], [0.2]], np.float32),
+            "w_q": rng.integers(-127, 128, size=(4, 3), dtype=np.int8),
+            "w_scale": np.array([0.1, 0.2, 0.3], np.float32),
+            "b": np.zeros(3, np.float32),
+        }
+        dy = rng.standard_normal((2, 3)).astype(np.float32)
+        g = self._graph()
+        out = _run(
+            backward(g, wrt=[g.find("x_scale"), g.find("w_scale")]),
+            {**feed, "dy": dy},
+        )
+        xd = feed["x_q"].astype(np.float32) * feed["x_scale"]
+        wd = feed["w_q"].astype(np.float32) * feed["w_scale"]
+        dact = dy @ wd.T
+        dweight = xd.T @ dy
+        want_xs = (dact * feed["x_q"]).sum(axis=-1, keepdims=True)
+        want_ws = (dweight * feed["w_q"]).sum(axis=0)
+        np.testing.assert_allclose(out["dx_scale"], want_xs, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(out["dw_scale"], want_ws, rtol=1e-6, atol=1e-6)
 
 
 class TestFakeQuantizeI8(unittest.TestCase):
@@ -1463,6 +1494,288 @@ class TestGroupDequantize(unittest.TestCase):
         np.testing.assert_array_equal(_run(g, feed)["w"], _run(again, feed)["w"])
 
 
+class TestLinearI8Group(unittest.TestCase):
+    """逐组 weight-only 线性层（5.329）。
+
+    与 ``TestGroupDequantize`` 的分工：那一组只钉"逐组反量化"这一格，
+    这里钉整条路径——组内共用 scale 的权重进入 GEMM 后，数值必须等于
+    ``matmul(x, dequantize_i8_group(q, s)) + bias``，按逐通道解释会把
+    第二组及之后的贡献算错。
+    """
+
+    def _graph(self, x_shape=(2, 8), w_shape=(8, 6), groups=4, bias=True):
+        g = Graph("linear_i8_group")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(groups, w_shape[-1])])
+        args = [x, q, s]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_i8_group", args), "y")
+        return g
+
+    def test_matches_group_dequantize_then_matmul(self):
+        rng = np.random.default_rng(51)
+        x = rng.standard_normal((2, 8)).astype(np.float32)
+        q = rng.integers(-127, 128, size=(8, 6), dtype=np.int8)
+        s = (np.abs(rng.standard_normal((4, 6))) * 0.2 + 0.05).astype(np.float32)
+        b = rng.standard_normal(6).astype(np.float32)
+        got = _run(self._graph(), {"x": x, "q": q, "s": s, "b": b})["y"]
+        weight = q.astype(np.float32) * np.repeat(s, 2, axis=0)
+        np.testing.assert_allclose(
+            got, np.matmul(x, weight) + b, rtol=1e-6, atol=1e-6
+        )
+
+    def test_group_of_one_matches_per_channel_linear(self):
+        rng = np.random.default_rng(52)
+        x = rng.standard_normal((2, 8)).astype(np.float32)
+        q = rng.integers(-127, 128, size=(8, 6), dtype=np.int8)
+        s = (np.abs(rng.standard_normal((1, 6))) * 0.1 + 0.01).astype(np.float32)
+        b = rng.standard_normal(6).astype(np.float32)
+        got = _run(self._graph(groups=1), {"x": x, "q": q, "s": s, "b": b})["y"]
+        np.testing.assert_array_equal(
+            got, np.matmul(x, q.astype(np.float32) * s[0]) + b
+        )
+
+    def test_rejects_bad_shapes(self):
+        with self.subTest(case="k_not_divisible_by_groups"):
+            g = Graph("bad_group_linear")
+            x = g.input("x", f32[2, 5])
+            q = g.input("q", i8[5, 4])
+            s = g.input("s", f32[2, 4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_i8_group", [x, q, s])
+        with self.subTest(case="bias_length"):
+            g = Graph("bad_group_linear")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", i8[4, 3])
+            s = g.input("s", f32[2, 3])
+            b = g.input("b", f32[4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_i8_group", [x, q, s, b])
+        with self.subTest(case="x_not_f32"):
+            g = Graph("bad_group_linear")
+            x = g.input("x", f16[2, 4])
+            q = g.input("q", i8[4, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_i8_group", [x, q, s])
+        with self.subTest(case="weight_not_i8"):
+            g = Graph("bad_group_linear")
+            x = g.input("x", f32[2, 4])
+            q = g.input("q", f32[4, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_i8_group", [x, q, s])
+
+    def test_backward_matches_hand_derivation(self):
+        rng = np.random.default_rng(53)
+        g = self._graph(bias=True)
+        feed = {
+            "x": rng.standard_normal((2, 8)).astype(np.float32),
+            "q": rng.integers(-127, 128, size=(8, 6), dtype=np.int8),
+            "s": (np.abs(rng.standard_normal((4, 6))) * 0.2 + 0.05).astype(np.float32),
+            "b": np.zeros(6, np.float32),
+        }
+        dy = rng.standard_normal((2, 6)).astype(np.float32)
+        out = _run(
+            backward(g, wrt=[g.find("x"), g.find("b")]), {**feed, "dy": dy}
+        )
+        weight = feed["q"].astype(np.float32) * np.repeat(feed["s"], 2, axis=0)
+        np.testing.assert_allclose(out["dx"], dy @ weight.T, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(out["db"], dy.sum(axis=0), rtol=1e-6, atol=1e-6)
+
+    def test_graph_survives_json_roundtrip(self):
+        rng = np.random.default_rng(54)
+        feed = {
+            "x": rng.standard_normal((2, 8)).astype(np.float32),
+            "q": rng.integers(-127, 128, size=(8, 6), dtype=np.int8),
+            "s": (np.abs(rng.standard_normal((4, 6))) * 0.2 + 0.05).astype(np.float32),
+            "b": np.zeros(6, np.float32),
+        }
+        g = self._graph()
+        np.testing.assert_array_equal(
+            _run(g, feed)["y"], _run(loads(dumps(g)), feed)["y"]
+        )
+
+
+class TestQuantizeWeightGroup(unittest.TestCase):
+    def test_scale_shape_and_per_group_range(self):
+        rng = np.random.default_rng(61)
+        w = (rng.standard_normal((8, 3)) * 2).astype(np.float32)
+        q, s = quantize_weight_group(w, 4)
+        self.assertEqual(q.dtype, np.int8)
+        self.assertEqual(q.shape, w.shape)
+        self.assertEqual(s.shape, (2, 3))
+        for gi in range(2):
+            chunk = np.abs(q[gi * 4 : (gi + 1) * 4])
+            np.testing.assert_array_equal(chunk.max(axis=0), np.full(3, QUANT_MAX, np.int8))
+
+    def test_error_is_bounded_by_the_group_scale(self):
+        rng = np.random.default_rng(62)
+        w = (rng.standard_normal((8, 5)) * 3).astype(np.float32)
+        q, s = quantize_weight_group(w, 2)
+        back = q.astype(np.float32) * np.repeat(s, 2, axis=0)
+        err = np.max(np.abs(back - w), axis=0)
+        self.assertTrue(np.all(err <= s.max(axis=0) / 2 + 1e-5), (err, s))
+
+    def test_grouping_beats_per_channel_when_rows_differ_in_scale(self):
+        """一行放大 2000 倍：逐通道 scale 会把其余行整片舍成 0。"""
+        w = np.full((8, 1), 0.01, np.float32)
+        w[0, 0] = 20.0
+        q_channel, _ = quantize_weight(w)
+        q_group, _ = quantize_weight_group(w, 4)
+        self.assertEqual(int(np.count_nonzero(q_channel[1:, 0])), 0)
+        # 后四行自成一组（scale = 0.01/127），0.01 恰好落在正端点上。
+        self.assertEqual(int(np.count_nonzero(q_group[1:, 0])), 4)
+
+    def test_zero_group_gets_unit_scale(self):
+        w = np.zeros((4, 2), np.float32)
+        w[2, 0] = 1.0
+        q, s = quantize_weight_group(w, 2)
+        np.testing.assert_array_equal(q[:2], np.zeros((2, 2), np.int8))
+        np.testing.assert_array_equal(s[0], np.ones(2, np.float32))
+        self.assertGreater(float(s[1, 0]), 0.0)
+
+    def test_helper_rejections(self):
+        with self.assertRaises(ValueError):
+            quantize_weight_group(np.zeros((2, 2, 2), np.float32), 1)
+        with self.assertRaises(TypeError):
+            quantize_weight_group(np.zeros((4, 2), np.int32), 2)
+        with self.assertRaises(ValueError):
+            quantize_weight_group(np.array([[1.0, np.nan]], np.float32), 1)
+        with self.assertRaises(ValueError):
+            quantize_weight_group(np.zeros((5, 2), np.float32), 2)
+        with self.assertRaises(ValueError):
+            quantize_weight_group(np.zeros((4, 2), np.float32), 0)
+
+
+class TestGroupLinearBuilder(unittest.TestCase):
+    def test_builder_matches_quantized_weight(self):
+        rng = np.random.default_rng(71)
+        w = (rng.standard_normal((8, 4)) * 1.5).astype(np.float32)
+        q, s = quantize_weight_group(w, 2)
+        g = Graph("group_builder")
+        _, out = build_int8_group_linear(g, 8, 4, 2, batch=3)
+        g.output(out, "y")
+        x = rng.standard_normal((3, 8)).astype(np.float32)
+        b = rng.standard_normal(4).astype(np.float32)
+        got = _run(g, {"x": x, "w_i8": q, "scale": s, "bias": b})["y"]
+        want = np.matmul(x, q.astype(np.float32) * np.repeat(s, 2, axis=0)) + b
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+
+    def test_builder_rejects_indivisible_group(self):
+        with self.assertRaises(ValueError):
+            build_int8_group_linear(Graph("bad"), 8, 4, 3)
+        with self.assertRaises(ValueError):
+            build_int8_group_linear(Graph("bad"), 8, 4, 0)
+        with self.assertRaises(ValueError):
+            build_int8_group_linear(Graph("bad"), 0, 4, 1)
+
+
+class TestW8A8QATBuilder(unittest.TestCase):
+    """QAT 构建器：前向落在 int8 格点上，反向把梯度送回浮点参数。"""
+
+    def test_forward_uses_the_same_lattice_as_deployment(self):
+        rng = np.random.default_rng(81)
+        x = rng.standard_normal((2, 8)).astype(np.float32)
+        w = (rng.standard_normal((8, 4)) * 0.5).astype(np.float32)
+        xq, xs = quantize_activation(x)
+        wq, ws = quantize_weight(w)
+        b = rng.standard_normal(4).astype(np.float32)
+        g = Graph("qat")
+        _, out = build_int8a8_linear_qat(g, 8, 4)
+        g.output(out, "y")
+        got = _run(g, {"x": x, "x_scale": xs, "w": w, "w_scale": ws, "bias": b})["y"]
+        np.testing.assert_array_equal(
+            got, np.matmul(xq.astype(np.float32) * xs, wq.astype(np.float32) * ws) + b
+        )
+        self.assertEqual(xq.dtype, np.int8)
+
+    def test_ste_path_has_no_scale_gradient(self):
+        g = Graph("qat")
+        inputs, out = build_int8a8_linear_qat(g, 4, 3)
+        g.output(out, "y")
+        with self.assertRaises(NoGradientError):
+            backward(g, wrt=[inputs["x_scale"]])
+
+    def test_learn_scale_path_has_scale_gradient(self):
+        g = Graph("qat_lsq")
+        inputs, out = build_int8a8_linear_qat(g, 4, 3, learn_scale=True)
+        g.output(out, "y")
+        gw = backward(g, wrt=[inputs["x_scale"], inputs["w_scale"]])
+        rng = np.random.default_rng(82)
+        out_vals = _run(
+            gw,
+            {
+                "x": rng.standard_normal((2, 4)).astype(np.float32),
+                "x_scale": np.full((2, 1), 0.1, np.float32),
+                "w": rng.standard_normal((4, 3)).astype(np.float32),
+                "w_scale": np.full(3, 0.1, np.float32),
+                "bias": np.zeros(3, np.float32),
+                "dy": rng.standard_normal((2, 3)).astype(np.float32),
+            },
+        )
+        self.assertEqual(out_vals["dx_scale"].shape, (2, 1))
+        self.assertEqual(out_vals["dw_scale"].shape, (3,))
+
+    def test_builder_rejects_non_positive_features(self):
+        with self.assertRaises(ValueError):
+            build_int8a8_linear_qat(Graph("bad"), 0, 4)
+        with self.assertRaises(ValueError):
+            build_int8a8_linear_qat(Graph("bad"), 4, -1)
+
+
+class TestDynamicW8A8Builder(unittest.TestCase):
+    def test_matches_host_per_token_quantization(self):
+        rng = np.random.default_rng(91)
+        x = rng.standard_normal((3, 8)).astype(np.float32)
+        x[1] = 0.0  # 全零 token 必须走 scale=1.0 分支
+        w = (rng.standard_normal((8, 4)) * 0.5).astype(np.float32)
+        wq, ws = quantize_weight(w)
+        b = rng.standard_normal(4).astype(np.float32)
+        g = Graph("dynamic")
+        _, out = build_int8a8_linear_dynamic(g, 8, 4)
+        g.output(out, "y")
+        got = _run(g, {"x": x, "w_q": wq, "w_scale": ws, "bias": b})["y"]
+        xq, xs = quantize_activation(x)
+        want = get_op("linear_i8a8").reference([xq, xs, wq, ws, b], {})
+        np.testing.assert_array_equal(got, want)
+
+    def test_scale_is_computed_per_token_not_per_tensor(self):
+        x = np.array([[1.0, 2.0], [100.0, 200.0]], np.float32)
+        w = np.ones((2, 1), np.float32)
+        wq, ws = quantize_weight(w)
+        g = Graph("dynamic")
+        _, out = build_int8a8_linear_dynamic(g, 2, 1, bias=False)
+        g.output(out, "y")
+        got = _run(g, {"x": x, "w_q": wq, "w_scale": ws})["y"]
+        xq, xs = quantize_activation(x)
+        want = get_op("linear_i8a8").reference([xq, xs, wq, ws], {})
+        np.testing.assert_array_equal(got, want)
+        # 第一行的 scale 是 2/127 而不是全局的 200/127：若 scale 是逐张量的，
+        # 1.0 会被舍成 1 格（≈1.57），sum 就只有 ≈2.57 而不是 ≈3.01。
+        self.assertGreater(float(got[0, 0]), 2.9)
+
+    def test_without_bias_and_graph_survives_roundtrip(self):
+        rng = np.random.default_rng(92)
+        w = (rng.standard_normal((4, 3)) * 0.5).astype(np.float32)
+        wq, ws = quantize_weight(w)
+        feed = {"x": rng.standard_normal((2, 4)).astype(np.float32), "w_q": wq, "w_scale": ws}
+        g = Graph("dynamic")
+        _, out = build_int8a8_linear_dynamic(g, 4, 3, bias=False)
+        g.output(out, "y")
+        np.testing.assert_array_equal(
+            _run(g, feed)["y"], _run(loads(dumps(g)), feed)["y"]
+        )
+
+    def test_builder_rejects_non_positive_features(self):
+        with self.assertRaises(ValueError):
+            build_int8a8_linear_dynamic(Graph("bad"), 0, 4)
+        with self.assertRaises(ValueError):
+            build_int8a8_linear_dynamic(Graph("bad"), 4, 0)
+
+
 class TestLinearFP8(unittest.TestCase):
     """fp8 线性层：载荷是 f32 载体，语义是"按 scale 反量化一次再做 f32 GEMM"。
 
@@ -1844,6 +2157,7 @@ class TestConformanceCases(unittest.TestCase):
             "fake_quantize_i8_channel",
             "fake_quantize_i8_lsq_channel",
             "linear_i8_bias",
+            "linear_i8_group_bias",
             "linear_i8a8_bias",
             "quantize_i8_zp_channel",
             "dequantize_i8_zp_channel",

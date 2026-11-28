@@ -448,6 +448,29 @@ class _LinearMixin:
             out = self._binary("add", [out, args[3]])
         return out
 
+    def _op_linear_i8_group(self, node, args, attrs):
+        """逐组 weight-only int8 线性层：按组反量化权重后走既有 f32 GEMM。
+
+        与 ``linear_i8`` 的唯一差别是权重侧 scale 的形状（``(K/G, N)`` 而不是
+        ``(N,)``）；反量化仍在浮点里做，收益还是"权重占 1 字节"，不是算力。
+        """
+        cp = self.cp
+        x, qweight, scale = args[0], args[1], args[2]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8_group 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2 or scale.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8_group 要求 x 秩 >= 2、权重秩 2、"
+                f"scale 秩 2，收到 {x.shape} / {qweight.shape} / {scale.shape}"
+            )
+        weight = self._op_dequantize_i8_group(node, [qweight, scale], attrs)
+        out = self._op_matmul(node, [x, weight], {})
+        if len(args) > 3:
+            out = self._binary("add", [out, args[3]])
+        return out
+
     def _op_linear_i8a8(self, node, args, attrs):
         """W8A8 线性层：i8 输入、**int32 累加**，最后才乘两路 scale。
 
@@ -792,7 +815,19 @@ class _LinearMixin:
         上界保证。
 
         零点减法会打散字节对齐，所以这里不走 ``__dp4a``，用标量乘加；两条
-        后端共用同一份源码，结果逐位相同。
+        后端共用同一份源码，结果逐位相同。bias 直接融进内核的 epilogue
+        （``af_linear_i8a8_zp_bias``），不再单独发一次 ``add``：省掉一次
+        launch 与一块 ``m*n`` 的中间张量。融合用的是 ``__fmul_rn`` /
+        ``__fadd_rn``，与"分开两次内核各自 RN 舍入"逐位一致。
+
+        dp4a / IMMA 仍然欠着：零点相减后的差值不是 int8，``__dp4a`` 的
+        4 路点积吃不下；要复用整数点积只能做下面这条展开——
+
+            sum((x - zx)*(w - zw)) = P - zx*Sw - zw*Sx + K*zx*zw
+
+        其中 ``Sw`` / ``Sx`` 是逐行 / 逐列整型和。展开在数学上与逐项相减
+        等价，但需要额外汇总轴并在跨后端验证整数溢出边界（``P`` 的上界
+        与 ``K*255*255`` 同量级），所以留到有真机可验证时再做。
         """
         cp = self.cp
         xq, xs, xzp = args[0], args[1], args[2]
@@ -844,6 +879,7 @@ class _LinearMixin:
 
         m = int(np.prod(xq.shape[:-1]))
         out = cp.empty((m, n), cp.float32)
+        has_bias = len(args) > 6
         if out.size:
             x = self._contig(xq).reshape(m, k)
             w = self._contig(wq)
@@ -852,27 +888,16 @@ class _LinearMixin:
             zwa = self._contig(wzp).reshape(n)
             swa = self._contig(ws).reshape(n)
             kernel = self._kernel(
-                ("linear_i8a8_zp",), _LINEAR_I8A8_ZP_SRC, "af_linear_i8a8_zp"
+                ("linear_i8a8_zp", has_bias),
+                _LINEAR_I8A8_ZP_SRC,
+                "af_linear_i8a8_zp_bias" if has_bias else "af_linear_i8a8_zp",
             )
             block, grid = self._grid("linear_i8a8_zp", m * n)
-            kernel(
-                (grid,),
-                (block,),
-                (
-                    x,
-                    zxa,
-                    sxa,
-                    w,
-                    zwa,
-                    swa,
-                    out,
-                    np.int64(m),
-                    np.int64(k),
-                    np.int64(n),
-                ),
-            )
+            operands = [x, zxa, sxa, w, zwa, swa]
+            if has_bias:
+                operands.append(self._contig(args[6]).reshape(n))
+            operands.extend((out, np.int64(m), np.int64(k), np.int64(n)))
+            kernel((grid,), (block,), tuple(operands))
         out = out.reshape(xq.shape[:-1] + (n,))
-        if len(args) > 6:
-            out = self._binary("add", [out, args[6]])
         return out
 
