@@ -21110,6 +21110,64 @@ communicator），旧的"注入 provider 却选 host"用例改为显式
   期望值），本次未放开。
 
 
+### 5.332 循环级 IR：循环不变量外提与单图规范形态
+
+**缺口。** 控制流一直只有"图与图之间"的形态：`WhileLoop` 每轮在主机上拼
+feeds（5.201），`DeviceWhileLoop` 把条件与体各捕获一次（5.245）。循环内部
+的结构没有被任何一层分析过，所以"体里哪些计算每轮重算、结果却不变"没有
+答案，编译器也就没有循环级优化的落点。README 第 6 节因此把"无 loop 级 IR"
+列为与主流编译器的差距。
+
+**1. `LoopIR`：循环的单图规范形态。** 新模块 `ir/loop.py` 用
+`LoopIR(condition, body, carried=..., max_steps=..., name=...)` 表示一个循环：
+条件与体都必须是单张 `Graph`，构造期直接复用 `WhileLoop` 的契约检查
+（carried 封闭、谓词单标量、类型一致），不另写一份事实来源。
+`LoopIR.from_control` / `to_control` 与 `WhileLoop` 互转；`to_control()`
+是它与既有宿主路径（`WhileLoop.run`、`DeviceWhileLoop`、`Trainer`）的桥——
+本层不新增执行机制。嵌套控制区域（`Conditional` / 内层 `WhileLoop`）没有
+可静态分析的单图形态，显式抛 `LoopIRError` 并指回 `WhileLoop`，不假装能分析。
+
+**2. 依赖分析：`must_run` 与 `invariant_nodes`。** 从 body 中 carried 状态
+对应的输入出发，沿生产者传播得到"必须每轮执行"的值；不纯节点（`op.pure`
+为假，即带 RNG / STATE / IO 效果）及它们的消费者也进入该集合——把"每轮
+重新采样"改成"只采样一次"会改变数值。其余纯节点即 `invariant_nodes()`。
+`constant` 不计入不变量：它本身几乎零成本，外提只会多一次每轮传递的输入。
+
+**3. `split_invariants`：preheader + 瘦身循环。** 从"必须留在体内的节点
+输入"与图输出出发，沿生产者收集被实际消费的不变值（未被使用的纯节点是
+死代码，两边都不保留），复制成 preheader 图；新体保留原自由输入，并把
+外提值作为**同名输入**接回来——carried 映射与输出别名因此都不用改。
+体内直接引用的常量就地复制，不变成循环输入。重写后两张图都过 verifier：
+外提最容易出的事故是"新图少一条边"，而它看起来仍是一张合法 DAG。
+`LoopSplit.run` 先跑一次 preheader、把结果并入 feeds，再走
+`WhileLoop.run`，所以数值与原循环逐位相同。`optimize_loop(WhileLoop)`
+是"提取 + 外提"的一步入口。
+
+**4. 序列化。** `loop_to_spec` / `loop_from_spec` 与 `ir.control` 的
+`to_spec` / `from_spec` 并列：普通控制流存档仍是 `kind="while"`，循环级 IR
+用 `kind="loop"`，子图复用 `ir.serialize`。两套入口刻意不合并——`control`
+不能反向依赖 `loop`（会形成循环导入），而把两个 `kind` 塞进同一个函数只会
+让"拿到的是哪种对象"更难判断。
+
+**验证。** `tests/test_loop_ir.py` 30 条：提取 / 往返、嵌套区域拒绝、
+`invariant_nodes` 的命名与数量（含 RNG 节点不参与、常量链可外提但常量
+本身不出现在结果里）、外提后的节点数（preheader 4 / 体 3）、两张图过
+verifier、多轮数值与原 `WhileLoop` 逐位相同（`acc = 21`）、重复执行、
+额外输出（`y`）拿到相同的 bias、无可外提时原样返回、缺前置输入 / 缺
+carried 初值的显式错误、JSON 往返与三类非法存档。
+
+**未声称。**
+
+- 只支持单图体；嵌套控制区域不进入循环级 IR，也不做"把内层循环展平"
+  这类变换。
+- 只做循环不变量外提，不做循环融合 / 分块 / 软件流水，也不把循环接到
+  schedule 搜索或编译流水线上——调度搜索的接线是后续阶段。
+- 条件图不参与外提：它必须每轮求值，否则"何时退出"就不再由数据决定。
+- 外提只按"是否依赖状态 + 是否纯"判断，没有成本模型；对极小的不变计算，
+  preheader 多一次图执行可能不划算。
+
+
+
 
 
 

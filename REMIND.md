@@ -20,6 +20,10 @@
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
+- **循环级 IR**（5.332）：`LoopIR` 把 `WhileLoop` 收敛成"单图条件 + 单图体 +
+  carried"的规范形态，`split_invariants` 把每轮重算但不变的纯计算搬进
+  preheader（`LoopSplit`），数值与原循环逐位相同；带 RNG / STATE / IO 的节点
+  与依赖 carried 的节点留在体内。支持 JSON 往返，嵌套控制区域显式拒绝。
 - **自动微分**：49 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行
   （5.331 起 NCCL / RCCL 可加载时**默认设备侧归约**：单进程多卡自动
@@ -135,7 +139,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3287 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3317 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -191,6 +195,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   （写侧由导出器负责）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
   显式报错，原生设备端 NHWC 内核尚未实现。训练图保持 NCHW（NHWC 无反向规则）。
+- **循环级 IR**（5.332）：`LoopIR` / `LoopSplit` 只接受单图体，嵌套控制区域
+  显式抛 `LoopIRError`；只做循环不变量外提，不做循环融合 / 分块 / 软件流水，
+  也未接进 schedule 搜索或编译流水线。条件图不参与外提（每轮必须求值）；
+  外提判据只有"是否依赖状态 + 是否纯"，没有成本模型，极小的不变计算可能
+  不如留在体内。
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
   状态与输出常驻显存，但每次判定仍要读一次谓词；实测**不比宿主路径快**，交付的是
   执行形态而非加速。没有 device-side 真分支，`Conditional` / `WhileLoop` 的判定
@@ -812,6 +821,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `ncclCommInitAll` 多卡归约、`NcclDeviceCollective.from_env` 的 uid 分发与
   两卡数值用例均待授权真机回归。`overlap` 仍为 False，设备态强制
   `bucket_bytes=0` / `threads=1` / `overlap=False`。
+- **可外提的前提是"纯"与"不读状态"**（5.332）：只按 `op.pure` 与 carried
+  依赖判断；RNG 每轮重新采样、STATE / IO 有副作用，都不能外提，它们的
+  消费者也不能——否则新体会引用一个留在体内的值。
+- **常量不参与外提，但要跟着复制**（5.332）：`constant` 从 `invariant_nodes`
+  里排除（外提它只会多一次每轮输入），但外提节点依赖的常量必须复制进
+  preheader，否则少一条边；体内直接引用的常量就地复制，不变成循环输入。
+- **外提值用原名接回**（5.332）：新体把外提值作为同名输入，carried 映射与
+  输出别名因此都不用改，调用方也从 preheader 输出名直接对上。
+- **重写后必须过 verifier**（5.332）：外提最容易出的事故是"新图少一条边"，
+  而它看起来仍是一张合法 DAG；`split_invariants` 对 preheader 与新体各跑
+  一次 verify，ERROR 直接抛。
 
 ---
 
