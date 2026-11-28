@@ -10,6 +10,7 @@ from .events import (
 )
 from .device_control import DeviceConditional, DeviceLoopError, DeviceWhileLoop
 from .paged_cache import PagedCacheFullError, PagedCacheManager, PagedKVCache
+from .prefix_store import DiskPrefixCache
 from .reference import ReferenceExecutor, ShapeMismatchError
 from .telemetry import (
     InstrumentedBackend,
@@ -40,6 +41,7 @@ __all__ = [
     "PagedKVCache",
     "PagedCacheFullError",
     "PagedCacheManager",
+    "DiskPrefixCache",
     "DeviceWhileLoop",
     "DeviceConditional",
     "DeviceLoopError",

@@ -33,7 +33,8 @@ import numpy as np
 
 from ..ir.graph import Graph, Value
 from ..ir.types import f32
-from ..runtime.paged_cache import PagedCacheManager, PagedKVCache
+from ..runtime.paged_cache import PagedCacheFullError, PagedCacheManager, PagedKVCache
+from ..runtime.prefix_store import DiskPrefixCache
 from .transformer import TransformerSpec
 
 __all__ = [
@@ -600,6 +601,15 @@ class PagedGenerator:
     新页；命中数与被复用的 token 数记在 :meth:`stats` 的 ``prefix_hits`` /
     ``prefix_reused_tokens`` / ``prefix_misses`` 里。换出态序列不参与匹配
     （``fork`` 要求驻留），等长序列也不行——生成需要一个尚未解码的位置。
+
+    **落盘前缀缓存**（5.337，``disk_cache`` 非 ``None`` 时开启）：内存里没
+    命中时去 :class:`aetherflow.runtime.DiskPrefixCache` 查同一判据的最长严格
+    前缀，命中就把条目 KV 直接 ``append`` 进池，省掉整个 prefill；``generate``
+    结束时再把这条序列已解码的全长落盘，新进程首次请求就能复用。命中数、
+    被复用的 token 数与落盘次数记在 :meth:`stats` 的 ``disk_hits`` /
+    ``disk_reused_tokens`` / ``disk_misses`` / ``disk_stores`` 里。条目装不进
+    池（``PagedCacheFullError``）时退回普通 prefill；``prefix_cache=False``
+    同时关闭盘缓存查询——那是对"自动前缀复用"的显式拒绝。
     """
 
     def __init__(
@@ -614,6 +624,7 @@ class PagedGenerator:
         on_swap_out=None,
         on_swap_in=None,
         prefix_cache: bool = True,
+        disk_cache=None,
     ) -> None:
         if isinstance(spec.vocab, bool) or not isinstance(spec.vocab, int):
             raise TypeError(
@@ -682,6 +693,41 @@ class PagedGenerator:
             "prefix_reused_tokens": 0,
             "prefix_misses": 0,
         }
+        self._disk_cache = self._check_disk_cache(disk_cache)
+        self._disk_stats = {
+            "disk_hits": 0,
+            "disk_reused_tokens": 0,
+            "disk_misses": 0,
+            "disk_stores": 0,
+        }
+
+    def _check_disk_cache(self, disk_cache):
+        """盘缓存的页宽 / 形状 / dtype 必须与这份池一致：不一致就早失败。
+
+        不做"临时转换再导入"——那会让同一个目录在两种配置下都能用，等于让
+        配置失配从显式错误变成静默的慢路径。换配置请换目录。
+        """
+        if disk_cache is None:
+            return None
+        if not isinstance(disk_cache, DiskPrefixCache):
+            raise TypeError(
+                f"disk_cache 必须是 DiskPrefixCache 或 None，"
+                f"得到 {type(disk_cache).__name__}"
+            )
+        store = self._scheduler.cache.cache
+        problems = []
+        for label, got, want in (
+            ("block_size", disk_cache.block_size, store.block_size),
+            ("num_layers", disk_cache.num_layers, store.num_layers),
+            ("num_heads", disk_cache.num_heads, store.num_heads),
+            ("head_dim", disk_cache.head_dim, store.head_dim),
+            ("dtype", disk_cache.dtype, store.dtype),
+        ):
+            if got != want:
+                problems.append(f"{label}={got!r}（池里是 {want!r}）")
+        if problems:
+            raise ValueError("disk_cache 与分页池不一致：" + "；".join(problems))
+        return disk_cache
 
     # -- 只读视图 -----------------------------------------------------
 
@@ -697,6 +743,7 @@ class PagedGenerator:
     def stats(self) -> Dict[str, int]:
         info = self._scheduler.stats()
         info.update(self._prefix_stats)
+        info.update(self._disk_stats)
         return info
 
     def tokens(self, rid: int) -> List[int]:
@@ -741,6 +788,45 @@ class PagedGenerator:
                 continue
             best_rid, best_len = rid, size
         return best_rid
+
+    def _load_from_disk(self, rid: int, ids: List[int]) -> int:
+        """查盘并导入最长严格前缀；返回复用的 token 数（未命中为 0）。
+
+        命中时在这里直接提交 ``rid`` 并把条目 KV 追加进池；装不下
+        （``PagedCacheFullError``）就结束这条刚提交的序列并退回普通 prefill——
+        "盘上有但池里放不下"是容量条件，不该让请求失败。
+        """
+        found = self._disk_cache.lookup(ids)
+        if found is None:
+            self._disk_stats["disk_misses"] += 1
+            return 0
+        length, payload = found
+        self.submit(rid)
+        try:
+            self._scheduler.cache.append(rid, payload["keys"], payload["values"])
+        except PagedCacheFullError:
+            self.finish(rid)
+            self._disk_stats["disk_misses"] += 1
+            return 0
+        self._tokens[rid] = list(payload["tokens"])
+        self._disk_stats["disk_hits"] += 1
+        self._disk_stats["disk_reused_tokens"] += length
+        return length
+
+    def _persist(self, rid: int) -> None:
+        """把这条序列已解码的全长落盘；没有盘缓存或关闭自动复用时什么都不做。"""
+        if self._disk_cache is None or not self._prefix_cache:
+            return
+        seen = self._tokens.get(rid)
+        if not seen:
+            return
+        keys, values = [], []
+        for layer in range(self.spec.num_layers):
+            key, value = self._scheduler.cache.gather(rid, layer)
+            keys.append(key)
+            values.append(value)
+        self._disk_cache.store(seen, keys=keys, values=values)
+        self._disk_stats["disk_stores"] += 1
 
     def suspend(self, rid: int, *, evict: bool = False) -> bool:
         return self._scheduler.suspend(rid, evict=evict)
@@ -815,8 +901,9 @@ class PagedGenerator:
 
         ``fork_from=None`` 且构造时 ``prefix_cache=True``（默认）时，按
         "最长严格前缀"自动选父序列——调用方不需要知道父序列的 id，命中只
-        多出 prefill 剩余 token 的成本。显式 ``fork_from`` 优先，且不在
-        该分支记命中/未命中（那是调用方的显式决策，不是缓存判断）。
+        多出 prefill 剩余 token 的成本。内存里没命中且给了 ``disk_cache``
+        时再查盘，命中就整段导入 KV、跳过 prefill。显式 ``fork_from`` 优先，
+        且不在这两个分支记命中/未命中（那是调用方的显式决策，不是缓存判断）。
         """
         ids = _token_ids(prompt, self.vocab, "prompt")
         if not ids:
@@ -837,16 +924,19 @@ class PagedGenerator:
 
         if fork_from is None:
             parent = self._match_prefix(ids, exclude=rid) if self._prefix_cache else None
-            if parent is None:
-                if self._prefix_cache:
-                    self._prefix_stats["prefix_misses"] += 1
-                self.submit(rid)
-                consumed = 0
-            else:
+            if parent is not None:
                 consumed = len(self._tokens[parent])
                 self._prefix_stats["prefix_hits"] += 1
                 self._prefix_stats["prefix_reused_tokens"] += consumed
                 self.fork(parent, rid)
+            else:
+                consumed = 0
+                if self._prefix_cache and self._disk_cache is not None:
+                    consumed = self._load_from_disk(rid, ids)
+                if not consumed:
+                    if self._prefix_cache:
+                        self._prefix_stats["prefix_misses"] += 1
+                    self.submit(rid)
         else:
             if fork_from not in self._tokens:
                 raise KeyError(f"序列 {fork_from!r} 没有提交；先 submit(rid)")
@@ -876,10 +966,12 @@ class PagedGenerator:
             if len(out) == max_new_tokens:
                 break
             next_id = self.feed(rid, next_id)
+        self._persist(rid)
         return out
 
     def __repr__(self) -> str:
         return (
             f"PagedGenerator({self._scheduler.cache!r}, vocab={self.vocab}, "
-            f"max_steps={self.max_steps}, sequences={len(self._tokens)})"
+            f"max_steps={self.max_steps}, sequences={len(self._tokens)}, "
+            f"disk={'on' if self._disk_cache is not None else 'off'})"
         )
