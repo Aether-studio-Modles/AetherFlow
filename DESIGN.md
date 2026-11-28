@@ -22996,6 +22996,52 @@ pattern 就等于换了一份分词器，产出的 id 每个都合法但不是�
 梯度仍未合并（5.359 的 630.2M vs 494M）。LoRA 要挂的就是这条链路：冻结
 基座、只训练注入的低秩 A/B，数据与 mask 不变。
 
+### 5.361　LoRA：冻结基座靠"反向只对谁求导"，不靠算子
+
+LoRA 在图上只有一句话：被适配的线性层多一条旁路
+`y = x @ W + (x @ A @ B) * (alpha / rank)`，`A` 是 `(in, rank)`、`B` 是
+`(rank, out)`，与基座权重同为 IR 约定（`matmul` 的权重形状是 `(in, out)`，
+不做转置）。缩放是 0 维常量乘 `(B,T,out)`，走已有的 `mul` 广播；**不把
+scale 折进 B**——折进去会让存档里的 B 与标准 LoRA 语义不符，别人拿
+`alpha/rank` 复现时数值对不上。构建器新增 `LoraSpec` / `lora_param_shapes`
+与 `build_llama(..., lora=...)`，名字挂在被适配投影后面
+（`...self_attn.q_proj.lora_a` / `.lora_b`），与基座参数同一命名空间。
+
+**冻结不是"把梯度丢掉"。** `Optimizer.prepare_step` 明确拒绝两类梯度：
+优化器里没有的参数（unknown）与优化器里有却没梯度的参数（missing）。所以
+"只训 adapter"不能靠 `grad_hook` 过滤——反向如果对全部参数求导，基座梯度
+必然出现在字典里。正确的切面在**反向图的 `wrt`**：`Trainer(trainable=...)`
+让 `self._params` 只含 adapter，反向图就只产出 adapter 的 `d<name>`；
+优化器也只持 adapter，两边的参数集合恰好相等，`prepare_step` 的检查自然
+通过。主机态每步的梯度字典、设备态的分段梯度缓冲、异步预取与
+`load_training_state` 的累积模板都跟着换成可训练集合。与 `zero3` /
+分桶反向同时用会显式报错：两者都假设"每一步都有全部参数的梯度"，冻结参数
+没有梯度，分片拼不回去、桶也凑不齐。
+
+**装载边界。** 基座权重文件里没有 adapter，但 store 里必须有
+（`ParameterStore.from_graph` 按图建全量参数）。`load_llama_weights(...,
+skip=adapter)` 把 adapter 排除在张量匹配之外：不要求文件提供、也不覆盖，
+但 skip 里的名字必须真的在 store 里——少写一个真实缺失的基座权重仍会报错。
+`lora_b` 必须初始化为 0：`A` 随机、`B` 为零时旁路恰好乘出 0，训练前的
+前向与基座逐位相同。测试 `tests/test_llama_lora.py` 把这条钉成
+`np.array_equal`，不是 `allclose`。
+
+**两个口径的数字。** 缩小版（d128 / 2 层 / seq256 / rank8 挂 q、v，adapter
+1.98% 可训练）20 步回答段 5.93 → 4.72，窗口均值 5.68 → 4.93；接 2 步预训练
+存档后 5 步 5.61 → 5.38。真实 Qwen2.5-0.5B（630.17M 基座 + 0.54M adapter，
+0.09% 可训练，rank8、alpha16、挂 q/v，V100-SXM2-32GB，seq128/batch1，
+Adam lr 2e-4，20 步）：同一批回答段 3.4728 → 1.0306，窗口均值 2.9977 →
+2.1595；训练结束后 Python 侧逐位比较 291 个基座参数，全部未变。设备态
+（CUDA Graph 捕获）在这条路径上同样成立：冻结参数留在驻留缓冲里当图输入，
+但不进优化器。
+
+**局限。** 示例只存 adapter（`np.savez`，键是 IR 参数名），没有做"合并回
+基座"的导出；8 条指令对、20 步仍是闭环验证，不是可发布的 adapter；batch=1、
+数据未打乱、tied 梯度未合并与 5.360 相同。真实链路上更常见的做法是先全参
+SFT 再 LoRA，本仓两段都已能独立跑通，但"在 SFT 存档上继续挂 adapter"目前
+只在缩小版验证过（真实权重路径的存档需要外部给出结构配置）。
+
+
 
 
 

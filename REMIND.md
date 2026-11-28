@@ -460,7 +460,15 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   前 5 步 3.72 → 后 5 步 1.05（DESIGN 5.360）。Qwen 的 tokenizer 用 `Split`
   预分词、`BpeTokenizer` 明确拒绝，所以真实词表走 `--data-json` 交预编码
   样本（`{"ids": [...], "answer_start": n}`）。
-- 阶段 4（待做）：LoRA——adapter 注入与单独存取。
+- 阶段 4（完成）：LoRA——`LoraSpec` / `lora_param_shapes` / `build_llama(lora=...)`
+  在 target 投影上加 `(x@A@B)*alpha/rank`；冻结靠 `Trainer(trainable=...)` 把
+  反向 `wrt` 与梯度字典收窄到 adapter，优化器只持 adapter（`prepare_step` 的
+  unknown/missing 检查因此通过）。`zero3` / 分桶反向 + 子集显式报错；
+  `load_llama_weights(skip=...)` 让基座权重与 adapter 共存。`lora_b` 必须初始
+  化为 0（零增量起步）。tiny 20 步回答段 5.93 → 4.72；真实 Qwen2.5-0.5B
+  rank8 挂 q/v（0.54M / 630.17M = 0.09%）20 步回答段 3.47 → 1.03，窗口
+  3.00 → 2.16，291 个基座参数逐位不变（DESIGN 5.361）。adapter 存成 npz
+  （键 = IR 参数名），未做合并回基座的导出。
 - 注意：`seq` 静态（无 `arange`），换长度要重建图；图内不做权重转置。
 - `lm_head` 与 `embed_tokens` 当前各占一份（tied 只在加载时填两份），所以 0.5B
   结构实测 630.2M 参数；训练期合并两份梯度尚未做。
