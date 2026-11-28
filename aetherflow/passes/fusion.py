@@ -116,18 +116,21 @@ class FuseLayerNormResidual(Pass):
 
     1. layernorm 恰好是 3 输入形态（已经是融合形态就不再处理）
     2. 它的第 0 个输入由一个 ``add`` 生产
-    3. add 的输出只被这个 layernorm 消费（fanout == 1）
-    4. add 的输出不是图输出
-    5. add 的两个输入与 layernorm 的第 0 个输入**同类型**（不吸收广播）
+    3. add 的消费者只有 1 个（就是本 layernorm）或 2 个（另一个是 ``add``）：
+       - 只有 1 个且 add 输出不是图输出：吸收 add，x1 不再物化；
+       - 有 2 个且另一个是 ``add``（pre-norm 残差块的真实形态）：
+         **只把 layernorm 换成 4 输入形态，保留 add**——x1 仍被下游残差
+         读取，物化无法省掉；换来的是 LayerNorm 的归约与残差加法进了同一个
+         内核，少一次 launch，代价是 layernorm 改读 add 的两个输入而不是
+         x1，多一遍张量读。这是有意的取舍：pre-norm 块按"少一次 launch"
+         算账，而不是按"少一遍读"。
+       - 3 个及以上、或第 2 个消费者不是 add：不融合（x1 的物化仍在别处
+         被需要，吸收会造成重复计算）。
+    4. add 的两个输入与 layernorm 的第 0 个输入**同类型**（不吸收广播）
 
-    第 5 条是严格限制：若 add 依赖广播（例如 ``(B,S,D) + (D,)``），
+    第 4 条是严格限制：若 add 依赖广播（例如 ``(B,S,D) + (D,)``），
     把两个张量都塞进 layernorm 就需要在内核里复刻广播规则，得不偿失；
     参考语义仍然正确，但没有对应的内核承接，融合结果会变成"没人能执行"。
-
-    注意真实 pre-norm Transformer 里 ``x1 = add(x, attn)`` 同时喂给
-    ``layernorm(x1)`` 与最终残差 ``add(x1, ff)``，fanout 是 2，因此**不会**
-    命中这条规则——残差本身仍然要被物化，融合只剩"少读一遍"，反而不划算。
-    这条规则服务的是残差只有一个使用者的图（单分支 / post-norm / 子块）。
     """
 
     name = "fuse_layernorm_residual"
@@ -135,8 +138,13 @@ class FuseLayerNormResidual(Pass):
     def run(self, graph: Graph) -> Graph:
         consumers = _consumers(graph)
         outputs = {v.id for v in graph.outputs}
+        users: Dict[int, list] = {}
+        for node in graph.nodes:
+            for v in node.inputs:
+                users.setdefault(v.id, []).append(node)
 
-        merged: Dict[int, Tuple[Value, Value]] = {}
+        # layernorm 输出 -> (a, b, 是否吸收 add)
+        merged: Dict[int, Tuple[Value, Value, bool]] = {}
         absorbed: Set[int] = set()
 
         for node in graph.nodes:
@@ -145,16 +153,26 @@ class FuseLayerNormResidual(Pass):
             producer = node.inputs[0].producer
             if producer is None or producer.op.name != "add":
                 continue
-            if consumers.get(producer.output.id, 0) != 1:
-                continue
-            if producer.output.id in outputs:
+            pid = producer.output.id
+            count = consumers.get(pid, 0)
+            others = [u for u in users.get(pid, ()) if u is not node]
+            if count == 1:
+                if pid in outputs:
+                    continue
+                absorb = True
+            elif count == 2 and len(others) == 1 and others[0].op.name == "add":
+                # pre-norm 残差块：x1 = add(x, attn)；x1 同时喂 norm 与最终残差。
+                # 保留 add，只融合 norm。
+                absorb = False
+            else:
                 continue
             a, b = producer.inputs
             src = node.inputs[0].type
             if a.type != src or b.type != src:
                 continue
-            merged[node.output.id] = (a, b)
-            absorbed.add(producer.output.id)
+            merged[node.output.id] = (a, b, absorb)
+            if absorb:
+                absorbed.add(pid)
 
         if not merged:
             return graph
@@ -164,9 +182,9 @@ class FuseLayerNormResidual(Pass):
         for node in graph.nodes:
             if node.output.id in absorbed:
                 continue
-            pair = merged.get(node.output.id)
-            if pair is not None:
-                a, b = pair
+            item = merged.get(node.output.id)
+            if item is not None:
+                a, b, _ = item
                 gamma, beta = node.inputs[1], node.inputs[2]
                 rw.map[node.output.id] = rw.new.add_node(
                     "layernorm",

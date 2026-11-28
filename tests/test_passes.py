@@ -522,7 +522,7 @@ class TestFuseLayerNormResidual(unittest.TestCase):
         )
 
     def test_two_fanouts_block_fusion(self):
-        """残差还被别处使用（pre-norm Block 的真实形态），就不能被吸收。"""
+        """fanout=2 但第二个消费者不是 add：仍不命中，避免重复计算。"""
         g = Graph()
         a = g.input("a", f32[3, 5])
         r = g.input("r", f32[3, 5])
@@ -531,6 +531,51 @@ class TestFuseLayerNormResidual(unittest.TestCase):
         s = g.add(a, r)
         g.output(g.layernorm(s, gamma, beta, axes=(-1,)), "y")
         g.output(g.relu(s), "r2")
+        out = FuseLayerNormResidual().run(g)
+        ln = [n for n in out.nodes if n.op.name == "layernorm"][0]
+        self.assertEqual(len(ln.inputs), 3)
+
+    def test_prenorm_residual_fuses_norm_only(self):
+        """pre-norm 块：x1 = add(x, attn) 同时喂 norm 和最终残差。
+
+        add 保留（物化省不掉），只把 layernorm 换成 4 输入形态，少一次 launch。
+        """
+        g = Graph()
+        x = g.input("x", f32[3, 5])
+        attn = g.input("attn", f32[3, 5])
+        ff = g.input("ff", f32[3, 5])
+        gamma = g.input("g", f32[5])
+        beta = g.input("b", f32[5])
+        s = g.add(x, attn)
+        y = g.layernorm(s, gamma, beta, axes=(-1,))
+        g.output(g.add(s, ff), "out")
+        g.output(y, "y")
+
+        out = FuseLayerNormResidual().run(g)
+        self.assertEqual(out.op_names().count("add"), 2)
+        ln = [n for n in out.nodes if n.op.name == "layernorm"][0]
+        self.assertEqual(len(ln.inputs), 4)
+
+        rng = np.random.default_rng(17)
+        feed = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in {
+            "x": (3, 5), "attn": (3, 5), "ff": (3, 5), "g": (5,), "b": (5,)
+        }.items()}
+        ref = ReferenceBackend()
+        before, after = ref.execute(g, feed), ref.execute(out, feed)
+        np.testing.assert_array_equal(after["out"], before["out"])
+        np.testing.assert_array_equal(after["y"], before["y"])
+
+    def test_three_fanouts_block_fusion(self):
+        """x1 被三个消费者使用，融合会造成重复计算，不命中。"""
+        g = Graph()
+        a = g.input("a", f32[3, 5])
+        r = g.input("r", f32[3, 5])
+        gamma = g.input("g", f32[5])
+        beta = g.input("b", f32[5])
+        s = g.add(a, r)
+        g.output(g.layernorm(s, gamma, beta, axes=(-1,)), "y")
+        g.output(g.relu(s), "r2")
+        g.output(g.exp(s), "r3")
         out = FuseLayerNormResidual().run(g)
         ln = [n for n in out.nodes if n.op.name == "layernorm"][0]
         self.assertEqual(len(ln.inputs), 3)
@@ -655,17 +700,23 @@ class TestFusedPipelineOnBlockExtended(unittest.TestCase):
                 feed[name] = (rng.standard_normal(shape) * 0.1).astype(np.float32)
         return g, feed
 
-    def test_pre_norm_residual_does_not_fuse(self):
-        """x1 同时喂 layernorm 与最终残差，fanout=2，不该融合。
+    def test_pre_norm_residual_fuses_norm_only(self):
+        """x1 同时喂 layernorm 与最终残差：add 保留，只把 norm 换成 4 输入。
 
-        这条测试固定的是一个**否定结论**：融合规则不能为了"命中"而放开
-        fanout 限制——那样残差仍要物化，融合反而多读一遍。
+        这条测试固定的是**取舍边界**：fanout=2 时 add 不能被吸收（x1 仍被
+        下游残差读取，物化省不掉），但 layernorm 可以改读 add 的两个输入，
+        少一次 launch。
         """
         g, _ = self._build()
         fused = fused_pipeline().run(g)
         lns = [n for n in fused.nodes if n.op.name == "layernorm"]
         self.assertTrue(lns)
-        self.assertTrue(all(len(n.inputs) == 3 for n in lns))
+        self.assertEqual(sum(1 for n in lns if len(n.inputs) == 4), 1)
+        # x1 的 add 没有被吸收：add 节点数与未融合图一致
+        self.assertEqual(
+            sum(1 for n in fused.nodes if n.op.name == "add"),
+            sum(1 for n in g.nodes if n.op.name == "add"),
+        )
 
     def test_pipeline_still_valid_and_equal(self):
         g, feed = self._build()
