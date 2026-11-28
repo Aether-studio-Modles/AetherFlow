@@ -100,6 +100,10 @@
   scale（5.326）；`packed=True` 读 1 字节位模式（F8 / I8 / U8，I8 / U8 需显式
   kind，字节走 `SafeTensorsFile.raw` 不经解码再编码以免 NaN 多码归一化），
   `FP8Weight.pack()` 返回幂等的 1 字节副本且 `dequantize()` 数值不变（5.328）。
+  GGUF（llama.cpp 系）走 `read_gguf`：v2/v3 容器、mmap 按需解码，F32 / F16 /
+  BF16 / F64 / 四种整数，以及 Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q2_K /
+  Q3_K / Q4_K / Q5_K / Q6_K / Q8_K 量化块解成 f32；IQ / TQ 系与 v1 头显式拒绝
+  （5.348）。
 - **文本入口**：`BpeTokenizer` 读 HF `tokenizer.json` 的 ByteLevel BPE 谱系
   （GPT-2 / Qwen2 / Qwen3），不引 `tokenizers`；支持 merges 两种写法、added /
   special token 整体匹配、NFC 系 normalizer、`use_regex` / `add_prefix_space`；
@@ -167,7 +171,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3496 个用例，464 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3540 个用例，464 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -291,8 +295,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   （否则前缀已发出、撤回不了）。检测粒度是 token，跨 token 的 stop 会多生成到
   完整命中为止。流式仍由每个请求轮询 `ServingEngine.progress()` 快照，并发很大
   时应改成调度器推送增量。
-- **权重入口**：只读 `safetensors` 容器（不读 GGUF / PyTorch `.bin` / `.pt` / TF
-  检查点）；fp4 与稀疏张量不支持，fp8 权重读入时解码成 f32 载体（5.319）、
+- **权重入口**：safetensors 与 GGUF 两套容器，各自只读（不读 PyTorch `.bin` /
+  `.pt` / TF 检查点）；GGUF 只读 v2 / v3，IQ 系（格点码本）、TQ 系（三值）与分块
+  向量布局不解码、遇到显式拒绝，`Q8_K` 的 `bsums` 跳过；没有拿真实 `.gguf`
+  与 llama.cpp 做端到端对拍（5.348）。fp4 与稀疏张量不支持，fp8 权重读入时
+  解码成 f32 载体（5.319）、
   不保留单字节；量化权重
   支持本仓库自己的 `quantization` / `quantization.group_size` 约定（5.317），
   **不声称兼容 GPTQ / AWQ 原始检查点**（它们的 int32 交织打包与 `qzeros` 的

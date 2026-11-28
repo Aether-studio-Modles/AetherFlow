@@ -238,8 +238,8 @@ GPU 作业仍未接上真实 runner。
 | 算子覆盖 | 78 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），对称与非对称零点两套主机侧语义（非对称见 5.315、量化 / 反量化内核见 5.322、融合线性层见 5.323；逐组的非对称 `dequantize_i8_group_zp` 见 5.321），逐组（per-group）weight-only 反量化（`dequantize_i8_group` / `_zp`，5.317 语义、5.321 设备内核），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），fp8 的 cast 已落到设备端（5.325，载体仍是 f32、不省带宽），但没有 fp8 GEMM |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
-| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314）、WordPiece（5.345）与 Unigram / SentencePiece（5.347，含 `Metaspace` 与 precompiled 字符映射），但没有内置 HF 权重转换表、无 GGUF |
-| 生态 | 能读 safetensors（5.313，按需读取 + 名字 / 布局显式映射）与 HF `tokenizer.json` 的 ByteLevel BPE 谱系（5.314），无预训练权重分发、无 Hub、无第三方算子库 | 各自有完整生态 | 权重与分词入口已通，分发仍然缺位 |
+| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）与 GGUF（5.348，v2/v3 + 主流 ggml 量化块）、文本能过 ByteLevel BPE（5.314）、WordPiece（5.345）与 Unigram / SentencePiece（5.347，含 `Metaspace` 与 precompiled 字符映射），但没有内置 HF 权重转换表、不解 IQ / TQ 量化 |
+| 生态 | 能读 safetensors（5.313，按需读取 + 名字 / 布局显式映射）与 GGUF（5.348，mmap 按需解码）；能读 HF `tokenizer.json` 的 ByteLevel BPE 谱系（5.314）；无预训练权重分发、无 Hub、无第三方算子库 | 各自有完整生态 | 权重与分词入口已通，分发仍然缺位 |
 | 失败语义 | 能力未覆盖即显式报错（构图期拒绝或 `BackendCapabilityError`），捕获期登记、replay 后复查 | 常见做法是回落或静默降级 | 这是设计差异，不是能力差异 |
 
 **这张表怎么用**：定位是"可插拔后端 + 可验证跨厂商一致性的训练 / 推理基础设施"，
@@ -19915,7 +19915,8 @@ transpose=(), strict=True, allow_downcast=False)`：
 
 **未声称 / 未验证。**
 
-- 只支持 safetensors 容器；不读 GGUF、PyTorch `.bin` / `.pt`、TF 检查点。
+- 只支持 safetensors 容器；不读 PyTorch `.bin` / `.pt`、TF 检查点（GGUF 由
+  5.348 单独处理，不在本入口）。
 - 不支持 fp4、稀疏张量、量化元数据（`*.scale` 之类按普通张量处理）。
 - 不做名字的模糊匹配或按后缀猜映射；没有内置任何具体模型的转换表。
 - 没有拿真实规模权重（GB 级）做实机加载耗时与内存峰值测量；按需读取的接口
@@ -22221,6 +22222,84 @@ ruff 通过；全量 `3496 通过 / 464 跳过`。
   做全量对拍；darts-clone 的 `validate` 也只按 SentencePiece 的长度判据做。
 - 没有与 HF / sentencepiece 官方实现在真实词表上做全量对拍，也没有分词吞吐数字。
 - `.model`（protobuf 二进制）不读：只吃 `tokenizer.json`。
+
+
+
+### 5.348　权重入口补 GGUF：容器解析与 ggml 量化块解码
+
+**缺口。** 5.313 只吃 safetensors。本地推理生态里分发量最大的一类权重是
+GGUF（llama.cpp 系），它与 safetensors 的差别不在"又一个容器"，而是**张量本身
+不是浮点数**：一个 `Q4_K` 张量存的是 256 个元素一组的块（两个 f16 缩放、12 字节
+6 bit 编码的缩放/最小值、128 字节 4 bit 码点），按块解码错了不会报错，只会安静地
+给出错权重。所以这条入口的判据是"解出来能逐元素对上"，而不是"能读出个数组"。
+
+**为什么不引入 `gguf` / llama.cpp 的 Python 侧解析。** 与 5.313 同一条理由：
+运行期只依赖 numpy。容器格式本身只有"头 + 元数据 KV + 张量表 + 对齐后的数据区"
+四段，用标准库 `struct` 解析比多一条二进制依赖更容易审；块解码则完全在 numpy 上
+做向量化（按块批量），不需要 C 扩展。
+
+**实现面。**
+
+- 容器：magic `GGUF`、version、tensor_count、metadata_kv_count（均小端）；元数据
+  值类型 0..12（UINT8 / INT8 / UINT16 / INT16 / UINT32 / INT32 / FLOAT32 / BOOL /
+  STRING / ARRAY / UINT64 / INT64 / FLOAT64），数组只允许一维、元素类型不能是
+  ARRAY；tensor info 为 name + n_dims + dims(u64×n) + type(u32) + offset(u64)，
+  `offset` 相对数据区；数据区起点 = 头结束位置按 `general.alignment`（缺省 32）
+  向上取整。
+- 维度顺序：ggml 的 `ne[0]` 是最内层，`info.shape` 存 `dims[::-1]`，`tensor()` 按它
+  reshape；`dims` 保留原序一并给出。
+- 按需解码：`read_gguf(path)` 用 `mmap`，`tensor(name)` 只解码那一个张量，不留整份
+  权重在内存；`read_gguf(bytes)` 供测试不落盘。`GGUFFile` 支持 `with` 与 `close()`。
+- 逐元素类型：F32 / F16 / BF16（左移 16 位按 f32 位模式解释，精确）/ F64；整数
+  I8 / I16 / I32 / I64 原样返回。
+- 量化块（名字 → id, 块大小, 块字节）：Q4_0(2,32,18) / Q4_1(3,32,20) /
+  Q5_0(6,32,22) / Q5_1(7,32,24) / Q8_0(8,32,34) / Q8_1(9,32,36) / Q2_K(10,256,84) /
+  Q3_K(11,256,110) / Q4_K(12,256,144) / Q5_K(13,256,176) / Q6_K(14,256,210) /
+  Q8_K(15,256,292)，一律解成 float32。
+  - `Q4_0`：前 16 字节为低半字节、后 16 字节为高半字节，`(q-8)*d`；`Q4_1`：`q*d+m`。
+  - `Q5_0/Q5_1`：4 字节 `qh` 组成 uint32，第 j 位给低半字节、第 j+16 位给高半字节
+    补上最高位；`Q8_0` 直接 `q*d`，`Q8_1` 忽略 `s` 字段（它只服务训练期），
+    `Q8_K` 的 `d` 是 **f32**、`bsums` 是 int16[16]（跳过，不参与解码）。
+  - `Q4_K/Q5_K`：`get_scale_min_k4` 的 6 bit 缩放/最小值解包（j<4 取
+    `q[j]&63 / q[j+4]&63`；j≥4 取 `(q[j+4]&0xF)|((q[j-4]>>6)<<4)` 与
+    `(q[j+4]>>4)|((q[j]>>6)<<4)`），每 32 个元素用一组 `(scale, min)`，前半 64 个
+    用 `is`、后半 64 个用 `is+1`；`Q5_K` 另从 `qh` 取每 32 元素的高位。
+  - `Q2_K`：每 128 个元素 4 组 2 bit，每个 shift 拆两组 16 元素（各用自己的
+    scale/min）；`Q3_K`：12 字节 scales 按 `aux0..3` 的 `0x03030303 / 0x0F0F0F0F`
+    掩码解成 16 个 6 bit 值（`-32`），`hmask` 位为 0 时码点再减 4；
+    `Q6_K`：`qh` 每 2 bit 补一个 4 bit 码点成 6 bit（`-32`），每 16 个元素换一个
+    int8 缩放。
+- 拒绝面：v1 头；IQ 系（16..23, 29）、TQ 系（34, 35）、分块向量布局（31-33,
+  36-38）等本实现不解码的类型 id；元素数不是块大小整数倍；偏移未按 alignment
+  对齐；维度为 0 或维数不在 1..4。**拒绝而不是猜**：不认识的码本"猜一个"比读不
+  出来更糟。
+- 先校验后读：头长、字符串长度（上限 64 MiB）、数组元素数（上限 2^28）、
+  tensor_count / kv_count（上限 2^20）、张量数据区间全部在切片之前检查，错误里
+  带具体字段。`tensor_count` 说谎时 GGUF 没有可对照的长度字段，只能在解析途中
+  发现——那条错误会补上"第几个、声明了几个、与文件内容对不上"。
+- 解析期用"每类型块结构的 `itemsize` 必须等于类型表 `block_bytes`"的导入期断言
+  防止布局漂移；解码后再核对元素数，对不上即报错。
+
+**验证。** `tests/test_gguf.py` 44 条，写入器在测试里独立实现（不复用被测代码），
+覆盖：头与各类元数据、dims 反转、alignment=64 与 v2、路径往返与 `close`、magic /
+版本 / 头截断 / 数据截断、计数说谎（tensor / kv）、不支持的值类型、嵌套数组、
+重复 key / 重复张量名、非法 UTF-8 key、不支持量化 id、元素数非块大小整数倍、
+偏移未对齐、alignment 非 2 的幂、维度含 0、缺张量名；F32 / F16 / BF16 / F64 /
+四种整数；以及 Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1 / Q8_K / Q2_K（含最小值）/
+Q3_K（6 bit 缩放与 hmask 减 4）/ Q4_K（缩放与最小值）/ Q5_K / Q6_K / 多块形状，
+每条都用逐元素手算的期望值对拍。
+
+ruff 通过；全量 `3540 通过 / 464 跳过`（GGUF 之前是 3496）。
+
+**未声称。**
+
+- 没有拿 llama.cpp 产物或真实模型（如 Llama / Qwen 的 `.gguf`）做端到端对拍，
+  只按块布局与手算期望逐元素验证；也没有解码吞吐数字。
+- IQ 系（格点码本）、TQ 系（三值）、分块向量布局、v1 头都不支持，遇到显式拒绝。
+- 只读，不写 GGUF；不做张量名到图输入名的映射，也不推断布局（与 5.313 的
+  `load_into_store` 一样，名字与转置都要显式给）。
+- `Q8_K` 的 `bsums` 按规范跳过，不做反量化时的整块校核。
+
 
 
 
