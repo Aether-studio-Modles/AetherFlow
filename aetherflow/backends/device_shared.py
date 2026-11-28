@@ -465,9 +465,9 @@ __device__ __forceinline__ double af_fp8_rint(double x) {
   return (double)(q + (q & 1ull));
 }
 
-/* 把 f32 载体编码成 fp8 字节（含符号位）。规则与 runtime/fp8.py 的
-   ``pack_fp8`` 逐位一致：double 下的两次 RNE、e4m3 饱和到 ±448（无 inf）、
-   e5m2 溢出到 inf。 */
+/* Encode an f32 carrier into an fp8 byte (sign bit included). Bit-identical to
+   runtime/fp8.py's pack_fp8: two RNE steps in double, e4m3 saturates to +-448
+   (no inf), e5m2 overflows to inf. */
 __device__ __forceinline__ int af_fp8_encode(float f, int kind) {
   int M = (kind == 1) ? 3 : 2;
   int exp_bits = (kind == 1) ? 4 : 5;
@@ -530,8 +530,8 @@ __device__ __forceinline__ int af_fp8_encode(float f, int kind) {
   return negative ? (code | 0x80) : code;
 }
 
-/* 解码：fp8 字节 -> f32 载体。每个编码恰好对应一个 f32 值（含 ±inf / NaN），
-   与 runtime/fp8.py 的 ``unpack_fp8`` 逐位一致。 */
+/* Decode: fp8 byte -> f32 carrier. Every code maps to exactly one f32 value
+   (including +-inf / NaN); bit-identical to runtime/fp8.py's unpack_fp8. */
 __device__ __forceinline__ float af_fp8_decode(int byte, int kind) {
   int M = (kind == 1) ? 3 : 2;
   int bias = (kind == 1) ? 7 : 15;
@@ -741,8 +741,10 @@ extern "C" __global__ void af_linear_i8a8(
 # 累加不等价（参考实现 5.315 就是这样定的）。零点减法会打散字节对齐，所以
 # 这一版不走 ``__dp4a``，用标量乘加；两条后端共用同一份源码。
 _LINEAR_I8A8_ZP_SRC = r"""
-// 逐项减零点的整数累加。抽成 device 函数只为一件事：无 bias / 带 bias
-// 两个入口必须共用同一份累加体，否则"融合 epilogue"会悄悄变成第二条语义。
+// Integer accumulation with the zero point subtracted per term. It is a device
+// function for one reason: the no-bias / bias entry points must share the same
+// accumulation body, otherwise the "fused epilogue" quietly becomes a second
+// semantics.
 __device__ __forceinline__ int af_i8a8_zp_acc(
     const signed char* __restrict__ xr,
     const signed char* __restrict__ wc,
@@ -774,10 +776,11 @@ extern "C" __global__ void af_linear_i8a8_zp(
   out[idx] = (float)acc * xs[row] * ws[col];
 }
 
-// 带 bias 的入口：把 ``add`` 融进来，省一次 kernel launch 与一块 m*n 中间张量。
-// 两次乘法用 ``__fmul_rn``、加法用 ``__fadd_rn``：不融合时 bias 是在另一颗
-// 内核里做 f32 加法，各自按 RN 舍入；若这里让编译器发 FFMA，末位会差 1 ulp，
-// "融合前后逐位相同"就不成立了。
+// Bias entry point: fuse the ``add`` in, saving one kernel launch and one m*n
+// intermediate tensor. Both multiplies use ``__fmul_rn`` and the add uses
+// ``__fadd_rn``: without fusion the bias add runs f32 RN rounding in a separate
+// kernel, and letting the compiler emit FFMA here would differ in the last ulp,
+// breaking "bit-identical before and after fusion".
 extern "C" __global__ void af_linear_i8a8_zp_bias(
     const signed char* __restrict__ x,
     const signed char* __restrict__ xzp,

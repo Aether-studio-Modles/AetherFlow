@@ -3767,6 +3767,38 @@ class TestCodegenDtypes(unittest.TestCase):
                 src = codegen.render(getattr(codegen, name), dtype)
                 self.assertTrue(src.isascii(), f"{name}/{dtype} 含非 ASCII 字符")
 
+    def test_every_device_source_is_ascii(self):
+        """按目录扫，而不是维护一张模板名清单。
+
+        5.345 的教训：``device_shared`` 里后加的 fp8 / i8a8_zp 源码不在
+        ``TEMPLATES`` 里，中文注释只在真机上炸（``NVRTC`` 报
+        ``UnicodeEncodeError``），本地全绿。判据取"含 ``__global__ void`` /
+        ``__device__ __forceinline__`` / ``extern "C"`` 的字符串常量"，新增源码
+        不需要改测试就会纳入（模块 docstring 里提到这些词不算）。
+        """
+        import ast
+        import pathlib
+
+        from aetherflow import backends
+
+        markers = ("__global__ void", "__device__ __forceinline__", 'extern "C"')
+        base = pathlib.Path(backends.__file__).parent
+        checked = 0
+        for path in sorted(base.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                    continue
+                text = node.value
+                if not any(marker in text for marker in markers):
+                    continue
+                checked += 1
+                self.assertTrue(
+                    text.isascii(),
+                    f"{path.name}:{node.lineno} 的设备源码含非 ASCII 字符",
+                )
+        self.assertGreater(checked, 0, "没有扫到任何设备源码：判据已失效")
+
     def test_render_expands_type_placeholders(self):
         from aetherflow.backends.cuda import codegen
 

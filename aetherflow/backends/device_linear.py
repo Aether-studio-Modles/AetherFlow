@@ -1111,9 +1111,13 @@ class _LinearMixin:
         ws_stride = 0 if int(ws.size) == 1 else 1
         ws_flat = self._contig(ws).reshape(-1)
         m = int(xx.shape[0])
-        out = cp.empty((m, n), np.float32)
+        # 输出按激活的前导维 + N 分配，而不是 (m, n)：IR 对秩 >= 3 的激活推导
+        # 出 (..., N)，执行器按这个形状校验写回；内核只按线性索引写 m*n 个数，
+        # 形状本身不影响它。
+        out = cp.empty(tuple(xq.shape[:-1]) + (n,), cp.float32)
         if m * n == 0:
             return out
+        flat = out.reshape(m, n)
         kernel = self._kernel(
             ("linear_fp8a8_packed", kind),
             _LINEAR_FP8A8_PACKED_SRC,
@@ -1128,7 +1132,7 @@ class _LinearMixin:
                 xs_flat,
                 ww,
                 ws_flat,
-                out,
+                flat,
                 np.int64(m),
                 np.int64(int(xq.shape[-1])),
                 np.int64(n),

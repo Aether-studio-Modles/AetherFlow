@@ -1061,6 +1061,7 @@ class Trainer:
         # 数据只在"第一个用到它的段"里以主机数组传入，由 replay 走 pinned
         # 异步拷贝；后面再读同一个数据输入的段直接拿已就位的显存缓冲。
         pending = dict(data)
+        loss_dev = None
         for segment, plan in zip(segments, self._seg_fwd):
             feed = self._segment_feed(segment)
             for orig, local in segment.inputs:
@@ -1069,8 +1070,15 @@ class Trainer:
             outs = plan.run_device(feed)
             for orig, local in segment.outputs:
                 self._dev_acts[orig][...] = outs[local]
+                # 损失直接从**图输出**发起 D2H。边界缓冲那份 D2D 写回排在默认流
+                # 上，而这个拷贝排在 ``seg_stream`` 上：非阻塞流与默认流之间没有
+                # 隐式同步，先拷就会读到上一轮的值。真机（V100）上的表现是损失
+                # 整体滞后一步，前向本身完全正确。
+                if orig == self._loss_value.name:
+                    loss_dev = outs[local]
         loss = self._host_async(
-            self._dev_acts[self._loss_value.name], self._seg_stream
+            self._dev_acts[self._loss_value.name] if loss_dev is None else loss_dev,
+            self._seg_stream,
         )
 
         # cotangent 与参数梯度都是"累加"出来的，每步先清零：不清零会读到
