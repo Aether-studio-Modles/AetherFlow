@@ -231,11 +231,11 @@ GPU 作业仍未接上真实 runner。
 | 维度 | AetherFlow | 其它框架的典型做法 | 可比性 |
 |---|---|---|---|
 | 执行模型 | 静态语义 IR：构图 → 校验 → 优化 → 后端预检 → 执行；`EagerGraph` 只改构图手感，产物仍是静态图 | PyTorch define-by-run + Dynamo 捕获；JAX 函数式 trace + `jit`；ONNX Runtime 解释 / 编译 ONNX 图；TVM 编译 Relay / Relax 图 | 都是"图或程序 → 后端"，但我们在构图期就把能力不足报掉 |
-| 微分 | IR 层展开成普通图（66 条 VJP），反向图可序列化、可执行、可再优化；二阶导只对具备 VJP 的算子成立 | PyTorch autograd 引擎按算子注册反向；JAX `vjp` / `jvp` 可任意阶；ONNX Runtime 以推理为主；TVM 的自动微分生态较小 | 不提供 tape，也不承诺"任意算子可导" |
+| 微分 | IR 层展开成普通图（69 条 VJP），反向图可序列化、可执行、可再优化；二阶导只对具备 VJP 的算子成立 | PyTorch autograd 引擎按算子注册反向；JAX `vjp` / `jvp` 可任意阶；ONNX Runtime 以推理为主；TVM 的自动微分生态较小 | 不提供 tape，也不承诺"任意算子可导" |
 | 动态形状 | 前端拒绝 SymInt；执行器支持一次构图多形状（5.217）；训练循环与分段重算要求静态 | PyTorch / JAX 原生支持（JAX 按形状重编译） | 我们是"多形状绑定"，不是"动态图" |
 | 控制流 | `Conditional` / `WhileLoop` 是子图关系，判定回主机；设备端循环每次读一次谓词（5.245） | PyTorch 用 TorchScript / Dynamo 表达分支；JAX 的 `lax.cond` / `lax.while_loop` 编译进设备端 | 我们的控制流不追求设备端无同步 |
 | 后端接入 | 两个必需方法 + 六个可选契约；新硬件写一个包即可（HIP 为证），IR / 前端 / 优化零改动 | PyTorch 需 PrivateUse1 / dispatch key；JAX 需 PJRT plugin；ONNX Runtime 需 Execution Provider；TVM 需 BYOC | 接入面更窄，代价是生态工具要自己写 |
-| 算子覆盖 | 117 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
+| 算子覆盖 | 120 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），对称与非对称零点两套主机侧语义（非对称见 5.315、量化 / 反量化内核见 5.322、融合线性层见 5.323；逐组的非对称 `dequantize_i8_group_zp` 见 5.321），逐组（per-group）weight-only 反量化（`dequantize_i8_group` / `_zp`，5.317 语义、5.321 设备内核），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），fp8 的 cast 已落到设备端（5.325，载体仍是 f32、不省带宽），但没有 fp8 GEMM |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
 | 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）与 GGUF（5.348，v2/v3 + 主流 ggml 量化块）、文本能过 ByteLevel BPE（5.314）、WordPiece（5.345）与 Unigram / SentencePiece（5.347，含 `Metaspace` 与 precompiled 字符映射），但没有内置 HF 权重转换表、不解 IQ / TQ 量化 |
@@ -22403,6 +22403,117 @@ ruff 通过；全量 `3540 通过 / 464 跳过`（GGUF 之前是 3496）。
 - `flip` / `roll` / `cumprod` 都是单轴；多轴要么链式调用，要么显式 reshape。
 - `roll` 的移位在主机侧归一化，符号口径与 numpy 一致（正数向高下标方向），
   但没有对 `shift` 是张量的情形做支持——它必须是构图期常量。
+
+### 5.350　算子面再补三个：atan2 / remainder / repeat_interleave
+
+**缺口。** 5.349 之后算子面清单上还剩三处高频缺口：`atan2`（复数相位、
+RoPE 的二维旋转、方位角回归）、`remainder`（floor 语义取余，数据增强与周期
+编码里当"回绕"用）、`repeat_interleave`（上采样与掩码扩散，`torch.repeat_interleave`
+在导出图里几乎与 `cat` 同级常见）。`interpolate` 仍未做，见末尾"未声称"。
+
+**语义面。**
+
+- `atan2(y, x)`：两个输入的 dtype 必须一致且为浮点（整数拒绝——`atan2` 的
+  返回值是浮点，整数输入在 numpy 里也会先被提升，接受它等于让"dtype 由后端
+  决定"）。支持广播。**不能用 `atan(y/x)` 代替**：`x < 0` 时差一个 π，
+  `x == 0` 时会除零；测试与真机用例都刻意覆盖四象限。
+- `remainder(a, b)`：**floor 语义**，结果符号跟随除数，与 `np.mod` /
+  `torch.remainder` 一致。这是它与 `mod`（5.349 之前的整数取余，符号跟随被
+  除数）的区别；对整数输入走既有的 `ew_mod_int`，浮点才进本算子。除数为 0
+  时按 IEEE 返回 NaN（`fmodf` 的行为），不做"静默给 0"的兜底。
+- `repeat_interleave(x, repeats, axis)`：`repeats` 必须是**正**整数（bool、
+  0、负数、浮点一律拒绝——0 会让输出轴长为 0，而"要不要产出空张量"是构图
+  期该问清的事）；默认 `axis=-1`；`repeats` 是标量，不对"每元素不同重复次数"
+  的张量形式做支持。
+
+**梯度。**
+
+- `atan2`：`dy = g · x / (x² + y²)`，`dx = -g · y / (x² + y²)`。广播由 VJP
+  里的 `reduce_sum` 负责（形状回到输入形状）；原点处导数是 `0/0`，与解析式
+  一致地给出 NaN，不特判。
+- `remainder`：`da = g`，`db = -g · floor(a / b)`。后者是几乎处处成立的
+  分段常数，`floor` 在整数点不可导但测度为零；测试用数值差分避开整数点。
+- `repeat_interleave`：反向是"每 `repeats` 个相邻元素求和"。实现为
+  `reshape(..., dim, repeats, ...)` 后 `reduce_sum(axis+1)`，不新增反向内核
+  ——搬运的伴随是归约，既有原语就够。
+
+**设备面。**
+
+- `atan2` / `remainder` 进逐元素族（`device_elementwise._binary`），同形、
+  标量、广播三条路径共用。**`remainder` 不能直接调 `fmodf`**：C 的 `fmodf`
+  是截断取余，`-7 % 3` 给 `-1`，而 numpy 给 `2`。设备侧新增 `af_rem`
+  （`float` 版）：`r = fmodf(a, b)`，异号时补一个 `b`。`atan2` 直接用
+  `atan2f`。
+- `repeat_interleave` 进搬运族（`device_scan`），与 `flip` / `roll` 同一套
+  "扁平下标重排"：输出下标拆成 `(o, j, i)`，`j ∈ [0, steps·repeats)`，源下标
+  `(o · steps + j / repeats) · inner + i`。一个线程一个元素，不需要 shared；
+  与 `roll` 的区别是**没有偏移量**，只做整除缩放。
+- **L2 表达式表分两类**：中缀运算符（`BINARY_OP`）与函数调用（新增
+  `BINARY_CALL`）。`atan2` / `remainder` 打印成 `atan2f(a, b)` / `af_rem(a, b)`，
+  实参不能加 `Paren`——`Paren` 是给中缀表达式防优先级错误的，套在函数实参上
+  只会多一对括号（无害但会让"生产源码与手写模板逐 token 相等"的对照用例
+  失败）。把函数调用式算子塞进 `BINARY_OP` 会把打印结果变成
+  `a atan2f b`，因此单开一张表，`_binary_value` 统一分派。
+
+**一个实现坑（真机抓到的）。** 新增的 `af_rem` 起初拼进 `_F32_HELPERS` /
+`_F16_HELPERS` / `_BF16_HELPERS` 三块，普通逐元素内核因此都能拿到它。但
+`cast` 与比较族方言的 helper 是**把三块拼在一起**（`_CAST_HELPERS =
+_F32 + _F16 + _BF16`，`_BOOL_HELPERS = _CAST_HELPERS + _BOOL`），于是同一个
+生成单元里 `af_rem` 出现 3 次，NVRTC 报 `function "af_rem" has already been
+defined`，连带 `logical_and` / `logical_or` / `logical_not` / `reduce_all` /
+`reduce_any` 五条既有用例全部编译失败。本地没有 GPU、后端构造测试被跳过，
+跑不到这条路径；只有真机 `verify_cuda.py` 暴露。修法：三个 dtype 块只保留
+"按存储宽度读写"的 helper，表达式级 helper 由**使用方拼一次**——单 dtype
+方言（`CUDA_DIALECT` 的三个值、HIP 的 f32）各追加一份，组合方言
+（`_CAST_HELPERS`）只追加一次。`_HELPERS` 旧模板表同步补上，保持"每个生成
+单元恰好一份"。修完用 `dialect.prelude(dtype).count("af_rem(")` 对 6 个方言
+× dtype 全量核对，全部为 1。
+
+**验证。** `tests/test_ops_extra.py` 新增 3 个测试类共 13 条：`TestAtan2`
+（四象限前向、广播、对解析式与数值差分的两条梯度、拒绝整数、拒绝混合
+dtype）、`TestRemainder`（四种符号组合逐位等于 `np.mod` 且手算
+`[2, 1, -1, -2]`、两条梯度对数值差分、整数输入报错信息含 "mod"）、
+`TestRepeatInterleave`（中间轴前向 `(2, 9, 4)`、梯度每组求和与数值差分、
+默认 `axis=-1`、拒绝 `repeats ∈ {0, -1, 1.5, True}`、符号轴报错）。
+`conformance.default_cases()` 增 3 条（`atan2_quadrants` / `remainder_floor` /
+`repeat_interleave_middle`）。`verify_cuda.py` 增 4 条边界用例
+（`atan2_quadrants_broadcast`、`remainder_both_signs`、
+`repeat_interleave_axis0`、`repeat_interleave_last_wide`）。ruff 通过；本地
+全量 `3576 通过 / 464 跳过`（5.349 之后是 3563，新增 13 条）。
+
+**真机验证（V100-SXM2-32GB / 驱动 550.127.05 / CUDA 12.9 / cupy 14.2）。**
+`verify_cuda.py` → `177 executed / 3 refused / 0 failed`，`coverage` 检查
+`119/119`（声明的每个算子至少成功执行一次）。**真机第二轮还抓到第二个错**：
+这两个新用例的输出名写成了 `out`，而 `verify_cuda._run_extra` 统一按 `["y"]`
+取输出，报 `KeyError: 'y'`；改回 `"y"`（输入另起名 `a` / `b`）后通过。`out`
+这个名字在 `Graph` 里本身合法，问题只在验证脚本的取用约定——属于测试脚手架
+的口径，不是算子缺陷。
+
+| 用例 | 结果 |
+|---|---|
+| `atan2_quadrants` | `err=2.4e-07` |
+| `remainder_floor` | `err=0.0e+00` |
+| `repeat_interleave_middle` | `err=0.0e+00` |
+| `atan2_quadrants_broadcast`（y 广播） | PASS |
+| `remainder_both_signs`（四种符号 × 非整数商） | PASS |
+| `repeat_interleave_axis0` / `repeat_interleave_last_wide` | PASS |
+| 5.349 的 `cumprod` / `flip` / `roll` / `argmin` / `logsumexp` 九条 | 仍全部 `err=0.0e+00` |
+| 3 条 refused | 两条 `sort`（按设计不承接）+ 既有 `f64_input_relu` |
+
+全量 `python3 -m unittest discover -s tests -t .` → `3562 个用例 / 178 跳过 /
+OK`，95 秒（本地无 GPU 是 `3576 / 464 跳过`，差值全部是设备端测试）。
+
+**未声称。**
+
+- `interpolate`（`nearest` / `bilinear` / `bicubic`）仍未做：三种模式的对齐
+  口径（`align_corners` / `half_pixel`）、`antialias`、任意秩输入各不相同，
+  先把语义面钉死再写内核，比先给一种近似实现更省事；目前构图期显式拒绝。
+- 三个新算子**没有吞吐数字**：只验数值等价，没做基准对照。
+- `repeat_interleave` 只支持标量 `repeats` 与单轴；`repeats` 为张量、
+  多轴一次完成都不支持。
+- `remainder` 的除数为 0 返回 NaN，与 numpy 一致；不提供"钳到最小正规数"
+  的选项。
+
 
 
 

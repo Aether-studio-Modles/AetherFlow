@@ -16,17 +16,20 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：117 个 IR 算子，CUDA 承接 116 个（含 cuFFT 的
-  `fft` / `rfft`）、HIP 承接 114 个；
+- **一份语义 IR，多个硬件后端**：120 个 IR 算子，CUDA 承接 119 个（含 cuFFT 的
+  `fft` / `rfft`）、HIP 承接 117 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
-- **算子面补齐**（5.349）：`sort` / `argmin` / `cumprod` / `flip` / `roll` /
-  `logsumexp` 进 IR；除 `sort` 外都有设备内核，`sort` 设备端刻意不承接
-  （排序要 bitonic 或库内核，不写 O(n²) 凑合实现）。`cumprod` / `flip` / `roll` /
-  `logsumexp` 有 VJP，`sort` / `argmin` 不注册——`backward` 遇到它们报
+- **算子面补齐**（5.349 / 5.350）：`sort` / `argmin` / `cumprod` / `flip` / `roll` /
+  `logsumexp` 与 `atan2` / `remainder` / `repeat_interleave` 进 IR；除 `sort` 外
+  都有设备内核，`sort` 设备端刻意不承接（排序要 bitonic 或库内核，不写 O(n²)
+  凑合实现）。`cumprod` / `flip` / `roll` / `logsumexp` / `atan2` / `remainder` /
+  `repeat_interleave` 有 VJP，`sort` / `argmin` 不注册——`backward` 遇到它们报
   `NoGradientError`，不静默给零。`argmin` 输出 i32、并列取首个；`logsumexp` 在
-  f32 里稳定化求值，±1000 量级不溢出。
+  f32 里稳定化求值，±1000 量级不溢出。`remainder` 是 floor 语义，设备侧走自加的
+  `af_rem`——`fmodf` 是截断取余，异号时符号会错；`repeat_interleave` 复用扁平
+  搬运，反向是 reshape + 归约（不新增反向内核）。
 - **循环级 IR**（5.332）：`LoopIR` 把 `WhileLoop` 收敛成"单图条件 + 单图体 +
   carried"的规范形态，`split_invariants` 把每轮重算但不变的纯计算搬进
   preheader（`LoopSplit`），数值与原循环逐位相同；带 RNG / STATE / IO 的节点
@@ -35,7 +38,7 @@
   形状签名` 查配置库，命中后覆盖逐元素 / 归约的 block 与 conv2d 的
   tile/roc/cb。优先级是"显式 `set_tuning` → 构造参数 → 库 → 自动"；未命中
   统计可查，库里的坏值（如非 2 的幂的 block）当场报错而不是静默回退。
-- **自动微分**：66 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
+- **自动微分**：69 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行
   （5.331 起 NCCL / RCCL 可加载时**默认设备侧归约**：单进程多卡自动
   `ncclCommInitAll`、每进程一卡自动 `ncclCommInitRank`；库缺失或显式
@@ -177,10 +180,10 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3563 个用例，464 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3576 个用例，464 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `174 executed / 3 refused / 0 failed`（5.349 复跑：`cumprod` / `flip` / `roll` / `roll_negative` / `argmin` ×3 / `logsumexp` ×2 全部 err=0.0，3 条 refused 是两条 `sort`——设备端按设计不承接——与既有的 `f64_input_relu`）；全量 `3549 个用例 / 178 跳过 / OK`、96 秒（5.349 起跑全量；此前只跑子集）。历史备注：`matmul_partial_batch` 的 4.8e-07 来自 f32 GEMM 累加顺序 |
+| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `177 executed / 3 refused / 0 failed`、`coverage 119/119`（5.350 复跑：`atan2` / `remainder` / `repeat_interleave` 各 1 主用例 + 4 条边界，err 均 ≤2.4e-07；5.349 的 `cumprod` / `flip` / `roll` / `argmin` / `logsumexp` 九条仍 err=0.0；3 条 refused 是两条 `sort`——设备端按设计不承接——与既有的 `f64_input_relu`）；全量 `3562 个用例 / 178 跳过 / OK`、95 秒。历史备注：`matmul_partial_batch` 的 4.8e-07 来自 f32 GEMM 累加顺序 |
 
 ```bash
 # 本地全量
@@ -268,10 +271,14 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   `embedding(上一状态, parents)`，每步一次 replay；A800 同机同口径
   `num_beams=1/2/4` 各快 5.5% / 4.2% / 4.5%），投机解码仍走宿主路径。
 - **算子面**：`sort` 只给值、不给下标，也没有 `stable` 参数，设备端不承接
-  （构图期报 `BackendCapabilityError`）；`argmin` / `flip` / `roll` / `cumprod`
-  都是单轴，空轴显式拒绝，全归约请先 reshape；`roll` 的 `shift` 只能是构图期常量。
-  5.349 的 5 个设备内核在 V100 上数值等价（`verify_cuda.py` 174 executed /
-  3 refused / 0 failed，新用例 err 全为 0），但没有吞吐基准，不作性能结论（5.349）。
+  （构图期报 `BackendCapabilityError`）；`argmin` / `flip` / `roll` / `cumprod` /
+  `repeat_interleave` 都是单轴，空轴显式拒绝，全归约请先 reshape；`roll` 的
+  `shift` 只能是构图期常量，`repeat_interleave` 的 `repeats` 必须是正标量
+  （张量形式不支持）。`remainder` 是 floor 语义（符号跟除数），除数为 0 返回
+  NaN；`atan2` 只接同 dtype 浮点，四象限由 `atan2f` 保证。5.349 / 5.350 的 8 个
+  设备内核在 V100 上数值等价（`verify_cuda.py` 177 executed / 3 refused /
+  0 failed，新用例 err 全为 0），但没有吞吐基准，不作性能结论（5.349 / 5.350）。
+  `interpolate` 仍未做，构图期显式拒绝。
 - **动态形状**：主机态的执行与训练支持符号批维——一次构图跑不同 batch，归约反向的
   计数在运行期按实际形状算；`DynamicRunner(dynamic_axes={"x": {0: "B"}})` 把这条能力
   包成"按形状模板缓存"，声明过的轴取任意值都复用同一张图（DESIGN 5.276）。设备态
@@ -973,6 +980,34 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   core；存储减半要靠 `pack_int4` 离线打包，本版没有打包线性层，设备端还会
   物化 f32 权重副本。没有 VJP（量化权重按冻结常量处理），设备端只做源码级
   验证，真机 conformance 待授权。
+- **表达式级设备 helper 必须由使用方"恰好拼一次"**（5.350）：新增的 `af_rem`
+  起初拼进 `_F32/_F16/_BF16_HELPERS` 三块，`cast` 与比较族方言的 helper 是
+  把三块**拼在一起**（`_CAST_HELPERS` / `_BOOL_HELPERS`），于是同一个生成
+  单元里 `af_rem` 出现 3 次，NVRTC 报 `function "af_rem" has already been
+  defined`，连带 `logical_and` / `logical_or` / `logical_not` / `reduce_all` /
+  `reduce_any` 五条既有用例全部编译失败。本地没有 GPU、后端构造测试被跳过，
+  只有真机 `verify_cuda.py` 暴露。现在三个 dtype 块只放"按存储宽度读写"的
+  函数，表达式级 helper 由单 dtype 方言各追加一份、组合方言追加一次；核对
+  手段是 `dialect.prelude(dtype).count("af_rem(")` 对 6 个方言 × dtype 全部
+  等于 1（本地就能查）。
+- **函数调用式算子不能塞进 `BINARY_OP`**（5.350）：`BINARY_OP` 是中缀拼接
+  表（`a + b`），把 `atan2` / `remainder` 放进去会打印成 `a atan2f b`。单开
+  `BINARY_CALL` 走 `Call`，由 `_binary_value` 统一分派；实参**不加** `Paren`
+  ——`Paren` 只用于中缀表达式的优先级保护，套在函数实参上会让"生产源码与
+  手写模板逐 token 相等"的对照用例失败。
+- **`fmodf` 是截断取余，不是 floor 取余**（5.350）：C 的 `-7 % 3` 给 -1，
+  而 numpy / PyTorch 的 `mod` / `remainder` 给 2（符号跟除数）。设备侧因此
+  自加 `af_rem`：`r = fmodf(a, b)`，`r` 与 `b` 异号时补一个 `b`。HIP 的
+  `fmod` 语义相同，同一份 helper 逐字复用。
+- **`verify_cuda._run_extra` 统一按 `["y"]` 取输出**（5.350）：新用例把输出
+  名写成 `out` 会报 `KeyError: 'y'`。`out` 在 `Graph` 里本身合法（只要不与
+  输入重名），这是验证脚本的取用约定，不是算子缺陷；新用例的输出名保持 `y`，
+  输入另起名（`a` / `b`）避开重名。
+- **`repeat_interleave` 的源下标**（5.350）：输出轴被放大成 `steps·repeats`，
+  源下标 `(o·steps + j/repeats)·inner + i`（`j ∈ [0, steps·repeats)`）。L2
+  打印器不推断优先级，`o·steps + j/repeats` 这类嵌套 `Bin` 每一层都要显式
+  `Paren`，否则 `j / repeats * inner` 会被左结合成 `(j/repeats)*inner` 之外
+  的另一种切分。
 
 ---
 
