@@ -11,6 +11,7 @@ from .device_shared import (
     _DEQUANTIZE_I8_ZP_SRC,
     _LINEAR_I8A8_DP4A_SRC,
     _LINEAR_I8A8_SRC,
+    _LINEAR_I8A8_ZP_SRC,
     _QUANTIZE_I8_SRC,
     _QUANTIZE_I8_ZP_SRC,
 )
@@ -526,5 +527,123 @@ class _LinearMixin:
         out = out.reshape(xq.shape[:-1] + (n,))
         if len(args) > 4:
             out = self._binary("add", [out, args[4]])
+        return out
+
+    def _op_linear_i8_zp(self, node, args, attrs):
+        """非对称 weight-only int8 线性层：先反量化权重，再走既有 f32 GEMM。
+
+        与 ``linear_i8`` 的唯一差别是读出权重时多减一个零点（5.322 的
+        ``dequantize_i8_zp``）；GEMM 与 bias 完全复用。因此收益仍只在
+        "i8 驻留与读带宽"，不宣称算力提升。
+        """
+        cp = self.cp
+        x, qweight, scale, zp = args[0], args[1], args[2], args[3]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8_zp 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8_zp 要求 x 秩 >= 2、权重秩 2，"
+                f"收到 {x.shape} 与 {qweight.shape}"
+            )
+        weight = self._op_dequantize_i8_zp(node, [qweight, scale, zp], {})
+        out = self._op_matmul(node, [x, weight], {})
+        if len(args) > 4:
+            out = self._binary("add", [out, args[4]])
+        return out
+
+    def _op_linear_i8a8_zp(self, node, args, attrs):
+        """非对称 W8A8：两侧各减零点后 int32 累加，最后乘两路 scale。
+
+        逐位口径与参考实现一致：``(float)acc * xs * ws (+ bias)``，acc 的每一项
+        都是 ``(xq - xzp) * (wq - wzp)``。不能先按对称版算完 acc 再在 f32 里补
+        偏置——展开后的 ``-zx*colsum - zw*rowsum + K*zx*zw`` 与逐项相减的整数
+        累加不等价（5.315 的语义）。int32 不溢出由 IR 的 ``K * 255 * 255``
+        上界保证。
+
+        零点减法会打散字节对齐，所以这里不走 ``__dp4a``，用标量乘加；两条
+        后端共用同一份源码，结果逐位相同。
+        """
+        cp = self.cp
+        xq, xs, xzp = args[0], args[1], args[2]
+        wq, ws, wzp = args[3], args[4], args[5]
+        if xq.dtype != cp.int8 or wq.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8_zp 要求激活与权重都是 i8，"
+                f"收到 {xq.dtype} 与 {wq.dtype}"
+            )
+        if xzp.dtype != cp.int8 or wzp.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8_zp 的 zero_point 必须是 i8，"
+                f"收到 {xzp.dtype} 与 {wzp.dtype}"
+            )
+        if xs.dtype != cp.float32 or ws.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8_zp 的 scale 必须是 f32，"
+                f"收到 {xs.dtype} 与 {ws.dtype}"
+            )
+        if xq.ndim < 2 or wq.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_i8a8_zp 要求激活秩 >= 2、权重秩 2，"
+                f"收到 {xq.shape} 与 {wq.shape}"
+            )
+        rows = tuple(xq.shape[:-1]) + (1,)
+        if tuple(xs.shape) != rows or tuple(xzp.shape) != rows:
+            raise BackendCapabilityError(
+                f"linear_i8a8_zp 的激活 scale / zero_point 形状必须是激活的"
+                f"前导维加 1，收到 {xs.shape} / {xzp.shape} 对 {xq.shape}"
+            )
+        k = int(xq.shape[-1])
+        n = int(wq.shape[-1])
+        if int(wq.shape[0]) != k:
+            raise BackendCapabilityError(
+                f"linear_i8a8_zp 的内维不匹配：{xq.shape} @ {wq.shape}"
+            )
+        if int(ws.size) != n or int(wzp.size) != n:
+            raise BackendCapabilityError(
+                f"linear_i8a8_zp 的权重 scale / zero_point 长度必须是 {n}，"
+                f"收到 {ws.shape} / {wzp.shape}"
+            )
+        if len(args) > 6:
+            bias = args[6]
+            if bias.dtype != cp.float32 or int(bias.size) != n:
+                raise BackendCapabilityError(
+                    f"linear_i8a8_zp 的 bias 必须是长度 {n} 的 f32，收到 "
+                    f"{bias.dtype} {bias.shape}"
+                )
+
+        m = int(np.prod(xq.shape[:-1]))
+        out = cp.empty((m, n), cp.float32)
+        if out.size:
+            x = self._contig(xq).reshape(m, k)
+            w = self._contig(wq)
+            zxa = self._contig(xzp).reshape(m)
+            sxa = self._contig(xs).reshape(m)
+            zwa = self._contig(wzp).reshape(n)
+            swa = self._contig(ws).reshape(n)
+            kernel = self._kernel(
+                ("linear_i8a8_zp",), _LINEAR_I8A8_ZP_SRC, "af_linear_i8a8_zp"
+            )
+            block, grid = self._grid("linear_i8a8_zp", m * n)
+            kernel(
+                (grid,),
+                (block,),
+                (
+                    x,
+                    zxa,
+                    sxa,
+                    w,
+                    zwa,
+                    swa,
+                    out,
+                    np.int64(m),
+                    np.int64(k),
+                    np.int64(n),
+                ),
+            )
+        out = out.reshape(xq.shape[:-1] + (n,))
+        if len(args) > 6:
+            out = self._binary("add", [out, args[6]])
         return out
 

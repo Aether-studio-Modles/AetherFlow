@@ -75,7 +75,9 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "fake_quantize_i8",
         "fake_quantize_i8_lsq",
         "linear_i8",
+        "linear_i8_zp",
         "linear_i8a8",
+        "linear_i8a8_zp",
         "conv2d",
         "maxpool2d",
         "maxpool2d_indices",
@@ -156,6 +158,9 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     "linear_i8": frozenset({1}),
     # W8A8：激活与权重都是 i8 数据，scale / bias 仍是 f32。
     "linear_i8a8": frozenset({0, 2}),
+    # 非对称版：多出来的是两处 zero_point（都是 i8 数据）。
+    "linear_i8_zp": frozenset({1, 3}),
+    "linear_i8a8_zp": frozenset({0, 2, 3, 5}),
     # 整数取模：两侧都是**整数数据**，不是下标。
     "mod": frozenset({0, 1}),
 }
@@ -338,6 +343,39 @@ extern "C" __global__ void af_linear_i8a8(
     acc = __dp4a(xv, wv, acc);
   }
   for (; kk < k; ++kk) acc += (int)xr[kk] * (int)wc[kk * n];
+  out[idx] = (float)acc * xs[row] * ws[col];
+}
+"""
+
+
+# 非对称 W8A8：每个乘子先减自己的零点再相乘，累加仍在 int32，最后乘两路
+# scale。**不能**先按对称版算 acc 再在 f32 里补偏置——展开后的
+# ``-zx*colsum - zw*rowsum + K*zx*zw`` 需要额外的归约，且与逐项相减的整数
+# 累加不等价（参考实现 5.315 就是这样定的）。零点减法会打散字节对齐，所以
+# 这一版不走 ``__dp4a``，用标量乘加；两条后端共用同一份源码。
+_LINEAR_I8A8_ZP_SRC = r"""
+extern "C" __global__ void af_linear_i8a8_zp(
+    const signed char* __restrict__ x,
+    const signed char* __restrict__ xzp,
+    const float* __restrict__ xs,
+    const signed char* __restrict__ w,
+    const signed char* __restrict__ wzp,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    long long m, long long k, long long n) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  long long total = m * n;
+  if (idx >= total) return;
+  long long row = idx / n;
+  long long col = idx - row * n;
+  const signed char* xr = x + row * k;
+  const signed char* wc = w + col;
+  int zx = (int)xzp[row];
+  int zw = (int)wzp[col];
+  int acc = 0;
+  for (long long kk = 0; kk < k; ++kk) {
+    acc += ((int)xr[kk] - zx) * ((int)wc[kk * n] - zw);
+  }
   out[idx] = (float)acc * xs[row] * ws[col];
 }
 """

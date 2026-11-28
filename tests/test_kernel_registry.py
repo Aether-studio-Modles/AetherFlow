@@ -188,6 +188,11 @@ class TestCudaDeclarations(unittest.TestCase):
         self.assertEqual(_INDEX_ARGS["dequantize_i8_zp"], frozenset({0, 2}))
         self.assertIn("quantize_i8_zp", GPU_OPS)
         self.assertIn("dequantize_i8_zp", GPU_OPS)
+        # 非对称线性层：零点与另一侧的 i8 数据都要登记，scale / bias 仍是 f32。
+        self.assertEqual(_INDEX_ARGS["linear_i8_zp"], frozenset({1, 3}))
+        self.assertEqual(_INDEX_ARGS["linear_i8a8_zp"], frozenset({0, 2, 3, 5}))
+        self.assertIn("linear_i8_zp", GPU_OPS)
+        self.assertIn("linear_i8a8_zp", GPU_OPS)
 
 
 @unittest.skipUnless(CUDA_AVAILABLE, "需要 cupy 与 CUDA 设备")
