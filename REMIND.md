@@ -119,7 +119,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 | 参考 | Windows / Python 3.14 | 3198 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `136 executed / 4 refused / 0 failed`（5.323 后；`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05 来自 f32 GEMM 累加顺序；4 个 refused 是既有的 `matmul_partial_batch` / `cast_f8e4m3` / `cast_f8e5m2` / `f64_input_relu`）；`tests.test_cuda_backend` 382 条 3.1 秒全过（2 跳过）；未跑全量 unittest |
+| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `137 executed / 3 refused / 0 failed`（5.324 后；`matmul_partial_batch` 首次成功、err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05；3 个 refused 是 `cast_f8e4m3` / `cast_f8e5m2` / `f64_input_relu`）；`tests.test_cuda_backend` 382 条 2.5 秒全过（2 跳过）；未跑全量 unittest |
 
 ```bash
 # 本地全量

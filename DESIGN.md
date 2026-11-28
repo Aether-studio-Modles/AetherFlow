@@ -17052,7 +17052,7 @@ fusion_is_bitwise_identical`（逐位 + 参考对照）。
 | 累积与更新仍在 f32 | f16 只降低存储与带宽，归约与 GEMM 的累加都在 f32 完成；master 权重与优化器状态必须保持 f32（5.28），f16 参数直接更新会被量化吞掉 |
 | softmax / layernorm / reduce_sum 只支持最后一维 | 覆盖 Transformer，不覆盖全部模型。**已由 5.153 关闭**：任意单轴可跑，多轴 `reduce_*` 与 `argmax` 仍限末维 |
 | 广播折叠后上限 4 维 | 超高维张量的非常规广播会被明确拒绝 |
-| 批量的部分广播（`(2,1,…)` 对 `(2,3,…)`） | cuBLAS 一个标量 stride 表达不了，明确拒绝 |
+| 批量的部分广播（`(2,1,…)` 对 `(2,3,…)`） | cuBLAS 一个标量 stride 表达不了。**已由 5.324 关闭**：广播侧物化成完整批次后仍走 strided batched，代价是 batch 份副本 |
 | conv2d 分块核只在 K <= 32 时占优；分组卷积不走分块核 | K 大时仍走 im2col（列矩阵放大 8~9 倍）；groups > 1 时逐组 im2col 并逐组 GEMM，depthwise 可用但没有专门的 depthwise 内核。见 5.16、5.34 |
 | 池化仍缺参数开关 | maxpool2d / avgpool2d / adaptive_avg_pool2d 均可用（全局池化 = `output_size=(1,1)`）。**已由 5.154 关闭**：`ceil_mode` / `count_include_pad` 是 IR 属性、前端直通，新增 `maxpool2d_indices`；只有 `divisor_override` 仍明确拒绝 |
 | scan 的并行度 | `scan_linear` / `scan_linear_backward` 一个尾元素一个线程沿 T 串行，延迟随 T 线性增长；`chunked_scan=` 打开后走两趟分块（块内复合 + 块前缀/读出），M40 上 `T=16384` 前向 3.11×、反向 3.56×，`scan_last_state` 只写末状态（16 MB → 4 KB）。**5.155 起默认自动**：`steps >= 512` 且尾维 `<= 2048` 时取块长 64，短 T / 宽尾维仍串行；分块与串行不逐位，要逐位显式 `chunked_scan=0`。见 5.35、5.128、5.155 |
@@ -20517,6 +20517,50 @@ bias 若是 f32 且长度 `N`。这套严格度沿用既有 `linear_i8a8` 的口
   为 `(N,)`），不支持 IR 允许的标量 / 逐元素广播。
 - 没有反向规则（IR 侧 `linear_i8a8_zp` 只有 bias 可导），也没有 epilogue 融合：
   int32 累加后仍要物化一份 f32 输出。
+
+### 5.324　设备端 matmul 支持批量维的部分广播
+
+**起点。** 5.98 起设备端批量 GEMM 走 cuBLAS 的 strided batched，两个操作数各只有
+一个标量 stride，因此只接受两种批量形状：与输出批量维完全一致（密集步长），
+或整批只有 1 个 batch（步长 0，复用同一份数据）。`(2,1,4,8) @ (2,3,8,6)` 这种
+部分广播一直被 `_batch_stride` 显式拒绝，conformance 里记为一个 `refused`
+（5.322 / 5.323 的 `136 executed / 4 refused` 中的第一个）。
+
+**为什么不能靠 stride 表达。** 部分广播的每个 batch 在左操作数上的偏移是
+`(i * 0) * (m*k)` 与 `(j) * 0` 这样的组合，取决于哪个轴取 1；strided batched
+的接口只给 A/B 各一个标量，没有"逐 batch 偏移表"。要正确表达只能换接口
+（cuBLAS 没有）或者改变数据布局。
+
+**方案：物化广播侧。** `_batch_operand` 替代 `_batch_stride`：形状一致 → 密集
+步长；整体为 1（包括没有批量维）→ 步长 0；其余 → `broadcast_to` 出完整批次再
+`ascontiguousarray`，然后给密集步长，复用同一条已测的批量路径。三条分支之外
+不再有拒绝面。刻意不选"逐 batch 循环 launch"：那会把一次 batched GEMM 拆成
+batch 次小 GEMM，多出 batch 次 launch 开销，而副本路径至少还留在一条连续的
+批量调用里。
+
+**代价。** 物化只在部分广播时发生，内存是 `batch × m × k` 的 f32/f16 副本；
+常规批量与整体广播路径的代码与步长完全不变。没有加体积上限——能算出结果优先，
+病态形状（例如 `(1,1,4096,4096)` 广播到 64 个 batch）会把选择权留给调用方，
+这与其他"显式物化"的取舍一致（见 5.282 的参数广播）。
+
+**验证。** V100 上 `verify_cuda.py`：`137 executed / 3 refused / 0 failed`，
+`result : PASS`，`matmul_partial_batch` 首次成功执行：
+
+```
+[executed] matmul_partial_batch  ops=matmul  err=4.8e-07
+```
+
+4.8e-07 来自 f32 GEMM 的累加顺序，在 1e-4 容差内。剩余 3 个 refused 是
+`cast_f8e4m3` / `cast_f8e5m2`（无 fp8 存储容器）与 `f64_input_relu`（f64 部分
+承接）。同机 `tests.test_cuda_backend` 382 条全过（2 跳过），本地全量
+3198 条 / 460 跳过全绿，ruff 通过。
+
+**未声称。**
+
+- 只补了批量维的广播；逐元素广播仍由 IR 在构图期拒绝（`_broadcast_shape` 的
+  符号维规则不变）。
+- 没有体积上限，也没有把副本缓存起来复用：每次调用各算各的。
+- 只影响批量路径，非批量 GEMM 仍走 `sgemm` / `hgemm` / `bgemm`。
 
 
 
