@@ -593,5 +593,95 @@ class TestPagedGenerator(unittest.TestCase):
             gen2.feed(1, 4)
 
 
+class TestPrefixCache(unittest.TestCase):
+    """5.335 前缀缓存：自动挑最长前缀，命中结果与独立生成逐 token 相同。
+
+    缓存只省 prefill，不改变数学——所以每条命中用例都拿同一个参数集的
+    独立实例（不共享任何页）做参照。
+    """
+
+    def _generator(self, spec, params, **overrides):
+        options = dict(
+            num_blocks=max(8, math.ceil(spec.seq / 2)), block_size=2, max_steps=spec.seq
+        )
+        options.update(overrides)
+        return PagedGenerator(BACKEND, params, spec, **options)
+
+    def test_hit_reuses_prefix_and_matches_independent(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=12)
+        gen = self._generator(spec, params)
+        gen.generate([1, 4, 7], max_new_tokens=0, rid=1)
+
+        prompt = [1, 4, 7, 2, 5]
+        got = gen.generate(prompt, max_new_tokens=3, rid=2)
+        self.assertEqual(got, _dense_greedy(params, spec, prompt, 3))
+        info = gen.stats()
+        self.assertEqual(info["prefix_hits"], 1)
+        self.assertEqual(info["prefix_reused_tokens"], 3)
+        self.assertEqual(info["prefix_misses"], 1)  # 第一条 prompt 没命中
+
+    def test_hit_shares_blocks_instead_of_copying(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=14)
+        gen = self._generator(spec, params)
+        gen.generate([1, 4, 7], max_new_tokens=0, rid=1)
+        used = gen.stats()["used_blocks"]
+
+        gen.generate([1, 4, 7, 2], max_new_tokens=0, rid=2)
+        info = gen.stats()
+        # 子序列只多一个 token：共享父的两页，至多因写尾页多一页（写时复制）
+        self.assertLessEqual(info["used_blocks"] - used, 1)
+        self.assertGreater(info["shared_blocks"], 0)
+        self.assertEqual(info["forks"], 1)
+
+    def test_longest_prefix_wins(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=16)
+        gen = self._generator(spec, params)
+        gen.generate([1, 4], max_new_tokens=0, rid=1)
+        gen.generate([1, 4, 7], max_new_tokens=0, rid=2)  # 命中 rid=1 的 2 个
+        gen.generate([1, 4, 7, 9, 2], max_new_tokens=2, rid=3)  # 命中 rid=2 的 3 个
+
+        info = gen.stats()
+        self.assertEqual(info["prefix_hits"], 2)
+        self.assertEqual(info["prefix_reused_tokens"], 5)
+        self.assertEqual(
+            gen.generate([1, 4, 7, 9, 2, 5], max_new_tokens=1, rid=4),
+            _dense_greedy(params, spec, [1, 4, 7, 9, 2, 5], 1),
+        )
+
+    def test_equal_length_and_swapped_are_not_reused(self):
+        spec = _vocab_spec(seq=8)
+        params = _vocab_params(spec, seed=18)
+
+        swapped = self._generator(spec, params, num_blocks=4, block_size=2)
+        swapped.generate([1, 4, 7], max_new_tokens=0, rid=1)
+        swapped.suspend(1, evict=True)
+        got = swapped.generate([1, 4, 7, 2], max_new_tokens=1, rid=2)
+        self.assertEqual(swapped.stats()["prefix_hits"], 0)
+        self.assertEqual(got, _dense_greedy(params, spec, [1, 4, 7, 2], 1))
+
+        equal = self._generator(spec, params)
+        equal.generate([1, 4, 7], max_new_tokens=0, rid=1)
+        # 等长：没有"尚未解码的位置"，不能从父序列的末尾续写
+        equal.generate([1, 4, 7], max_new_tokens=1, rid=2)
+        self.assertEqual(equal.stats()["prefix_hits"], 0)
+
+    def test_disabled_cache_keeps_sequences_independent(self):
+        spec = _vocab_spec()
+        params = _vocab_params(spec, seed=20)
+        gen = self._generator(spec, params, prefix_cache=False)
+        gen.generate([1, 4, 7], max_new_tokens=0, rid=1)
+        used = gen.stats()["used_blocks"]
+
+        gen.generate([1, 4, 7, 2], max_new_tokens=1, rid=2)
+        info = gen.stats()
+        self.assertEqual(info["prefix_hits"], 0)
+        self.assertEqual(info["prefix_misses"], 0)
+        self.assertEqual(info["shared_blocks"], 0)
+        self.assertGreater(info["used_blocks"], used)
+
+
 if __name__ == "__main__":
     unittest.main()

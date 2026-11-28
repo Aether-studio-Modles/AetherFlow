@@ -593,6 +593,13 @@ class PagedGenerator:
     ``max_new_tokens`` 超过它就显式报错——位置编码是有限表，越界没有定义。
     池满且所有序列都 active 时 ``step`` 照旧抛 ``PagedCacheFullError``，此时
     序列长度与 token 历史都不变，``suspend`` 别的请求后可以重试。
+
+    **前缀缓存**（5.335，``prefix_cache=True`` 时默认开启）：``generate`` 不传
+    ``fork_from`` 时，自动在所有驻留序列里找"token 序列是 prompt 严格前缀"
+    且最长的一条，``fork`` 它并只 prefill 多出来的部分。父子共享页，命中不占
+    新页；命中数与被复用的 token 数记在 :meth:`stats` 的 ``prefix_hits`` /
+    ``prefix_reused_tokens`` / ``prefix_misses`` 里。换出态序列不参与匹配
+    （``fork`` 要求驻留），等长序列也不行——生成需要一个尚未解码的位置。
     """
 
     def __init__(
@@ -606,6 +613,7 @@ class PagedGenerator:
         block_size: int = 4,
         on_swap_out=None,
         on_swap_in=None,
+        prefix_cache: bool = True,
     ) -> None:
         if isinstance(spec.vocab, bool) or not isinstance(spec.vocab, int):
             raise TypeError(
@@ -668,6 +676,12 @@ class PagedGenerator:
         self._head_feed = {w_head.name: np.asarray(params["w_head"], dtype=np.float32)}
 
         self._tokens: Dict[int, List[int]] = {}
+        self._prefix_cache = bool(prefix_cache)
+        self._prefix_stats = {
+            "prefix_hits": 0,
+            "prefix_reused_tokens": 0,
+            "prefix_misses": 0,
+        }
 
     # -- 只读视图 -----------------------------------------------------
 
@@ -681,7 +695,9 @@ class PagedGenerator:
         return self._scheduler.is_swapped(rid)
 
     def stats(self) -> Dict[str, int]:
-        return self._scheduler.stats()
+        info = self._scheduler.stats()
+        info.update(self._prefix_stats)
+        return info
 
     def tokens(self, rid: int) -> List[int]:
         """这条序列已经解码过的 token（``fork`` 前缀校验用的就是它）。"""
@@ -704,6 +720,27 @@ class PagedGenerator:
             raise ValueError(f"序列 {child!r} 已经提交；fork 需要一个新的 id")
         self._scheduler.fork(parent, child)
         self._tokens[child] = list(self._tokens[parent])
+
+    def _match_prefix(self, ids: List[int], *, exclude: int):
+        """最长的"token 序列是 ``ids`` 严格前缀"的驻留序列；没有返回 ``None``。
+
+        扫全部驻留序列而不是维护哈希索引：序列数在单进程里是个位数到几十，
+        而索引要在 ``finish`` / ``fork`` / ``suspend`` 三处同步失效，维护成本
+        高于收益。三个排除条件都是正确性要求：自身（还没 submit，本就不会
+        命中，保留是为了防御调用顺序变化）、换出态（``fork`` 要求驻留）、
+        等长（生成需要一个尚未解码的位置）。
+        """
+        best_rid, best_len = None, 0
+        for rid, seen in self._tokens.items():
+            size = len(seen)
+            if rid == exclude or size <= best_len or size >= len(ids):
+                continue
+            if self._scheduler.is_swapped(rid):
+                continue
+            if ids[:size] != seen:
+                continue
+            best_rid, best_len = rid, size
+        return best_rid
 
     def suspend(self, rid: int, *, evict: bool = False) -> bool:
         return self._scheduler.suspend(rid, evict=evict)
@@ -775,6 +812,11 @@ class PagedGenerator:
         的全部 token 开头，只对多出来的部分做 prefill。生成结束后序列仍然
         驻留（可以继续 :meth:`feed` 或 :meth:`stats`），回收请显式
         :meth:`finish`。
+
+        ``fork_from=None`` 且构造时 ``prefix_cache=True``（默认）时，按
+        "最长严格前缀"自动选父序列——调用方不需要知道父序列的 id，命中只
+        多出 prefill 剩余 token 的成本。显式 ``fork_from`` 优先，且不在
+        该分支记命中/未命中（那是调用方的显式决策，不是缓存判断）。
         """
         ids = _token_ids(prompt, self.vocab, "prompt")
         if not ids:
@@ -794,8 +836,17 @@ class PagedGenerator:
             )
 
         if fork_from is None:
-            self.submit(rid)
-            consumed = 0
+            parent = self._match_prefix(ids, exclude=rid) if self._prefix_cache else None
+            if parent is None:
+                if self._prefix_cache:
+                    self._prefix_stats["prefix_misses"] += 1
+                self.submit(rid)
+                consumed = 0
+            else:
+                consumed = len(self._tokens[parent])
+                self._prefix_stats["prefix_hits"] += 1
+                self._prefix_stats["prefix_reused_tokens"] += consumed
+                self.fork(parent, rid)
         else:
             if fork_from not in self._tokens:
                 raise KeyError(f"序列 {fork_from!r} 没有提交；先 submit(rid)")
