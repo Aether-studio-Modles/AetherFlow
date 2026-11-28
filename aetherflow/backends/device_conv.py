@@ -20,6 +20,7 @@ from ..lower.plan import (
     plan_conv_tiled,
 )
 from .base import BackendCapabilityError
+from ..tuning.signature import conv2d_signature
 import numpy as np
 from .device_shared import _pair
 
@@ -729,6 +730,25 @@ class _ConvMixin:
         所以这里传一个有效的已有指针占位即可，不需要额外分配。
         """
         cp = self.cp
+        tile_w, roc, cb = self._conv_tile, self._conv_roc, self._conv_cb
+        # 三个旋钮都还是"自动"时才查配置库：调用方手动调过其中任意一项，
+        # 说明正在做 A/B，此时再叠库里的值会分不清"这次改的到底起没起作用"。
+        policy = self._schedule_policy
+        if policy is not None and tile_w is None and roc is None and cb is None:
+            cfg = self._scheduled_config(
+                "conv2d",
+                conv2d_signature(
+                    x.shape,
+                    weight.shape,
+                    stride=(sh, sw),
+                    padding=(ph, pw),
+                    dilation=(dh, dw),
+                    dtype=x.dtype,
+                ),
+            )
+            if cfg is not None:
+                merged = policy.overlay(cfg, {"tile_w": None, "roc": None, "cb": None})
+                tile_w, roc, cb = merged["tile_w"], merged["roc"], merged["cb"]
         tiling = plan_conv_tiled(
             kh=kh,
             kw=kw,
@@ -736,9 +756,9 @@ class _ConvMixin:
             o=o,
             ho=ho,
             wo=wo,
-            tile_w=self._conv_tile,
-            roc=self._conv_roc,
-            cb=self._conv_cb,
+            tile_w=tile_w,
+            roc=roc,
+            cb=cb,
         )
 
         out = cp.empty((n, o, ho, wo), dtype=x.dtype)

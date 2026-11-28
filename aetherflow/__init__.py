@@ -157,6 +157,7 @@ from .runtime.telemetry import RunRecord, TelemetryRecorder, load_records
 from .tuning import (
     AllRejectedError,
     ConfigStore,
+    SchedulePolicy,
     TuningRecord,
     TuningResult,
     TuningSpace,
@@ -283,6 +284,7 @@ __all__ = [
     "unregister_operator",
     "AllRejectedError",
     "ConfigStore",
+    "SchedulePolicy",
     "TuningRecord",
     "TuningResult",
     "TuningSpace",

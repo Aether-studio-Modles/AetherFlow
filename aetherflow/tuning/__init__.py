@@ -48,6 +48,7 @@ from .paired import (
     tune_replicated,
     tune_staged,
 )
+from .policy import SchedulePolicy
 from .search import (
     AllRejectedError,
     CandidateResult,
@@ -55,6 +56,7 @@ from .search import (
     measure_configs,
     tune,
 )
+from .signature import block_signature, conv2d_signature
 from .space import TuningSpace, canonical_signature
 from .store import STORE_VERSION, ConfigStore, TuningRecord
 
@@ -71,13 +73,16 @@ __all__ = [
     "PairedResult",
     "RankedTuningResult",
     "STORE_VERSION",
+    "SchedulePolicy",
     "TuningRecord",
     "TuningResult",
     "TuningSpace",
     "V100_LIKE",
     "VOTE_ALL",
     "VOTE_MAJORITY",
+    "block_signature",
     "canonical_signature",
+    "conv2d_signature",
     "conv_tile_cost",
     "cost_ranked_tune",
     "elementwise_cost",

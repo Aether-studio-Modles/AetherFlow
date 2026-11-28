@@ -61,6 +61,9 @@ from ..lower.plan import (
 )
 from ..runtime.bf16 import pack_bf16 as pack_bf16, unpack_bf16
 from ..tuning.space import TuningSpace
+from ..tuning.policy import SchedulePolicy
+from ..tuning.signature import block_signature
+from ..tuning.store import ConfigStore
 from .base import BackendCapabilityError
 from .contracts import MemoryStats
 from .registry import KernelRegistry
@@ -264,6 +267,10 @@ class DeviceBackend(
         self._conv_tile: Optional[int] = None
         self._conv_roc: Optional[int] = None
         self._conv_cb: Optional[int] = None
+        # 执行期调度策略（配置库按形状命中的入口）。``None`` = 没有接库，
+        # 行为与之前完全一致；显式 ``set_tuning`` 与构造参数 ``block`` 永远
+        # 排在它前面，见 ``_launch_block`` 的优先级说明。
+        self._schedule_policy: Optional[SchedulePolicy] = None
         # f16 支持面：子类声明的集合优先，否则就是全部已实现算子
         self._f16_ops: FrozenSet[str] = self._OPS if self._F16_OPS is None else self._F16_OPS
         # bf16 支持面：默认空集，子类显式声明才开启（见 ``_BF16_OPS``）
@@ -1081,6 +1088,56 @@ class DeviceBackend(
             out[_CONV_TILE_OP] = conv
         return out
 
+    def set_schedule(self, store: ConfigStore, *, enabled: bool = True) -> SchedulePolicy:
+        """接一个配置库：之后 launch 时按形状签名查表。
+
+        接上以后优先级是：按算子 ``set_tuning`` 的覆盖 → 构造参数 ``block``
+        → 配置库 → 按规模自动。前两者是人当场下的指令，库是过去测出来的
+        建议，自动是没人说话时的兜底——库排在自动前面，但不越过人。
+
+        conv2d 只在三个旋钮都为 ``None`` 时查库：手动调过其中任意一项，
+        说明调用方正在做 A/B，此时混入库里的值会让"这次改了什么"说不清。
+
+        本方法只换策略对象并作废派生缓存，不校验库里的几何约束——那些要在
+        真正 launch 前结合形状判断（见 ``plan_conv_tiled``）。
+        """
+        policy = SchedulePolicy.from_backend(self, store, enabled=enabled)
+        self._schedule_policy = policy
+        self._invalidate_plans()
+        return policy
+
+    def clear_schedule(self) -> None:
+        """断开配置库，回到"覆盖 → 构造参数 → 自动"。"""
+        self._schedule_policy = None
+        self._invalidate_plans()
+
+    def schedule_policy(self) -> Optional[SchedulePolicy]:
+        """当前接的调度策略；没接时 ``None``。"""
+        return self._schedule_policy
+
+    def _scheduled_config(self, op: str, signature: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """查库；没接库、已禁用或未命中都返回 ``None``。"""
+        policy = self._schedule_policy
+        if policy is None or not policy.enabled:
+            return None
+        return policy.lookup(op, signature)
+
+    def _scheduled_block(self, op: str, signature: Mapping[str, Any]) -> Optional[int]:
+        """库里的 block；未命中或记录里没有 ``block`` 时返回 ``None``。
+
+        值合法性与 ``set_tuning`` 同一口径：非 2 的幂 / 越界直接抛错，不静默
+        退回自动——否则一条写坏的记录会表现为"调优没生效"，很难查。
+        """
+        policy = self._schedule_policy
+        cfg = self._scheduled_config(op, signature)
+        if cfg is None or policy is None:
+            return None
+        block = policy.overlay(cfg, {"block": None})["block"]
+        if block is None:
+            return None
+        check_block(block)
+        return block
+
     def _require_tunable(self, op: str) -> None:
         """``op`` 是否接受按算子的 block 覆盖。
 
@@ -1095,18 +1152,26 @@ class DeviceBackend(
     def _launch_block(self, op: str, work: int, vec: int = 1) -> int:
         """该算子这一次 launch 用多大 block。
 
-        优先级：按算子的调优覆盖 → 构造参数给的固定值 → 按规模自动选。
-        前两者都是"人定的"，自动只在没人说话时接手。
+        优先级：按算子的调优覆盖 → 构造参数给的固定值 → 配置库 → 按规模自动。
+        前三者都是"定了的"，自动只在没人说话时接手。库排在自动之前、人之后：
+        它是别的时刻测出来的建议，不该推翻调用方当场设的值。
+
+        签名只用 ``work`` 与 ``vec``，不含 dtype：线程铺法取决于"有多少活、
+        每个线程搬几个"，与元素类型无关。离线写库也用 ``block_signature``，
+        两边必须传同一组字段，否则永远不命中。
         """
         override = self._blocks.get(op)
         if override is not None:
             return override
         if self.block is not None:
             return self.block
+        scheduled = self._scheduled_block(op, block_signature(op, work=work, vec=vec))
+        if scheduled is not None:
+            return scheduled
         return auto_block(work, vec=vec, preferred=BLOCK_DEFAULT, target_blocks=self.sm_count)
 
     def _reduce_block(self, op: str, cols: int) -> int:
-        """归约类这一次 launch 的 block：覆盖 → 构造参数 → 按列数推导。
+        """归约类这一次 launch 的 block：覆盖 → 构造参数 → 配置库 → 按列数推导。
 
         与 ``_launch_block`` 的优先级一致，但默认值来自 ``plan_reduce``：末维
         归约是"一个 block 一行"，block 应当不小于列数，让块内归约一次做完；
@@ -1121,6 +1186,9 @@ class DeviceBackend(
             return override
         if self.block is not None:
             return self.block
+        scheduled = self._scheduled_block(op, block_signature(op, work=cols))
+        if scheduled is not None:
+            return scheduled
         return plan_reduce(cols)
 
     def _grid(self, op: str, work: int, vec: int = 1) -> Tuple[int, int]:
