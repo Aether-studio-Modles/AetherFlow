@@ -47,7 +47,8 @@
   饱和到 ±448，e5m2 溢出到 inf，5.318），设备端无存储与内核、显式拒绝；
   NHWC 布局传播 pass 与后端布局声明（仅参考后端承接）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
-  支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8 显式拒绝；
+  支持按需读取单张量与分片目录合并、bf16 无损展宽为 f32、fp8（e4m3 / e5m2）
+  按位模式解码成 f32 载体（5.318 / 5.319）；
   `load_into_store` 把外部张量装进参数容器——名字映射、PyTorch `nn.Linear` 布局
   转置、有损 dtype 转换都要显式声明，先全量校验再原地写，失败不留半装状态
   （5.313）；`load_quantized_linear` / `QuantizedWeight` 读量化权重——int8 强制、
@@ -113,7 +114,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3194 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3195 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
@@ -148,8 +149,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   tensor core（没有 IMMA / wmma 分块），**不要期待"int8 算得更快"的结论**；
   QAT 到假量化算子（`fake_quantize_i8`，5.311）与 LSQ 的可学步长版本
   （`fake_quantize_i8_lsq`，5.312）——后者要求 scale 作为图输入才能收到梯度，
-  没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 只有参考语义
-  （e4m3 / e5m2，5.318），设备端没有存储容器与内核、遇到即显式拒绝；
+  没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 有参考语义与
+  权重读取入口（e4m3 / e5m2，5.318 / 5.319），设备端没有存储容器与内核、
+  遇到即显式拒绝；
   W8A8 也尚无反向（bias 除外）。非对称零点与逐组反量化只有参考语义与构图入口
   （5.315 / 5.317），CUDA / HIP 没有内核、遇到即显式拒绝，因此这两条路径目前
   不能用于真机推理；也没有主机侧的逐组量化 helper（写侧由导出器负责）。
