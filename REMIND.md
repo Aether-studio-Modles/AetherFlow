@@ -24,6 +24,10 @@
   carried"的规范形态，`split_invariants` 把每轮重算但不变的纯计算搬进
   preheader（`LoopSplit`），数值与原循环逐位相同；带 RNG / STATE / IO 的节点
   与依赖 carried 的节点留在体内。支持 JSON 往返，嵌套控制区域显式拒绝。
+- **调优接进执行路径**（5.333）：`SchedulePolicy` 按 `backend + device + op +
+  形状签名` 查配置库，命中后覆盖逐元素 / 归约的 block 与 conv2d 的
+  tile/roc/cb。优先级是"显式 `set_tuning` → 构造参数 → 库 → 自动"；未命中
+  统计可查，库里的坏值（如非 2 的幂的 block）当场报错而不是静默回退。
 - **自动微分**：49 条 VJP 规则，反向图是普通可序列化图；支持二阶导、激活重算、反向图裁剪。
 - **训练**：MLP / CNN / RNN / Transformer / Mamba / SNN 构件；数据并行
   （5.331 起 NCCL / RCCL 可加载时**默认设备侧归约**：单进程多卡自动
@@ -139,7 +143,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3317 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3343 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
 | CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `139 executed / 1 refused / 0 failed`（5.325 后；`cast_f8e4m3` / `cast_f8e5m2` 首次执行、err=0.0，唯一的 refused 是 `f64_input_relu`；`matmul_partial_batch` err=4.8e-07 来自 f32 GEMM 累加顺序，`linear_i8a8_zp` 逐位相同、`linear_i8_zp` err=1.5e-05）；`tests.test_cuda_backend` 382 条 5.1 秒全过（2 跳过）；未跑全量 unittest |
@@ -200,6 +204,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   也未接进 schedule 搜索或编译流水线。条件图不参与外提（每轮必须求值）；
   外提判据只有"是否依赖状态 + 是否纯"，没有成本模型，极小的不变计算可能
   不如留在体内。
+- **配置库的执行期命中面很窄**（5.333）：只接了逐元素 / 归约 block 与
+  conv2d 分块核三个旋钮；im2col / implicit GEMM / Winograd / matmul 的选型
+  仍走启发式。没测过的形状照旧走自动，不做在线探索；库被改写要重新
+  `set_schedule`，不做热更新。block 签名不含 dtype（线程铺法与元素类型无关），
+  离线写库必须用同一个 `block_signature`。
 - **设备端控制流**：`DeviceWhileLoop` / `DeviceConditional` 把条件、分支各捕获一次、
   状态与输出常驻显存，但每次判定仍要读一次谓词；实测**不比宿主路径快**，交付的是
   执行形态而非加速。没有 device-side 真分支，`Conditional` / `WhileLoop` 的判定
@@ -832,6 +841,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **重写后必须过 verifier**（5.332）：外提最容易出的事故是"新图少一条边"，
   而它看起来仍是一张合法 DAG；`split_invariants` 对 preheader 与新体各跑
   一次 verify，ERROR 直接抛。
+- **写库与查库必须是同一个签名函数**（5.333）：执行期用
+  `tuning.signature.block_signature` / `conv2d_signature`，离线脚本也必须用
+  它们。手工拼 `{"work": 4096}` 这类字典很容易多一个键或把 tuple 留成
+  tuple，结果是"库里有记录、运行时永远 miss"，且不会报错。
+- **库里的坏值要报错而不是回退**（5.333）：配置记录等于"预置的
+  `set_tuning`"。`block=96` 会被内核按 3 的倍数派线程，静默退回自动只会
+  表现为"调优没生效"；`overlay` 对非正整数抛错，几何越界交给
+  `plan_conv_tiled` 在执行前拒绝。
+- **conv2d 只在三个旋钮全为 None 时查库**（5.333）：手动设过任意一项说明
+  正在做 A/B；此时叠库里的值会分不清"这次改的到底起没起作用"。命中后用
+  局部变量，不回写 `_conv_*` 字段。
 
 ---
 

@@ -21167,6 +21167,76 @@ carried 初值的显式错误、JSON 往返与三类非法存档。
   preheader 多一次图执行可能不划算。
 
 
+### 5.333 调度配置接进执行路径：按形状命中的 `SchedulePolicy`
+
+**缺口。** 配置库（5.37，搜索与配对判定见 5.140～5.160）与执行路径之间
+一直没有桥。`tune` / `cost_ranked_tune` 能把"某张卡、某个形状下实测最快"
+写进 `ConfigStore`，`agent_api.recommend_config` 能把它查出来给智能体看
+——但真正 launch 时，`_launch_block` / `_reduce_block` / `_conv2d_tiled`
+只看 `set_tuning` 的覆盖与启发式，库里的答案不会自己生效。结果就是
+"测过、存过，跑起来还是老样子"。
+
+**1. 签名必须与写库时同源。** 新增 `tuning/signature.py`：
+`block_signature(op, *, work, vec=1, dtype=None)` 与
+`conv2d_signature(x_shape, weight_shape, *, stride, padding, dilation, groups,
+dtype)`。两者都过 `canonical_signature`（tuple 与 list 统一成 list、dtype 转
+字符串），保证"写库脚本算出的键"与"执行期算出的键"是同一个 JSON 字符串。
+形状长度不为 2 直接抛 `ValueError`——`_pair` 式的长度校验放在入口，比在
+配置库里留一条永远匹配不上的记录好查。
+
+**2. `SchedulePolicy`：查表、缓存、统计。** 新模块 `tuning/policy.py`。
+四段键与库一致（`backend + device + op + signature`）；`from_backend` 剥掉
+上报包装层（`inner`），设备名取 `device_info().name`，取不到写 `"unknown"`
+——与库的写入口径一致，不编造。`lookup` 按 `(op, 规范签名)` 缓存结果（包括
+"没有记录"），逐次 launch 不再重复序列化签名；`enabled=False` 时直接返回
+`None` 且不计入统计，"没开"与"没命中"要能分开。
+
+`overlay(config, current)` 只覆盖**当前认识的键**：未知键（旧版本记录多带
+的参数）忽略并计入 `unknown`；值不是正整数或 `None` 则抛 `ValueError`，
+与 `set_tuning` 同一口径。库里一条 `block=96` 的记录会让内核按 3 的倍数
+派线程，静默退回自动只会表现为"调优没生效"，所以宁可当场报错。`None`
+是合法值，表示该项仍交给计划层按形状推导。
+
+**3. 接通执行路径与优先级。** `DeviceBackend` 增加
+`set_schedule(store)` / `clear_schedule()` / `schedule_policy()`，前者按
+后端自身的 `name` 与设备名建策略并 `_invalidate_plans()`。优先级固定为：
+
+```
+按算子 set_tuning 覆盖 → 构造参数 block → 配置库 → 按规模自动
+```
+
+前两者是人当场下的指令，库是过去测出来的建议，自动是没人说话时的兜底。
+`_launch_block` 的签名只用 `work` 与 `vec`，不含 dtype：block 是线程铺法，
+取决于"有多少活、每线程搬几个"，与元素类型无关；离线写库也必须用同一组
+字段，否则永远不命中（文档写在两个函数的 docstring 里）。
+
+conv2d 只在 `_conv_tile` / `_conv_roc` / `_conv_cb` **全为 `None`** 时查库，
+命中后用局部变量覆盖三个旋钮传给 `plan_conv_tiled`，不改后端字段：调用方
+手动调过其中任意一项，说明正在做 A/B，此时混入库里的值会让"这次改的到底
+起没起作用"说不清。几何约束（`tile_w * block_y <= 1024` 等）仍由
+`plan_conv_tiled` 在真正执行前判断，坏值同样报错而不是静默回退。
+
+**验证。** `tests/test_schedule_policy.py` 26 条：签名键与 JSON 往返、
+tuple/list 等价、形状非法报错；命中 / 未命中 / 禁用不计 / 缓存计数 / 返回值
+是副本 / 空签名与非法构造参数；`from_backend` 剥包装层、设备名缺失记
+`unknown`、设备名可显式覆盖；`overlay` 的覆盖 / 忽略未知键 / 坏值报错 /
+`None` 表自动；后端优先级（显式覆盖 > 构造参数 > 库 > 自动）、库中非法
+block 报错、`clear_schedule` 回到自动、`set_schedule` 作废计划缓存。
+用例用 `object.__new__(DeviceBackend)` 装上 `_launch_block` 需要的字段，
+不启动硬件——这一层要钉的是优先级，不是这张卡快不快。
+
+**未声称。**
+
+- 不做"运行时自动发现在跑什么并触发搜索"。接库只回答"已经测过的形状用
+  什么"，没测过的形状仍走启发式与成本模型；在线探索要先有可信测量。
+- 配置库在执行期被改写不会自动生效：`SchedulePolicy` 缓存的是查表结果，
+  更新库后要重新 `set_schedule`，不做隐式热更新。
+- 只接了逐元素 / 归约的 block 与 conv2d 分块核的三个旋钮。im2col、
+  implicit GEMM、Winograd 与 matmul 的选型还没有按形状查库的入口。
+- 同一份配置的收益仍以真机测量为准；本轮只保证"库里的答案会被用上、用错
+  会报错"，不声称任何加速比。
+
+
 
 
 
