@@ -19107,7 +19107,7 @@ cc 112 段 0.359（6.4%）。
 | --- | --- | --- |
 | 1 | bool 已是一等类型（5.330）、导入侧已接（5.340）、设备端归约内核已接（5.341）；仅剩真机回归 | 带 mask 的模型能进、参考端与设备端都能跑逻辑组合；`reduce_all` / `reduce_any` 缺 V100 / gfx1100 上的 conformance |
 | 2 | 设备侧归约已是数据并行默认（5.331），主机态已有桶间并发归约（5.302）；仍缺"设备态与反向重叠"与 P2P | 多卡扩展性（设备态反向是整图 capture / replay，准入判据见 5.338） |
-| 3 | 量化只到 weight-only int8 | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，但仍无 fp8 GEMM 与存储容器） |
+| 3 | 量化只到 weight-only int8 | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，fp8 线性层见 5.327，1 字节存储与 packed 线性层见 5.328，逐组 scale 与两端打包的 W8A8 见 5.342；仍无 fp8 tensor core，解码仍是标量循环） |
 | 4 | 无调度搜索 / GEMM epilogue（loop IR 见 5.332、原生 NHWC 见 5.334；5.333 只把配置库接进执行路径） | 峰值性能上限 |
 | 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中；前缀缓存的自动匹配见 5.335，跨进程 / 落盘复用见 5.337） |
 | 6 | 国产卡后端 | 特定硬件市场（天数 / 沐曦两个硬件包已在各自仓库真机跑通，主仓侧契约验收通过；主仓未跑 conformance，见 5.336） |
@@ -21842,6 +21842,90 @@ mtime、不重写。`generate` 之后紧接 `finish` 会连着走两次 `_persis
 - 一次归约的轴长上限 `2^24`；更长请先分段再合并。
 - `reduce_sum(bool)` 仍然拒绝（5.330 的约束不变，计数先 `cast` 到 f32）。
 - bool 归约没有梯度（5.330：掩码不该进损失）。
+
+### 5.342　fp8 逐组 scale 与 packed 激活
+
+**缺口。** 5.328 的 `linear_fp8_packed` 只接 `(1,)` / `(N,)` 的 scale，逐组
+scale 在构图期显式拒绝并留到 5.329；5.329 的"未声称"又把它留作独立阶段。
+另一边，packed 只打包权重，激活仍是 f32 载体。于是 fp8 的"1 字节存储"只覆盖
+了一半：权重侧没有 GPTQ / AWQ 那种 `group_size` 形态，激活侧完全没有打包。
+这两条是 5.328 / 5.329 遗留项，本节补齐。
+
+**不扩展既有契约。** `linear_fp8_packed` 的内核只在内层循环外读一次 scale
+（`ws[0]` 或 `ws[col]`），逐组 scale 沿 K 变化，塞进去要么静默只用第一组、
+要么退化成逐元素分支；激活打包则是另一个签名（多一路 `x_scale` 与激活码）。
+所以新增三个算子，既有四个 fp8 算子的签名与语义一字不动：
+
+- `dequantize_fp8_group(q_i8 (K, N), scale_f32 (K/G, N)[, kind]) -> f32`：
+  与 5.321 的 `dequantize_i8_group` 同构，组内共用一份 scale，参考语义是
+  `unpack_fp8(q) * repeat(scale, G)`。组数只从形状推（`K % K/G == 0`），
+  不另设 `group_size` attr——多一个可以和形状矛盾的旋钮只是多一条拒绝面。
+- `linear_fp8_group(x_f32 (..., K), q_i8 (K, N), weight_scale_f32 (K/G, N)
+  [, bias], kind) -> f32`：参考语义 `matmul(x, unpack(q) * repeat(scale))`
+  `[+ bias]`，与 `linear_i8_group` 同构，只是把 int8 换成 fp8 解码。
+- `linear_fp8a8_packed(x_q_i8 (..., K), x_scale_f32, w_q_i8 (K, N),
+  w_scale_f32[, bias], kind) -> f32`：两端都是 1 字节。参考语义是
+  `matmul(unpack(x_q) * broadcast(x_scale), unpack(w_q) * w_scale) [+ bias]`。
+
+**输出是 f32，不是 f8 载体。** `unpack_fp8` 的输出是 f8 载体，因为它只做位
+模式到格点值的转换；`dequantize_fp8_group` 乘上 scale 之后结果一般不在格点上
+（`scale` 不是 2 的幂时必然如此）。若沿用 f8 载体，执行器会在节点边界把
+`unpack(q) * scale` 二次舍入回 fp8 格点：`1.875 * 0.75 = 1.40625` 会被舍成
+`1.375`，误差一整个 fp8 间距。所以它的输出 dtype 是 `f32`，与
+`dequantize_i8_group` 一致。连带结果是它**不进** `FP8_OPS`：图里没有 fp8
+类型，白名单的"带 fp8 载体的节点"这一族与它无关。
+
+**设备端。** 两个专用内核（均复用 `_FP8_COMMON_SRC` 的 `af_fp8_decode`）：
+
+- `af_dequantize_fp8_group`：照 `_DEQUANTIZE_I8_GROUP_SRC`，把整数乘换成
+  寄存器解码再乘 scale，一组一份 scale。
+- `af_linear_fp8a8_packed`：照 `_LINEAR_I8A8_SRC` 的朴素结构，每线程一个输出
+  元素，权重与激活都按 `unsigned char` 读、在寄存器里解码，`(x*xs)*(w*ws)`
+  的顺序与参考一致，f32 顺序累加。`xs_stride` / `ws_stride` 为 0 表示逐张量 /
+  逐 token 的共享 scale，为 1 表示逐行 / 逐列。
+
+`linear_fp8_group` 没有专用内核：`_op_dequantize_fp8_group` → `_op_matmul`
+→ 可选 `_add`，与 `_op_linear_i8_group` 同一形状。代价是物化一份 f32 权重
+副本，换来的是与 int8 逐组路径共用同一份 GEMM 与同一套形状校验。
+
+**拒绝面。** 构图期只看得见形状，值域的检查放在参考语义与设备端：
+
+- 三个算子都要求 scale 严格为正——`min(scale) <= 0` 在 reference 里
+  `raise ValueError`，设备端在读数到主机后同样报错。
+- `linear_fp8a8_packed` 的 `x_scale` 允许 0 维（逐张量）或
+  `x_q.shape[:-1] + (1,)`（逐 token）；`shape[-1] != 1` 的激活 scale 沿 K
+  变化，无法在解码前提到循环外，构图期直接拒绝。`w_scale` 秩 ≤ 1 且长度
+  为 1 或 `N`。
+- 权重必须是 i8 位模式、激活是 f32、内维一致、bias 长度 `N`，与 5.327 /
+  5.328 同一口径。
+
+**主机侧。** `quantize_weight_fp8_group(weight, group_size, kind)`：每
+`group_size` 行取 abs-max 除以 `FP8_MAX[kind]`，`scale` 形状 `(K/G, N)`，
+全零组给 1.0；组大小必须整除 `K`。它返回的是**格点载体**（不含 scale），与
+`FP8Weight.dequantize()` 的口径一致——`FP8Weight` 早就支持 `group_size`
+与 `(K/G, N)` 的 scale，本节只补 IR 与设备承接，容器不动。
+
+**验证。** `tests/test_quantize.py` 新增 9 条：逐组反量化的组边界（相邻组
+量级差一个数量级时必须用各自的 scale）、e5m2 与不等组的对拍、逐组线性层与
+手写 `matmul(x, unpack*repeat)` 对拍、packed 激活与 f32 路径对拍（含 bias）、
+两个标量 scale 入口、逐组与 packed 的形状 / dtype 拒绝面、非正 scale、
+写侧 helper 与误差界、JSON 往返、设备源码与 `GPU_OPS` / `_INDEX_ARGS` 对账。
+`conformance.py` 新增 5 条（`dequantize_fp8_group_e4m3`、
+`linear_fp8_group_e4m3_bias`、`linear_fp8_group_e5m2_rank2`、
+`linear_fp8a8_packed_e4m3_bias`、`linear_fp8a8_packed_e5m2_rank2`），参考
+后端全部通过。ruff 通过；全量测试见 REMIND 的当轮记录。
+
+**未声称。**
+
+- 不省算力：解码在寄存器里做，没有 fp8 tensor core，算力与 f32 GEMM 持平
+  或更慢。`linear_fp8a8_packed` 的收益是读带宽（激活 4 字节 → 1 字节），
+  不是吞吐。
+- `linear_fp8_group` 在设备端会物化 f32 权重副本，显存峰值不降；它降的是
+  调用方持有的常驻字节数，不是运行期峰值。
+- 三个算子都没有反向规则（量化权重与量化激活按冻结常量处理，与 5.327 /
+  5.328 / 5.309 一致）。
+- 设备端只做源码级验证；V100 / gfx1100 上的 conformance 与 `verify_cuda.py`
+  仍待授权执行。
 
 
 

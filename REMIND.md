@@ -16,7 +16,7 @@
 
 ### 亮点
 
-- **一份语义 IR，多个硬件后端**：104 个 IR 算子，CUDA 承接 102 个、HIP 承接 100 个；
+- **一份语义 IR，多个硬件后端**：107 个 IR 算子，CUDA 承接 105 个、HIP 承接 103 个；
   新增硬件只需写插件，不改 IR、verifier、前端与优化。
 - **一份参考语义**：每个算子都有不依赖加速库的 numpy 定义，是跨后端对齐的唯一真值；
   `conformance` 套件按算子逐项比对，支持不了的地方显式失败，不静默降级。
@@ -68,8 +68,13 @@
   存成 1 字节的 `pack_fp8` / `unpack_fp8`（IR 用 i8 位模式承载）与融合内核
   `linear_fp8_packed`（5.328：权重 1 字节驻留、设备端解码后乘 scale 累加，
   读带宽降到 f32 载体的 1/4，但不省算力；主机侧入口
-  `FP8Weight.pack()` / `load_fp8_linear(packed=True)`），其它算子遇到 fp8
-  仍显式拒绝；
+  `FP8Weight.pack()` / `load_fp8_linear(packed=True)`），逐组 scale 的
+  `dequantize_fp8_group` / `linear_fp8_group`（`(K/G, N)` 组 scale，组数由
+  形状推出；反量化输出 f32，不走 f8 载体，避免节点边界把乘过 scale 的值
+  二次舍入回格点）与两端都打包的 W8A8 `linear_fp8a8_packed`（激活与权重
+  各 1 字节、专用内核寄存器解码、f32 累加，5.342），主机侧入口
+  `quantize_weight_fp8_group`；其它算子遇到 fp8 仍显式拒绝；没有 fp8
+  tensor core，收益是读带宽不是算力；
   NHWC 布局传播 pass 与后端布局声明（设备端自 5.334 起原生承接 conv2d 分块直算
   与 maxpool2d / avgpool2d 前向）。
 - **权重入口**：自带 `safetensors` 解析（不引第三方依赖，运行期仍只有 numpy），
@@ -881,6 +886,18 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **conv2d 只在三个旋钮全为 None 时查库**（5.333）：手动设过任意一项说明
   正在做 A/B；此时叠库里的值会分不清"这次改的到底起没起作用"。命中后用
   局部变量，不回写 `_conv_*` 字段。
+- **反量化的输出不是 f8 载体**（5.342）：`dequantize_fp8_group` 的输出
+  dtype 是 f32。用 f8 载体的话，执行器会在节点边界把
+  `unpack(q) * scale` 二次舍入回 fp8 格点——`1.875 * 0.75 = 1.40625`
+  被舍成 `1.375`，误差一整个间距（scale 不是 2 的幂时必然发生）。`unpack_fp8`
+  本身保持 f8 载体，因为它只做位模式到格点值、结果仍在格点上。这条也决定
+  了它不进 `FP8_OPS`：图里没有 fp8 类型，白名单只管带 fp8 载体的节点。
+- **fp8 逐组与两端打包的收益在读带宽**（5.342）：`linear_fp8a8_packed` 的
+  激活与权重各 1 字节，`linear_fp8_group` 的权重常驻 1 字节；解码都在寄存器
+  里做，没有 fp8 tensor core，算力与 f32 GEMM 持平或更慢。`linear_fp8_group`
+  在设备端还会物化一份 f32 权重副本（反量化 → sgemm），运行期显存峰值不降。
+  三个新算子都没有 VJP 规则（量化权重与量化激活按冻结常量处理），设备端
+  只做源码级验证，真机 conformance 待授权。
 
 ---
 
