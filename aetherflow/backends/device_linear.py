@@ -5,10 +5,12 @@ from __future__ import annotations
 from .base import BackendCapabilityError
 import numpy as np
 from .device_shared import (
+    _DEQUANTIZE_FP8_GROUP_SRC,
     _DEQUANTIZE_I8_GROUP_SRC,
     _DEQUANTIZE_I8_GROUP_ZP_SRC,
     _DEQUANTIZE_I8_SRC,
     _DEQUANTIZE_I8_ZP_SRC,
+    _LINEAR_FP8A8_PACKED_SRC,
     _LINEAR_FP8_PACKED_SRC,
     _LINEAR_I8A8_DP4A_SRC,
     _LINEAR_I8A8_SRC,
@@ -779,6 +781,213 @@ class _LinearMixin:
         )
         if len(args) > 3:
             out = self._binary("add", [out, args[3]])
+        return out
+
+    def _op_dequantize_fp8_group(self, node, args, attrs):
+        """逐组 fp8 反量化：i8 位模式 (K, N)，scale (K/G, N) 组内共用。
+
+        与 ``dequantize_i8_group`` 同形：组大小由 ``K / scale.shape[0]`` 推出。
+        区别只在读出后要先按 fp8 格点解码，乘法顺序与参考实现的
+        ``unpack_fp8(q) * repeat(scale)`` 相同，因此逐位一致。
+        """
+        cp = self.cp
+        q, scale = args
+        if q.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_fp8_group 第一个输入必须是 i8 位模式"
+                f"（用 pack_fp8 生成），收到 {q.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 dequantize_fp8_group 的 scale 必须是 f32，"
+                f"收到 {scale.dtype}"
+            )
+        cols, group = self._group_shape("dequantize_fp8_group", q, scale)
+        if float(np.min(self.to_host(scale))) <= 0.0:
+            raise BackendCapabilityError(
+                "dequantize_fp8_group 的 scale 必须严格为正；"
+                "非正 scale 的反量化为未定义"
+            )
+        kind = self._fp8_kind(attrs, "dequantize_fp8_group")
+        qq = self._contig(q)
+        ss = self._contig(scale)
+        out = cp.empty(qq.shape, np.float32)
+        n = int(qq.size)
+        if n == 0:
+            return out
+        kernel = self._kernel(
+            ("dequantize_fp8_group", kind),
+            _DEQUANTIZE_FP8_GROUP_SRC,
+            "af_dequantize_fp8_group",
+        )
+        block, grid = self._grid("dequantize_fp8_group", n)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                qq,
+                ss,
+                out,
+                np.int64(n),
+                np.int64(cols),
+                np.int64(group),
+                np.int32(kind),
+            ),
+        )
+        return out
+
+    def _op_linear_fp8_group(self, node, args, attrs):
+        """逐组 weight-only fp8 线性层：反量化后走既有 f32 GEMM。
+
+        与 ``linear_fp8_packed`` 的分界是 scale 的形状：那边只有逐张量 /
+        逐输出通道，这里沿 K 每 ``K/G`` 行共用一份（GPTQ / AWQ 的 group_size
+        形态）。做法与 ``linear_i8_group`` 同构——反量化会物化一份 f32 权重
+        副本，收益仍是"权重驻留 1 字节 + 更细的量化粒度"，不是算力。
+        """
+        cp = self.cp
+        x, qweight, scale = args[0], args[1], args[2]
+        if x.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_group 要求 x 是 f32，收到 {x.dtype}"
+            )
+        if qweight.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_group 要求权重是 i8 位模式"
+                f"（用 pack_fp8 生成），收到 {qweight.dtype}"
+            )
+        if scale.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_group 的 scale 必须是 f32，"
+                f"收到 {scale.dtype}"
+            )
+        if x.ndim < 2 or qweight.ndim != 2 or scale.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8_group 要求 x 秩 >= 2、权重秩 2、"
+                f"scale 秩 2，收到 {x.shape} / {qweight.shape} / {scale.shape}"
+            )
+        if int(qweight.shape[0]) != int(x.shape[-1]):
+            raise BackendCapabilityError(
+                f"linear_fp8_group 的内维不匹配：{x.shape} @ {qweight.shape}"
+            )
+        n = int(qweight.shape[-1])
+        if len(args) > 3:
+            bias = args[3]
+            if bias.dtype != cp.float32 or int(bias.size) != n:
+                raise BackendCapabilityError(
+                    f"linear_fp8_group 的 bias 必须是长度 {n} 的 f32，收到 "
+                    f"{bias.dtype} {bias.shape}"
+                )
+        weight = self._op_dequantize_fp8_group(node, [qweight, scale], attrs)
+        out = self._op_matmul(node, [x, weight], {})
+        if len(args) > 3:
+            out = self._binary("add", [out, args[3]])
+        return out
+
+    def _op_linear_fp8a8_packed(self, node, args, attrs):
+        """两端都打包的 W8A8：激活与权重各以 1 字节码驻留，寄存器里解码。
+
+        与 ``linear_fp8a8`` 的数值语义相同（f32 累加、按行 / 按列缩放），
+        区别是激活也不物化 f32 载体：内核按 ``unsigned char`` 读入并解码。
+        这正是 5.329 遗留的 "packed 激活"，驻留从 4 字节降到 1 字节。
+
+        累加仍是 f32（没有 fp8 tensor core），所以不宣称算力。激活 scale
+        允许标量或 ``x.shape[:-1] + (1,)``，与 ``linear_fp8a8`` 同口径；
+        ``xs_stride = 0`` 表示逐张量。
+        """
+        cp = self.cp
+        xq, xs, wq, ws = args[0], args[1], args[2], args[3]
+        if xq.dtype != cp.int8 or wq.dtype != cp.int8:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8a8_packed 要求激活与权重都是 i8 位模式，"
+                f"收到 {xq.dtype} 与 {wq.dtype}"
+            )
+        if xs.dtype != cp.float32 or ws.dtype != cp.float32:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8a8_packed 的 scale 必须是 f32，"
+                f"收到 {xs.dtype} 与 {ws.dtype}"
+            )
+        if xq.ndim < 2 or wq.ndim != 2:
+            raise BackendCapabilityError(
+                f"{self._LABEL}的 linear_fp8a8_packed 要求激活秩 >= 2、权重秩 2，"
+                f"收到 {xq.shape} 与 {wq.shape}"
+            )
+        if int(wq.shape[0]) != int(xq.shape[-1]):
+            raise BackendCapabilityError(
+                f"linear_fp8a8_packed 的内维不匹配：{xq.shape} @ {wq.shape}"
+            )
+        n = int(wq.shape[-1])
+        if xs.ndim == 0:
+            if int(xs.size) != 1:
+                raise BackendCapabilityError(
+                    f"linear_fp8a8_packed 的标量激活 scale 只能有 1 个元素，"
+                    f"收到 {xs.shape}"
+                )
+        elif (
+            int(xs.shape[-1]) != 1
+            or tuple(xs.shape[:-1]) != tuple(xq.shape[:-1])
+        ):
+            raise BackendCapabilityError(
+                f"linear_fp8a8_packed 的激活 scale 形状必须是激活的前导维加 1，"
+                f"收到 {xs.shape} 对 {xq.shape}"
+            )
+        if ws.ndim > 1 or int(ws.size) not in (1, n):
+            raise BackendCapabilityError(
+                f"linear_fp8a8_packed 的权重 scale 只能是逐张量标量或"
+                f"逐输出通道 ({n},)，收到 {ws.shape}"
+            )
+        if float(np.min(self.to_host(xs))) <= 0.0:
+            raise BackendCapabilityError(
+                "linear_fp8a8_packed 的激活 scale 必须严格为正；"
+                "非正 scale 的反量化为未定义"
+            )
+        if float(np.min(self.to_host(ws))) <= 0.0:
+            raise BackendCapabilityError(
+                "linear_fp8a8_packed 的权重 scale 必须严格为正；"
+                "非正 scale 的反量化为未定义"
+            )
+        if len(args) > 4:
+            bias = args[4]
+            if bias.dtype != cp.float32 or int(bias.size) != n:
+                raise BackendCapabilityError(
+                    f"linear_fp8a8_packed 的 bias 必须是长度 {n} 的 f32，收到 "
+                    f"{bias.dtype} {bias.shape}"
+                )
+        kind = self._fp8_kind(attrs, "linear_fp8a8_packed")
+        xx = self._contig(xq).reshape(-1, int(xq.shape[-1]))
+        ww = self._contig(wq)
+        xs_stride = 0 if int(xs.size) == 1 else 1
+        xs_flat = self._contig(xs).reshape(-1)
+        ws_stride = 0 if int(ws.size) == 1 else 1
+        ws_flat = self._contig(ws).reshape(-1)
+        m = int(xx.shape[0])
+        out = cp.empty((m, n), np.float32)
+        if m * n == 0:
+            return out
+        kernel = self._kernel(
+            ("linear_fp8a8_packed", kind),
+            _LINEAR_FP8A8_PACKED_SRC,
+            "af_linear_fp8a8_packed",
+        )
+        block, grid = self._grid("linear_fp8a8_packed", m * n)
+        kernel(
+            (grid,),
+            (block,),
+            (
+                xx,
+                xs_flat,
+                ww,
+                ws_flat,
+                out,
+                np.int64(m),
+                np.int64(int(xq.shape[-1])),
+                np.int64(n),
+                np.int64(xs_stride),
+                np.int64(ws_stride),
+                np.int32(kind),
+            ),
+        )
+        if len(args) > 4:
+            out = self._binary("add", [out, args[4]])
         return out
 
     def _op_linear_i8_zp(self, node, args, attrs):

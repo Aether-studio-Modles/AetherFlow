@@ -716,6 +716,86 @@ def _linear_fp8_packed(
     return build
 
 
+def _dequantize_fp8_group(
+    kind: str = "e4m3", shape: tuple = (8, 6), groups: int = 4
+):
+    """逐组 fp8 反量化：1 字节位模式 + ``(K/G, N)`` 的 scale，组内共用。"""
+
+    def build(rng):
+        g = Graph("dequantize_fp8_group")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(groups, shape[-1])])
+        g.output(g.add_node("dequantize_fp8_group", [q, s], {"kind": kind}), "y")
+        scale = (np.abs(_f32(rng, (groups, shape[-1]), scale=0.2)) + 0.05).astype(
+            np.float32
+        )
+        repeated = np.repeat(scale, shape[0] // groups, axis=0)
+        values = quantize_fp8(_f32(rng, shape, scale=1.5), repeated, kind)
+        return g, {"q": pack_fp8(values, kind).view(np.int8), "s": scale}
+
+    return build
+
+
+def _linear_fp8_group(
+    kind: str = "e4m3",
+    x_shape: tuple = (2, 3, 8),
+    w_shape: tuple = (8, 6),
+    groups: int = 4,
+):
+    """逐组 weight-only fp8：权重 1 字节驻留，scale 沿 K 每 K/G 行一份。"""
+    def build(rng):
+        g = Graph("linear_fp8_group")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(groups, w_shape[-1])])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(g.add_node("linear_fp8_group", [x, q, s, b], {"kind": kind}), "y")
+        scale = (np.abs(_f32(rng, (groups, w_shape[-1]), scale=0.2)) + 0.05).astype(
+            np.float32
+        )
+        repeated = np.repeat(scale, w_shape[0] // groups, axis=0)
+        values = quantize_fp8(_f32(rng, w_shape, scale=1.5), repeated, kind)
+        return g, {
+            "x": _f32(rng, x_shape, scale=0.5),
+            "q": pack_fp8(values, kind).view(np.int8),
+            "s": scale,
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
+def _linear_fp8a8_packed(
+    kind: str = "e4m3", x_shape: tuple = (2, 3, 8), w_shape: tuple = (8, 6)
+):
+    """两端都打包的 W8A8：激活与权重都是 1 字节位模式。"""
+    def build(rng):
+        g = Graph("linear_fp8a8_packed")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input("x_scale", f32[x_shape[:-1] + (1,)])
+        wq = g.input("w_q", i8[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        b = g.input("b", f32[(w_shape[-1],)])
+        g.output(
+            g.add_node("linear_fp8a8_packed", [q, sx, wq, sw, b], {"kind": kind}), "y"
+        )
+        x_scale = (np.abs(_f32(rng, x_shape[:-1] + (1,), scale=0.1)) + 0.02).astype(
+            np.float32
+        )
+        w_scale = (np.abs(_f32(rng, (w_shape[-1],), scale=0.2)) + 0.05).astype(np.float32)
+        xv = quantize_fp8(_f32(rng, x_shape, scale=1.5), x_scale, kind)
+        wv = quantize_fp8(_f32(rng, w_shape, scale=1.5), w_scale, kind)
+        return g, {
+            "x_q": pack_fp8(xv, kind).view(np.int8),
+            "x_scale": x_scale,
+            "w_q": pack_fp8(wv, kind).view(np.int8),
+            "w_scale": w_scale,
+            "b": _f32(rng, (w_shape[-1],), scale=0.1),
+        }
+
+    return build
+
+
 def _softmax(axis: int = -1, scaled: bool = False, shape: tuple = (6, 11)):
     def build(rng):
         g = Graph("softmax")
@@ -1897,6 +1977,22 @@ def default_cases() -> List[Case]:
               note="权重以 i8 位模式驻留（1 字节），设备端寄存器解码后 f32 累加；"
                    "权重读流量与驻留都是 linear_fp8 的 1/4"),
         _case("linear_fp8_packed_e5m2", _linear_fp8_packed("e5m2", x_shape=(4, 8)),
+              note="秩 2 激活 + e5m2 位模式：与 e4m3 共用同一条内核"),
+        # fp8 逐组 scale 与 packed 激活（5.342）
+        _case("dequantize_fp8_group_e4m3", _dequantize_fp8_group("e4m3"),
+              note="逐组反量化：K=8 分 4 组，组内共用一份 scale；"
+                   "数值必须等于 unpack 后乘 repeat 后的 scale"),
+        _case("linear_fp8_group_e4m3_bias", _linear_fp8_group("e4m3"),
+              note="逐组 weight-only fp8：权重 1 字节驻留，(K/G, N) 的 scale "
+                   "组内共用；与 linear_fp8_packed 的差别只在 scale 粒度"),
+        _case("linear_fp8_group_e5m2_rank2",
+              _linear_fp8_group("e5m2", x_shape=(4, 8), groups=2),
+              note="秩 2 激活 + e5m2 + 2 组：组数由形状推出，与 e4m3 共用实现"),
+        _case("linear_fp8a8_packed_e4m3_bias", _linear_fp8a8_packed("e4m3"),
+              note="两端都打包的 W8A8：激活与权重各 1 字节，寄存器里解码后 "
+                   "f32 累加；激活驻留是 linear_fp8a8 的 1/4"),
+        _case("linear_fp8a8_packed_e5m2_rank2",
+              _linear_fp8a8_packed("e5m2", x_shape=(4, 8)),
               note="秩 2 激活 + e5m2 位模式：与 e4m3 共用同一条内核"),
         # 卷积
         _case("conv2d_3x3_pad1", _conv2d(),

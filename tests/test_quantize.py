@@ -46,6 +46,7 @@ from aetherflow.models.quantize import (
     quantize_weight,
     quantize_weight_asymmetric,
     quantize_weight_fp8,
+    quantize_weight_fp8_group,
     quantize_weight_group,
 )
 from aetherflow.runtime.fp8 import FP8_MAX, pack_fp8, quantize_fp8, round_fp8, unpack_fp8
@@ -2149,6 +2150,322 @@ class TestLinearFP8Packed(unittest.TestCase):
         np.testing.assert_array_equal(_run(g, feed)["y"], _run(again, feed)["y"])
 
 
+class TestFP8GroupAndPackedActivation(unittest.TestCase):
+    """5.342：fp8 的逐组 scale 与 packed 激活。
+
+    钉住三件事：
+
+    1. 逐组反量化的 scale 只在组内生效：手推 ``unpack(q) * repeat(scale, G)``
+       对拍，组边界不能串（第 i 组串用第 i+1 组的 scale 必须能看出来）；
+    2. 两端都打包的 W8A8 与"先解码再 f32 矩阵乘"数值一致，激活与权重都
+       按 1 字节码读出；
+    3. 用不了的形态（不是 i8 位模式、沿 K 变化的激活 scale、秩 > 1 的权重
+       scale、不整除 K 的组）在构图期被拒绝。
+    """
+
+    def _group_graph(self, shape, groups, kind="e4m3"):
+        g = Graph("dequantize_fp8_group")
+        q = g.input("q", i8[shape])
+        s = g.input("s", f32[(groups, shape[-1])])
+        g.output(g.add_node("dequantize_fp8_group", [q, s], {"kind": kind}), "y")
+        return g
+
+    def _linear_group_graph(self, x_shape, w_shape, groups, kind="e4m3", bias=True):
+        g = Graph("linear_fp8_group")
+        x = g.input("x", f32[x_shape])
+        q = g.input("q", i8[w_shape])
+        s = g.input("s", f32[(groups, w_shape[-1])])
+        args = [x, q, s]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_fp8_group", args, {"kind": kind}), "y")
+        return g
+
+    def _packed_a8_graph(self, x_shape, w_shape, kind="e4m3", bias=True):
+        g = Graph("linear_fp8a8_packed")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input("x_scale", f32[x_shape[:-1] + (1,)])
+        wq = g.input("w_q", i8[w_shape])
+        sw = g.input("w_scale", f32[(w_shape[-1],)])
+        args = [q, sx, wq, sw]
+        if bias:
+            args.append(g.input("b", f32[(w_shape[-1],)]))
+        g.output(g.add_node("linear_fp8a8_packed", args, {"kind": kind}), "y")
+        return g
+
+    def test_dequantize_group_uses_scale_per_group(self):
+        rng = np.random.default_rng(342)
+        w = rng.standard_normal((8, 3)).astype(np.float32)
+        scale = np.array([[0.5, 0.25, 0.125], [0.75, 1.5, 0.0625]], np.float32)
+        carrier = quantize_fp8(w, np.repeat(scale, 4, axis=0), "e4m3")
+        codes = pack_fp8(carrier, "e4m3").view(np.int8)
+        got = _run(self._group_graph((8, 3), 2), {"q": codes, "s": scale})["y"]
+        decoded = unpack_fp8(codes.view(np.uint8), "e4m3")
+        want = decoded * np.repeat(scale, 4, axis=0)
+        np.testing.assert_array_equal(got, want)
+        # 组边界：前 4 行只乘第 0 组，后 4 行只乘第 1 组；串组会在这里露出来。
+        np.testing.assert_array_equal(got[:4], decoded[:4] * scale[0])
+        np.testing.assert_array_equal(got[4:], decoded[4:] * scale[1])
+
+    def test_dequantize_group_e5m2_and_uneven_groups(self):
+        rng = np.random.default_rng(343)
+        w = rng.standard_normal((12, 2)).astype(np.float32)
+        scale = np.array([[0.5, 0.25], [1.0, 0.125]], np.float32)
+        carrier = quantize_fp8(w, np.repeat(scale, 6, axis=0), "e5m2")
+        codes = pack_fp8(carrier, "e5m2").view(np.int8)
+        got = _run(
+            self._group_graph((12, 2), 2, kind="e5m2"), {"q": codes, "s": scale}
+        )["y"]
+        np.testing.assert_array_equal(
+            got,
+            unpack_fp8(codes.view(np.uint8), "e5m2") * np.repeat(scale, 6, axis=0),
+        )
+
+    def test_linear_group_matches_dequantized_matmul(self):
+        rng = np.random.default_rng(344)
+        x_shape, w_shape, groups = (2, 3, 8), (8, 4), 4
+        x = rng.standard_normal(x_shape).astype(np.float32)
+        w = rng.standard_normal(w_shape).astype(np.float32)
+        scale = (np.abs(rng.standard_normal((groups, 4))).astype(np.float32) * 0.5 + 0.125)
+        b = rng.standard_normal(4).astype(np.float32)
+        carrier = quantize_fp8(w, np.repeat(scale, 2, axis=0), "e4m3")
+        codes = pack_fp8(carrier, "e4m3").view(np.int8)
+        got = _run(
+            self._linear_group_graph(x_shape, w_shape, groups),
+            {"x": x, "q": codes, "s": scale, "b": b},
+        )["y"]
+        want = (
+            np.matmul(x, unpack_fp8(codes.view(np.uint8), "e4m3") * np.repeat(scale, 2, axis=0))
+            + b
+        )
+        np.testing.assert_array_equal(got, want)
+
+    def test_packed_activation_matches_float_path(self):
+        rng = np.random.default_rng(345)
+        x_shape, w_shape = (2, 3, 8), (8, 6)
+        x = rng.standard_normal(x_shape).astype(np.float32)
+        w = rng.standard_normal(w_shape).astype(np.float32)
+        xs = (np.abs(rng.standard_normal((2, 3, 1))).astype(np.float32) * 0.25 + 0.25)
+        ws = np.array([0.5, 0.25, 0.125, 1.0, 0.75, 0.0625], np.float32)
+        b = rng.standard_normal(6).astype(np.float32)
+        xc = pack_fp8(quantize_fp8(x, xs, "e4m3"), "e4m3").view(np.int8)
+        wc = pack_fp8(quantize_fp8(w, ws, "e4m3"), "e4m3").view(np.int8)
+        got = _run(
+            self._packed_a8_graph(x_shape, w_shape),
+            {"x_q": xc, "x_scale": xs, "w_q": wc, "w_scale": ws, "b": b},
+        )["y"]
+        want = (
+            np.matmul(
+                unpack_fp8(xc.view(np.uint8), "e4m3") * xs,
+                unpack_fp8(wc.view(np.uint8), "e4m3") * ws,
+            )
+            + b
+        )
+        np.testing.assert_array_equal(got, want)
+
+    def test_packed_activation_scalar_scales(self):
+        rng = np.random.default_rng(346)
+        x_shape, w_shape = (4, 8), (8, 3)
+        x = rng.standard_normal(x_shape).astype(np.float32)
+        w = rng.standard_normal(w_shape).astype(np.float32)
+        xc = pack_fp8(quantize_fp8(x, np.float32(0.5), "e5m2"), "e5m2").view(np.int8)
+        wc = pack_fp8(quantize_fp8(w, np.float32(0.25), "e5m2"), "e5m2").view(np.int8)
+        g = Graph("linear_fp8a8_packed")
+        q = g.input("x_q", i8[x_shape])
+        sx = g.input("x_scale", f32[()])
+        wq = g.input("w_q", i8[w_shape])
+        sw = g.input("w_scale", f32[()])
+        g.output(
+            g.add_node("linear_fp8a8_packed", [q, sx, wq, sw], {"kind": "e5m2"}), "y"
+        )
+        got = _run(
+            g,
+            {
+                "x_q": xc,
+                "x_scale": np.float32(0.5),
+                "w_q": wc,
+                "w_scale": np.float32(0.25),
+            },
+        )["y"]
+        want = np.matmul(
+            unpack_fp8(xc.view(np.uint8), "e5m2") * np.float32(0.5),
+            unpack_fp8(wc.view(np.uint8), "e5m2") * np.float32(0.25),
+        )
+        np.testing.assert_array_equal(got, want)
+
+    def test_group_rejects_bad_shapes(self):
+        with self.subTest(case="scale_does_not_divide_k"):
+            with self.assertRaises(ValueError):
+                self._group_graph((8, 3), 3)
+        with self.subTest(case="scale_rank_one"):
+            g = Graph("dequantize_fp8_group")
+            q = g.input("q", i8[8, 3])
+            s = g.input("s", f32[3])
+            with self.assertRaises(ValueError):
+                g.add_node("dequantize_fp8_group", [q, s], {"kind": "e4m3"})
+        with self.subTest(case="weight_not_i8"):
+            g = Graph("dequantize_fp8_group")
+            q = g.input("q", f8e4m3[8, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("dequantize_fp8_group", [q, s], {"kind": "e4m3"})
+        with self.subTest(case="linear_x_not_f32"):
+            g = Graph("linear_fp8_group")
+            x = g.input("x", f16[2, 8])
+            q = g.input("q", i8[8, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8_group", [x, q, s], {"kind": "e4m3"})
+        with self.subTest(case="linear_weight_is_f8_carrier"):
+            g = Graph("linear_fp8_group")
+            x = g.input("x", f32[2, 8])
+            q = g.input("q", f8e4m3[8, 3])
+            s = g.input("s", f32[2, 3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8_group", [x, q, s], {"kind": "e4m3"})
+        with self.subTest(case="linear_bias_length"):
+            g = Graph("linear_fp8_group")
+            x = g.input("x", f32[2, 8])
+            q = g.input("q", i8[8, 3])
+            s = g.input("s", f32[2, 3])
+            b = g.input("b", f32[4])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8_group", [x, q, s, b], {"kind": "e4m3"})
+
+    def test_packed_activation_rejects_bad_shapes(self):
+        with self.subTest(case="activation_is_f8_carrier"):
+            g = Graph("linear_fp8a8_packed")
+            q = g.input("x_q", f8e4m3[2, 8])
+            sx = g.input("x_scale", f32[2, 1])
+            wq = g.input("w_q", i8[8, 3])
+            sw = g.input("w_scale", f32[3])
+            with self.assertRaises(TypeError):
+                g.add_node("linear_fp8a8_packed", [q, sx, wq, sw], {"kind": "e4m3"})
+        with self.subTest(case="activation_scale_along_k"):
+            g = Graph("linear_fp8a8_packed")
+            q = g.input("x_q", i8[2, 8])
+            sx = g.input("x_scale", f32[2, 8])
+            wq = g.input("w_q", i8[8, 3])
+            sw = g.input("w_scale", f32[3])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8a8_packed", [q, sx, wq, sw], {"kind": "e4m3"})
+        with self.subTest(case="weight_scale_rank_two"):
+            g = Graph("linear_fp8a8_packed")
+            q = g.input("x_q", i8[2, 8])
+            sx = g.input("x_scale", f32[2, 1])
+            wq = g.input("w_q", i8[8, 3])
+            sw = g.input("w_scale", f32[4, 3])
+            with self.assertRaises(ValueError):
+                g.add_node("linear_fp8a8_packed", [q, sx, wq, sw], {"kind": "e4m3"})
+
+    def test_rejects_non_positive_scale(self):
+        rng = np.random.default_rng(347)
+        codes = pack_fp8(rng.standard_normal((8, 3)).astype(np.float32), "e4m3")
+        codes = codes.view(np.int8)
+        for bad in (0.0, -0.5):
+            with self.subTest(op="dequantize_fp8_group", scale=bad):
+                with self.assertRaises(ValueError):
+                    _run(
+                        self._group_graph((8, 3), 2),
+                        {"q": codes, "s": np.full((2, 3), bad, np.float32)},
+                    )
+            with self.subTest(op="linear_fp8a8_packed", scale=bad):
+                g = self._packed_a8_graph((2, 8), (8, 3), bias=False)
+                with self.assertRaises(ValueError):
+                    _run(
+                        g,
+                        {
+                            "x_q": codes,
+                            "x_scale": np.full((2, 1), bad, np.float32),
+                            "w_q": codes,
+                            "w_scale": np.ones(3, np.float32),
+                        },
+                    )
+
+    def test_group_helper_matches_manual(self):
+        rng = np.random.default_rng(348)
+        w = rng.standard_normal((8, 6)).astype(np.float32)
+        carrier, scale = quantize_weight_fp8_group(w, 4, "e4m3")
+        amax = np.max(np.abs(w.reshape(2, 4, 6)), axis=1)
+        limit = FP8_MAX["e4m3"]
+        self.assertEqual(scale.shape, (2, 6))
+        np.testing.assert_allclose(scale, (amax / limit).astype(np.float32))
+        # 载体全部落在格点上：再 pack / unpack 一轮不变。
+        np.testing.assert_array_equal(
+            carrier, unpack_fp8(pack_fp8(carrier, "e4m3").view(np.uint8), "e4m3")
+        )
+        # 每组都贴着端点：scale 取的是本组的 amax，不是邻组的。
+        group_max = np.max(np.abs(carrier.reshape(2, 4, 6)), axis=1)
+        np.testing.assert_allclose(group_max, np.full_like(group_max, limit), rtol=1e-6)
+
+    def test_group_helper_rejects(self):
+        w = np.ones((8, 3), np.float32)
+        for bad in (0, -4):
+            with self.subTest(group_size=bad):
+                with self.assertRaises(ValueError):
+                    quantize_weight_fp8_group(w, bad)
+        with self.subTest(case="does_not_divide_k"):
+            with self.assertRaises(ValueError):
+                quantize_weight_fp8_group(w, 3)
+        with self.subTest(case="not_two_dim"):
+            with self.assertRaises(ValueError):
+                quantize_weight_fp8_group(np.ones((8,), np.float32), 4)
+        with self.subTest(case="nan"):
+            bad = np.ones((8, 3), np.float32)
+            bad[0, 0] = np.nan
+            with self.assertRaises(ValueError):
+                quantize_weight_fp8_group(bad, 4)
+
+    def test_graph_survives_json_roundtrip(self):
+        rng = np.random.default_rng(349)
+        scale = np.array([[0.5, 0.25, 0.125], [1.0, 0.75, 0.0625]], np.float32)
+        w = rng.standard_normal((8, 3)).astype(np.float32)
+        codes = pack_fp8(
+            quantize_fp8(w, np.repeat(scale, 4, axis=0), "e4m3"), "e4m3"
+        ).view(np.int8)
+        feed = {
+            "q": codes,
+            "s": scale,
+            "x": rng.standard_normal((2, 8)).astype(np.float32),
+            "b": np.zeros(3, np.float32),
+        }
+        graphs = {
+            "dequantize_fp8_group": (self._group_graph((8, 3), 2), ["q", "s"]),
+            "linear_fp8_group": (
+                self._linear_group_graph((2, 8), (8, 3), 2),
+                ["x", "q", "s", "b"],
+            ),
+        }
+        for name, (g, keys) in graphs.items():
+            with self.subTest(op=name):
+                sub = {k: feed[k] for k in keys}
+                again = loads(dumps(g))
+                np.testing.assert_array_equal(_run(g, sub)["y"], _run(again, sub)["y"])
+
+    def test_device_kernels_and_tables_declared(self):
+        from aetherflow.backends.device_shared import (
+            FP8_OPS,
+            GPU_OPS,
+            _DEQUANTIZE_FP8_GROUP_SRC,
+            _INDEX_ARGS,
+            _LINEAR_FP8A8_PACKED_SRC,
+        )
+
+        self.assertIn("af_dequantize_fp8_group", _DEQUANTIZE_FP8_GROUP_SRC)
+        self.assertEqual(_DEQUANTIZE_FP8_GROUP_SRC.count("af_fp8_decode((int)"), 1)
+        self.assertIn("af_linear_fp8a8_packed", _LINEAR_FP8A8_PACKED_SRC)
+        self.assertEqual(_LINEAR_FP8A8_PACKED_SRC.count("af_fp8_decode((int)"), 2)
+        for name in (
+            "dequantize_fp8_group",
+            "linear_fp8_group",
+            "linear_fp8a8_packed",
+        ):
+            self.assertIn(name, GPU_OPS)
+        self.assertNotIn("dequantize_fp8_group", FP8_OPS)
+        self.assertEqual(_INDEX_ARGS["linear_fp8a8_packed"], frozenset({0, 2}))
+        self.assertEqual(_INDEX_ARGS["linear_fp8_group"], frozenset({1}))
+
+
 class TestConformanceCases(unittest.TestCase):
     def test_reference_backend_passes_new_cases(self):
         names = {
@@ -2175,6 +2492,11 @@ class TestConformanceCases(unittest.TestCase):
             "unpack_fp8_e5m2",
             "linear_fp8_packed_e4m3_bias",
             "linear_fp8_packed_e5m2",
+            "dequantize_fp8_group_e4m3",
+            "linear_fp8_group_e4m3_bias",
+            "linear_fp8_group_e5m2_rank2",
+            "linear_fp8a8_packed_e4m3_bias",
+            "linear_fp8a8_packed_e5m2_rank2",
         }
         cases = [c for c in default_cases() if c.name in names]
         self.assertEqual({c.name for c in cases}, names)

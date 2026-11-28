@@ -1998,6 +1998,263 @@ register(
 )
 
 
+# --------------------------------------------------------------------------
+# fp8 逐组 scale 与 W8A8 packed 激活（5.342）
+# --------------------------------------------------------------------------
+#
+# 5.328 把 fp8 的权重压到 1 字节，但 scale 只接逐张量 / 逐输出通道；逐组
+# （``(K/G, N)``，GPTQ / AWQ 的 group_size 形态）在构图期显式拒绝，留给了本
+# 阶段。这里的三个算子补齐缺口：
+#
+# - ``dequantize_fp8_group``：组内共用一份 scale 的 fp8 反量化，与
+#   ``dequantize_i8_group`` 同形同口径；
+# - ``linear_fp8_group``：逐组 weight-only 线性层，权重仍是 i8 位模式；
+# - ``linear_fp8a8_packed``：**两端都打包**的 W8A8——激活与权重各以 1 字节
+#   码驻留，设备端在寄存器里解码后做 f32 累加。它才是 5.329 遗留的"packed
+#   激活"：此前的 ``linear_fp8a8`` 激活仍是 f32 载体。
+#
+# 三者都不承诺 fp8 tensor core：累加仍是 f32，收益只在驻留与读带宽。
+
+
+def _infer_dequantize_fp8_group(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) != 2:
+        raise ValueError(
+            f"dequantize_fp8_group 需要 (q, scale) 两个输入，得到 {len(inputs)}"
+        )
+    _fp8_kind_attr(attrs, "dequantize_fp8_group")
+    q, scale = inputs
+    if q.dtype != DType.I8:
+        raise TypeError(
+            f"dequantize_fp8_group 的第一个输入必须是 i8 位模式（用 pack_fp8 生成），"
+            f"得到 {q.dtype.value}"
+        )
+    if q.rank != 2:
+        raise ValueError(
+            f"dequantize_fp8_group 的 q 必须是二维 (K, N)，得到秩 {q.rank}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"dequantize_fp8_group 的 scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+    _check_group_params(q, scale, "dequantize_fp8_group", "scale")
+    # 反量化的结果是真实数值，不是格式格点上的载体：输出 f32。若沿用 f8
+    # 载体，执行时会在节点边界把 ``unpack(q) * scale`` 二次舍入回 fp8 格点
+    # （scale 不是 2 的幂时可见），丢掉刚乘上去的精度。
+    return TensorType(DType.F32, q.shape)
+
+
+def _ref_dequantize_fp8_group(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    from ..runtime.fp8 import unpack_fp8
+
+    kind = _fp8_kind_attr(attrs, "dequantize_fp8_group")
+    q, scale = args
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            "dequantize_fp8_group 的 scale 必须严格为正，"
+            f"得到最小值 {float(np.min(scale))}"
+        )
+    codes = np.ascontiguousarray(q, dtype=np.int8).view(np.uint8)
+    repeated = np.repeat(scale, q.shape[0] // scale.shape[0], axis=0)
+    return unpack_fp8(codes, kind) * repeated
+
+
+register(
+    Op(
+        name="dequantize_fp8_group",
+        infer=_infer_dequantize_fp8_group,
+        reference=_ref_dequantize_fp8_group,
+        attrs_schema=("kind",),
+        doc="逐组 fp8 反量化：i8 位模式 (K, N) 沿输入维分成 K/G 组，scale "
+        "(K/G, N) 组内共用（GPTQ / AWQ 的 group_size 形态）；组数由形状推出，"
+        "不另设 attr。数值是 ``unpack_fp8(q) * repeat(scale, G)``，输出 f32",
+    )
+)
+
+
+def _infer_linear_fp8_group(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) not in (3, 4):
+        raise ValueError(
+            "linear_fp8_group 需要 (x, qweight, weight_scale[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    _fp8_kind_attr(attrs, "linear_fp8_group")
+    x, qweight, scale = inputs[0], inputs[1], inputs[2]
+    if x.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8_group 的 x 必须是 f32，得到 {x.dtype.value}；"
+            "反量化之后的 GEMM 用 f32 累加，混精度入口不在这一版"
+        )
+    if x.rank < 2:
+        raise ValueError(f"linear_fp8_group 的 x 至少是 2 维，得到秩 {x.rank}")
+    if qweight.dtype != DType.I8:
+        raise TypeError(
+            f"linear_fp8_group 的权重必须是 i8 位模式（用 pack_fp8 生成），"
+            f"得到 {qweight.dtype.value}；已解码的 f8 载体请用 linear_fp8"
+        )
+    if qweight.rank != 2:
+        raise ValueError(
+            f"linear_fp8_group 的量化权重必须是 2 维 (K, N)，得到 {qweight.shape}"
+        )
+    if scale.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8_group 的 weight_scale 必须是 f32，得到 {scale.dtype.value}"
+        )
+
+    k, n = qweight.shape
+    kx = x.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_fp8_group 的内维不匹配：x 的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_fp8_group 的内维符号不一致：x={kx} 与权重 K={k}")
+
+    _check_group_params(qweight, scale, "linear_fp8_group", "weight_scale")
+    _check_bias(inputs, 3, n, "linear_fp8_group")
+    return TensorType(DType.F32, x.shape[:-1] + (n,))
+
+
+def _ref_linear_fp8_group(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    from ..runtime.fp8 import unpack_fp8
+
+    kind = _fp8_kind_attr(attrs, "linear_fp8_group")
+    x, qweight, scale = args[0], args[1], args[2]
+    if float(np.min(scale)) <= 0.0:
+        raise ValueError(
+            "linear_fp8_group 的 weight_scale 必须严格为正，"
+            f"得到最小值 {float(np.min(scale))}"
+        )
+    codes = np.ascontiguousarray(qweight, dtype=np.int8).view(np.uint8)
+    repeated = np.repeat(scale, qweight.shape[0] // scale.shape[0], axis=0)
+    weight = unpack_fp8(codes, kind) * repeated
+    out = np.matmul(x, weight)
+    if len(args) > 3:
+        out = out + args[3]
+    return out
+
+
+register(
+    Op(
+        name="linear_fp8_group",
+        infer=_infer_linear_fp8_group,
+        reference=_ref_linear_fp8_group,
+        attrs_schema=("kind",),
+        doc="逐组 weight-only fp8 线性层：(..., K) x i8(K, N) -> (..., N)，"
+        "权重沿输入维每 K/G 行共用一份 scale（(K/G, N)）。数值等于 "
+        "``matmul(x, unpack_fp8(q) * repeat(scale, G)) [+ bias]``；"
+        "省的是权重驻留与读带宽，不是算力",
+    )
+)
+
+
+def _infer_linear_fp8a8_packed(
+    inputs: Tuple[TensorType, ...], attrs: dict
+) -> TensorType:
+    if len(inputs) not in (4, 5):
+        raise ValueError(
+            "linear_fp8a8_packed 需要 (x_q, x_scale, w_q, w_scale[, bias]) 输入，"
+            f"得到 {len(inputs)}"
+        )
+    _fp8_kind_attr(attrs, "linear_fp8a8_packed")
+    xq, xs, wq, ws = inputs[0], inputs[1], inputs[2], inputs[3]
+    if xq.dtype != DType.I8:
+        raise TypeError(
+            f"linear_fp8a8_packed 的激活必须是 i8 位模式（用 pack_fp8 生成），"
+            f"得到 {xq.dtype.value}；f8 载体的激活请用 linear_fp8a8"
+        )
+    if wq.dtype != DType.I8:
+        raise TypeError(
+            f"linear_fp8a8_packed 的权重必须是 i8 位模式，得到 {wq.dtype.value}"
+        )
+    if xs.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8a8_packed 的激活 scale 必须是 f32，得到 {xs.dtype.value}"
+        )
+    if ws.dtype != DType.F32:
+        raise TypeError(
+            f"linear_fp8a8_packed 的权重 scale 必须是 f32，得到 {ws.dtype.value}"
+        )
+    if xq.rank < 2:
+        raise ValueError(f"linear_fp8a8_packed 的激活至少是 2 维，得到秩 {xq.rank}")
+    if wq.rank != 2:
+        raise ValueError(
+            f"linear_fp8a8_packed 的量化权重必须是 2 维 (K, N)，得到 {wq.shape}"
+        )
+
+    k, n = wq.shape
+    kx = xq.shape[-1]
+    if isinstance(kx, int) and isinstance(k, int):
+        if kx != k:
+            raise ValueError(
+                f"linear_fp8a8_packed 的内维不匹配：激活的最后一维 {kx} 与权重的 K={k}"
+            )
+    elif kx != k:
+        raise ValueError(f"linear_fp8a8_packed 的内维符号不一致：激活 {kx} 与权重 K={k}")
+
+    _check_scale_broadcast(xq, xs, "linear_fp8a8_packed 的激活 scale")
+    # f32 累加不要求 scale 能提到求和号之外，但设备内核按行取 scale（每行
+    # 一个），沿 K 维变化的形态没有对应的读法；与 linear_fp8a8 同一口径。
+    if xs.rank > 0 and xs.shape[-1] != 1:
+        raise ValueError(
+            f"linear_fp8a8_packed 的激活 scale 必须沿 K 维恒定"
+            f"（形状 {xq.shape[:-1]}+(1,) 或标量），得到 {xs.shape}"
+        )
+    if ws.rank > 1:
+        raise ValueError(
+            f"linear_fp8a8_packed 的权重 scale 必须是逐输出通道 (N,) 或逐张量标量，"
+            f"得到秩 {ws.rank} 形状 {ws.shape}"
+        )
+    if ws.rank == 1 and ws.shape[0] != 1 and ws.shape[0] != n:
+        raise ValueError(
+            f"linear_fp8a8_packed 的权重 scale 长度 {ws.shape[0]} 与 N={n} 不一致"
+        )
+
+    _check_bias(inputs, 4, n, "linear_fp8a8_packed")
+    return TensorType(DType.F32, xq.shape[:-1] + (n,))
+
+
+def _ref_linear_fp8a8_packed(args: List[np.ndarray], attrs: dict) -> np.ndarray:
+    from ..runtime.fp8 import unpack_fp8
+
+    kind = _fp8_kind_attr(attrs, "linear_fp8a8_packed")
+    xq, xs, wq, ws = args[0], args[1], args[2], args[3]
+    if float(np.min(xs)) <= 0.0:
+        raise ValueError(
+            f"linear_fp8a8_packed 的激活 scale 必须严格为正，得到最小值 {float(np.min(xs))}"
+        )
+    if float(np.min(ws)) <= 0.0:
+        raise ValueError(
+            f"linear_fp8a8_packed 的权重 scale 必须严格为正，得到最小值 {float(np.min(ws))}"
+        )
+    xcodes = np.ascontiguousarray(xq, dtype=np.int8).view(np.uint8)
+    wcodes = np.ascontiguousarray(wq, dtype=np.int8).view(np.uint8)
+    xd = unpack_fp8(xcodes, kind) * np.broadcast_to(xs, xq.shape)
+    wd = unpack_fp8(wcodes, kind) * ws
+    out = np.matmul(xd, wd)
+    if len(args) > 4:
+        out = out + args[4]
+    return out
+
+
+register(
+    Op(
+        name="linear_fp8a8_packed",
+        infer=_infer_linear_fp8a8_packed,
+        reference=_ref_linear_fp8a8_packed,
+        attrs_schema=("kind",),
+        doc="两端都打包的 fp8 W8A8 线性层：i8 位模式激活 (..., K) 与 i8 位模式"
+        "权重 (K, N)，各配一份 scale，数值等于 "
+        "``matmul(unpack(x_q) * x_scale, unpack(w_q) * w_scale) [+ bias]``。"
+        "激活与权重的驻留都是 1 字节；累加仍是 f32，不承诺 fp8 tensor core",
+    )
+)
+
+
 def _infer_linear_i8a8(inputs: Tuple[TensorType, ...], attrs: dict) -> TensorType:
     if len(inputs) not in (4, 5):
         raise ValueError(

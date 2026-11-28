@@ -73,6 +73,7 @@ __all__ = [
     "build_int8a8_linear_qat",
     "build_int8a8_linear_dynamic",
     "quantize_weight_fp8",
+    "quantize_weight_fp8_group",
     "dequantize_weight_fp8",
     "quantize_activation_fp8",
 ]
@@ -608,6 +609,42 @@ def quantize_weight_fp8(
         amax = np.max(np.abs(w), axis=0)
     scale = np.where(amax > 0, amax / limit, 1.0).astype(np.float32)
     return quantize_fp8(w.astype(np.float32), scale, kind), scale
+
+
+def quantize_weight_fp8_group(
+    weight: np.ndarray, group_size: int, kind: str = "e4m3"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """把 ``(K, N)`` 权重按**输入维分组**压到 fp8 格点，返回 ``(w_f8, scale)``。
+
+    ``scale`` 的形状是 ``(K/G, N)``：沿 K 每 ``group_size`` 行共用一份，
+    与 GPTQ / AWQ 的 group_size 形态、以及 :class:`weights.FP8Weight` 的
+    per-group 口径一致。``w_f8`` 仍是 f32 载体，值全部落在 fp8 格点上。
+
+    分组能降低量化误差：一个离群值只抬高它所在那一组的 scale，不再拖累整
+    列。代价是 scale 的驻留从 ``N`` 个 float 变成 ``K/G * N`` 个。
+    """
+    limit = _fp8_limit(kind)
+    w = np.asarray(weight)
+    if w.ndim != 2:
+        raise ValueError(
+            f"quantize_weight_fp8_group 只接受 (K, N) 的线性层权重，得到 {w.shape}"
+        )
+    if w.dtype.kind != "f":
+        raise TypeError(f"quantize_weight_fp8_group 需要浮点权重，得到 {w.dtype}")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("权重里有 NaN / Inf：量化会把这些值传播到整条推理链")
+
+    k, n = w.shape
+    gs = int(group_size)
+    if gs <= 0:
+        raise ValueError(f"group_size 必须是正整数，得到 {group_size}")
+    if k % gs != 0:
+        raise ValueError(f"group_size={gs} 不能整除 K={k}")
+
+    amax = np.max(np.abs(w.reshape(k // gs, gs, n)), axis=1)
+    scale = np.where(amax > 0, amax / limit, 1.0).astype(np.float32)
+    repeated = np.repeat(scale, gs, axis=0)
+    return quantize_fp8(w.astype(np.float32), repeated, kind), scale
 
 
 def dequantize_weight_fp8(w: np.ndarray, scale: np.ndarray) -> np.ndarray:

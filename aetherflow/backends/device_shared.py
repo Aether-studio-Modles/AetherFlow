@@ -39,7 +39,13 @@ FP8_DTYPES: FrozenSet[DType] = frozenset({DType.F8E4M3, DType.F8E5M2})
 #: ``linear_fp8_packed`` 不在这里：它的权重是 i8 位模式，图里根本没有
 #: fp8 标量（位模式即存储形态）。
 FP8_OPS: FrozenSet[str] = frozenset(
-    {"cast", "linear_fp8", "linear_fp8a8", "pack_fp8", "unpack_fp8"}
+    {
+        "cast",
+        "linear_fp8",
+        "linear_fp8a8",
+        "pack_fp8",
+        "unpack_fp8",
+    }
 )
 
 
@@ -103,6 +109,10 @@ GPU_OPS: FrozenSet[str] = frozenset(
         "pack_fp8",
         "unpack_fp8",
         "linear_fp8_packed",
+        # 5.342：逐组 scale 的反量化 / 线性层，以及两端都打包的 W8A8。
+        "dequantize_fp8_group",
+        "linear_fp8_group",
+        "linear_fp8a8_packed",
         "conv2d",
         "maxpool2d",
         "maxpool2d_indices",
@@ -195,6 +205,11 @@ _INDEX_ARGS: Dict[str, FrozenSet[int]] = {
     # 的权重都是 i8 位模式（不是整数数据，但同样不能走"只支持浮点"）。
     "unpack_fp8": frozenset({0}),
     "linear_fp8_packed": frozenset({1}),
+    # 5.342：逐组反量化的 q 是 i8 位模式；逐组线性层与 W8A8 packed 的
+    # 激活 / 权重同样是 1 字节码，scale 是 f32。
+    "dequantize_fp8_group": frozenset({0}),
+    "linear_fp8_group": frozenset({1}),
+    "linear_fp8a8_packed": frozenset({0, 2}),
     # 整数取模：两侧都是**整数数据**，不是下标。
     "mod": frozenset({0, 1}),
 }
@@ -545,6 +560,55 @@ extern "C" __global__ void af_linear_fp8_packed(
   for (long long kk = 0; kk < k; ++kk) {
     float wv = af_fp8_decode((int)(unsigned char)wc[kk * n], kind);
     acc += xr[kk] * (wv * s);
+  }
+  out[idx] = acc;
+}
+"""
+
+# 逐组 fp8 反量化（5.342）：组内共用一份 scale，结构照
+# ``_DEQUANTIZE_I8_GROUP_SRC``，只多一步寄存器里的解码。乘法顺序是
+# ``decode(q) * s``，与参考实现的 ``unpack_fp8(q) * repeat(scale)`` 逐位一致。
+_DEQUANTIZE_FP8_GROUP_SRC = _FP8_COMMON_SRC + r"""
+extern "C" __global__ void af_dequantize_fp8_group(
+    const signed char* __restrict__ q,
+    const float* __restrict__ s,
+    float* __restrict__ out,
+    long long n, long long cols, long long group, int kind) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long row = i / cols;
+  long long col = i - row * cols;
+  long long si = (row / group) * cols + col;
+  out[i] = af_fp8_decode((int)(unsigned char)q[i], kind) * s[si];
+}
+"""
+
+# 两端都打包的 W8A8（5.342）：激活与权重各按 1 字节读出、在寄存器里解码，
+# 累加仍是 f32（没有 fp8 tensor core）。``xs_stride`` / ``ws_stride`` 为 0
+# 表示逐张量 scale；参考语义是 ``matmul(unpack(x)*xs, unpack(w)*ws)``，这里
+# 按同样的乘法顺序逐项累加，差异只来自累加顺序（BLAS 分块 vs 顺序）。
+_LINEAR_FP8A8_PACKED_SRC = _FP8_COMMON_SRC + r"""
+extern "C" __global__ void af_linear_fp8a8_packed(
+    const signed char* __restrict__ x,
+    const float* __restrict__ xs,
+    const signed char* __restrict__ w,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    long long m, long long k, long long n,
+    long long xs_stride, long long ws_stride, int kind) {
+  long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= m * n) return;
+  long long row = idx / n;
+  long long col = idx - row * n;
+  const signed char* xr = x + row * k;
+  const signed char* wc = w + col;
+  float a = xs_stride ? xs[row] : xs[0];
+  float b = ws_stride ? ws[col] : ws[0];
+  float acc = 0.0f;
+  for (long long kk = 0; kk < k; ++kk) {
+    float xv = af_fp8_decode((int)(unsigned char)xr[kk], kind);
+    float wv = af_fp8_decode((int)(unsigned char)wc[kk * n], kind);
+    acc += (xv * a) * (wv * b);
   }
   out[idx] = acc;
 }

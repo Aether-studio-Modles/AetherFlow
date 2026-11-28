@@ -475,6 +475,12 @@ class DeviceBackend(
         r.register("pack_fp8", self._op_pack_fp8)
         r.register("unpack_fp8", self._op_unpack_fp8)
         r.register("linear_fp8_packed", self._op_linear_fp8_packed)
+        # 5.342：逐组 scale 的反量化 / 线性层，以及两端都打包的 W8A8。逐组
+        # 反量化有自己的内核；逐组线性层复用它再走 sgemm；W8A8 packed 的
+        # 激活与权重都按 1 字节读，有自己的内核。
+        r.register("dequantize_fp8_group", self._op_dequantize_fp8_group)
+        r.register("linear_fp8_group", self._op_linear_fp8_group)
+        r.register("linear_fp8a8_packed", self._op_linear_fp8a8_packed)
         r.register("conv2d", self._op_conv2d)
         r.register("maxpool2d", self._op_maxpool2d)
         r.register("maxpool2d_indices", self._op_maxpool2d_indices)
@@ -1221,18 +1227,21 @@ class DeviceBackend(
                 f"{self._LABEL}未实现算子 {name}（节点 %{node.output.name}）"
             )
         # fp8 的载体是 f32，但语义要求节点边界落在格式格点上；设备端承接
-        # fp8 的只有 ``cast``（内核在设备上重做 RNE 量化，见 5.325）、两个
-        # 线性层（按 f32 载体读出、反量化后走既有 GEMM，见 5.327）与
-        # pack / unpack（位模式与载体互转，见 5.328）。其它算子遇到 fp8
-        # 必须显式拒绝，否则会被 f32 载体当成 f32 算掉。
+        # **带 fp8 载体的节点**的只有 ``cast``（内核在设备上重做 RNE 量化，
+        # 见 5.325）、``linear_fp8`` / ``linear_fp8a8``（按 f32 载体读出、
+        # 反量化后走既有 GEMM，见 5.327）与 ``pack_fp8`` / ``unpack_fp8``
+        # （位模式与载体互转，见 5.328）。其它算子遇到 fp8 必须显式拒绝，
+        # 否则会被 f32 载体当成 f32 算掉。5.342 的三个算子只吃 i8 位模式与
+        # f32，输出也是 f32，不含 fp8 载体，因此不需要进白名单。
         if name not in _FP8_OPS:
             for item in (*node.inputs, node.output):
                 if item.type.dtype in _FP8_DTYPES:
                     raise BackendCapabilityError(
                         f"{self._LABEL}的 {name} 不承接 fp8（节点 "
                         f"%{node.output.name} 涉及 {item.type.dtype.value}）；"
-                        "目前只有 cast / pack_fp8 / unpack_fp8 与两个 fp8 "
-                        "线性层承接，见 DESIGN 5.325 / 5.328"
+                        "目前只有 cast / pack_fp8 / unpack_fp8 / linear_fp8 / "
+                        "linear_fp8a8 承接带 fp8 载体的节点，见 DESIGN 5.325 / "
+                        "5.327 / 5.328"
                     )
         if name in _LAYOUT_OPS:
             layout = attrs.get("layout", "nchw")
