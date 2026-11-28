@@ -452,8 +452,15 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - 阶段 2（完成）：`examples/llm/pretrain.py` 字节级从零训练，tiny 200 步 11 秒
   loss 5.44 → 2.88；0.5B 结构（630.2M 参数、真实 15 万词表、seq64 / batch1 /
   Adam 3e-4）在 V100 上 60 步 11.84 → 7.98，0.20 s/步，峰值显存 16578 MiB。
-- 阶段 3（待做）：全参 SFT——指令对数据、只对回答段算 loss（`mask` 已支持）；
-  阶段 4（待做）：LoRA——adapter 注入与单独存取。
+- 阶段 3（完成）：`examples/llm/sft.py` 全参 SFT——内置 8 条中文指令对，
+  `mask[t] = 1` 当 `t+1` 落在回答段（含 eos / `<|im_end|>`），targets 仍是
+  扁平 `(b*T+t)*V+y`。tiny 20 步回答段 5.93 → 2.82；`--init` 接
+  `pretrain.py --save` 的存档；真实 Qwen2.5-0.5B（630.2M、V100、seq128 /
+  batch1 / lr2e-5）20 步回答段 3.60 → 0.40（同一批），全段 5.71 → 3.97，
+  前 5 步 3.72 → 后 5 步 1.05（DESIGN 5.360）。Qwen 的 tokenizer 用 `Split`
+  预分词、`BpeTokenizer` 明确拒绝，所以真实词表走 `--data-json` 交预编码
+  样本（`{"ids": [...], "answer_start": n}`）。
+- 阶段 4（待做）：LoRA——adapter 注入与单独存取。
 - 注意：`seq` 静态（无 `arange`），换长度要重建图；图内不做权重转置。
 - `lm_head` 与 `embed_tokens` 当前各占一份（tied 只在加载时填两份），所以 0.5B
   结构实测 630.2M 参数；训练期合并两份梯度尚未做。
@@ -463,11 +470,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - 入口：移动 `ssh root@223.109.239.36 -p 24124`；电信
   `ssh vipuser@180.127.11.177 -p 24124`（密码 `Ahg4EeNo`，`sudo` 同密码；
   vipuser 不能直接写 `/root`，用 `echo 密码 | sudo -S ...`）。旧端口 24432 已失效。
-- 代码：`/root/afv3`，非 git 仓库，用本机 `git archive HEAD` 打包后 sftp 上传、
-  `sudo tar xzf ... -C /root/afv3` 覆盖同步（包约 2 MB）。
+- 代码：`/root/afv3`，非 git 仓库，把工作区打成 tar（排除 `.git` /
+  `__pycache__` / `build`）后 sftp 上传、`tar xzf ... -C /root/afv3` 覆盖同步
+  （包约 2 MB）。移动入口的 root 无法 sftp 写 `/tmp`，改上传到 `/root/`。
 - 模型：`/root/models/Qwen2.5-0.5B/`（`config.json` + `model.safetensors` 988 MB
   bf16 + `tokenizer.json`）。
-- Python 3.10 + numpy 2.2.6 + cupy-cuda12x 14.2.0 + torch 2.14.1+cpu +
+- Python 3.10 + numpy 2.2.6 + cupy-cuda12x 14.2.0 + **torch 2.13.0+cpu** +
   transformers 4.46.3 + safetensors。**torch 必须用
   `--index-url https://download.pytorch.org/whl/cpu`**（196 MB）；走 pypi 镜像
   会拉 CUDA 版（数 GB）。其余包用清华镜像。

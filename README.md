@@ -89,11 +89,13 @@ RNN（RNN / LSTM / GRU）、多层 Transformer、Mamba block（`scan_linear`）�
 （`build_llama` + `LlamaSpec`，含 GQA、RoPE、qkv bias；`LlamaSpec.qwen2_5_0_5b()`
 是 Qwen2.5-0.5B 的官方超参，参数名与 HF `state_dict` 同名，DESIGN 5.358）。
 
-两个可直接跑的 LLM 示例：`examples/llm/pretrain.py`（字节级从零预训练，
-tiny 200 步 loss 5.44 → 2.88）与 `examples/llm/forward.py`（默认随机初始化，
-`--weights DIR` 读真实 Qwen2.5-0.5B 权重）。真实权重在 HF、参考后端、CUDA
-后端三路对拍到 1e-4；同结构 0.5B / 15 万词表在 V100 上从零训练 60 步，
-loss 11.84 → 7.98，每步 0.20 s（DESIGN 5.359）。
+三个可直接跑的 LLM 示例：`examples/llm/pretrain.py`（字节级从零预训练，
+tiny 200 步 loss 5.44 → 2.88，`--save` 存档可接 SFT）、`examples/llm/forward.py`
+（默认随机初始化，`--weights DIR` 读真实 Qwen2.5-0.5B 权重）与
+`examples/llm/sft.py`（全参 SFT，`mask` 只让回答段算 loss；tiny 20 步回答段
+5.93 → 2.82）。真实权重在 HF、参考后端、CUDA 后端三路对拍到 1e-4；同结构
+0.5B / 15 万词表在 V100 上从零训练 60 步，loss 11.84 → 7.98，每步 0.20 s；
+同一份真实权重做 20 步 SFT，回答段 loss 3.60 → 0.40（DESIGN 5.359 / 5.360）。
 
 ### 装外部权重
 

@@ -22956,6 +22956,48 @@ numpy 的累加顺序，不是口径差异。同一张图参考后端 13.1 s、C
 磨掉。它证明的是梯度、优化器状态、设备态捕获与显存估算在真实规模下都成立，
 接下来的全参 SFT 与 LoRA 才能挂在这条已经被验证过的链路上。
 
+### 5.360　全参 SFT：mask 让梯度只从回答段流回
+
+SFT 与预训练共用同一条闭环（前向 / 反向 / 优化器 / 设备态 / checkpoint），
+差别只有三处：数据从连续语料换成指令对、损失用 `mask` 把 prompt 段置 0、
+初始权重可以接预训练存档或 HF 权重。`masked_lm_loss_indexed`（5.357 前后
+引入的 LLM 损失）本来就是按 `mask` 加权平均，不需要新算子。
+
+**样本构造。** `ids = prompt_ids + answer_ids`（回答段以 eos / `<|im_end|>`
+收尾），`inputs = ids[:-1]`、`labels = ids[1:]`；位置 `t` 的 target 是
+`ids[t+1]`，所以 `mask[t] = 1` 当且仅当 `t + 1 >= answer_start`。batch 内
+右侧 pad，pad 位置 `mask = 0`；targets 保持 `(B,T)` 的扁平下标
+`(b*T + t)*V + y`，与预训练完全一致。**回答段 loss 与全段 loss 的差距就是
+mask 是否生效的判据**：写错时回答段 loss 停在高位，而全段 loss 照样很低
+（prompt 只占少数 token 且更容易）。
+
+**三个示例口径。** `examples/llm/sft.py` 默认缩小版（d128 / 2 层 / seq256 /
+batch1 / 字节级词表），内置 8 条中文指令对，20 步回答段 loss 5.93 → 2.82；
+`--init out.npz` 接 `pretrain.py --save out.npz` 的产物（8 步预训练后再 SFT
+10 步，回答段 5.01 → 4.55，同一批全段 6.01 → 4.31）；`--weights DIR` 读
+真实 Qwen2.5-0.5B 权重（630.2M、15 万词表）。
+
+**真实规模（V100-SXM2-32GB，seq=128，batch=1，Adam lr 2e-5，20 步）。**
+同一批样本上，训练前全段 5.7143 / 回答段 3.6016，训练后全段 3.9668 /
+回答段 0.3960；回答段前 5 步均值 3.7169 → 后 5 步 1.0478。全段与回答段的
+训练后差距（3.97 vs 0.40）正是 mask 的作用面：prompt 段没有被优化，它仍
+停留在基座模型的分布上。
+
+**Qwen 词表为什么走 `--data-json`。** Qwen2.5 的 `tokenizer.json` 用
+`Split` 预分词，本仓 `BpeTokenizer` 明确拒绝这类自定义组件（5.314：不读
+pattern 就等于换了一份分词器，产出的 id 每个都合法但不是训练时那串）。示例
+本身不引入 transformers 依赖：真实场景下由外部把 `{"ids": [...],
+"answer_start": n}` 编好交进来，示例只负责 batch 化与训练。`answer_start`
+的语义仍然是"第一个计入 loss 的 target 位置减一"，与字节级路径同源。
+
+**局限。** 8 条指令对、20 步只证明"梯度确实只从回答段流回、优化器在真实
+规模上能把回答段 loss 压下去"，不构成可用的 SFT 模型；batch=1，没有打乱
+数据（按顺序轮转，20 步重复了两轮多）；tied 的 `lm_head` / `embed_tokens`
+梯度仍未合并（5.359 的 630.2M vs 494M）。LoRA 要挂的就是这条链路：冻结
+基座、只训练注入的低秩 A/B，数据与 mask 不变。
+
+
+
 
 
 
