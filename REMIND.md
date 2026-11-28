@@ -40,7 +40,8 @@
   `fake_quantize_i8_lsq`（前向逐位相同，反向按非饱和区直通并给 scale 梯度，
   5.312）；非对称零点的主机侧语义（`quantize_i8_zp` / `dequantize_i8_zp` /
   `linear_i8_zp` / `linear_i8a8_zp`，值域扩到含 0、W8A8 的 int32 上界收到
-  `K*255*255`，5.315，设备端仍无内核、显式拒绝）与逐组 weight-only 反量化
+  `K*255*255`，5.315；量化 / 反量化两个设备内核见 5.322，线性层融合仍显式
+  拒绝）与逐组 weight-only 反量化
   （`dequantize_i8_group` / `dequantize_i8_group_zp`：组大小由 `K / K_g` 推出，
   不另设 attr，5.317；设备内核 5.321，同一份源码供 NVRTC / hipRTC，只做反量化、
   不融合 GEMM，V100 上 conformance 逐位相同）；fp8（e4m3 / e5m2）的参考语义与单字节位模式
@@ -118,7 +119,7 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 | 参考 | Windows / Python 3.14 | 3198 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `132 executed / 8 refused / 0 failed`（5.321 后；两条逐组反量化 `dequantize_i8_group` / `_zp` 均 `err=0.0e+00`）；`tests.test_cuda_backend` 382 条 4.5 秒全过（2 跳过）；未跑全量 unittest |
+| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `134 executed / 6 refused / 0 failed`（5.322 后；`quantize_i8_zp` / `dequantize_i8_zp` 均 `err=0.0e+00`，两条逐组反量化同样逐位）；`tests.test_cuda_backend` 382 条 4.5 秒全过（2 跳过）；未跑全量 unittest |
 
 ```bash
 # 本地全量
@@ -153,9 +154,9 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   没有 W8A8 的 QAT 构建器，也没把假量化自动接进训练器；fp8 有参考语义与
   权重读取入口（e4m3 / e5m2，5.318 / 5.319），设备端没有存储容器与内核、
   遇到即显式拒绝；
-  W8A8 也尚无反向（bias 除外）。非对称零点只有参考语义与构图入口
-  （5.315），CUDA / HIP 没有内核、遇到即显式拒绝，因此这条路径目前
-  不能用于真机推理；逐组反量化已有设备内核（5.321，只做反量化、不融合 GEMM，
+  W8A8 也尚无反向（bias 除外）。非对称零点的量化 / 反量化已有设备内核
+  （5.322，V100 上 conformance 逐位相同），`linear_i8_zp` / `linear_i8a8_zp`
+  仍显式拒绝，融合 GEMM 这条路径还不能用于真机推理；逐组反量化已有设备内核（5.321，只做反量化、不融合 GEMM，
   融合成 `linear_i8_group` 仍未做），但没有主机侧的逐组量化 helper
   （写侧由导出器负责）。
 - **布局**：NHWC 传播 pass 已交付，但只有参考后端承接；设备后端对 `layout="nhwc"`
@@ -267,12 +268,11 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 ### 维护者备注
 
 - 临时脚本（`_tmp_*.py` 等）用完即删；结论写进 DESIGN 对应小节，凭证不落盘。
-- **文档里的算子总数长期滞后**：本轮实测 `len(OPS) == 93`、`len(GPU_OPS) == 87`
-  （HIP 的 `HIP_OPS` 直接继承，`CUDA_OPS` 同为 87），而正文明面上的 80 / 73 是
-  5.312 起的增量口径（5.315、5.317、5.318、5.321 各加若干，设备端只跟了 5.321
-  的 2 个逐组反量化），与实际值仍差 13 / 14。未承接的 6 个是 `dequantize_i8_zp` /
-  `quantize_i8_zp` / `linear_i8_zp` / `linear_i8a8_zp`（显式拒绝）与
-  `fft` / `rfft`（CUDA 由 cuFFT 承接）。下次统一校准一次，以
+- **文档里的算子总数长期滞后**：本轮实测 `len(OPS) == 93`、`len(GPU_OPS) == 89`
+  （HIP 的 `HIP_OPS` 直接继承，`CUDA_OPS` 同为 89），而正文明面上的 80 / 75 是
+  5.312 起的增量口径（5.315、5.317、5.318、5.321、5.322 各加若干），与实际值
+  仍差 13 / 14。未承接的 4 个是 `linear_i8_zp` / `linear_i8a8_zp`（显式拒绝）
+  与 `fft` / `rfft`（CUDA 由 cuFFT 承接）。下次统一校准一次，以
   `py -3.14 -c "from aetherflow.ir.ops import OPS; print(len(OPS))"` 与
   `device_shared.GPU_OPS` 为准，并把"70 个自研内核"这类分项一起重数，不要只改总数。
 - 提交后用 `git status` / `git diff --stat` 核对。曾出现工作区文件被旧版覆盖
