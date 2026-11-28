@@ -23041,6 +23041,35 @@ Adam lr 2e-4，20 步）：同一批回答段 3.4728 → 1.0306，窗口均值 2
 SFT 再 LoRA，本仓两段都已能独立跑通，但"在 SFT 存档上继续挂 adapter"目前
 只在缩小版验证过（真实权重路径的存档需要外部给出结构配置）。
 
+### 5.362　跨卡一致性表：HIP 的 `topk` axis0 与测试的归约路径
+
+发布前把 `run_conformance` 在三个后端各跑一遍，第一次暴露出 HIP 上
+`topk_values` / `topk_indices` 的 axis0 形态失败：`device_reduce._topk_result`
+用 `out_perm.transpose(inv)` 调的是数组对象的方法。CUDA 的 `self.cp` 是 CuPy，
+`ndarray` 自带 `transpose`；HIP 的 `self.cp` 是 `runtime` 模块，数组是自研
+`DeviceArray`，没有这个方法。两个 `cp` 都提供模块级 `transpose(a, axes)`，
+改成 `self.cp.transpose(out_perm, inv)` 后两端同源，不需要给 `DeviceArray`
+补一个只为一个调用点存在的方法。此前 CUDA 侧只跑过默认轴的 topk，axis0
+的结果重建（排完序再逆置换回原轴序）没有被真机覆盖过。
+
+同一次运行还发现测试侧的一处错配：`collective_support` 只按"本机 NCCL / RCCL
+库可加载"判断设备侧归约可用，不看后端是不是真设备。用 `_FakeDevices` 测
+分片与合并的用例在 WSL（有 RCCL、只有一块卡）上因此默认走到设备侧，真去
+`ncclCommInitAll` 并因卡数不足报 invalid argument；这些用例测的是主机中转
+的语义，显式 `collective="host"` 才是它们要覆盖的路径。多卡真机的用例
+（`TestCudaDataParallel`）不受影响。
+
+| 后端 | 真机 | executed / refused / failed | 覆盖算子 |
+|---|---|---|---|
+| 参考 | 本机 CPU（numpy） | 192 / 0 / 0 | 124 |
+| CUDA | Tesla V100-SXM2-32GB（sm_70） | 189 / 3 / 0 | 123 |
+| HIP | RX 7650 GRE（gfx1100 / ROCm 7.2） | 182 / 10 / 0 | 121 |
+
+CUDA 的 3 条 refused 是 `sort` 两个方向与 f64 的 `relu`；HIP 的 10 条再加
+FFT 的 7 条（没有 rocFFT 绑定）。全量测试：本地 3644 / 464 跳过、V100
+3621 / 81 跳过、WSL HIP 3644 / 468 跳过，均 OK。
+
+
 
 
 

@@ -164,8 +164,20 @@ python -m benchmarks.run --backend ref      # 性能基准（另有 hip / cuda�
 python -m benchmarks.framework_compare --device cuda   # 与 torch eager / compile 的同机对照（单算子 + 整图）
 ```
 
-当前基线：**3635 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
-V100 真机 3621 个用例 / 81 跳过 / OK（差值都是只在本地跳过的设备端测试）。
+当前基线：**3644 个用例**，本地 464 跳过（Python 3.14 + torch 2.13）全绿；
+V100 真机 3621 个用例 / 81 跳过 / OK、WSL HIP（RX 7650 GRE）3644 个用例 / 468 跳过 / OK
+（差值都是只在本地跳过的设备端测试）。
+
+跨卡一致性（`run_conformance`，192 个用例 / 124 个算子）：
+
+| 后端 | 真机 | 结果 | 覆盖算子 |
+|---|---|---|---|
+| 参考 | 本机 CPU（numpy） | 192 executed / 0 refused / 0 failed | 124 |
+| CUDA | Tesla V100-SXM2-32GB（sm_70） | 189 / 3 / 0 | 123（FFT 走 cuFFT） |
+| HIP | RX 7650 GRE（gfx1100 / ROCm 7.2） | 182 / 10 / 0 | 121 |
+
+`refused` 是后端能力声明里**没有**的形态，按契约拒绝而不是静默降级：CUDA 的 3 条是
+`sort` 两个方向与 f64 的 `relu`；HIP 的 10 条再加 FFT 的 7 条（没有 rocFFT 绑定）。
 
 ## 4. 第一代版本的能力面
 

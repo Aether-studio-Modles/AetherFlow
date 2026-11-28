@@ -469,6 +469,17 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   rank8 挂 q/v（0.54M / 630.17M = 0.09%）20 步回答段 3.47 → 1.03，窗口
   3.00 → 2.16，291 个基座参数逐位不变（DESIGN 5.361）。adapter 存成 npz
   （键 = IR 参数名），未做合并回基座的导出。
+- 阶段 5（完成）：跨卡一致性表与发布前回归。`run_conformance` 三后端各跑一遍：
+  参考 192 / 0 / 0（124 算子）、CUDA V100 189 / 3 / 0（123）、HIP RX 7650 GRE
+  182 / 10 / 0（121）；refused 是 `sort` 两个方向 + f64 的 `relu`，HIP 再加
+  没有 rocFFT 的 7 条 FFT。顺手修掉 HIP 上 topk axis0 的 3 个 failed：
+  `device_reduce._topk_result` 原先调 `out_perm.transpose(inv)`（CuPy 的数组
+  方法），HIP 的 `DeviceArray` 没有，改成两端都有的模块级
+  `self.cp.transpose(out_perm, inv)`（DESIGN 5.362）。`_FakeDevices` 的分片 /
+  合并用例显式 `collective="host"`：`collective_support` 只看库是否可加载，
+  WSL 单卡上有 RCCL 会被默认拉到设备侧、真去 `ncclCommInitAll` 而失败。
+  全量测试：本地 3644 / 464 跳过、V100 3621 / 81 跳过、WSL HIP 3644 / 468
+  跳过，均 OK；ruff 通过。
 - 注意：`seq` 静态（无 `arange`），换长度要重建图；图内不做权重转置。
 - `lm_head` 与 `embed_tokens` 当前各占一份（tied 只在加载时填两份），所以 0.5B
   结构实测 630.2M 参数；训练期合并两份梯度尚未做。
