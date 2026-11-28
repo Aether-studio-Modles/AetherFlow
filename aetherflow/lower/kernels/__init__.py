@@ -30,6 +30,7 @@ from .elementwise import (
 )
 from .reduce import (
     reduce_sum_last,
+    reduce_sum_rows as reduce_sum_rows,
     reduce_max_last,
     reduce_mean_last,
     reduce_axis,
