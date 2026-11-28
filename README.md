@@ -286,10 +286,11 @@ PyTorch / JAX / ONNX Runtime / TVM / vLLM 的主要差距：
   设备端自 5.334 起有原生 NHWC 内核（conv2d 只走分块直算，maxpool2d / avgpool2d
   只覆盖前向；f32、groups=1）。im2col / 隐式 / Winograd / 分组 / cuDNN 与池化反向
   仍只有 NCHW，越界请求在算子入口显式报错；也没有 GEMM epilogue；
-- **国产卡后端**：只有接入路径与准入判据（DESIGN 5.336），仓库内没有实现、
-  也没有实测记录。可离线验证的只有方言（同一批模板换 f16 存取）、能力声明与
-  装配拒绝面；runtime / BLAS 绑定要等厂商 SDK 与硬件，未写的原因是不猜厂商
-  API——猜出来的包会"像能跑、永远跑不对"；
+- **国产卡后端**：天数（Iluvatar CoreX）与沐曦（MetaX C500）两个硬件包已各自
+  在真机跑通，实现在独立仓库（`aetherflow_iluvatar` / `aetherflow_metax`），
+  不在本仓发布、也不在本仓 CI 里；主仓侧只保证契约——`install_hardware` 能装、
+  能识别，无厂商库时 `BackendUnavailableError` 显式拒绝，清单摘要失配即拒绝
+  （DESIGN 5.336）；
 - **量化推理**：weight-only int8（`quantize_i8` / `dequantize_i8` / `linear_i8`，
   权重驻留 1 字节、GEMM 仍走 f32 反量化）与 W8A8（`linear_i8a8`：int8 激活 ×
   int8 权重在 int32 里累加后再乘两个 scale，CUDA 的内核走 `__dp4a`、HIP 走标量

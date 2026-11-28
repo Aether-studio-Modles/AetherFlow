@@ -19110,7 +19110,7 @@ cc 112 段 0.359（6.4%）。
 | 3 | 量化只到 weight-only int8 | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，但仍无 fp8 GEMM 与存储容器） |
 | 4 | 无 loop IR / 调度搜索 / 原生 NHWC / GEMM epilogue | 峰值性能上限 |
 | 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中；前缀缓存的自动匹配见 5.335） |
-| 6 | 无国产卡后端 | 特定硬件市场（接入路径、离线可验证面与真机准入判据见 5.336；当前无硬件，未实现） |
+| 6 | 国产卡后端 | 特定硬件市场（天数 / 沐曦两个硬件包已在各自仓库真机跑通，主仓侧契约验收通过；主仓未跑 conformance，见 5.336） |
 
 第 4 项与"IR 语义简单、数值可验证"的设计约束正面冲突（等于换一套后端），
 排在最后且很可能永远不做；第 3、5 项取决于项目定位（卖推理才做）；第 6 项
@@ -21369,9 +21369,40 @@ prompt 以父序列全部 token 开头。服务侧最想要的那一格——"�
 
 ### 5.336 国产卡后端：接入路径、离线可验证面与真机准入判据
 
-本小节是**计划**，不含实现。缺口表第 6 项原先写"不做"，理由是"需要厂商联合
-优化，单机项目做了也是半成品"；现在把这条决策收窄成"只做能离线验证的部分，
-真机部分等硬件与 SDK 到位再做"，而不是推翻它。
+本小节记录**已落地的接入形态**与主仓侧的验收状态。缺口表第 6 项原先写"不做"，
+理由是"需要厂商联合优化，单机项目做了也是半成品"；现在的收窄方式是：实现放在
+**独立仓库的硬件包**里（`aetherflow_iluvatar` / `aetherflow_metax`，各自独立
+git 仓库），主仓只负责契约验收与拒绝面，不在 `aetherflow/backends/` 下再养两套
+设备后端。
+
+**两个实现（事实）**
+
+| 包 | 厂商 / 卡 | 工具链 | 状态 |
+|---|---|---|---|
+| `iluvatar_af` 0.1.0 | Iluvatar CoreX / 智铠 MR-V100 | 天数 Clang `-x ivcore --cubin`，driver API 加载 | 真机跑通，flash attention 512×512×64 / 256 batch·head 约 0.6 ms（约 57 TFLOPS） |
+| `metax_af` 0.1.0 | MetaX / 曦云 C500 | `mxcc -O2 -D__CUDACC__`，MACA 3.10.1.11 的同名 CUDA 兼容库 | 真机跑通（含 D=64 / D=128 两套 flash attention） |
+
+两者共同的取舍：不继承 `CudaBackend`（否则把 cupy 容器与 cuDNN 假设一起带过来），
+直接继承 `DeviceBackend`；内核模板逐字复用 `cuda.codegen`，只替换 f16 的三个
+辅助函数（PTX → `_Float16` + `__builtin_bit_cast`）；`ctypes` 直连厂商运行时与
+BLAS，不引 cupy / torch；`CONV_IMPLS` 去掉 `cudnn`。两家 flash attention 的
+mma 片段形状不同（天数 16×16×32、C500 16×16×16），这部分各自重写并实测。
+
+**主仓侧已验收（本机无卡，2026-11-28）**
+
+用 `install_hardware` 把两个 zip 装进隔离的 `AETHERFLOW_HARDWARE_DIR`：
+
+- 两个包都被识别成 `api=1` 的硬件包，`name` / `version` / `vendor` / `factory`
+  与清单一致，`scan_errors` 为空；未签名（`signed=False`）按契约接受。
+- 无厂商库时 `get_backend("iluvatar")` / `get_backend("metax")` 抛
+  `BackendUnavailableError`，消息列出尝试过的 `libcudart.so.10.2` /
+  `libcudart.so.10`——**不静默回退参考后端**，这正是契约要的行为。
+- `requires` 只声明 `numpy` 与算子子集，安装期不执行包作者代码（`find_spec`
+  查依赖），`metax` 的清单在构建时按当前 `GPU_OPS` 生成。
+
+**未验收**：主仓内没有跑过这两个包的 conformance——那需要对应硬件。真机结论
+（数值、性能、四模式 flash attention）在两包各自的 `REMIND.md` 里，不是主仓
+的证据。
 
 **已具备的接入条件（事实，不是设想）**
 
@@ -21390,19 +21421,18 @@ prompt 以父序列全部 token 开头。服务侧最想要的那一格——"�
 
 **三层拆分，各自的可验证性**
 
-1. **方言层（离线可验证）**：模板是纯 C++ + `__global__`，天数软件栈兼容
-   CUDA C；不通用的是 f16 的 PTX 内联汇编与 `__ldg`——HIP 已经踩过同一处
-   （5.40 的 `invalid output constraint`）。做法与 `hip/codegen.py` 相同：
-   只替换 prelude 的三个 f16 辅助函数，主体与 CUDA 逐字共用。
-   离线准入：f32 / f16 / bool 三类源码都能打印，且与 CUDA 方言对拍后
-   结构一致、只有 helper 名不同。
-2. **运行时层（需要硬件与 SDK）**：runtime 要提供 `set_device` / 分配 / 拷贝 /
-   编译（厂商 runtime 编译或 AOT）/ 启动 / 同步 / `sm_count`；BLAS 绑定要提供
-   sgemm / hgemm / batched，按能力裁剪。**没有 SDK 文档就不写**——猜 API 会
-   产出一个"看起来能跑、永远跑不对"的包，比不写更糟。
-3. **能力声明层（离线可验证）**：`capabilities()` 只能来自实际跑通的内核集合，
-   不能照抄 CUDA 的表。起点与 HIP 一致：`GPU_OPS` 去掉库依赖项
-   （SPARSE / FFT / cuDNN 快路径），等 conformance 逐项通过再扩。
+1. **方言层**：模板是纯 C++ + `__global__`，不通用的是 f16 的 PTX 内联汇编。
+   两家都用编译器原生能力替换：天数 Clang（`-x ivcore`）与沐曦 `mxcc` 都接受
+   `_Float16` + `__builtin_bit_cast`，与 HIP 踩过的同一处（5.40 的
+   `invalid output constraint`）解法一致；主体与 CUDA 逐字共用。
+2. **运行时层**：两包都用 `ctypes` 直连厂商运行时（不引 cupy / torch），编译
+   是离线产 `cubin`（天数 Clang、沐曦 `mxcc`），加载与启动走 driver API
+   （`cuModuleLoadData` / `cuLaunchKernel`），BLAS 走厂商提供的 CUDA 兼容库。
+   主仓不重复实现这一层。
+3. **能力声明层**：`capabilities()` 只能来自实际跑通的内核集合，不能照抄 CUDA
+   的表。两包都从 `GPU_OPS` 去掉库依赖项（SPARSE / FFT / cuDNN 快路径）起步
+   （`metax_af` 参考 100 个算子，`iluvatar_af` 同量级），等 conformance 逐项
+   通过再扩。
 
 **真机准入判据（不可谈判）**
 
@@ -21412,17 +21442,19 @@ prompt 以父序列全部 token 开头。服务侧最想要的那一格——"�
   不支持的图捕获，都显式报错，不静默降级。
 - 性能不进准入：没有实测数字就不写数字，也不把"能跑"说成"更快"。
 
-**分阶段与依赖**
+**主仓侧待做与依赖**
 
-- P1（离线，可立即做）：方言 + manifest + 源码对拍用例；`execute` 在没有
-  厂商运行时时抛 `BackendUnavailableError`。产出"骨架就位"，不宣称能跑。
-- P2（需硬件）：runtime + BLAS，跑通 conformance 的 f32 子集。
-- P3（需硬件）：f16 / bool / 图捕获按 conformance 逐项打开。
-- P4：性能与 `SchedulePolicy` 的设备名入库（5.333 的库需要真机签名）。
+- 已做（离线）：安装 / 识别 / 能力声明 / 无卡拒绝面，见上。
+- 待做（需天数机器）：`run_conformance` 的 f32 子集，通过后把逐项结果写回
+  两包各自的 `REMIND.md`，并更新本节状态列。
+- 待做（需沐曦机器）：同上，另加 D=64 / D=128 两条 flash attention 的数值
+  对拍（掩码 / dropout / causal 截断四模式）。
+- 待做（两机都有后）：`SchedulePolicy` 的设备名入库（5.333 的库要真机签名）。
 
 **明确不做**
 
-- 不猜厂商 API，不写未经真机验证的 runtime。
+- 主仓不重复实现厂商 runtime：两个包的 runtime / BLAS / 编译都在包内，主仓
+  只保证契约；厂商 API 以两包现场验证过的调用为准，不另写一套。
 - 不在 `aetherflow/backends/` 里加第四套设备后端：国产卡走硬件包，与 novac
   同层；把转译塞进装配层会让"一套 IR 落到不同硬件"变成各家自己解释 IR
   （`hardware.py` 已有的边界）。
@@ -21431,16 +21463,17 @@ prompt 以父序列全部 token 开头。服务侧最想要的那一格——"�
 
 **未声称**
 
-- 当前没有国产卡硬件，本小节只是计划；仓库里没有任何"国产卡实测通过"的记录。
-- 5.292 的天数结论来自外部现场（打包 + 硬件包安装），该包源码不在仓库内，
-  不能当作"已接入"的证据。
-- 方言层能否被天数编译器接受，只有拿到编译器才能验证；这里不预先宣称。
+- 主仓内没有任何国产卡 conformance 结果；本机无卡，只验证了装配与拒绝面。
+- 两包的真机数字（MR-V100 的 0.6 ms / 57 TFLOPS、C500 的 flash attention）
+  来自包侧 `REMIND.md`，主仓未复跑，也不把它们写成主仓的基线。
+- 两包不在主仓的 CI 里，也不随主仓发布；换框架版本时要各自重打包——清单里的
+  文件摘要会失配，安装期就拒绝，不会"装上了但跑的是旧代码"。
 
 **继续推进需要的东西**
 
-厂商 SDK 名称与版本、runtime 编译方式（NVRTC 对应物或 AOT）、BLAS 库名与
-soname、是否支持流捕获；以及一台可用的卡（或远程机器，凭证走环境变量 /
-密钥文件，不写进仓库与日志）。
+一台天数 MR 卡与一台沐曦 C500（或远程机器，凭证走环境变量 / 密钥文件，不写进
+仓库与日志），在两机上按各自 `REMIND.md` 的命令复跑 conformance，把结果回填到
+本节的状态列。
 
 
 
