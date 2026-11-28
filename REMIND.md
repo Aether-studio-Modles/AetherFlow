@@ -39,7 +39,8 @@
   decode 图捕获一次、状态常驻显存、每步只把 logits 取回主机（DESIGN 5.279～5.281；
   空闲 A800 24 层 81.2 → 8.2 ms/token，连续批处理 `capacity=8` 时 66.1 → 491.6 tok/s）；
   分页 KV cache（含换出 / 换入、LRU 调度与共享前缀 `fork` / 写时复制，以及
-  token→token 的贪心生成闭环 `PagedGenerator`）与贪心投机
+  token→token 的贪心生成闭环 `PagedGenerator` 与自动前缀缓存，5.310 / 5.335）
+  与贪心投机
   解码（组件级，见"已知限制"）；OpenAI 兼容 HTTP 子集（`aetherflow.serve`：
   `/v1/completions`、`/v1/chat/completions`、SSE 流式）。
 - **调优与可观测**：与后端无关的参数空间与搜索、conv / 逐元素 / 归约的调优旋钮、
@@ -238,9 +239,12 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
   解码的请求）；`PagedDecodeScheduler` 把多序列交错解码接在同一张单步图上，
   `suspend` / `resume` 对应解除保护与换入，`fork` 让新序列共享父序列的前缀。
   `fork` 在缓存层是多条序列共享同一批物理页、写入时按页拆分（块级引用计数），
-  适合同前缀多路采样 / 束搜索 / 同系统提示的多请求；它是显式动作，不做前缀
-  内容匹配。`PagedGenerator`（5.310）在调度器之上补了 token→token 的贪心生成闭环
-  （主机侧嵌入 + 位置编码、一层词表头、EOS 停止）。这些组件都是主机态，没有真机
+  适合同前缀多路采样 / 束搜索 / 同系统提示的多请求。`PagedGenerator`（5.310）
+  在调度器之上补了 token→token 的贪心生成闭环（主机侧嵌入 + 位置编码、一层
+  词表头、EOS 停止）；5.335 起 `generate` 默认做**自动前缀缓存**——不传
+  `fork_from` 时扫描驻留序列挑最长严格前缀（跳过换出态与等长序列），fork 后
+  只 prefill 剩余 token，命中统计在 `stats()` 的 `prefix_hits` /
+  `prefix_reused_tokens` / `prefix_misses`。这些组件都是主机态，没有真机
   D2H 与拆页开销的实测，也要求 `batch=1` 与静态 `max_steps`。投机解码走
   `LMRunner.generate_speculative`（5.303），只支持贪心验收与 `batch=1`。
 - **推理服务**：OpenAI 兼容只做子集——`logprobs` / `n>1` / 工具调用 /

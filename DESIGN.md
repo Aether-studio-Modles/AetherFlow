@@ -238,7 +238,7 @@ GPU 作业仍未接上真实 runner。
 | 算子覆盖 | 78 个 IR 算子；前端代码里出现 116 个 `aten.*` 名字（含拒绝面） | PyTorch 的 aten 是全集量级；JAX 以 Primitive 为基；ONNX Runtime 按 ONNX op 集 | 我们是**子集**，缺的算子显式拒绝，不静默降级 |
 | 精度 | f32 / f16 全覆盖（65 个设备算子），bf16 32 个，f64 与复数部分承接 | 各家覆盖更宽，且已有 FP8 / FP4 等低精度格式 | 量化有 weight-only int8 与 W8A8（int8 输入、int32 累加的设备内核，5.309），对称与非对称零点两套主机侧语义（非对称见 5.315、量化 / 反量化内核见 5.322、融合线性层见 5.323；逐组的非对称 `dequantize_i8_group_zp` 见 5.321），逐组（per-group）weight-only 反量化（`dequantize_i8_group` / `_zp`，5.317 语义、5.321 设备内核），以及 QAT 的假量化算子（5.311，scale 不可学）与 LSQ 的可学步长版本（5.312），fp8 的 cast 已落到设备端（5.325，载体仍是 f32、不省带宽），但没有 fp8 GEMM |
 | 分布式 | DP（主机中转 / 设备侧 NCCL）、ZeRO-1/2/3、GPipe / 1F1B、张量并行（仅前向） | PyTorch 有 FSDP / DTensor / 专家并行；JAX 有 `pjit` / sharding | 缺专家并行、P2P 与 FSDP 等价物 |
-| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（解码器未接 `generate`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314），但没有内置 HF 权重转换表、无 GGUF、无 WordPiece / Unigram |
+| 推理服务 | OpenAI 兼容 HTTP、连续批处理、设备态解码、分页 KV cache（`PagedGenerator` 的 token→token 闭环与自动前缀缓存，5.310 / 5.335；未接 `LMRunner`）、贪心投机解码 | PyTorch 生态靠 vLLM / TGI 等；ONNX Runtime 有 Serving | 自带服务面；权重能读 safetensors（5.313）、文本能过 ByteLevel BPE（5.314），但没有内置 HF 权重转换表、无 GGUF、无 WordPiece / Unigram |
 | 生态 | 能读 safetensors（5.313，按需读取 + 名字 / 布局显式映射）与 HF `tokenizer.json` 的 ByteLevel BPE 谱系（5.314），无预训练权重分发、无 Hub、无第三方算子库 | 各自有完整生态 | 权重与分词入口已通，分发仍然缺位 |
 | 失败语义 | 能力未覆盖即显式报错（构图期拒绝或 `BackendCapabilityError`），捕获期登记、replay 后复查 | 常见做法是回落或静默降级 | 这是设计差异，不是能力差异 |
 
@@ -19109,7 +19109,7 @@ cc 112 段 0.359（6.4%）。
 | 2 | DDP 走主机中转、无反向重叠、无 P2P | 多卡扩展性 |
 | 3 | 量化只到 weight-only int8 | 推理性能上限（W8A8 的主机侧语义见 5.308、设备内核见 5.309；QAT 的假量化算子见 5.311，可学步长（LSQ）见 5.312；非对称零点的语义与构图入口见 5.315，量化 / 反量化内核见 5.322、融合线性层见 5.323，逐组 weight-only 反量化见 5.317、设备内核见 5.321；量化权重的 safetensors 读取约定见 5.317；fp8 的参考语义见 5.318、设备端 cast 的量化内核见 5.325，但仍无 fp8 GEMM 与存储容器） |
 | 4 | 无 loop IR / 调度搜索 / 原生 NHWC / GEMM epilogue | 峰值性能上限 |
-| 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中） |
+| 5 | prefix caching / KV swap / 投机未接主路径 | 长上下文服务的显存效率（投机已接 `LMRunner`，见 5.303；分页换出 / 换入与共享前缀见 5.304 / 5.307；token→token 的生成闭环见 5.310，`LMRunner` 主干是 Mamba、没有 KV，故不在其中；前缀缓存的自动匹配见 5.335） |
 | 6 | 无国产卡后端 | 特定硬件市场 |
 
 第 4 项与"IR 语义简单、数值可验证"的设计约束正面冲突（等于换一套后端），
@@ -21304,6 +21304,65 @@ conv 与 maxpool 各一条，无 ROCm 时跳过）。全量 3357 条通过，ruf
   收益取决于形状与访存模式，要以真机测量为准。
 - 配置库没有 NHWC 记录：新签名要重新测过才有命中，本轮不生成。参数化版本
   也没有进 `plan_conv_tiled` 的成本模型（几何仍按 NCHW 同一套预算判定）。
+
+### 5.335 前缀缓存接主路径：`generate` 自动挑选最长前缀
+
+**缺口。** 5.307 给了块级引用计数与写时复制，5.310 给了 token→token 的生成
+闭环，但"共享前缀"仍是**显式动作**：调用方必须自己知道父序列的 id，并且保证
+prompt 以父序列全部 token 开头。服务侧最想要的那一格——"同一个系统提示、
+不同的用户问题"——要么手工维护一张 prompt→rid 的映射，要么每次重解系统提示。
+缺口表第 5 项的 KV swap 部分已由 5.304 / 5.310 接上（`suspend(evict=True)` 后
+`resume` 续写），本节补的是 prefix caching 的自动匹配。
+
+**做法：命中判断放进 `PagedGenerator.generate`，不进调度器。**
+
+- `PagedGenerator.__init__` 增加 `prefix_cache: bool = True`，并给
+  `stats()` 增加三个计数（与调度器统计合并返回）：
+  `prefix_hits` / `prefix_reused_tokens` / `prefix_misses`。
+- `generate` 在 `fork_from is None` 且开关打开时调用 `_match_prefix(ids)`：
+  遍历驻留序列（`self._tokens`），取"token 序列是 prompt 严格前缀"里最长的
+  一条，`fork` 它，只对剩余 token 做 prefill。显式 `fork_from` 优先，且不计
+  命中/未命中——那是调用方的决策，不是缓存判断。
+- 三个排除条件都是正确性而不是优化：**自身**（防止调用顺序变化时自 fork）、
+  **换出态**（`fork` 要求驻留，换出的父序列得先 `resume`，而"自动触发换入"
+  会把一次生成变成不可预期的搬运）、**等长**（生成需要一个尚未解码的位置，
+  父序列最后一步的 logits 没保存，和显式 `fork_from` 的既有报错同一理由）。
+
+**为什么不做哈希索引。** 单进程里驻留序列通常是个位数到几十，线性扫一眼的
+成本远低于维护一张"前缀树 / token 序列 → rid"索引——后者要在 `finish`、
+`fork`、`suspend`、`resume`、`feed` 五处同步失效，任何一处漏掉就是**用别的
+请求的 KV 算出错误 token**（不会报错，只会答错）。这是本仓库最不能接受的
+失败模式，所以第一版选可读的线性匹配；等序列数真的上千再谈索引，届时正确性
+边界要重新论证。
+
+**与换出 / 换入的关系。** 命中只共享**驻留**序列：换出态被跳过，但换出态本身
+仍可通过 `resume` 回到驻留、再被后续请求命中（它的 `_tokens` 一直在
+`self._tokens` 里）。`fork` 出来的子序列也进入同一张表，所以链式命中成立
+（A → B → C 依次共享越来越长的前缀），用例
+`test_longest_prefix_wins` 覆盖了这条。
+
+**验证。** `tests/test_attention_cache.py::TestPrefixCache` 5 条：
+
+1. 命中后的生成结果与同参数集独立实例逐 token 相等（缓存只省 prefill）；
+2. 命中共享父序列的物理页，`forks` 加一、`shared_blocks` 非零，`used_blocks`
+   至多多一个写时复制的尾页；
+3. 多条候选时取最长前缀（复用 token 数 2 + 3）；
+4. 换出态与等长序列都不参与匹配，结果仍等于独立生成；
+5. `prefix_cache=False` 时 `shared_blocks` 为 0、页数按独立序列增长。
+
+全量 3362 条通过，ruff 通过。
+
+**未声称。**
+
+- 没有跨进程 / 跨实例 / 落盘的前缀缓存，也没有 token 级哈希（按整条序列
+  比对，命中粒度是"某个请求已经解码到的位置"）。
+- 不自动换入：换出态的序列不会被命中触发 `resume`，调用方仍要自己决定
+  何时把长上下文请求搬回显存。
+- 不做前缀树的 LRU 淘汰：驻留序列的生命周期仍由显式 `finish` 控制，
+  `prefix_cache` 只改变"新请求怎么复用"，不改变"旧序列何时释放"。
+- 仍是主机态组件：命中省的是 prefill 的 host→device 与算子调用，没有真机
+  D2H / 页搬运的端到端时延数据。
+
 
 
 
