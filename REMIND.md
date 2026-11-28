@@ -114,10 +114,10 @@ python -m benchmarks.framework_compare --device cuda  # 与 torch eager / compil
 
 | 后端 | 环境 | 用例 |
 |---|---|---|
-| 参考 | Windows / Python 3.14 | 3195 个用例，460 跳过，全绿 |
+| 参考 | Windows / Python 3.14 | 3197 个用例，460 跳过，全绿 |
 | HIP | WSL + ROCm 7.2 / RX 7650 GRE（`gfx1102`） | 本轮复跑 `test_hip_backend` 72 条、`test_device_control` + `test_lm_device_state` 44 条，全绿 |
 | CUDA | Ubuntu 22.04 / A800-SXM4-40GB（`sm_80`）/ CUDA 12.4 / 驱动 550 | 2857 个用例、80 跳过；123 条前端 error 是该机 torch 2.5.1 不在兼容矩阵内（按设计显式拒绝），CUDA 组含新增用例全过 |
-| CUDA | Tesla PG503-216（V100 32GB / `sm_70`）/ CUDA 12.9 / cupy 14.2.0 | 本轮只跑 `conformance`（130 executed / 2 refused / 0 failed，`fake_quantize_i8_channel` / `fake_quantize_i8_lsq_channel` 与 `quantize_i8` / `dequantize_i8` / `linear_i8a8_bias` 误差均为 0）；上轮 `verify_cuda.py`（含两条 W8A8 边界用例）结论沿用；未跑全量 unittest |
+| CUDA | Tesla V100-SXM2-32GB（`sm_70`）/ 驱动 550.127.05 / Ubuntu 22.04 / python3.10.12 + cupy 14.2.0 | `python3 verify_cuda.py` → `130 executed / 10 refused / 0 failed`（5.320 修复后；refused 含 `cast_f8e4m3` / `cast_f8e5m2`）；`tests.test_cuda_backend` 382 条 3.9 秒全过（2 跳过）、`tests.test_fp8` 18 条全过；未跑全量 unittest |
 
 ```bash
 # 本地全量
@@ -659,17 +659,24 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 - **窄支持面优于近似实现**（5.314）：Llama-3 的 `Split` 预分词带一个会改切分
   边界的正则（数字按 1～3 位分组），忽略它就是拿别的分词器当自己的用。宁可
   显式报"不支持 Split"，也不静默产出"看起来能用"的 id。
-- **远端 V100 的凭证与环境**（5.304 / 5.309）：两条线路同一个端口与密码，
-  移动 `ssh root@223.109.239.32 -p 20824`、电信 `ssh root@180.127.11.166 -p 20824`，
-  账户 `root` / `vipuser`，密码 `co7eeNie`。单卡 Tesla PG503-216（V100
-  32GB / compute_cap 7.0 / sm_70，CUDA 12.9）；python3.10.12 + cupy 14.2.0 +
-  numpy 2.2.6。同步方式是本地
-  `tar -czf`（排除 `.git` / `__pycache__`，含 `benchmarks`，约 1.2 MB）→
-  paramiko SFTP 上传 → `/root/afv2` 解压；`python3 -m unittest
-  tests.test_cuda_backend tests.test_cuda_train` 383 条 2.9 秒全过。
-  5.309 的 W8A8 验证用同一套同步，跑 `python3 verify_cuda.py`（完整
-  conformance + 边界用例）与一段临时对拍脚本（7 种形态逐位比对，跑完删除）。
+- **远端 V100 的凭证与环境**（5.304 / 5.309 / 5.320）：两条线路同一个端口与
+  密码，移动 `ssh root@223.109.239.36 -p 24432`、电信
+  `ssh root@180.127.11.177 -p 24432`，账户 `root` / `vipuser`，密码 `hogheiW9`。
+  单卡 Tesla V100-SXM2-32GB（32768 MiB，compute_cap 7.0 / `sm_70`，驱动
+  550.127.05），Ubuntu 22.04（内核 6.2.0-37）、python3.10.12 + numpy 2.2.6 +
+  cupy 14.2.0，系统未装 nvcc。同步方式：本地
+  `tar -czf`（排除 `.git` / `__pycache__` / `.pytest_cache`，含 `aetherflow
+  tests benchmarks examples pyproject.toml verify_cuda.py`，约 1.37 MB）→
+  paramiko SFTP 上传 `/root/af_latest.tgz` → `/root/afv3` 解压。上一台
+  `223.109.239.32:20824` / `180.127.11.166:20824`（密码 `co7eeNie`、
+  `/root/afv2`）已释放，别再用。
   SSH 偶发 `banner` 被重置，连接要带 3–5 次重试，别把一次失败当环境坏了。
+- **两条执行路径要逐条对齐检查**（5.320）：设备后端同时有逐节点 `invoke` 与
+  计划期预绑定后的批量派发快路径。5.318 只在 `invoke` 里判 fp8，`_planned_kernel`
+  只扫输入 dtype，于是 `cast`（输入 f32、输出 fp8）被预绑定、绕开检查，真机上
+  表现为 "算错" 而不是 "拒绝"（`verify_cuda.py` 从 2 refused 变 2 failed）。
+  预绑定条件必须与 `invoke` 的检查一一对应，**输入与输出都要判**；判不了就返回
+  `None` 退回原路径，报错时机与文案不变。
 
 ---
 
