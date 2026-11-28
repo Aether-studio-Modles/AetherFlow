@@ -15,6 +15,7 @@ from aetherflow.lower.plan import (
     CONV_TILE_OPTIONS,
     CSR_SCAN_MAX,
     CSR_SCAN_SLOTS,
+    REDUCE_BLOCK,
     REDUCE_SCRATCH,
     REDUCE_TILE_X,
     SCAN_CHUNK,
@@ -216,12 +217,15 @@ class TestPlanReduce(unittest.TestCase):
     def test_block_tracks_columns(self):
         self.assertEqual(plan_reduce(0), 1)
         self.assertEqual(plan_reduce(1), 1)
-        self.assertEqual(plan_reduce(1000), 1024)
+        # 默认上限是 REDUCE_BLOCK（256）：一行一 block 的归约不该铺满 1024，
+        # 否则每 SM 只剩 2 行并行、归约树也多两级 barrier。
+        self.assertEqual(plan_reduce(1000), REDUCE_BLOCK)
 
     def test_block_capped(self):
-        self.assertEqual(plan_reduce(4096), BLOCK_MAX)
+        self.assertEqual(plan_reduce(4096), REDUCE_BLOCK)
 
     def test_custom_cap(self):
+        self.assertEqual(plan_reduce(4096, cap=BLOCK_MAX), BLOCK_MAX)
         self.assertEqual(plan_reduce(4096, cap=256), 256)
 
     def test_rejects_negative(self):

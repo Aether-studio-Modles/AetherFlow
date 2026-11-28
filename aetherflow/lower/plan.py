@@ -31,6 +31,7 @@ __all__ = [
     "BLOCK_DEFAULT",
     "SHARED_LIMIT",
     "REDUCE_SCRATCH",
+    "REDUCE_BLOCK",
     "ATTENTION_BLOCK",
     "CONV_TILE_W",
     "CONV_TILE_OPTIONS",
@@ -105,6 +106,15 @@ SHARED_LIMIT = 48 * 1024
 # 块内归约树的每一级占一个槽，block 不可能超过 1024，所以 1024 个 float
 # 恰好够用，也不会把 shared 预算吃掉（4KB）。
 REDUCE_SCRATCH = 1024
+
+# "一行一 block" 的归约（sum / max / mean / softmax / layernorm / rmsnorm）的
+# block 上限。取 256 而不是 1024：这类内核一行只有 cols 个元素（通常 512~4096），
+# 用 1024 线程时每 SM 只能驻 2 行、且归约树有 10 级 barrier，行级并行度全被
+# 屏障吃掉了。天数 MR-V100 实测（3355 万元素、f16/f32 各五档列数）：
+# cols=1024 的 layernorm 1.62 → 0.62 ms、softmax 1.45 → 0.63 ms；
+# cols=4096 的 layernorm 0.68 → 0.44 ms（463 GB/s，已到 elementwise 峰值）。
+# 每 SM 2048 线程时 256 能驻 8 行，且每线程 4~16 个元素的串行链还能提供 ILP。
+REDUCE_BLOCK = 256
 
 # 非末维归约在 inner 方向的线程上限。一个 warp 32 个线程正好覆盖一整段连续
 # inner：再宽不会让访存更合并，只会把 reduce 轴（blockDim.y）的并行度挤掉。
@@ -426,12 +436,16 @@ def plan_elementwise(
     return Launch(block=block, grid=grid, vec=vec)
 
 
-def plan_reduce(cols: int, *, cap: int = BLOCK_MAX) -> int:
+def plan_reduce(cols: int, *, cap: int = REDUCE_BLOCK) -> int:
     """一行一 block 的归约（sum / max / mean / softmax / layernorm）的 block。
 
     取 ``cols`` 向上取整到 2 的幂，最多 ``cap``：列数少时少派线程，
     列数多时每个线程串行多走几步。shared 只需要一块 ``REDUCE_SCRATCH``
     大小的暂存区，与列数无关——归约树深度由 block 决定。
+
+    ``cap`` 默认 ``REDUCE_BLOCK``（256）而不是 ``BLOCK_MAX``：一行只有 cols
+    个元素，block 铺满 1024 会同时丢掉行级并行度（每 SM 只能驻 2 块）并拉长
+    归约树（10 级 barrier）。依据见 ``REDUCE_BLOCK`` 的注释。
     """
     if cols < 0:
         raise ValueError(f"列数不能为负，收到 {cols}")

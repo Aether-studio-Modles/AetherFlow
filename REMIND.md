@@ -1078,6 +1078,36 @@ HSA_ENABLE_DXG_DETECTION=1 python -m unittest discover -s tests -t .
 
 ---
 
+## 归约类内核的 block 上限改为 256（5.357，2026-11-28）
+
+`plan_reduce` 原来把"一行一 block"的归约（sum / max / mean / softmax /
+layernorm / rmsnorm）铺到 `BLOCK_MAX`（1024）线程。天数 MR-V100 实测这是
+明确的反向选择：一行只有 cols 个元素，1024 线程时每 SM 只能驻 2 行，而
+`block_reduce_*` 的折半树有 10 级 `__syncthreads`，行级并行度全被屏障吃掉。
+
+把上限改成新增常量 `REDUCE_BLOCK = 256`，同形状实测（3355 万元素、f16）：
+
+| 用例 | cols=1024 旧 | 新 | 提升 |
+|---|---|---|---|
+| layernorm | 1.62 ms / 124 GB/s | 0.62 ms / 325 GB/s | -62% |
+| softmax | 1.45 ms / 93 GB/s | 0.63 ms / 212 GB/s | -56% |
+| rmsnorm | 1.11 ms / 121 GB/s | 0.45 ms / 298 GB/s | -59% |
+
+按实际扫描遍数折算：layernorm（3 遍读 + 1 遍写）410 GB/s、rmsnorm
+（2 遍）429 GB/s，elementwise 的峰值是 420~436 GB/s——归约类在 256 线程下
+只剩"多扫一遍"的差距。block 再降到 128 反而变慢（每线程串行链变长），
+cols=256 的极窄行是 128 略好，但 256 只差 13%，不为此加分支。f32 同样以
+256 最优或接近最优（cols=4096 时 512 略好 6%，不做 dtype 特化）。
+
+**代价**：block 变小后每线程跨步处理 cols/block 个元素，求和顺序与原来的
+1024 折半树不同（差异 ~1e-7）。一致性套件 `executed=146 refused=4
+failed=16` 与基线同名同数（既有 fp8 / topk / bool 缺口），归约类
+err 1e-8~5e-7；`test_plan.py` / `test_transformer` 相关本地测试全过。
+
+复测脚本见 `aetherflow_iluvatar/bench/op_bw_probe.py`（f16 各算子带宽表）。
+
+---
+
 ## 版本记录
 
 | 版本 | 日期 | 摘要 |
