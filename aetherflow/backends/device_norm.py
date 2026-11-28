@@ -56,8 +56,10 @@ class _NormMixin:
             )
         else:
             kernel = self._kernel(
-                ("layernorm_residual", dtype_key),
-                lambda: self.codegen.render(self.codegen.layernorm_residual_source(), x.dtype),
+                ("layernorm_residual", dtype_key, cache),
+                lambda: self.codegen.render(
+                    self.codegen.layernorm_residual_source(cache), x.dtype
+                ),
                 "layernorm_residual",
             )
             kernel(

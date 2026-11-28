@@ -193,16 +193,28 @@ def layernorm_last(cache: int = 0) -> Kernel:
     )
 
 
-def layernorm_residual_last() -> Kernel:
+def layernorm_residual_last(cache: int = 0) -> Kernel:
     """融合残差的 LayerNorm：``x + res`` 不落成中间张量。
 
     每次用到 ``xv`` 都重新算一遍 ``x + res``，并且**先舍入回存储类型**——
     f16 的参考实现（numpy 两个 f16 相加）也是这样，先加再窄化，而不是
     一路用 float 累加到最后才舍入。
+
+    ``cache`` 非 0 时第一遍把 ``xv`` 的 float 值留在寄存器里，后两遍不再
+    重读两个输入、也不再重算加法（见 ``layernorm_last``）。
     """
 
     def _scan(body: tuple) -> For:
         return For("i", Axis("tid"), Var("cols"), Axis("bdim"), body)
+
+    def _slot() -> Expr:
+        """``tid + k * bdim``：cache 版里第 k 个元素的下标。"""
+        return Bin("+", Axis("tid"), Bin("*", Var("k"), Axis("bdim")))
+
+    def _cache_loop(body: tuple) -> For:
+        return For(
+            "k", Num(0), Num(cache), Num(1), body, incr="++", type_name="int"
+        )
 
     def _xv() -> Stmt:
         """``%T% xv = %ST%(%LD%(xr[i]) + %LD%(rr[i]));``"""
@@ -225,30 +237,90 @@ def layernorm_residual_last() -> Kernel:
             (Bin("+", Bin("/", var, Cast("float", Var("cols"))), Var("eps")),),
         )
 
-    return Kernel(
-        name="layernorm_residual",
-        params=(
-            Tensor("x"),
-            Tensor("res"),
-            Tensor("gamma"),
-            Tensor("beta"),
-            Tensor("out", read_only=False),
-            Scalar("long long", "rows"),
-            Scalar("long long", "cols"),
-            Scalar("float", "eps"),
+    prologue = (
+        Let("long long", "row", Axis("bid")),
+        If(Bin(">=", Var("row"), Var("rows")), (Return(),)),
+        Ptr("xr", "x", Bin("*", Var("row"), Var("cols"))),
+        Ptr("rr", "res", Bin("*", Var("row"), Var("cols"))),
+        Ptr(
+            "orow",
+            "out",
+            Bin("*", Var("row"), Var("cols")),
+            const=False,
         ),
-        body=(
-            Let("long long", "row", Axis("bid")),
-            If(Bin(">=", Var("row"), Var("rows")), (Return(),)),
-            Ptr("xr", "x", Bin("*", Var("row"), Var("cols"))),
-            Ptr("rr", "res", Bin("*", Var("row"), Var("cols"))),
-            Ptr(
-                "orow",
-                "out",
-                Bin("*", Var("row"), Var("cols")),
-                const=False,
+        Shared("float", "smem", REDUCE_SCRATCH),
+    )
+    if cache:
+        tail = (
+            ArrayDecl("float", "xc", cache, None),
+            Let("float", "s", Num("0.f")),
+            _cache_loop(
+                (
+                    Let(
+                        None,
+                        "xv",
+                        Narrow(
+                            Bin(
+                                "+",
+                                Load("xr", _slot()),
+                                Load("rr", _slot()),
+                            )
+                        ),
+                    ),
+                    Store("xc", Var("k"), Widen(Var("xv")), raw=True),
+                    AugAssign(Var("s"), "+", Widen(Var("xv"))),
+                )
             ),
-            Shared("float", "smem", REDUCE_SCRATCH),
+            Assign(Var("s"), Call("block_reduce_sum", (Var("s"), Var("smem")))),
+            Let(
+                "float",
+                "mean",
+                Bin("/", Var("s"), Cast("float", Var("cols"))),
+            ),
+            Let("float", "v", Num("0.f")),
+            _cache_loop(
+                (
+                    Let(
+                        "float",
+                        "d",
+                        Bin("-", Index("xc", Var("k")), Var("mean")),
+                    ),
+                    AugAssign(Var("v"), "+", Bin("*", Var("d"), Var("d"))),
+                )
+            ),
+            Assign(Var("v"), Call("block_reduce_sum", (Var("v"), Var("smem")))),
+            Let("float", "inv", _inv_std(Var("v"))),
+            _cache_loop(
+                (
+                    Let("long long", "i", _slot()),
+                    Store(
+                        "orow",
+                        Var("i"),
+                        Bin(
+                            "+",
+                            Bin(
+                                "*",
+                                Bin(
+                                    "*",
+                                    Paren(
+                                        Bin(
+                                            "-",
+                                            Index("xc", Var("k")),
+                                            Var("mean"),
+                                        )
+                                    ),
+                                    Var("inv"),
+                                ),
+                                Load("gamma", Var("i")),
+                            ),
+                            Load("beta", Var("i")),
+                        ),
+                    ),
+                )
+            ),
+        )
+    else:
+        tail = (
             Let("float", "s", Num("0.f")),
             _scan((_xv(), AugAssign(Var("s"), "+", _xv_f()))),
             Assign(Var("s"), Call("block_reduce_sum", (Var("s"), Var("smem")))),
@@ -285,7 +357,21 @@ def layernorm_residual_last() -> Kernel:
                     ),
                 )
             ),
+        )
+
+    return Kernel(
+        name="layernorm_residual",
+        params=(
+            Tensor("x"),
+            Tensor("res"),
+            Tensor("gamma"),
+            Tensor("beta"),
+            Tensor("out", read_only=False),
+            Scalar("long long", "rows"),
+            Scalar("long long", "cols"),
+            Scalar("float", "eps"),
         ),
+        body=prologue + tail,
     )
 
 

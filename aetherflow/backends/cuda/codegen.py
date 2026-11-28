@@ -2412,9 +2412,12 @@ def layernorm_template() -> str:
     return LAYERNORM_SRC
 
 
-def layernorm_residual_source() -> Kernel:
-    """融合残差的末维 LayerNorm 的 L2 描述（生产路径）。"""
-    return layernorm_residual_last()
+def layernorm_residual_source(cache: int = 0) -> Kernel:
+    """融合残差的末维 LayerNorm 的 L2 描述（生产路径）。
+
+    ``cache`` 非 0 时整行只读一遍显存（见 ``norm.layernorm_residual_last``）。
+    """
+    return layernorm_residual_last(cache)
 
 
 def layernorm_residual_template() -> str:

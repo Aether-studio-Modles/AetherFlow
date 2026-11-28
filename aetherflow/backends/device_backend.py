@@ -176,6 +176,10 @@ class DeviceBackend(
     # plan.conv_winograd_preferred）。默认 False：阈值来自 A800 的七个形状，
     # 且 HIP 侧没有实测过这条路径，只有 CUDA 覆盖成 True。
     CONV_AUTO_WINOGRAD = False
+    # auto 模式下分块直算的最小 K（输入通道 × 核面积）。共享判据来自 CUDA：
+    # K ≤ CONV_TILED_MAX_K 时分块通常更快。极小 K 的分块核装不满整个 block，
+    # 厂商实测更慢时可抬高这个门槛，把它让给 im2col。
+    CONV_TILED_MIN_K = 1
     # sparse_linear 的实现选择。子类可以扩展（CUDA 多一个 "cusparse"）。
     SPARSE_IMPLS: Tuple[str, ...] = _SPARSE_IMPLS
 

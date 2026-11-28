@@ -302,6 +302,8 @@ class _ConvMixin:
         三条规则，每条都对应一个具体的失败模式：
 
         - ``conv_impl="im2col"``：人工强制，用于对照实验与排障。
+        - K 小于 ``CONV_TILED_MIN_K``：厂商实测里极小 K 的分块核装不满，
+          交给 im2col（天数 C=3 首层见 ``IluvatarBackend.CONV_TILED_MIN_K``）。
         - K 很大（深通道 / 大核）或输出总量太小：判据在 ``plan.conv_tiled_preferred``，
           数字来自 DESIGN 5.16 的实测。
         - shared 预算放不下一个输出通道：明确报错，不静默换实现。
@@ -310,7 +312,10 @@ class _ConvMixin:
         """
         if self.conv_impl == "im2col":
             return False
-        if self.conv_impl == "auto" and not conv_tiled_preferred(k, n * o * ho * wo):
+        if self.conv_impl == "auto" and (
+            k < self.CONV_TILED_MIN_K
+            or not conv_tiled_preferred(k, n * o * ho * wo)
+        ):
             return False
         if conv_oc_tile(kh * kw, o) is None:
             raise BackendCapabilityError(

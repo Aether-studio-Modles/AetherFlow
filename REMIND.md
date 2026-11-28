@@ -1166,9 +1166,9 @@ float 数组，后面的扫描直接读寄存器。softmax 连 `exp` 结果也�
 `executed=165 refused=10 failed=17`（失败全是既有缺口：fp8 / topk /
 bool 归约 / remainder_floor / logical_not）。
 
-**未覆盖**：`layernorm_residual_last` 仍是逐遍重读。训练里带 residual 的
-LN 很常用，同法处理即可（第一遍缓存 `Narrow(x + residual)`，与重算逐位
-相同）。
+**当时未覆盖**：`layernorm_residual_last` 仍是逐遍重读——5.359 已补齐。
+
+---
 
 端到端（单层图 LN→GEMM→GELU→softmax→+x→GEMM，`(64,512,1024)` f16，
 两个 GEMM 走 cuBLAS）：最初 5.674 ms → block=256 后 3.647（-35.7%）→
@@ -1177,6 +1177,22 @@ LN 很常用，同法处理即可（第一遍缓存 `Narrow(x + residual)`，与
 还有 attention，GEMM 占比更高，端到端提升会按占比打折。
 
 复测脚本见 `aetherflow_iluvatar/bench/op_bw_probe.py`（f16 各算子带宽表）。
+
+## 残差归一化与首层卷积的两处补丁（5.359，2026-11-28）
+
+**残差版归一化**：5.358 的寄存器缓存补进 `layernorm_residual_last(cache)`。
+第一遍把 `Narrow(x + residual)` 的 float 值存进寄存器，后两遍不再重读两个
+输入、也不再重算加法（与原来"每次重算再窄化"逐位相同）。天数真机
+`(64,512,1024)` f16：**0.692 → 0.474 ms（-31.5%）**。
+
+**首层卷积**：新增厂商门槛 `DeviceBackend.CONV_TILED_MIN_K`（默认 1，
+其他后端行为不变），`_use_tiled_conv` 在 `k < CONV_TILED_MIN_K` 时直接
+让给 im2col。天数设 32（C=3 的 3x3 是 K=27）。实测 `(32,3,32,32)→64`
+f32：tiled 1.953 ms、im2col 0.393 ms、auto 改后 **0.382 ms（-80%）**。
+C=4 的 3x3（K=36）仍在门槛之上，继续走分块。
+
+一致性：`executed=165 refused=10 failed=17`，与 5.358 逐项相同；conv 用例
+err 2.4e-7~3.8e-6。
 
 ---
 
