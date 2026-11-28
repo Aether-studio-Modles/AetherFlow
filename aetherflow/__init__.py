@@ -171,7 +171,7 @@ from .tuning import (
     tune,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 # 后端 / 硬件包契约的主版本。它与包版本分开：包可以频繁发版，但只要
 # Backend 协议、IR 序列化格式与方言数据结构没变，aetherflow_api 就保持 1，
 # 已安装的 zip 硬件包不需要跟着重发。
